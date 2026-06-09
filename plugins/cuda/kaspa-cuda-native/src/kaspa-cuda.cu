@@ -97,6 +97,25 @@ __device__ __inline__ void amul4bit(uint32_t packed_vec1[32], uint32_t packed_ve
 }
 
 
+/*
+ * Arch-specific launch bounds. On sm_80 (GA100 — A100 / CMP 170HX) the
+ * unrolled kernel naturally lands at 72 registers, which is just over
+ * the 65536/(2*512)=64 threshold, so it runs at only 1 block/SM (~25%
+ * occupancy) — the 170HX then idles at ~99W/250W, latency-bound. Forcing
+ * `__launch_bounds__(512, 2)` caps it at 64 regs (a trivial 12-byte
+ * spill) and unlocks 2 blocks/SM = 50% occupancy.
+ *
+ * Gated on __CUDA_ARCH__ so sm_120 (RTX 5090) is untouched — it already
+ * sits at 64 regs / 2 blocks/SM and is power-bound at 3.28 GH/s; pinning
+ * a block-size hint there could only constrain the driver's launch
+ * config, so we leave it alone.
+ */
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800)
+#define HEAVY_HASH_BOUNDS __launch_bounds__(512, 2)
+#else
+#define HEAVY_HASH_BOUNDS
+#endif
+
 extern "C" {
 
 
@@ -147,7 +166,7 @@ extern "C" {
      * Net of the launch-config sweep: upstream defaults win. The lever
      * for speed is on the kernel body, not the launch dispatcher.
      */
-    __global__ void heavy_hash(const uint64_t nonce_mask, const uint64_t nonce_fixed, const uint64_t nonces_len, uint8_t random_type, void* states, uint64_t *final_nonce) {
+    __global__ void HEAVY_HASH_BOUNDS heavy_hash(const uint64_t nonce_mask, const uint64_t nonce_fixed, const uint64_t nonces_len, uint8_t random_type, void* states, uint64_t *final_nonce) {
         // assuming header_len is 72
         int nonceId = threadIdx.x + blockIdx.x*blockDim.x;
         if (nonceId < nonces_len) {
