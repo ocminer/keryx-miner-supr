@@ -8,10 +8,13 @@ use log::LevelFilter;
 use std::error::Error as StdError;
 #[cfg(feature = "overclock")]
 use {
-    log::{error, info},
+    log::{error, info, warn},
+    nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor},
     nvml_wrapper::enums::device::GpuLockedClocksSetting,
     nvml_wrapper::Device as NvmlDevice,
     nvml_wrapper::Nvml,
+    std::thread,
+    std::time::Duration,
 };
 
 pub type Error = Box<dyn StdError + Send + Sync + 'static>;
@@ -122,6 +125,82 @@ impl Plugin for CudaPlugin {
                         };
                     };
                 }
+            }
+
+            // Fan speed control. nvml's set_fan_speed requires the GPU to be
+            // in manual fan-control mode first; on consumer cards under a
+            // headless driver that means root + `nvidia-smi -i <id> -fcm 1`
+            // or the X-coolbits route. We try-and-warn-on-failure so a
+            // non-root operator can still pass --cuda-fan-speed and see why
+            // it didn't stick.
+            #[cfg(feature = "overclock")]
+            if let Some(ref fans) = opts.overclock.cuda_fan_speed {
+                for i in 0..gpus.len() {
+                    let pct: u32 = match fans.get(i) {
+                        Some(p) => *p,
+                        None => *fans.last().unwrap_or(&0),
+                    };
+                    let pct = pct.min(100);
+                    let mut nvml_device: NvmlDevice = self.nvml_instance.device_by_index(gpus[i] as u32)?;
+                    let n_fans = nvml_device.num_fans().unwrap_or(1);
+                    let name = nvml_device.name().unwrap_or_else(|_| "GPU".into());
+                    for f in 0..n_fans {
+                        match nvml_device.set_fan_speed(f, pct) {
+                            Ok(()) => info!("GPU #{} #{} fan {} → {}%", i, name, f, pct),
+                            Err(e) => warn!("GPU #{} #{} fan {}: set_fan_speed({}%) failed: {:?} (need manual fan-control mode + permissions)", i, name, f, pct, e),
+                        }
+                    }
+                }
+            }
+
+            // Periodic monitor thread — logs temp / fan / power / clocks
+            // every `cuda_monitor_interval` seconds. The thread is detached;
+            // it dies with the process. Disabled if interval == 0.
+            #[cfg(feature = "overclock")]
+            if opts.overclock.cuda_monitor_interval > 0 {
+                let gpus_for_monitor = gpus.clone();
+                let interval = Duration::from_secs(opts.overclock.cuda_monitor_interval);
+                thread::Builder::new()
+                    .name("keryxcuda-monitor".into())
+                    .spawn(move || {
+                        // Each monitor thread builds its own NVML handle —
+                        // sharing across threads via Arc<Mutex<Nvml>> would
+                        // serialise everything for no benefit (NVML calls
+                        // are already cheap). Init failure is logged once.
+                        let nvml = match Nvml::init() {
+                            Ok(n) => n,
+                            Err(e) => { warn!("keryxcuda-monitor: NVML init failed: {:?} — monitor disabled", e); return; }
+                        };
+                        loop {
+                            for (idx, &gpu_id) in gpus_for_monitor.iter().enumerate() {
+                                if let Ok(dev) = nvml.device_by_index(gpu_id as u32) {
+                                    let temp = dev.temperature(TemperatureSensor::Gpu).ok();
+                                    let n_fans = dev.num_fans().unwrap_or(0);
+                                    let fan_pct: Vec<String> = (0..n_fans)
+                                        .filter_map(|f| dev.fan_speed(f).ok().map(|p| format!("{}%", p)))
+                                        .collect();
+                                    let power_w = dev.power_usage().ok().map(|mw| mw as f32 / 1000.0);
+                                    let core_mhz = dev.clock_info(Clock::Graphics).ok();
+                                    let mem_mhz = dev.clock_info(Clock::Memory).ok();
+                                    let mem_used = dev.memory_info().ok();
+                                    info!(
+                                        "[GPU #{}] temp={}°C fan={} power={} core={} MHz mem={} MHz vram={}",
+                                        idx,
+                                        temp.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+                                        if fan_pct.is_empty() { "?".into() } else { fan_pct.join(",") },
+                                        power_w.map(|w| format!("{:.1}W", w)).unwrap_or_else(|| "?".into()),
+                                        core_mhz.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                                        mem_mhz.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                                        mem_used
+                                            .map(|m| format!("{}/{}MB", m.used / (1024 * 1024), m.total / (1024 * 1024)))
+                                            .unwrap_or_else(|| "?".into()),
+                                    );
+                                }
+                            }
+                            thread::sleep(interval);
+                        }
+                    })
+                    .ok();
             }
 
             self.specs = (0..gpus.len())

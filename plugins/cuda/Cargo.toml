@@ -14,10 +14,17 @@ log = "0.4"
 rand = "0.8"
 clap = { version = "3.0", features = ["color", "derive"]}
 env_logger = "0.9"
-nvml-wrapper = { version = "0.10", optional = true }
+# nvml-wrapper drives the temperature / fan / power / clock monitor and
+# the locked-clock / power-limit overclock surface. Upstream gates it
+# behind the `overclock` feature; we enable it by default in `-supr` so
+# `--cuda-lock-mem-clocks`, `--cuda-lock-core-clocks`, `--cuda-power-limits`,
+# `--cuda-fan-speed`, and the periodic `[GPU #X] temp=… fan=… power=…`
+# log line are always available.
+nvml-wrapper = { version = "0.12", optional = true }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [features]
+default = ["overclock"]
 overclock = [ "nvml-wrapper" ]

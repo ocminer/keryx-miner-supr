@@ -22,12 +22,16 @@ impl FromStr for NonceGenEnum {
 #[cfg(feature = "overclock")]
 #[derive(clap::Args, Debug, Default)]
 pub struct OverClock {
-    #[clap(long = "cuda-lock-mem-clocks", use_delimiter = true, help = "Lock mem clocks eg: ,810, [default: 0]")]
+    #[clap(long = "cuda-lock-mem-clocks", use_delimiter = true, help = "Lock mem clocks (MHz) per GPU, comma-separated, e.g. 9500,9500")]
     pub cuda_lock_mem_clocks: Option<Vec<u32>>,
-    #[clap(long = "cuda-lock-core-clocks", use_delimiter = true, help = "Lock core clocks eg: ,1200, [default: 0]")]
+    #[clap(long = "cuda-lock-core-clocks", use_delimiter = true, help = "Lock core clocks (MHz) per GPU, comma-separated, e.g. 2400,2400")]
     pub cuda_lock_core_clocks: Option<Vec<u32>>,
-    #[clap(long = "cuda-power-limits", use_delimiter = true, help = "Lock power limits eg: ,150, [default: 0]")]
+    #[clap(long = "cuda-power-limits", use_delimiter = true, help = "Lock power limits (W) per GPU, comma-separated, e.g. 450,450")]
     pub cuda_power_limits: Option<Vec<u32>>,
+    #[clap(long = "cuda-fan-speed", use_delimiter = true, help = "Lock fan speed (% 0-100) per GPU, comma-separated, e.g. 80,80. Requires NVIDIA manual-fan-control mode (nvidia-smi -i <gpu> -fcm 1, or X+coolbits) on consumer cards.")]
+    pub cuda_fan_speed: Option<Vec<u32>>,
+    #[clap(long = "cuda-monitor-interval", default_value = "30", help = "Seconds between periodic GPU monitor lines (temp, fan, power, clocks). 0 to disable.")]
+    pub cuda_monitor_interval: u64,
 }
 
 #[derive(clap::Args, Debug)]
