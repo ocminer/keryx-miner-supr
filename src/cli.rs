@@ -89,14 +89,6 @@ pub struct Opt {
     #[clap(short = 's', long = "keryxd-address", default_value = "127.0.0.1", help = "The IP of the keryxd instance")]
     pub keryxd_address: String,
 
-    // Upstream `keryx-miner` hardcoded `keryx:qrxpcusy…` as the devfund and
-    // forced a 2 % minimum. The `-supr` fork removes the tax entirely: the
-    // default is 0 and there is no minimum clamp. If you want to donate to
-    // someone, pass `--devfund-percent N` explicitly and patch
-    // `Opt::process()` to point `devfund_address` somewhere meaningful.
-    #[clap(long = "devfund-percent", help = "The percentage of blocks to send to the devfund (default 0 — no tax)", default_value = "0", parse(try_from_str = parse_devfund_percent))]
-    pub devfund_percent: u16,
-
     #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22211]")]
     port: Option<u16>,
 
@@ -112,36 +104,6 @@ pub struct Opt {
         long_help = "Mine even when keryxd says it is not synced, only useful when passing `--allow-submit-block-when-not-synced` to keryxd  [default: false]"
     )]
     pub mine_when_not_synced: bool,
-
-    #[clap(skip)]
-    pub devfund_address: String,
-}
-
-fn parse_devfund_percent(s: &str) -> Result<u16, &'static str> {
-    let err = "devfund-percent should be --devfund-percent=XX.YY up to 2 numbers after the dot";
-    let mut splited = s.split('.');
-    let prefix = splited.next().ok_or(err)?;
-    // if there's no postfix then it's 0.
-    let postfix = splited.next().ok_or(err).unwrap_or("0");
-    // error if there's more than a single dot
-    if splited.next().is_some() {
-        return Err(err);
-    };
-    // error if there are more than 2 numbers before or after the dot
-    if prefix.len() > 2 || postfix.len() > 2 {
-        return Err(err);
-    }
-    let postfix: u16 = postfix.parse().map_err(|_| err)?;
-    let prefix: u16 = prefix.parse().map_err(|_| err)?;
-    // can't be more than 99.99%,
-    if prefix >= 100 || postfix >= 100 {
-        return Err(err);
-    }
-    // `-supr` fork: no 2 % minimum. Upstream forced `Ok(200u16)` when prefix
-    // was below 2, taxing every miner with no opt-out — see the parent
-    // commentary on `devfund_percent` above.
-    // DevFund is out of 10_000
-    Ok(prefix * 100 + postfix)
 }
 
 impl Opt {
@@ -170,17 +132,6 @@ impl Opt {
             self.num_threads = Some(0);
         }
 
-        let miner_network = self.mining_address.as_deref().and_then(|a| a.split(':').next());
-        self.devfund_address = String::from("keryx:qp0vrxc0k5w0pcyem6vau2pjgztje880tsm239rywtm7l7uv2pcxzq55n8khs");
-        let devfund_network = self.devfund_address.split(':').next();
-        if miner_network.is_some() && devfund_network.is_some() && miner_network != devfund_network {
-            self.devfund_percent = 0;
-            log::info!(
-                "Mining address ({}) and devfund ({}) are not from the same network. Disabling devfund.",
-                miner_network.unwrap(),
-                devfund_network.unwrap()
-            )
-        }
         Ok(())
     }
 

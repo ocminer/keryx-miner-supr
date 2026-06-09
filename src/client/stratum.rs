@@ -121,9 +121,6 @@ pub struct StratumHandler {
     stream: Pin<Box<dyn Stream<Item = Result<StratumLine, NewLineJsonCodecError>>>>,
     miner_address: String,
     mine_when_not_synced: bool,
-    devfund_address: Option<String>,
-    devfund_percent: u16,
-    mining_dev: Option<bool>,
     block_template_ctr: Arc<AtomicU16>,
 
     target_pool: Uint256,
@@ -149,11 +146,6 @@ pub struct StratumHandler {
 
 #[async_trait(?Send)]
 impl Client for StratumHandler {
-    fn add_devfund(&mut self, address: String, percent: u16) {
-        self.devfund_address = Some(address);
-        self.devfund_percent = percent;
-    }
-
     async fn register(&mut self) -> Result<(), Error> {
         let mut id = { Some(self.last_stratum_id.fetch_add(1, Ordering::SeqCst)) };
         self.send_channel
@@ -171,17 +163,9 @@ impl Client for StratumHandler {
             .await?;
         id = Some(self.last_stratum_id.fetch_add(1, Ordering::SeqCst));
 
-        let pay_address = match &self.devfund_address {
-            Some(devfund_address) if self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent => {
-                self.mining_dev = Some(true);
-                info!("Mining to devfund");
-                devfund_address.clone()
-            }
-            _ => {
-                self.mining_dev = Some(false);
-                self.miner_address.clone()
-            }
-        };
+        // Always authorize with the configured mining address. (The devfund
+        // address-swap cycle was removed — see docs/devfund-removed.md.)
+        let pay_address = self.miner_address.clone();
         self.send_channel
             .send(StratumLine {
                 id,
@@ -218,15 +202,6 @@ impl Client for StratumHandler {
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
         info!("Waiting for stuff");
         loop {
-            {
-                if (!self.mining_dev.unwrap_or(true)
-                    && self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent)
-                    || (self.mining_dev.unwrap_or(false)
-                        && self.block_template_ctr.load(Ordering::SeqCst) > self.devfund_percent)
-                {
-                    return Ok(());
-                }
-            }
             match self.stream.try_next().await? {
                 Some(msg) => self.handle_message(msg, miner).await?,
                 None => return Err("stratum message payload is empty".into()),
@@ -276,8 +251,6 @@ impl StratumHandler {
             send_channel,
             miner_address,
             mine_when_not_synced,
-            devfund_address: None,
-            devfund_percent: 0,
             block_template_ctr: block_template_ctr
                 .unwrap_or_else(|| Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16))),
             target_pool: Default::default(),
@@ -287,7 +260,6 @@ impl StratumHandler {
             extranonce: None,
             last_stratum_id,
             shares_stats: share_state,
-            mining_dev: None,
             block_channel,
             block_handle,
             ipfs_url,
