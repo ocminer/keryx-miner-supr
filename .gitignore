@@ -6,3 +6,5 @@ escrow_state.json
 .env
 
 target-hive/
+target-hiveos/
+hiveos/dist/
