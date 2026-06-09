@@ -1,0 +1,106 @@
+[package]
+name = "keryx-miner-supr"
+version = "0.4.0"
+edition = "2021"
+license = "MIT/Apache-2.0"
+repository = "https://github.com/suprnova/keryx-miner-supr"
+readme = "README.md"
+description = "Suprnova fork of the Keryx GPU miner — native sm_120, no devfund tax, faster kernels."
+categories = ["command-line-utilities"]
+keywords = ["blockchain", "cli"]
+include = [
+    "src/**/*.rs",
+    "src/**/*.s",
+    "proto/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "build.rs",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "README.md",
+]
+
+[dependencies]
+tonic = "0.8"
+tokio = { version = "1.17", features = ["macros", "rt-multi-thread"] }
+prost = "0.11"
+futures-util = "0.3"
+tokio-stream = {version = "0.1", features = ["net"]}
+once_cell = "1"
+num_cpus = "1"
+rand = "0.8"
+blake2b_simd = "1.0.0"
+clap = { version = "3.0", features = ["color", "derive"]}
+log = "0.4"
+env_logger = "0.9"
+keccak = { version = "0.1", optional = true }
+parking = { package = "parking_lot", version = "0.12", optional = true }
+libloading = "0.7"
+tokio-util = {version = "0.7.0", features = ["codec"]}
+serde_json = "1.0"
+serde_repr = "0.1"
+serde =  {version="1.0", features=["derive"]}
+futures = "0.3.21"
+bytes = "1.1.0"
+async-trait = "0.1"
+num = "0.4"
+nix = "0.25"
+hex = "0.4"
+keryx-inference = { path = "inference" }
+secp256k1 = { version = "0.29.0", features = ["global-context"] }
+semver = "1.0"
+# Phase-3 OPoI: SLM inference via candle.
+# suprnova test-fork: dropped `features = ["cuda"]` so the binary builds on a CUDA-less
+# host. At runtime the miner already detects no-CUDA via `GpuProbe::NoCuda` and falls back
+# to CPU. Only matters for LLM inference on AiRequest tasks; per-share `tag_fixed` MLP is
+# baked in from `inference/` and works either way.
+candle-core = { version = "0.8" }
+candle-transformers = { version = "0.8" }
+candle-nn = { version = "0.8" }
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+ureq = { version = "2", features = ["tls"] }
+base64 = "0.22"
+anyhow = "1"
+time = { version = "0.3", features = ["formatting", "macros"] }
+flate2 = "1.0"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Keep the library crate name as `keryx_miner` (not the default
+# `keryx_miner_supr` derived from the package name) so `use keryx_miner::*`
+# in src/* and `keryx_miner = { path = "../../", package = "keryx-miner-supr" }`
+# in the plugin manifests keep working without a sed-pass over the source tree.
+[lib]
+name = "keryx_miner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "keryx-miner-supr"
+path = "src/main.rs"
+
+[features]
+default = ["parking_lot"]
+parking_lot = ["parking", "tokio/parking_lot"]
+bench = []
+no-asm = ["keccak"]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keccak = "0.1"
+kernel32-sys = "0.2"
+win32console = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[build-dependencies]
+tonic-build = { version = "0.8", default-features = false, features = ["prost", "transport"] }
+cc = "1"
+time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
+
+[workspace]
+members = ["inference", "plugins/*"]
+default-members = [".", "plugins/cuda", "plugins/opencl"]
