@@ -17,6 +17,11 @@ static PTX_120: &str = include_str!("../resources/keryx-cuda-sm120.ptx");
 static PTX_100: &str = include_str!("../resources/keryx-cuda-sm100.ptx");
 static PTX_89: &str = include_str!("../resources/keryx-cuda-sm89.ptx");
 static PTX_86: &str = include_str!("../resources/keryx-cuda-sm86.ptx");
+// sm_80 (Ampere GA100 — A100 / CMP 170HX). HBM2 means tons of memory bandwidth
+// (~1.5 TB/s on the 170HX) but only ~70 SMs with sm_80 ALU throughput per SM.
+// Compute-bound for this kernel today; the HBM2 angle pays off if we ever
+// stage the matrix or per-warp work through global memory streams.
+static PTX_80: &str = include_str!("../resources/keryx-cuda-sm80.ptx");
 static PTX_75: &str = include_str!("../resources/keryx-cuda-sm75.ptx");
 static PTX_61: &str = include_str!("../resources/keryx-cuda-sm61.ptx");
 // sm_30 (Kepler) and sm_20 (Fermi) dropped: CUDA 12+ no longer compiles for
@@ -222,6 +227,20 @@ impl<'gpu> CudaGPUWorker<'gpu> {
         } else if major == 8 && minor >= 6 {
             // sm_86 (RTX 30 / Ampere)
             _module = Arc::new(load_ptx(PTX_86, "sm_86")?);
+        } else if major == 8 {
+            // sm_80 (datacenter Ampere — A100 / CMP 170HX). Distinct from
+            // sm_86 (consumer Ampere) — A100/170HX have HBM2 + larger
+            // shared memory budget but fewer SMs.
+            _module = Arc::new(match load_ptx(PTX_80, "sm_80") {
+                Ok(m) => {
+                    info!("GPU #{} using optimised sm_80 PTX", device_id);
+                    m
+                }
+                Err(e) => {
+                    info!("GPU #{} falling back to sm_75 PTX (sm_80 PTX failed: {})", device_id, e);
+                    Module::from_ptx(PTX_75, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|_| e)?
+                }
+            });
         } else if major > 7 || (major == 7 && minor >= 5) {
             // sm_75 (RTX 20 / Turing)
             _module = Arc::new(Module::from_ptx(PTX_75, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
