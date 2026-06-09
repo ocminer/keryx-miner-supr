@@ -29,6 +29,8 @@
 	.param .u64 heavy_hash_param_4,
 	.param .u64 heavy_hash_param_5
 )
+.maxntid 512, 1, 1
+.minnctapersm 2
 {
 	.reg .pred 	%p<11>;
 	.reg .b16 	%rs<14>;
