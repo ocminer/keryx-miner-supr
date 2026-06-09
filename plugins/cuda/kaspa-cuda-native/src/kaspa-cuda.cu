@@ -120,10 +120,16 @@ extern "C" {
      *   L1 hit rate              100 %          ← matrix lives in L1
      *   L2 hit rate               91 %
      *
-     * The kernel is hitting ≈ peak compute throughput at the achievable
-     * occupancy. Further gains need an algorithmic change (less work per
-     * nonce, tensor-core matmul, smaller Keccak permutation budget,
-     * etc.) rather than a launch-config tweak.
+     * `__launch_bounds__(1024, 1)` (committed but later measured at
+     * 2.55 GH/s — also a regression). The cust runtime's
+     * cuOccupancyMaxPotentialBlockSize picks block_size=512 to
+     * maximize occupancy at the 126-reg compute. Forcing 1024 either
+     * blew up regs (compiler had to budget across 1024 threads) or
+     * inflated the in-flight warp count past the SM scheduler's
+     * sweet spot — either way, slower.
+     *
+     * Net of the launch-config sweep: upstream defaults win. The lever
+     * for speed is on the kernel body, not the launch dispatcher.
      */
     __global__ void heavy_hash(const uint64_t nonce_mask, const uint64_t nonce_fixed, const uint64_t nonces_len, uint8_t random_type, void* states, uint64_t *final_nonce) {
         // assuming header_len is 72
@@ -196,6 +202,16 @@ extern "C" {
                 product1 >>= 6;
                 product1 &= 0xF0;
                 product2 >>= 10;
+                /*
+                 * On sm_120 the compiler-driven C path actually beats
+                 * an explicit lop3.b32 asm here — tried widening the
+                 * `__CUDA_ARCH__ < 500 || > 700` upstream gate to
+                 * sm_50+ and the rebuild measured 2.78 → 2.55 GH/s.
+                 * Hypothesis: the C variant works on u8 hash_.hash[rowId]
+                 * and nvcc lowers it to a byte-permute fused with the
+                 * `xor` step; lifting to u32 + lop3 + truncate forced an
+                 * extra promotion path. Kept upstream behaviour for now.
+                 */
                 #if __CUDA_ARCH__ < 500 || __CUDA_ARCH__ > 700
                 hash_.hash[rowId] = hash_.hash[rowId] ^ ((uint8_t)(product1) | (uint8_t)(product2));
                 #else
