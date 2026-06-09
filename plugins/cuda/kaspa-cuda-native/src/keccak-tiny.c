@@ -50,6 +50,7 @@ __device__ static inline void keccakf(void* state) {
   uint64_t t = 0;
   uint8_t x, y;
 
+  #pragma unroll
   for (int i = 0; i < 24; i++) {
     // Theta
     FOR5(x, 1,

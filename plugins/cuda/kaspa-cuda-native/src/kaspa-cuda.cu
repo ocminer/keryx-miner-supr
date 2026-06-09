@@ -101,11 +101,27 @@ extern "C" {
 
 
     /*
+     * *** BIG WIN (2026-06): unroll the Keccak round loop ***
+     * `keccakf()` in keccak-tiny.c had a ROLLED `for (i=0;i<24;i++)`
+     * round loop. Rolled, the 25-lane state stayed an addressable
+     * local array (the rho/pi step indexes a[pi[x]]), which pinned the
+     * kernel at 229 regs offline / 126 regs after driver JIT → only
+     * 1 block/SM, 33% occupancy, and no cross-round ILP (fatal on a
+     * latency-bound kernel at low occupancy). Adding `#pragma unroll`
+     * to that loop lets the π-permutation become pure register
+     * renaming: 229 → 64 regs, 0 spill, 2 blocks/SM, and the runtime
+     * workload 4×'d (44M → 178M nonces). Measured 2.57 → 3.28 GH/s
+     * (+28%) on the 5090 at stock 575W. Shares accepted, 0 rejects.
+     * The card is now power-bound at the TDP cap rather than
+     * compute-bound; further kernel wins must cut energy-per-hash.
+     *
+     * --- earlier (now superseded) launch-config sweep ---
      * Tried `__launch_bounds__(512, 2)` (force 2 blocks/SM by capping
      * regs/thread at ~64). Measured 2.78 → 2.01 GH/s — the compiler
      * spilled the Keccak f-1600 state to local memory and the latency
-     * blew up. The kernel is genuinely register-hungry; reducing the
-     * limit costs more than the occupancy gain.
+     * blew up. (This was BEFORE the unroll: the rolled loop made 64
+     * regs impossible without spilling. Post-unroll, 64 regs fits
+     * naturally with 0 spill — the lever was the loop, not the bound.)
      *
      * Profiling baseline (nsight 2026.1.1, ncu --section SpeedOfLight,
      * sm_120 RTX 5090, --light tier, 89 M-nonce launch):
