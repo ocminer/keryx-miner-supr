@@ -6,8 +6,7 @@ Suprnova fork of the [keryx-labs/keryx-miner](https://github.com/keryx-labs/kery
 
 | Area | Upstream | `-supr` |
 |---|---|---|
-| Dev tax | 2 % hardcoded, minimum-clamped | 0 % default, no clamp — pass `--devfund-percent N` explicitly to opt in |
-| Devfund address | `keryx:qrxpcusy…najuhte` (Keryx Labs) | pointed at the operator's own pool wallet by default; pass `--devfund-percent 0` to skip entirely |
+| Dev tax / devfund | 2 % hardcoded, minimum-clamped; periodically switches the authorized address | **Removed entirely.** No dev tax, no address-swap cycle — the miner always mines to the configured address and never switches. (The cycle also had a crash-loop bug; see `docs/devfund-removed.md` for the archived code + details.) |
 | NVIDIA Blackwell consumer (sm_120) | Loads sm_100 PTX → "unknown error" → falls back to sm_86 JIT (~50 % of native perf on RTX 5090) | Ships native `keryx-cuda-sm120.ptx` compiled with CUDA 13.0 nvcc (`-gencode=arch=compute_120,code=compute_120 --use_fast_math -Xptxas -O3`); `plugins/cuda/src/worker.rs` dispatches `major >= 12 → PTX_120`. Unrolled Keccak round loop → **3.28 GH/s** on RTX 5090 (see Performance) |
 | Datacenter Ampere (sm_80 — A100 / CMP 170HX) | Falls through to sm_75 PTX | Ships native `keryx-cuda-sm80.ptx` with an arch-gated `__launch_bounds__(512, 2)` for 2 blocks/SM → **188 MH/s** on a CMP 170HX |
 | CUDA toolkit (PoW miner) | 12.x | Builds against **CUDA 13.0**. The PoW runtime is `cust 0.3` (binds to the driver, not the toolkit) — `cudarc` is not in the miner's dependency tree, so there's no 13.x pin to clear. Avoid 13.2: driver 580 caps PTX at ISA 9.0. |

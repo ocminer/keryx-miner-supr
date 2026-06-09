@@ -31,8 +31,6 @@ pub struct KeryxdHandler {
     stream: Streaming<KaspadMessage>,
     miner_address: String,
     mine_when_not_synced: bool,
-    devfund_address: Option<String>,
-    devfund_percent: u16,
     block_template_ctr: Arc<AtomicU16>,
 
     block_channel: Sender<BlockSeed>,
@@ -78,11 +76,6 @@ pub struct KeryxdHandler {
 
 #[async_trait(?Send)]
 impl Client for KeryxdHandler {
-    fn add_devfund(&mut self, address: String, percent: u16) {
-        self.devfund_address = Some(address);
-        self.devfund_percent = percent;
-    }
-
     async fn register(&mut self) -> Result<(), Error> {
         // We actually register in connect
         Ok(())
@@ -178,8 +171,6 @@ impl KeryxdHandler {
             send_channel,
             miner_address,
             mine_when_not_synced,
-            devfund_address: None,
-            devfund_percent: 0,
             block_template_ctr: block_template_ctr
                 .unwrap_or_else(|| Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16))),
             block_channel,
@@ -220,12 +211,9 @@ impl KeryxdHandler {
     }
 
     async fn client_get_block_template(&mut self) -> Result<(), SendError<KaspadMessage>> {
-        let pay_address = match &self.devfund_address {
-            Some(devfund_address) if self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent => {
-                devfund_address.clone()
-            }
-            _ => self.miner_address.clone(),
-        };
+        // Always mine to the configured address. (Devfund address-swap cycle
+        // removed — see docs/devfund-removed.md.)
+        let pay_address = self.miner_address.clone();
         self.block_template_ctr.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000)).unwrap();
         // Append a per-request random nonce so that parallel blocks at the same blue_score
         // get distinct coinbase payloads → distinct tx_ids (avoids DAG coinbase collisions).

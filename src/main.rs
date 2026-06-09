@@ -232,9 +232,6 @@ async fn client_main(
     )
     .await?;
 
-    if opt.devfund_percent > 0 {
-        client.add_devfund(opt.devfund_address.clone(), opt.devfund_percent);
-    }
     client.register().await?;
     let mut miner_manager = MinerManager::new(client.get_block_channel(), opt.num_threads, plugin_manager);
     client.listen(&mut miner_manager).await?;
@@ -456,14 +453,6 @@ async fn main() -> Result<(), Error> {
     }
 
     let block_template_ctr = Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16));
-    if opt.devfund_percent > 0 {
-        info!(
-            "devfund enabled, mining {}.{}% of the time to devfund address: {} ",
-            opt.devfund_percent / 100,
-            opt.devfund_percent % 100,
-            opt.devfund_address
-        );
-    }
     loop {
         match client_main(&opt, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone()).await {
             Ok(_) => info!("Client closed gracefully"),
