@@ -1,0 +1,12 @@
+[package]
+name = "keryx-inference"
+version = "1.1.1"
+edition = "2021"
+rust-version = "1.88.0"
+license = "ISC"
+description = "OPoI (Optimistic Proof of Inference) — synthetic MLP engine for Keryx miners"
+
+[dependencies]
+candle-core = { version = "0.8", default-features = false }
+hex = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
