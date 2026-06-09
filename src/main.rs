@@ -137,8 +137,13 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
 
     let (current_w, vram_mb) = match output {
         Ok(o) if o.status.success() => {
+            // nvidia-smi prints one CSV line per GPU. Take only the first
+            // (GPU 0, the miner's primary device) — splitting the whole
+            // multi-line blob on ',' merged GPU 0's memory.total with GPU 1's
+            // power.limit (e.g. "32607\n250.00"), so the VRAM field failed to
+            // parse and always showed 0 on multi-GPU rigs.
             let s = String::from_utf8_lossy(&o.stdout);
-            let mut parts = s.trim().split(',');
+            let mut parts = s.lines().next().unwrap_or("").split(',');
             let cur: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
             let _max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
             let vram: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
