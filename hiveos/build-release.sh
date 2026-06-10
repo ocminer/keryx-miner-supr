@@ -79,13 +79,15 @@ mkdir -p "$HDEST"
 cp "$PKG"/h-manifest.conf "$PKG"/h-config.sh "$PKG"/h-run.sh "$PKG"/h-stats.sh "$HDEST/"
 cp "$OUT"/keryx-miner-supr "$HDEST/"
 chmod +x "$HDEST"/h-*.sh "$HDEST"/keryx-miner-supr
-HIVE_TARBALL="$OUT/keryx-miner-supr-${VERSION}-hiveos.tar.gz"
+# HiveOS requires `<minername>-<version>.tar.gz` with no '-' in the version, so
+# this one is NOT suffixed (its plain version is what HiveOS parses).
+HIVE_TARBALL="$OUT/keryx-miner-supr-${VERSION}.tar.gz"
 tar -czf "$HIVE_TARBALL" -C "$HIVE_STAGE" keryx-miner-supr
 rm -rf "$HIVE_STAGE"
 
 # ---- checksums + report -------------------------------------------------------
 ( cd "$OUT" && sha256sum "keryx-miner-supr-${VERSION}-linux-x86_64.tar.gz" \
-                          "keryx-miner-supr-${VERSION}-hiveos.tar.gz" > SHA256SUMS.txt )
+                          "keryx-miner-supr-${VERSION}.tar.gz" > SHA256SUMS.txt )
 echo ">> Done:"
 ls -la "$LINUX_TARBALL" "$HIVE_TARBALL"
 echo ">> glibc ceilings:"
