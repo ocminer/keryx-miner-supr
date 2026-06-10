@@ -6,12 +6,24 @@ HiveOS rigs run an **older glibc** (Ubuntu 20.04 = glibc 2.31) than the dev rig
 directory builds a glibc-2.31 binary in a container and wraps it in the HiveOS
 custom-miner format.
 
-## Build the package
+## Build the release archives
+
+One script builds BOTH archives (old glibc, one container pass):
 
 ```bash
-hiveos/build-glibc.sh     # builds binary + plugins in nvidia/cuda:12.8.0-devel-ubuntu20.04 (glibc 2.31)
-hiveos/package.sh         # -> hiveos/dist/keryx-miner-supr-<version>.tar.gz
+hiveos/build-release.sh
+# -> hiveos/dist/keryx-miner-supr-<ver>-linux-x86_64.tar.gz   (normal: binary + .so plugins)
+# -> hiveos/dist/keryx-miner-supr-<ver>-hiveos.tar.gz         (HiveOS: single static binary + h-*.sh)
+# -> hiveos/dist/SHA256SUMS.txt
 ```
+
+- **linux-x86_64** = the "normal" dynamic build for general Linux: run
+  `keryx-miner-supr` from its dir (it loads the `.so` plugins next to it).
+- **hiveos** = the custom-miner package (single `--features static-cuda`
+  binary, no `.so`).
+
+(`hiveos/build-glibc.sh` + `hiveos/package.sh` still exist and build just the
+HiveOS static archive if you only want that one.)
 
 `build-glibc.sh` prints the max `GLIBC_*` symbol of each artifact — it must be
 `<= 2.31`. The CUDA PoW kernels (`keryx-cuda-sm120.ptx` etc.) are pre-built and
