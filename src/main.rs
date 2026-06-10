@@ -12,8 +12,7 @@ use rand::{thread_rng, RngCore};
 use std::fs;
 use std::sync::atomic::AtomicU16;
 use std::sync::Arc;
-use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cli::Opt;
 use crate::client::grpc::KeryxdHandler;
@@ -453,12 +452,28 @@ async fn main() -> Result<(), Error> {
     }
 
     let block_template_ctr = Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16));
+    // Reconnect backoff. Pools blip (TCP accepts then drops, EOF, restarts).
+    // Without a delay the loop busy-spins ~10x/sec, re-initialising the GPU
+    // worker each time and hammering a dead pool. Start at 1s, double on each
+    // rapid failure up to 30s, and reset after a session that stayed up long
+    // enough to be considered healthy.
+    const RECONNECT_MIN: Duration = Duration::from_secs(1);
+    const RECONNECT_MAX: Duration = Duration::from_secs(30);
+    const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+    let mut backoff = RECONNECT_MIN;
     loop {
+        let started = Instant::now();
         match client_main(&opt, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone()).await {
             Ok(_) => info!("Client closed gracefully"),
             Err(e) => error!("Client closed with error {:?}", e),
         }
-        info!("Client closed, reconnecting");
-        sleep(Duration::from_millis(100));
+        // A session that lasted a while was healthy — treat the next drop as a
+        // fresh blip rather than escalating the backoff.
+        if started.elapsed() >= HEALTHY_SESSION {
+            backoff = RECONNECT_MIN;
+        }
+        info!("Client closed, reconnecting in {}s", backoff.as_secs());
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RECONNECT_MAX);
     }
 }
