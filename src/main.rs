@@ -1,8 +1,10 @@
 #![cfg_attr(all(test, feature = "bench"), feature(test))]
 
+#[cfg(not(feature = "static-cuda"))]
 use std::env::consts::DLL_EXTENSION;
 use std::env::current_exe;
 use std::error::Error as StdError;
+#[cfg(not(feature = "static-cuda"))]
 use std::ffi::OsStr;
 
 use clap::{App, FromArgMatches, IntoApp};
@@ -31,6 +33,7 @@ mod pow;
 mod target;
 mod watch;
 
+#[cfg(not(feature = "static-cuda"))]
 const WHITELIST: [&str; 4] = ["libkeryxcuda", "libkeryxopencl", "keryxcuda", "keryxopencl"];
 
 pub mod proto {
@@ -101,6 +104,7 @@ fn adjust_console() -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(not(feature = "static-cuda"))]
 fn filter_plugins(dirname: &str) -> Vec<String> {
     match fs::read_dir(dirname) {
         Ok(readdir) => readdir
@@ -246,15 +250,37 @@ async fn main() -> Result<(), Error> {
     });
     let mut path = current_exe().unwrap_or_default();
     path.pop(); // Getting the parent directory
+
+    // Dynamic plugin path (default): scan the binary's dir for libkeryx*.so.
+    #[cfg(not(feature = "static-cuda"))]
     let plugins = filter_plugins(path.to_str().unwrap_or("."));
-    let (app, mut plugin_manager): (App, PluginManager) = keryx_miner::load_plugins(Opt::into_app(), &plugins)?;
+    #[cfg(not(feature = "static-cuda"))]
+    let (app, mut plugin_manager): (App, PluginManager) =
+        keryx_miner::load_plugins(Opt::into_app(), &plugins)?;
+
+    // Static-cuda single-binary build: the CUDA worker is compiled in, so
+    // register it directly instead of dlopening a .so. (OpenCL is omitted.)
+    #[cfg(feature = "static-cuda")]
+    let plugins: Vec<String> = vec!["builtin:cuda (static)".to_string()];
+    #[cfg(feature = "static-cuda")]
+    let (app, mut plugin_manager): (App, PluginManager) = {
+        let mut manager = PluginManager::new();
+        let app = manager.register_builtin(
+            Opt::into_app(),
+            Box::new(keryxcuda::CudaPlugin::new()?),
+            |a| <keryxcuda::CudaOpt as clap::Args>::augment_args(a),
+        );
+        (app, manager)
+    };
 
     let matches = app.get_matches();
 
     let worker_count = plugin_manager.process_options(&matches)?;
     let mut opt: Opt = Opt::from_arg_matches(&matches)?;
     opt.process()?;
-    env_logger::builder().filter_level(opt.log_level()).parse_default_env().init();
+    // try_init: in the static-cuda build CudaPlugin::new already set a logger;
+    // init() would panic on the second call.
+    let _ = env_logger::builder().filter_level(opt.log_level()).parse_default_env().try_init();
     info!("=================================================================================");
     info!("                 Keryx-Miner GPU {}", env!("CARGO_PKG_VERSION"));
     info!(" Mining for: {}", opt.mining_address.as_deref().unwrap_or("(recovery mode)"));

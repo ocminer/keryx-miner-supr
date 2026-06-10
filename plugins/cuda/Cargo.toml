@@ -6,9 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-# Use the `package` alias so `extern crate keryx_miner` in lib.rs / worker.rs
-# keeps compiling unchanged after the parent rename to `keryx-miner-supr`.
-keryx_miner = { path = "../../", package = "keryx-miner-supr" }
+# Depend on the standalone plugin ABI crate (not the parent miner package) so
+# the binary can statically link this plugin without a Cargo dependency cycle.
+keryx_plugin_api = { path = "../../plugin-api", package = "keryx-plugin-api" }
 cust ="0.3"
 log = "0.4"
 rand = "0.8"

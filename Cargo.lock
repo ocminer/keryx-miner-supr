@@ -1548,6 +1548,8 @@ dependencies = [
  "keccak",
  "kernel32-sys",
  "keryx-inference",
+ "keryx-plugin-api",
+ "keryxcuda",
  "libloading 0.7.4",
  "log",
  "nix",
@@ -1577,13 +1579,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "keryx-plugin-api"
+version = "0.1.0"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "keryxcuda"
 version = "0.1.0"
 dependencies = [
  "clap",
  "cust",
  "env_logger",
- "keryx-miner-supr",
+ "keryx-plugin-api",
  "log",
  "nvml-wrapper",
  "rand 0.8.6",

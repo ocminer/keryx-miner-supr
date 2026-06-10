@@ -1,14 +1,16 @@
 use clap::ArgMatches;
-use std::any::Any;
-use std::error::Error as StdError;
+use libloading::{Library, Symbol};
 
 pub mod inference;
 pub mod models;
 pub mod slm;
-pub mod xoshiro256starstar;
-use libloading::{Library, Symbol};
 
-pub type Error = Box<dyn StdError + Send + Sync + 'static>;
+// The plugin ABI (traits, Error, RNG, declare_plugin! macro) lives in the
+// standalone `keryx-plugin-api` crate so the binary and the worker plugins can
+// share it without a Cargo cycle. Re-export it here so `keryx_miner::Plugin`,
+// `keryx_miner::Error`, `keryx_miner::xoshiro256starstar` and
+// `keryx_miner::declare_plugin!` keep resolving for the rest of the tree.
+pub use keryx_plugin_api::{declare_plugin, xoshiro256starstar, Error, Plugin, Worker, WorkerSpec};
 
 #[derive(Default)]
 pub struct PluginManager {
@@ -58,6 +60,21 @@ impl PluginManager {
         Ok(app)
     }
 
+    /// Register an in-process (statically linked) plugin instead of dlopening a
+    /// .so. Used by the `static-cuda` build. `augment` merges the plugin's clap
+    /// args into the app, mirroring what `_plugin_create` does on the dynamic
+    /// path.
+    pub fn register_builtin<'help>(
+        &mut self,
+        app: clap::App<'help>,
+        plugin: Box<dyn Plugin>,
+        augment: impl FnOnce(clap::App<'help>) -> clap::App<'help>,
+    ) -> clap::App<'help> {
+        let app = augment(app);
+        self.plugins.push(plugin);
+        app
+    }
+
     pub fn build(&self) -> Result<Vec<Box<dyn WorkerSpec + 'static>>, Error> {
         let mut specs = Vec::<Box<dyn WorkerSpec + 'static>>::new();
         for plugin in &self.plugins {
@@ -94,35 +111,6 @@ impl PluginManager {
     }
 }
 
-pub trait Plugin: Any + Send + Sync {
-    fn name(&self) -> &'static str;
-    fn enabled(&self) -> bool;
-    fn get_worker_specs(&self) -> Vec<Box<dyn WorkerSpec>>;
-    fn process_option(&mut self, matchs: &ArgMatches) -> Result<usize, Error>;
-}
-
-pub trait WorkerSpec: Any + Send + Sync {
-    /*type_: GPUWorkType,
-    opencl_platform: u16,
-    device_id: u32,
-    workload: f32,
-    is_absolute: bool*/
-    fn id(&self) -> String;
-    fn build(&self) -> Box<dyn Worker>;
-}
-
-pub trait Worker {
-    //fn new(device_id: u32, workload: f32, is_absolute: bool) -> Result<Self, Error>;
-    fn id(&self) -> String;
-    fn load_block_constants(&mut self, hash_header: &[u8; 72], matrix: &[[u16; 64]; 64], target: &[u64; 4]);
-
-    fn calculate_hash(&mut self, nonces: Option<&Vec<u64>>, nonce_mask: u64, nonce_fixed: u64);
-    fn sync(&self) -> Result<(), Error>;
-
-    fn get_workload(&self) -> usize;
-    fn copy_output_to(&mut self, nonces: &mut Vec<u64>) -> Result<(), Error>;
-}
-
 pub fn load_plugins<'help>(
     app: clap::App<'help>,
     paths: &[String],
@@ -138,34 +126,4 @@ pub fn load_plugins<'help>(
         };
     }
     Ok((app, factory))
-}
-
-#[macro_export]
-macro_rules! declare_plugin {
-    ($plugin_type:ty, $constructor:path, $args:ty) => {
-        use clap::Args;
-        #[no_mangle]
-        pub unsafe extern "C" fn _plugin_create(
-            app: *mut clap::App,
-        ) -> (*mut clap::App, *mut dyn $crate::Plugin, *const $crate::Error) {
-            // make sure the constructor is the correct type.
-            let constructor: fn() -> Result<$plugin_type, $crate::Error> = $constructor;
-
-            let object = match constructor() {
-                Ok(obj) => obj,
-                Err(e) => {
-                    return (
-                        app,
-                        unsafe { std::mem::MaybeUninit::zeroed().assume_init() }, // Translates to null pointer
-                        Box::into_raw(Box::new(e)),
-                    );
-                }
-            };
-
-            let boxed: Box<dyn $crate::Plugin> = Box::new(object);
-
-            let boxed_app = Box::new(<$args>::augment_args(unsafe { *Box::from_raw(app) }));
-            (Box::into_raw(boxed_app), Box::into_raw(boxed), std::ptr::null::<Error>())
-        }
-    };
 }
