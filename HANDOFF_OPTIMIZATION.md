@@ -11,6 +11,47 @@ and constraint has been verified against the running system.
 
 ---
 
+## SESSION CHANGELOG (2026-06-10) — current state, read this first
+
+All committed/pushed to `origin/main` (latest HEAD around `9ad5de4`+).
+
+**Performance (stock power, 0 rejects, pool-verified):**
+- RTX 5090 (sm_120): **2.57 → 3.28 GH/s (+28%)** — root cause was the Keccak
+  round loop being *rolled* (229 regs, 1 block/SM); added `#pragma unroll` →
+  64 regs, 2 blocks/SM. Now **power-bound** at the 575 W cap.
+- CMP 170HX (sm_80): **154 → 188 MH/s (+22%)** — arch-gated
+  `__launch_bounds__(512,2)` → 64 regs, 2 blocks/SM. Occupancy-capped there
+  (50-reg Keccak state floor) and cooling-limited (~82 °C in ~90 s even at
+  100% fan). 400 MH/s target is NOT reachable with this kernel.
+- Both cards together: **3.46 GH/s**, clean sum, no PCIe contention.
+- Matmul is only ~10% of instructions and already on the uniform datapath —
+  multi-accumulator attempt regressed (busted the 64-reg budget). Don't.
+
+**Correctness / stability fixes:**
+- **Devfund cycle removed entirely** — it had a crash-loop bug (counter wraps
+  to 0 → `listen()` returns before processing a job → tight reconnect loop).
+  Archived in `docs/devfund-removed.md` + branch `archive/devfund-cycle`.
+- **Reconnect backoff** — was a 100 ms busy-loop hammering a dead pool +
+  re-initialising the GPU each spin; now exponential 1→30 s, resets after a
+  healthy (≥60 s) session. `main.rs` outer loop.
+- **VRAM startup line** showed 0 MB on multi-GPU rigs (nvidia-smi multi-line
+  CSV parsed as one blob) — now parses the first line.
+
+**Packaging / build:**
+- **HiveOS = single static binary** via `static-cuda` feature + new
+  `keryx-plugin-api` crate (see [[static-cuda-single-binary]] memory).
+  `hiveos/build-glibc.sh` builds glibc-2.30 in a 20.04 container;
+  `hiveos/package.sh` → `hiveos/dist/keryx-miner-supr-<ver>.tar.gz` (one binary
+  + h-*.sh). Host to a public URL; Flight Sheet steps in `hiveos/README.md`.
+- **Build rig is Ubuntu 24.04 / CUDA 13.0** (not 12.8 — README/build use 13.0
+  now). NEVER `cargo clean` — LLM weights are cached in `target/` (the static
+  build uses a separate `target-hiveos/`).
+- Big models can be fetched fast with `aria2c -x16` from the IPFS gateway
+  (supports range requests) into `<exe_dir>/models/<DirName>/` + a `.ok`
+  sentinel file; verify sha256 against the spec's `model_id`.
+
+---
+
 ## 1. Project context
 
 `keryx-miner-supr` is the Suprnova fork of
