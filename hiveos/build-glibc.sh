@@ -35,18 +35,17 @@ docker run --rm \
     export RUSTFLAGS="-L /usr/local/cuda/lib64/stubs"
     export CARGO_TARGET_DIR=/src/target-hiveos
 
-    cargo build --release
+    # static-cuda: the CUDA worker is linked into the binary, so the HiveOS
+    # payload is ONE executable (no libkeryx*.so to ship).
+    cargo build --release --features static-cuda
     # Make artifacts readable by the host (uid 1000) after a root build.
-    cp target-hiveos/release/keryx-miner-supr \
-       target-hiveos/release/libkeryxcuda.so \
-       target-hiveos/release/libkeryxopencl.so \
-       /src/hiveos/dist/
+    cp target-hiveos/release/keryx-miner-supr /src/hiveos/dist/
     chmod -R a+rX /src/hiveos/dist
 '
 
 echo ">> Done. Verifying glibc symbol ceiling (must be <= 2.31):"
-for f in keryx-miner-supr libkeryxcuda.so libkeryxopencl.so; do
-  max=$(objdump -T "$OUT/$f" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1)
-  printf '   %-22s max %s\n' "$f" "$max"
-done
+max=$(objdump -T "$OUT/keryx-miner-supr" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1)
+printf '   %-22s max %s\n' "keryx-miner-supr" "$max"
+echo ">> Self-contained check (no .so plugin deps expected):"
+ldd "$OUT/keryx-miner-supr" 2>/dev/null | grep -iE 'keryxcuda|keryxopencl' && echo "   WARNING: still links a plugin .so" || echo "   OK — single binary, only the driver libcuda is dynamic"
 ls -la "$OUT"

@@ -1,7 +1,5 @@
-#[macro_use]
-extern crate keryx_miner;
-
 use clap::{ArgMatches, FromArgMatches};
+use keryx_miner::declare_plugin;
 use keryx_miner::{Plugin, Worker, WorkerSpec};
 use log::{info, warn, LevelFilter};
 use opencl3::device::{Device, CL_DEVICE_TYPE_ALL};

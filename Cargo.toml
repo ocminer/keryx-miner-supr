@@ -47,6 +47,12 @@ num = "0.4"
 nix = "0.25"
 hex = "0.4"
 keryx-inference = { path = "inference" }
+keryx-plugin-api = { path = "plugin-api" }
+# Optional: compile the CUDA worker straight into the binary instead of loading
+# libkeryxcuda.so at runtime. Enabled by the `static-cuda` feature for a
+# single-file build (HiveOS). No cycle because keryxcuda now depends on
+# keryx-plugin-api, not on this package.
+keryxcuda = { path = "plugins/cuda", optional = true }
 secp256k1 = { version = "0.29.0", features = ["global-context"] }
 semver = "1.0"
 # Phase-3 OPoI: SLM inference via candle.
@@ -83,6 +89,9 @@ default = ["parking_lot"]
 parking_lot = ["parking", "tokio/parking_lot"]
 bench = []
 no-asm = ["keccak"]
+# Single self-contained binary: link the CUDA worker in statically (no
+# libkeryxcuda.so to ship). Build with `cargo build --release --features static-cuda`.
+static-cuda = ["keryxcuda"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keccak = "0.1"
@@ -102,5 +111,5 @@ time = { version = "0.3", features = ["formatting"] }
 sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 
 [workspace]
-members = ["inference", "plugins/*"]
+members = ["inference", "plugin-api", "plugins/*"]
 default-members = [".", "plugins/cuda", "plugins/opencl"]

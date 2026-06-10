@@ -25,15 +25,17 @@ which the installed NVIDIA driver provides on the rig.
 
 ## Package layout
 
+The CUDA worker is linked into the binary (`--features static-cuda`), so the
+payload is a **single executable** — no `libkeryx*.so` to ship. The only `.so`
+it needs at runtime is the rig's NVIDIA driver `libcuda.so.1`.
+
 ```
 keryx-miner-supr/
 ├── h-manifest.conf      # name / version / log + config paths
 ├── h-config.sh          # flight sheet -> CLI args
 ├── h-run.sh             # launches the miner (foreground)
 ├── h-stats.sh           # hashrate/shares from log + temps/fans from agent
-├── keryx-miner-supr     # glibc-2.31 binary
-├── libkeryxcuda.so
-└── libkeryxopencl.so
+└── keryx-miner-supr     # single static-cuda binary (glibc 2.30)
 ```
 
 ## Install on a rig (Flight Sheet)

@@ -1,0 +1,17 @@
+[package]
+name = "keryx-plugin-api"
+version = "0.1.0"
+edition = "2021"
+
+# Shared plugin ABI: the Plugin/Worker/WorkerSpec traits, the Error type, the
+# xoshiro RNG and the `declare_plugin!` macro. Lives in its own crate so the
+# miner binary AND the worker plugins (keryxcuda/keryxopencl) can both depend on
+# it without a dependency cycle. That is what lets the CUDA plugin be linked
+# *statically* into the binary (the `static-cuda` feature) — otherwise the
+# binary -> keryxcuda -> keryx-miner-supr edge cycles.
+
+[dependencies]
+clap = { version = "3.0", features = ["color", "derive"] }
+
+[lib]
+name = "keryx_plugin_api"

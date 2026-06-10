@@ -1,9 +1,8 @@
-#[macro_use]
-extern crate keryx_miner;
+use keryx_plugin_api::declare_plugin;
 
 use clap::{ArgMatches, FromArgMatches};
 use cust::prelude::*;
-use keryx_miner::{Plugin, Worker, WorkerSpec};
+use keryx_plugin_api::{Plugin, Worker, WorkerSpec};
 use log::LevelFilter;
 use std::error::Error as StdError;
 #[cfg(feature = "overclock")]
@@ -22,7 +21,10 @@ pub type Error = Box<dyn StdError + Send + Sync + 'static>;
 mod cli;
 mod worker;
 
-use crate::cli::{CudaOpt, NonceGenEnum};
+// `CudaOpt` is re-exported (pub) so the binary's `static-cuda` path can merge
+// the CUDA clap args directly (`keryxcuda::CudaOpt::augment_args`).
+pub use crate::cli::CudaOpt;
+use crate::cli::NonceGenEnum;
 use crate::worker::CudaGPUWorker;
 
 const DEFAULT_WORKLOAD_SCALE: f32 = 1024.;
@@ -35,9 +37,12 @@ pub struct CudaPlugin {
 }
 
 impl CudaPlugin {
-    fn new() -> Result<Self, Error> {
+    pub fn new() -> Result<Self, Error> {
         cust::init(CudaFlags::empty())?;
-        env_logger::builder().filter_level(LevelFilter::Info).parse_default_env().init();
+        // try_init (not init) so it doesn't panic when the host binary also
+        // initialises a logger — happens in the statically-linked build where
+        // plugin and binary share one global logger.
+        let _ = env_logger::builder().filter_level(LevelFilter::Info).parse_default_env().try_init();
         Ok(Self {
             specs: Vec::new(),
             _enabled: false,
@@ -61,7 +66,7 @@ impl Plugin for CudaPlugin {
     }
 
     //noinspection RsTypeCheck
-    fn process_option(&mut self, matches: &ArgMatches) -> Result<usize, keryx_miner::Error> {
+    fn process_option(&mut self, matches: &ArgMatches) -> Result<usize, keryx_plugin_api::Error> {
         let opts: CudaOpt = CudaOpt::from_arg_matches(matches)?;
 
         self._enabled = !opts.cuda_disable;
