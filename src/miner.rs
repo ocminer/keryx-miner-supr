@@ -17,6 +17,21 @@ use keryx_miner::{PluginManager, WorkerSpec};
 
 type MinerHandler = std::thread::JoinHandle<Result<(), Error>>;
 
+// How long to wait for a worker to exit after it is asked to Close before we
+// assume it is frozen and force-kill it with SIGUSR1. Must comfortably exceed a
+// cold GPU-kernel JIT compile: some archs (e.g. AMD gfx1102) ship no precompiled
+// binary and compile the kernel from source at startup, which takes a few
+// seconds. If the pool drops *during* that compile the worker is busy, not
+// frozen — and force-killing a thread that is inside the GPU runtime's compiler
+// raises a non-unwinding panic (signal_panic) that aborts the whole process
+// before the reconnect loop can retry. The old 1s grace fired mid-compile.
+// kill_switch is cleared the instant join() returns, so a healthy worker (which
+// exits within ~100ms of Close) never waits anywhere near this long.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const FREEZE_GRACE: Duration = Duration::from_secs(30);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const FREEZE_POLL: Duration = Duration::from_millis(50);
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C" fn signal_panic(_signal: nix::libc::c_int) {
     panic!("Forced shutdown");
@@ -35,8 +50,21 @@ fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -
     use std::os::unix::thread::JoinHandleExt;
     let pthread_handle = handle.as_pthread_t();
     std::thread::spawn(move || {
-        sleep(Duration::from_millis(1000));
+        // Wait up to FREEZE_GRACE for the worker to exit on its own. kill_switch
+        // is cleared by Drop the moment join() returns, so poll it and bail out
+        // early — a worker that finishes a slow startup compile and then honours
+        // the Close command must NOT be force-killed. Only a worker still alive
+        // after the full grace is treated as genuinely frozen.
+        let mut waited = Duration::ZERO;
+        while waited < FREEZE_GRACE {
+            if !kill_switch.load(Ordering::SeqCst) {
+                return; // worker exited cleanly; nothing to kill
+            }
+            sleep(FREEZE_POLL);
+            waited += FREEZE_POLL;
+        }
         if kill_switch.load(Ordering::SeqCst) {
+            warn!("Worker did not exit within {}s of shutdown — force-killing (assumed frozen)", FREEZE_GRACE.as_secs());
             match nix::sys::pthread::pthread_kill(pthread_handle, nix::sys::signal::Signal::SIGUSR1) {
                 Ok(()) => {
                     info!("Thread killed successfully")
