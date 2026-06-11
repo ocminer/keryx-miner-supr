@@ -251,25 +251,40 @@ async fn main() -> Result<(), Error> {
     let mut path = current_exe().unwrap_or_default();
     path.pop(); // Getting the parent directory
 
-    // Dynamic plugin path (default): scan the binary's dir for libkeryx*.so.
+    // --disable-gpu must be honoured before plugins are dlopened/registered, but
+    // the CLI is parsed further down (plugins augment the arg set first). Detect
+    // it from the raw args here so we can skip discovering/loading GPU workers.
+    let disable_gpu = std::env::args().any(|a| a == "--disable-gpu");
+    if disable_gpu {
+        eprintln!("--disable-gpu: skipping GPU workers, mining on CPU only.");
+    }
+
+    // Dynamic plugin path (default): scan the binary's dir for libkeryx*.so,
+    // unless --disable-gpu was passed.
     #[cfg(not(feature = "static-cuda"))]
-    let plugins = filter_plugins(path.to_str().unwrap_or("."));
+    let plugins = if disable_gpu { Vec::new() } else { filter_plugins(path.to_str().unwrap_or(".")) };
     #[cfg(not(feature = "static-cuda"))]
     let (app, mut plugin_manager): (App, PluginManager) =
         keryx_miner::load_plugins(Opt::into_app(), &plugins)?;
 
     // Static-cuda single-binary build: the CUDA worker is compiled in, so
     // register it directly instead of dlopening a .so. (OpenCL is omitted.)
+    // --disable-gpu skips registering it, leaving a CPU-only miner.
     #[cfg(feature = "static-cuda")]
-    let plugins: Vec<String> = vec!["builtin:cuda (static)".to_string()];
+    let plugins: Vec<String> =
+        if disable_gpu { Vec::new() } else { vec!["builtin:cuda (static)".to_string()] };
     #[cfg(feature = "static-cuda")]
     let (app, mut plugin_manager): (App, PluginManager) = {
         let mut manager = PluginManager::new();
-        let app = manager.register_builtin(
-            Opt::into_app(),
-            Box::new(keryxcuda::CudaPlugin::new()?),
-            |a| <keryxcuda::CudaOpt as clap::Args>::augment_args(a),
-        );
+        let app = if disable_gpu {
+            Opt::into_app()
+        } else {
+            manager.register_builtin(
+                Opt::into_app(),
+                Box::new(keryxcuda::CudaPlugin::new()?),
+                |a| <keryxcuda::CudaOpt as clap::Args>::augment_args(a),
+            )
+        };
         (app, manager)
     };
 
@@ -277,6 +292,13 @@ async fn main() -> Result<(), Error> {
 
     let worker_count = plugin_manager.process_options(&matches)?;
     let mut opt: Opt = Opt::from_arg_matches(&matches)?;
+    // With --disable-gpu there are no GPU workers, so default the CPU thread
+    // count to the physical core count when the user didn't set --threads
+    // (otherwise the miner would start with 0 workers and bail out). Checked
+    // before opt.process(), which turns a missing --threads into Some(0).
+    if opt.disable_gpu && opt.num_threads.is_none() {
+        opt.num_threads = Some(crate::miner::get_num_cpus(None));
+    }
     opt.process()?;
     // try_init: in the static-cuda build CudaPlugin::new already set a logger;
     // init() would panic on the second call.

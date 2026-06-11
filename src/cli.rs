@@ -99,6 +99,14 @@ pub struct Opt {
     pub num_threads: Option<u16>,
 
     #[clap(
+        long = "disable-gpu",
+        help = "Disable all GPU workers and mine on CPU only, even if GPUs are present [default: false]",
+        long_help = "Skip loading the GPU worker plugins entirely and mine on CPU only, even if GPUs are present in the system. \
+If --threads is not given, it defaults to the number of physical CPU cores. Note: KeryxHash on CPU is orders of magnitude slower than on a GPU."
+    )]
+    pub disable_gpu: bool,
+
+    #[clap(
         long = "mine-when-not-synced",
         help = "Mine even when keryxd says it is not synced",
         long_help = "Mine even when keryxd says it is not synced, only useful when passing `--allow-submit-block-when-not-synced` to keryxd  [default: false]"
