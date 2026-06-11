@@ -8,3 +8,6 @@ escrow_state.json
 target-hive/
 target-hiveos/
 hiveos/dist/
+
+# AMD/OpenCL build output + runtime state (build-amd.sh)
+/dist-amd/
