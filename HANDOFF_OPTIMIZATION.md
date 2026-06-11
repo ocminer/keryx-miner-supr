@@ -610,3 +610,62 @@ not authoritative.
   reference for `wave_mix`).
 
 Good luck. The 5090 regression is the gatekeeper for everything else.
+
+---
+
+## 16. AMD / OpenCL path (added 2026-06-11)
+
+The OpenCL worker plugin (`plugins/opencl/`) was complete in-tree but had never
+been **built or shipped** — the fork only produced the `static-cuda` NVIDIA
+binary, so AMD GPUs had no miner. It is now built and pool-verified on
+`krx.suprnova.cc:4401` (RX 7600 XT gfx1102, MI50 gfx906), 0 rejects.
+
+### Build
+- `./build-amd.sh` → `dist-amd/{keryx-miner-supr, libkeryxopencl.so}`.
+  Builds the dynamic (CUDA-free; candle→CPU) binary + the OpenCL plugin. Needs
+  only OpenCL, no CUDA toolkit. Handles two host quirks: fetches a standalone
+  `protoc` (build.rs) and symlinks `libOpenCL.so` (ROCm ships only `.so.1`).
+- Does NOT build `plugins/cuda` (needs the CUDA toolkit) — the CUDA path is
+  untouched; build `libkeryxcuda.so` on the NVIDIA host (`cargo build --release
+  -p keryxcuda`) as before.
+
+### Auto-detect (one binary, both vendors)
+The binary dlopens any `libkeryx*.so` next to it; each plugin self-enables ONLY
+for its vendor (OpenCL on an AMD OpenCL platform, CUDA on a CUDA device). So a
+single binary + both `.so` runs on pure-AMD, pure-NVIDIA, or mixed rigs; a `.so`
+whose runtime is absent is logged and skipped. Two distinct binaries are NOT
+needed (the `static-cuda` single-file build is just a HiveOS convenience).
+- Fix shipped: `OpenCLPlugin::new` now uses `try_init()` (was `.init()`, which
+  panicked when both plugins were dlopen'd into one process).
+- `./package-universal.sh [path/to/libkeryxcuda.so]` assembles the universal
+  folder + tarball (AMD-only if no CUDA `.so` is found, with a note on adding it).
+
+### Speed (v_dot8, the win)
+- The 64×64 matrix multiply now uses `v_dot8_u32_u4` (packed 4-bit dot, 8
+  MACs/instr — half the instructions of `v_dot4_u32_u8`) **by default, no flag**,
+  on every DLOPS arch (gfx906/908/90a/940-942, gfx1100-1103, gfx1200-1201).
+  Capability-driven in `worker.rs` (`vdot8_default`), which drives BOTH the
+  `-D __FORCE_AMD_V_DOT8_U32_U4__=1` compile flag AND the packed-matrix host
+  upload (they must agree or shares reject).
+- Two latent bugs fixed: the JIT `from_source` built a malformed
+  `-D __gfx906:sramecc+:xnack-__` (suffix not stripped → `__gfx906__` undefined →
+  silent scalar fallback); and the shipped `gfx906_keryx-opencl.bin` was a v_dot4
+  build incompatible with the packed layout (removed → gfx906 JITs v_dot8).
+- Result: **RX 7600 XT 287→302 MH/s (+5%), MI50 285→316 MH/s (+7-11%)**, 0 rejects.
+- RDNA1.5/2 (gfx1011/1012/1030-1034) still ship a v_dot4 `.bin` so they stay
+  v_dot4 unless `--experimental-amd` is passed; regenerate those binaries with the
+  FORCE flag (see `plugins/opencl/README.md`) to make v_dot8 their default too.
+
+### Occupancy — investigated, NEGATIVE (don't re-tread)
+`heavy_hash` compiles to **65 VGPRs / 0 spills** on gfx906 (wave64) → 3 waves/SIMD.
+The 4-wave threshold is ≤64 VGPRs, but forcing it (`amdgpu_waves_per_eu(4)`)
+spills to scratch (4 spills at 4 waves, 2148 at 5) and **destabilized the gfx906
+compute queues**. Rolling Keccak (→68 VGPR) or the matrix loop (→83) is worse. The
+natural 65-VGPR build is the stable optimum. Shipped a default-OFF knob
+(`-D KERYX_WAVES_PER_EU=N`) + `plugins/opencl/kdump.c` (dumps VGPR/spill counts).
+
+### ⚠️ Known operational hazard
+Rapid miner start/stop and the spill experiment above can wedge `/dev/kfd`
+compute queues: `clinfo` still enumerates GPUs but kernel launches hang and the
+miner's SIGUSR1 freeze-watchdog fires "Forced shutdown" (`miner.rs:22`). Fix =
+reboot, or `sudo modprobe -r amdgpu && sudo modprobe amdgpu`. Not a code defect.
