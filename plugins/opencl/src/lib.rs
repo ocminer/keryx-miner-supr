@@ -24,7 +24,12 @@ pub struct OpenCLPlugin {
 
 impl OpenCLPlugin {
     fn new() -> Result<Self, Error> {
-        env_logger::builder().filter_level(LevelFilter::Info).parse_default_env().init();
+        // try_init (not init): when this plugin and libkeryxcuda.so are both dlopen'd
+        // into one binary (a mixed AMD+NVIDIA rig, or any NVIDIA box where both .so
+        // resolve), whichever plugin's `_plugin_create` runs second would panic on a
+        // second `init()`. The CUDA plugin already uses try_init; match it so the two
+        // can coexist in a single "both worlds" binary regardless of load order.
+        let _ = env_logger::builder().filter_level(LevelFilter::Info).parse_default_env().try_init();
         Ok(Self { specs: Vec::new(), _enabled: false })
     }
 }
