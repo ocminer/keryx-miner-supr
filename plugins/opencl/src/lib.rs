@@ -15,7 +15,9 @@ mod worker;
 use crate::cli::{NonceGenEnum, OpenCLOpt};
 use crate::worker::OpenCLGPUWorker;
 
-const DEFAULT_WORKLOAD_SCALE: f32 = 512.;
+// Sentinel: user did not pass --opencl-workload, so the worker resolves a
+// capability-driven default ratio from the GPU arch (see worker::default_workload_scale).
+const AUTO_WORKLOAD: f32 = 0.;
 
 pub struct OpenCLPlugin {
     specs: Vec<OpenCLWorkerSpec>,
@@ -117,7 +119,10 @@ impl Plugin for OpenCLPlugin {
                     workload: match &opts.opencl_workload {
                         Some(workload) if i < workload.len() => workload[i],
                         Some(workload) if !workload.is_empty() => *workload.last().unwrap(),
-                        _ => DEFAULT_WORKLOAD_SCALE,
+                        // AUTO: no --opencl-workload given. 0.0 is a sentinel that
+                        // tells the worker to pick a capability-driven default ratio
+                        // per GPU arch (the old flat 512 under-saturated big cards).
+                        _ => AUTO_WORKLOAD,
                     },
                     is_absolute: opts.opencl_workload_absolute,
                     experimental_amd: opts.experimental_amd,
