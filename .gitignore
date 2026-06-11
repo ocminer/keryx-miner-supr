@@ -7,9 +7,13 @@ escrow_state.json
 
 target-hive/
 target-hiveos/
+target-hiveos-amd/
 hiveos/dist/
+hiveos/dist-amd/
 
-# AMD/OpenCL build output + runtime state (build-amd.sh)
+# AMD/OpenCL build output + runtime state (build-amd.sh / package-amd.sh)
 /dist-amd/
 /dist-universal/
+/dist-pkg/
 /keryx-miner-supr-*-universal.tar.gz
+/amd-glibc-build.log
