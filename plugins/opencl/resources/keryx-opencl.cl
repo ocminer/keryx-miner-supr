@@ -365,6 +365,18 @@ void STATIC inline _amul4bit(__constant uchar4 packed_vec1[32], uchar4 packed_ve
 #endif
 #define SWAP4( x ) as_uint( as_uchar4( x ).wzyx )
 
+// Occupancy hint (AMD), OPT-IN only — do NOT enable by default.
+// The kernel naturally compiles to 65 VGPRs / 0 spills on gfx906 (wave64) →
+// 256/ceil(65,4) = 3 waves/SIMD. The only way to reach 4 waves (<=64 VGPRs) is to
+// force the allocator past the cliff, which spills 4 VGPRs to scratch (waves=4 →
+// 0, waves=5 → 2148 spills). Spilling on gfx906 destabilized the compute queues in
+// testing (kfd stall), so the register cliff is not safely crossable from source —
+// the stable optimum is the natural 65-VGPR / 3-wave build (this kernel, no hint).
+// Kept as a documented knob for experimenting on other archs/drivers; enable with
+// -D KERYX_WAVES_PER_EU=N. Use kdump.c to inspect .vgpr_count/.vgpr_spill_count.
+#if defined(OPENCL_PLATFORM_AMD) && defined(KERYX_WAVES_PER_EU)
+__attribute__((amdgpu_waves_per_eu(KERYX_WAVES_PER_EU)))
+#endif
 kernel void heavy_hash(
     const ulong local_size,
     const ulong nonce_mask,
