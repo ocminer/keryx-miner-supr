@@ -580,9 +580,8 @@ impl KeryxdHandler {
                     return Ok(());
                 }
                 // OPoI is mandatory: refuse to mine if no models are ready.
-                // suprnova test-fork: OPoI hard gate disabled. Per-share `tag_fixed` MLP is baked
-                // into the binary and works without LLM weights; only AiRequest answering needs them.
-                if false && keryx_miner::slm::loaded_model_ids().is_empty() {
+                // Keryx core invariant — no inference, no PoW.
+                if keryx_miner::slm::loaded_model_ids().is_empty() {
                     if self.last_known_daa % 200 == 0 {
                         log::warn!("OPoI: no models ready — mining suspended until model files are available");
                     }

@@ -398,9 +398,9 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
-                            // suprnova test-fork: OPoI hard gate disabled so the miner runs
-                            // when LLM weights aren't loaded. Per-share tag_fixed still flows.
-                            if false && keryx_miner::slm::loaded_model_ids().is_empty() {
+                            // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
+                            // Keryx core invariant — no inference, no PoW.
+                            if keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
                                     warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
                                 }
@@ -437,9 +437,9 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
-                            // suprnova test-fork: OPoI hard gate disabled so the miner runs
-                            // when LLM weights aren't loaded. Per-share tag_fixed still flows.
-                            if false && keryx_miner::slm::loaded_model_ids().is_empty() {
+                            // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
+                            // Keryx core invariant — no inference, no PoW.
+                            if keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
                                     warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
                                 }
@@ -465,9 +465,9 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
-                            // suprnova test-fork: OPoI hard gate disabled so the miner runs
-                            // when LLM weights aren't loaded. Per-share tag_fixed still flows.
-                            if false && keryx_miner::slm::loaded_model_ids().is_empty() {
+                            // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
+                            // Keryx core invariant — no inference, no PoW.
+                            if keryx_miner::slm::loaded_model_ids().is_empty() {
                                 if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
                                     warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
                                 }

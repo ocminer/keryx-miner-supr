@@ -2,6 +2,9 @@
 #include <assert.h>
 #include "keccak-tiny.c"
 #include "xoshiro256starstar.c"
+#ifdef KERYX_WMMA
+#include <mma.h>   // tensor-core matmul path (experimental, bench only)
+#endif
 
 
 
@@ -98,12 +101,16 @@ __device__ __inline__ void amul4bit(uint32_t packed_vec1[32], uint32_t packed_ve
 
 
 /*
- * Arch-specific launch bounds. On sm_80 (GA100 — A100 / CMP 170HX) the
- * unrolled kernel naturally lands at 72 registers, which is just over
- * the 65536/(2*512)=64 threshold, so it runs at only 1 block/SM (~25%
- * occupancy) — the 170HX then idles at ~99W/250W, latency-bound. Forcing
- * `__launch_bounds__(512, 2)` caps it at 64 regs (a trivial 12-byte
- * spill) and unlocks 2 blocks/SM = 50% occupancy.
+ * Arch-specific launch bounds. On sm_80 (GA100 — A100 / CMP 170HX) AND
+ * sm_90 (Hopper — H100) the unrolled kernel naturally lands at 72
+ * registers, just over the 65536/(2*512)=64 threshold, so it runs at only
+ * 1–3 blocks/SM (low occupancy) and the SM is latency-bound (ALU pipe hot
+ * but warps_active ~24% on the H100, idling at ~372W/700W). Forcing
+ * `__launch_bounds__(512, 2)` caps it at 64 regs (a trivial spill) and
+ * unlocks 2 blocks/SM = higher occupancy → the ALU pipe gets fed.
+ *   - sm_80: measured 154 → ~188 MH/s (+22%).
+ *   - sm_90: H100 was 72 regs / ~24% occupancy, ALU-bound with power to
+ *     spare (compute-bound, not power-bound) — the occupancy lever applies.
  *
  * Gated on __CUDA_ARCH__ so sm_120 (RTX 5090) is untouched — it already
  * sits at 64 regs / 2 blocks/SM and is power-bound at 3.28 GH/s; pinning
@@ -111,6 +118,10 @@ __device__ __inline__ void amul4bit(uint32_t packed_vec1[32], uint32_t packed_ve
  * config, so we leave it alone.
  */
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800)
+// NOTE: sm_90 (H100) was tested with __launch_bounds__(512,2) too — it drops
+// 72→64 regs but occupancy stays ~24% and throughput is unchanged (the H100
+// is ALU-pipe-bound at max clock with power to spare, not occupancy-bound),
+// so it is intentionally NOT applied there. sm_80 (170HX) keeps it (+22%).
 #define HEAVY_HASH_BOUNDS __launch_bounds__(512, 2)
 #else
 #define HEAVY_HASH_BOUNDS
@@ -166,56 +177,50 @@ extern "C" {
      * Net of the launch-config sweep: upstream defaults win. The lever
      * for speed is on the kernel body, not the launch dispatcher.
      */
-    __global__ void HEAVY_HASH_BOUNDS heavy_hash(const uint64_t nonce_mask, const uint64_t nonce_fixed, const uint64_t nonces_len, uint8_t random_type, void* states, uint64_t *final_nonce) {
-        // assuming header_len is 72
-        int nonceId = threadIdx.x + blockIdx.x*blockDim.x;
-        if (nonceId < nonces_len) {
-            if (nonceId == 0) *final_nonce = 0;
-            uint64_t nonce;
-            switch (random_type) {
-                case RANDOM_LEAN:
-                    nonce = ((uint64_t *)states)[0] ^ nonceId;
-                    break;
-                case RANDOM_XOSHIRO:
-                default:
-                    nonce = xoshiro256_next(((ulonglong4 *)states) + nonceId);
-                    break;
-            }
-            nonce = (nonce & nonce_mask) | nonce_fixed;
-            uint256_t hash_;
-            /*
-             * First Keccak call (powP / pre-pow hash).
-             *
-             * Upstream materialised an 80-byte `uint8_t input[80]` in
-             * local memory and `memcpy`'d 72 bytes of header + 8 bytes
-             * of nonce into it before handing the pointer to `hash()`.
-             * That 80-byte stack buffer is a non-trivial register / spill
-             * cost (we're already at 126 regs/thread) and the memcpy
-             * adds 9 loads + 9 stores that the compiler can't always
-             * elide.
-             *
-             * The Keccak state itself only ever reads:
-             *   • bytes 0..71  from `hash_header`  (constant memory)
-             *   • bytes 72..79 from the 64-bit nonce
-             *   • bytes 80..   are zero (sponge padding)
-             * which lets us absorb the rate block directly with 9 XOR-
-             * with-constant + 1 XOR-with-nonce ops, plus a straight copy
-             * of the 15-u64 capacity tail from `powP`. No local buffer,
-             * no memcpy.
-             */
-            {
-                uint64_t a[25];
-                const uint64_t *hp = (const uint64_t *) hash_header;
-                const uint64_t *p  = (const uint64_t *) powP;
-                #pragma unroll
-                for (int i = 0; i < 9; i++) a[i] = p[i] ^ hp[i];
-                a[9] = p[9] ^ nonce;
-                #pragma unroll
-                for (int i = 10; i < 25; i++) a[i] = p[i];
-                P(a);
-                #pragma unroll
-                for (int i = 0; i < 4; i++) ((uint64_t *) hash_.hash)[i] = a[i];
-            }
+    /*
+     * Per-nonce KeryxHash core (Keccak-powP → nibble matmul → wave_mix →
+     * Keccak-heavyP). Factored out of `heavy_hash` so the bench/correctness
+     * harness (KERYX_BENCH) can dump the full 32-byte output per nonce
+     * through the *identical* code path the miner uses. Pure code motion —
+     * byte-exact with the previous inline body.
+     */
+    /* First Keccak (powP / pre-pow). Absorbs hash_header(72B)+nonce(8B) XOR
+     * powP directly (no 80-byte local buffer / memcpy); bytes 80.. are zero
+     * sponge padding. Shared by the scalar and WMMA matmul paths. */
+    __device__ __forceinline__ uint256_t keccak_pow(uint64_t nonce) {
+        uint256_t hash_;
+        uint64_t a[25];
+        const uint64_t *hp = (const uint64_t *) hash_header;
+        const uint64_t *p  = (const uint64_t *) powP;
+        #pragma unroll
+        for (int i = 0; i < 9; i++) a[i] = p[i] ^ hp[i];
+        a[9] = p[9] ^ nonce;
+        #pragma unroll
+        for (int i = 10; i < 25; i++) a[i] = p[i];
+        P(a);
+        #pragma unroll
+        for (int i = 0; i < 4; i++) ((uint64_t *) hash_.hash)[i] = a[i];
+        return hash_;
+    }
+
+    /* Second Keccak (heavyP / final KeryxHash). Input bytes 32..79 are zero,
+     * so 6 of the 10 absorb XORs are skipped. Shared by both matmul paths. */
+    __device__ __forceinline__ uint256_t keccak_heavy(uint256_t hash_) {
+        uint64_t a[25];
+        const uint64_t *hh = (const uint64_t *) hash_.hash;
+        const uint64_t *p  = (const uint64_t *) heavyP;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) a[i] = hh[i] ^ p[i];
+        #pragma unroll
+        for (int i = 4; i < 25; i++) a[i] = p[i];
+        P(a);
+        #pragma unroll
+        for (int i = 0; i < 4; i++) ((uint64_t *) hash_.hash)[i] = a[i];
+        return hash_;
+    }
+
+    __device__ __forceinline__ uint256_t keryx_hash_one(uint64_t nonce) {
+            uint256_t hash_ = keccak_pow(nonce);
 
             //assert((rowId != 0) || (hashId != 0) );
             uchar4 packed_hash[QUARTER_MATRIX_SIZE] = {0};
@@ -260,37 +265,128 @@ extern "C" {
              * satisfy the target — protocol compliance is enforced implicitly. */
             wave_mix(&hash_);
 
-            /*
-             * Second Keccak call (heavyP / final KeryxHash).
-             *
-             * Upstream zeroed the 80-byte `input[]` and memcpy'd 32 bytes
-             * of `hash_` over the front, then called `hash(heavyP, ...)`.
-             * Inside `hash()` the first 80 input bytes get XOR'd with
-             * the first 80 of `heavyP`. Bytes 32..79 are guaranteed
-             * zero, so 6 of the 10 input XORs are `x ^ 0 = x` — pure
-             * waste. Inline + skip:
-             *   • XOR 4 u64 of the matrix-product hash with heavyP[0..3]
-             *   • COPY 6 u64 of heavyP[4..9] (no XOR — input is zero)
-             *   • COPY 15 u64 of heavyP[10..24] (capacity tail)
-             * Saves: 80-byte memset, 32-byte memcpy, 6 XORs, and the
-             * call frame for `hash()`.
-             */
-            {
-                uint64_t a[25];
-                const uint64_t *hh = (const uint64_t *) hash_.hash;
-                const uint64_t *p  = (const uint64_t *) heavyP;
-                #pragma unroll
-                for (int i = 0; i < 4; i++) a[i] = hh[i] ^ p[i];
-                #pragma unroll
-                for (int i = 4; i < 25; i++) a[i] = p[i];
-                P(a);
-                #pragma unroll
-                for (int i = 0; i < 4; i++) ((uint64_t *) hash_.hash)[i] = a[i];
+            return keccak_heavy(hash_);
+    }
+
+    __global__ void HEAVY_HASH_BOUNDS heavy_hash(const uint64_t nonce_mask, const uint64_t nonce_fixed, const uint64_t nonces_len, uint8_t random_type, void* states, uint64_t *final_nonce) {
+        // assuming header_len is 72
+        int nonceId = threadIdx.x + blockIdx.x*blockDim.x;
+        if (nonceId < nonces_len) {
+            if (nonceId == 0) *final_nonce = 0;
+            uint64_t nonce;
+            switch (random_type) {
+                case RANDOM_LEAN:
+                    nonce = ((uint64_t *)states)[0] ^ nonceId;
+                    break;
+                case RANDOM_XOSHIRO:
+                default:
+                    nonce = xoshiro256_next(((ulonglong4 *)states) + nonceId);
+                    break;
             }
+            nonce = (nonce & nonce_mask) | nonce_fixed;
+            uint256_t hash_ = keryx_hash_one(nonce);
             if (LT_U256(hash_, target)){
                 atomicCAS((unsigned long long int*) final_nonce, 0, (unsigned long long int) nonce);
             }
         }
     }
+
+#ifdef KERYX_BENCH
+    /* Bench/correctness harness kernel: dump the full 32-byte KeryxHash for
+     * a contiguous nonce range through the identical core path. Compiled only
+     * under -DKERYX_BENCH, never into the production PTX. */
+    __global__ void HEAVY_HASH_BOUNDS heavy_hash_dump(uint64_t base_nonce, uint64_t n, uint8_t *out) {
+        uint64_t id = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+        if (id < n) {
+            uint256_t h = keryx_hash_one(base_nonce + id);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) ((uint64_t *)(out + id * 32))[i] = h.number[i];
+        }
+    }
+#endif
+
+#ifdef KERYX_WMMA
+    /* Warp-cooperative INT8 tensor-core (wmma s8) matmul variant of the dump
+     * kernel. Block = 128 threads (4 warps); each warp batches its 32 nonces
+     * and computes C[m][t] = sum_k matrix[m][k]*nibble_t[k] as a 64x64 * 64x32
+     * GEMM on the tensor cores. The int32 dot products are bit-identical to the
+     * dp4a path (values 0-15, no overflow), so output is byte-exact.
+     *
+     * MEASURED VERDICT (2026-06-17, gated OFF — kept as the documented attempt):
+     * a LOSS on every card. The matmul is only ~10% of instructions and is
+     * register-resident in the dp4a path; the tensor path forces a shared-mem
+     * detour (write 64 nibbles to Bs, wmma, read 64 int32 from Cs) + barriers
+     * and inflates regs 72->86. Net:
+     *   5090 (sm_120): 3.23 -> 1.90 GH/s   H100 (sm_90): 1.56 -> 1.05 GH/s
+     * ncu on the H100 shows tensor pipe only 0.83% active (the matmul phase is
+     * too brief vs the 2x Keccak to utilise the tensor cores) while the ALU
+     * pipe stays ~62%. Byte-exact but slower -> NOT wired into production. */
+    #define WMMA_WARPS 4
+    __global__ void __launch_bounds__(128, 1)
+    heavy_hash_dump_wmma(uint64_t base_nonce, uint64_t n, uint8_t* out) {
+        using namespace nvcuda::wmma;
+        __shared__ int8_t  As[64 * 64];               // matrix, row-major, staged once/block
+        __shared__ int8_t  Bs[WMMA_WARPS][64 * 32];   // per-warp B: [k][t] row-major, ld=32
+        __shared__ int32_t Cs[WMMA_WARPS][64 * 32];   // per-warp C: [m][t] row-major, ld=32
+
+        int tid  = threadIdx.x;
+        int warp = tid >> 5;
+        int lane = tid & 31;
+
+        const int8_t* msrc = (const int8_t*)matrix;   // 64*64 nibbles (0..15)
+        for (int i = tid; i < 64 * 64; i += blockDim.x) As[i] = msrc[i];
+        __syncthreads();
+
+        uint64_t slot  = (uint64_t)blockIdx.x * blockDim.x + tid;
+        uint64_t nonce = base_nonce + slot;
+        uint256_t hash_ = keccak_pow(nonce);
+
+        // nibble-unpack -> this thread's 64 nibbles become column `lane` of Bs[warp]
+        #pragma unroll
+        for (int i = 0; i < QUARTER_MATRIX_SIZE; i++) {
+            int b0 = hash_.hash[2 * i];
+            int b1 = hash_.hash[2 * i + 1];
+            Bs[warp][(4 * i + 0) * 32 + lane] = (int8_t)((b0 & 0xF0) >> 4);
+            Bs[warp][(4 * i + 1) * 32 + lane] = (int8_t)( b0 & 0x0F);
+            Bs[warp][(4 * i + 2) * 32 + lane] = (int8_t)((b1 & 0xF0) >> 4);
+            Bs[warp][(4 * i + 3) * 32 + lane] = (int8_t)( b1 & 0x0F);
+        }
+        __syncwarp();
+
+        // C(64x32) = A(64x64) * B(64x32), 16x16x16 tiles
+        for (int mi = 0; mi < 4; mi++) {
+            for (int ni = 0; ni < 2; ni++) {
+                fragment<accumulator, 16, 16, 16, int32_t> cfrag;
+                fill_fragment(cfrag, 0);
+                #pragma unroll
+                for (int ki = 0; ki < 4; ki++) {
+                    fragment<matrix_a, 16, 16, 16, int8_t, row_major> afrag;
+                    fragment<matrix_b, 16, 16, 16, int8_t, row_major> bfrag;
+                    load_matrix_sync(afrag, &As[(mi * 16) * 64 + ki * 16], 64);
+                    load_matrix_sync(bfrag, &Bs[warp][(ki * 16) * 32 + ni * 16], 32);
+                    mma_sync(cfrag, afrag, bfrag, cfrag);
+                }
+                store_matrix_sync(&Cs[warp][(mi * 16) * 32 + ni * 16], cfrag, 32, mem_row_major);
+            }
+        }
+        __syncwarp();
+
+        // combine: column `lane` holds this thread's 64 dot products (byte-exact w/ dp4a)
+        #pragma unroll
+        for (int rowId = 0; rowId < HALF_MATRIX_SIZE; rowId++) {
+            uint32_t p1 = (uint32_t)Cs[warp][(2 * rowId) * 32 + lane];
+            uint32_t p2 = (uint32_t)Cs[warp][(2 * rowId + 1) * 32 + lane];
+            p1 >>= 6; p1 &= 0xF0; p2 >>= 10;
+            hash_.hash[rowId] = hash_.hash[rowId] ^ ((uint8_t)(p1) | (uint8_t)(p2));
+        }
+        wave_mix(&hash_);
+        hash_ = keccak_heavy(hash_);
+
+        if (slot < n) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) ((uint64_t*)(out + slot * 32))[i] = hash_.number[i];
+        }
+    }
+#endif
 
 }
