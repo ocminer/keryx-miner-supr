@@ -107,7 +107,9 @@ impl Display for ShareStats {
                 0 => "".to_string(),
                 v => format!("Duplicate: {} ", v),
             },
-            self.shares_pending.try_lock().unwrap().len()
+            // stats-string only: don't panic if the lock is momentarily held
+            // (try_lock().unwrap() raced -> TryLockError -> tokio-worker panic).
+            self.shares_pending.try_lock().map(|g| g.len()).unwrap_or(0)
         )
     }
 }
