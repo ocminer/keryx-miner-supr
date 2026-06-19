@@ -36,8 +36,13 @@ pub struct OpenCLOpt {
     pub opencl_enable: bool,
     #[clap(long = "opencl-amd-disable", help = "Disables AMD mining (does not override opencl-enable)")]
     pub opencl_amd_disable: bool,
-    #[clap(long = "opencl-no-amd-binary", help = "Disable fetching of precompiled AMD kernel (if exists)")]
+    #[clap(long = "opencl-no-amd-binary", help = "Disable fetching of precompiled AMD kernel (if exists). [default behaviour as of v0.5.2 — kept for compatibility]")]
     pub opencl_no_amd_binary: bool,
+    #[clap(
+        long = "opencl-use-amd-binary",
+        help = "Opt in to the bundled precompiled AMD kernel binaries. Default (v0.5.2+) is to JIT-compile the OpenCL source on the actual GPU, which always matches the current kernel + driver (the precompiled blobs could desync and produce rejected shares)."
+    )]
+    pub opencl_use_amd_binary: bool,
     #[clap(
         long = "experimental-amd",
         help = "Uses SMID instructions in AMD. Miner will crash if instruction is not supported"

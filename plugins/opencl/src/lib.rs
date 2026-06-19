@@ -126,7 +126,11 @@ impl Plugin for OpenCLPlugin {
                     },
                     is_absolute: opts.opencl_workload_absolute,
                     experimental_amd: opts.experimental_amd,
-                    use_amd_binary: !opts.opencl_no_amd_binary,
+                    // v0.5.2: default to JIT-compiling the OpenCL source on the actual
+                    // GPU (it always matches the current kernel + driver). The bundled
+                    // precompiled .bin blobs could desync from the host/kernel and yield
+                    // rejected shares, so they are now opt-in via --opencl-use-amd-binary.
+                    use_amd_binary: opts.opencl_use_amd_binary && !opts.opencl_no_amd_binary,
                     random: opts.opencl_nonce_gen,
                 })
                 .collect();

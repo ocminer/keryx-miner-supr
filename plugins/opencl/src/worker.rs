@@ -273,8 +273,15 @@ impl OpenCLGPUWorker {
                     }
                 }
             }
-            false => from_source(&context, &device, options)
-                .unwrap_or_else(|e| panic!("{}::Program::create_and_build_from_binary failed: {}", name, e)),
+            false => {
+                info!(
+                    "{}: JIT-compiling OpenCL kernel from source{}",
+                    name,
+                    if options.is_empty() { "" } else { " (v_dot8)" }
+                );
+                from_source(&context, &device, options)
+                    .unwrap_or_else(|e| panic!("{}::Program::create_and_build_from_source failed: {}", name, e))
+            }
         };
         info!("Kernels: {:?}", program.kernel_names());
         let heavy_hash =
