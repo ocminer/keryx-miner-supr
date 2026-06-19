@@ -51,4 +51,4 @@ if [[ -n "$LOG_FILE" && -f "$LOG_FILE" ]]; then
 fi
 
 # mmpOS JSON: air = [accepted, invalid, rejected] (strings)
-echo "{\"busid\":$busid,\"hash\":$hash,\"units\":\"hs\",\"air\":[\"$acc\",\"0\",\"$rej\"],\"miner_name\":\"$NAME\",\"miner_version\":\"${ver:-0.5.1}\"}"
+echo "{\"busid\":$busid,\"hash\":$hash,\"units\":\"hs\",\"air\":[\"$acc\",\"0\",\"$rej\"],\"miner_name\":\"$NAME\",\"miner_version\":\"${ver:-0.5.2}\"}"
