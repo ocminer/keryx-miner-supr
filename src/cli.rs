@@ -99,6 +99,12 @@ pub struct Opt {
     pub num_threads: Option<u16>,
 
     #[clap(
+        long = "api-bind",
+        help = "Serve a JSON stats HTTP API at host:port (e.g. 127.0.0.1:4067). Endpoints: / or /stats (generic), /mmpos (mmpOS format). For HiveOS/mmpos/dashboards. Disabled if unset."
+    )]
+    pub api_bind: Option<String>,
+
+    #[clap(
         long = "disable-gpu",
         help = "Disable all GPU workers and mine on CPU only, even if GPUs are present [default: false]",
         long_help = "Skip loading the GPU worker plugins entirely and mine on CPU only, even if GPUs are present in the system. \

@@ -86,6 +86,11 @@ pub struct ShareStats {
 
 static SHARE_STATS: OnceLock<Arc<ShareStats>> = OnceLock::new();
 
+/// Live share counters for the stats API (None until the pool client connects).
+pub fn share_stats() -> Option<Arc<ShareStats>> {
+    SHARE_STATS.get().cloned()
+}
+
 impl Display for ShareStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(

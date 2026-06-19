@@ -116,6 +116,20 @@ enum WorkerCommand {
     Close,
 }
 
+/// One device's current hashrate (hashes/sec); `label` is e.g. "#0 (NVIDIA GeForce RTX 5090)".
+#[derive(Default, Clone)]
+pub struct DeviceRate {
+    pub label: String,
+    pub hashrate: f64,
+}
+
+/// Live hashrate snapshot, refreshed by the logger every LOG_RATE. Read by the stats API.
+#[derive(Default)]
+pub struct MinerStats {
+    pub total_hashrate: f64,
+    pub devices: Vec<DeviceRate>,
+}
+
 #[allow(dead_code)]
 pub struct MinerManager {
     handles: Vec<MinerHandler>,
@@ -127,6 +141,14 @@ pub struct MinerManager {
     hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
     current_state_id: AtomicUsize,
     opoi_challenge_active: Arc<AtomicBool>,
+    stats: Arc<Mutex<MinerStats>>,
+}
+
+impl MinerManager {
+    /// Shared live hashrate snapshot (for the stats API).
+    pub fn stats(&self) -> Arc<Mutex<MinerStats>> {
+        Arc::clone(&self.stats)
+    }
 }
 
 impl Drop for MinerManager {
@@ -167,6 +189,7 @@ impl MinerManager {
         let hashes_tried = Arc::new(AtomicU64::new(0));
         let hashes_by_worker = Arc::new(Mutex::new(HashMap::<String, Arc<AtomicU64>>::new()));
         let opoi_challenge_active = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(MinerStats::default()));
         let (send, recv) = watch::channel(None);
         let mut handles =
             Self::launch_cpu_threads(send_channel.clone(), Arc::clone(&hashes_tried), recv.clone(), n_cpus)
@@ -188,12 +211,14 @@ impl MinerManager {
                 Arc::clone(&hashes_tried),
                 hashes_by_worker.clone(),
                 Arc::clone(&opoi_challenge_active),
+                Arc::clone(&stats),
             )),
             is_synced: true,
             hashes_tried,
             current_state_id: AtomicUsize::new(0),
             hashes_by_worker,
             opoi_challenge_active,
+            stats,
         }
     }
 
@@ -456,6 +481,7 @@ impl MinerManager {
         hashes_tried: Arc<AtomicU64>,
         hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
         opoi_challenge_active: Arc<AtomicBool>,
+        stats: Arc<Mutex<MinerStats>>,
     ) {
         let mut ticker = tokio::time::interval(LOG_RATE);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -464,7 +490,7 @@ impl MinerManager {
             let now = ticker.tick().await;
             let duration = (now - last_instant).as_secs_f64();
             let challenge_active = opoi_challenge_active.load(Ordering::Relaxed);
-            Self::log_single_hashrate(
+            let total = Self::log_single_hashrate(
                 &hashes_tried,
                 "Current hashrate is".into(),
                 "Workers stalled or crashed. Considered reducing workload and check that your node is synced",
@@ -472,8 +498,15 @@ impl MinerManager {
                 false,
                 challenge_active,
             );
+            let mut devices = Vec::new();
             for (device, rate) in &*hashes_by_worker.lock().unwrap() {
-                Self::log_single_hashrate(rate, format!("Device {}:", device), "0 hash/s", duration, true, challenge_active);
+                let r = Self::log_single_hashrate(rate, format!("Device {}:", device), "0 hash/s", duration, true, challenge_active);
+                devices.push(DeviceRate { label: device.clone(), hashrate: r });
+            }
+            // Publish the snapshot for the stats API (hashrates are hashes/sec).
+            if let Ok(mut s) = stats.lock() {
+                s.total_hashrate = total;
+                s.devices = devices;
             }
             last_instant = now;
         }
@@ -486,7 +519,7 @@ impl MinerManager {
         duration: f64,
         keep_prefix: bool,
         challenge_active: bool,
-    ) {
+    ) -> f64 {
         let hashes = counter.swap(0, Ordering::AcqRel);
         let rate = (hashes as f64) / duration;
         if hashes == 0 {
@@ -506,6 +539,7 @@ impl MinerManager {
             let (rate, suffix) = Self::hash_suffix(rate);
             info!("{} {:.2} {}", prefix, rate, suffix);
         }
+        rate
     }
 
     #[inline]

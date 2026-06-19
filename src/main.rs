@@ -23,6 +23,7 @@ use crate::client::Client;
 use crate::miner::MinerManager;
 use crate::target::Uint256;
 
+mod api;
 mod cli;
 mod client;
 mod escrow;
@@ -237,6 +238,9 @@ async fn client_main(
 
     client.register().await?;
     let mut miner_manager = MinerManager::new(client.get_block_channel(), opt.num_threads, plugin_manager);
+    if let Some(bind) = opt.api_bind.clone() {
+        tokio::spawn(api::serve(bind, miner_manager.stats(), env!("CARGO_PKG_VERSION").to_string()));
+    }
     client.listen(&mut miner_manager).await?;
     drop(miner_manager);
     Ok(())
