@@ -336,7 +336,12 @@ impl MinerManager {
                         if let Some(block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
                             match send_channel.blocking_send(block_seed.clone()) {
                                 Ok(()) => block_seed.report_block(),
-                                Err(e) => error!("Failed submitting block: ({})", e.to_string()),
+                                // "block_seed" is a share at pool difficulty (or a real block when it
+                                // also beats network target). A send error here means the pool
+                                // connection's submit channel is gone — the stratum client now detects
+                                // this and reconnects (see conn_dead in client/stratum.rs), so this is
+                                // transient, not a lost-forever condition.
+                                Err(e) => warn!("Could not submit share — pool connection dropped ({}); reconnecting", e),
                             };
                             if let BlockSeed::FullBlock(_) = block_seed {
                                 state = None;
@@ -446,7 +451,7 @@ impl MinerManager {
                     if let Some(block_seed) = state_ref.generate_block_if_pow(nonce.0) {
                         match send_channel.blocking_send(block_seed.clone()) {
                             Ok(()) => block_seed.report_block(),
-                            Err(e) => error!("Failed submitting block: ({})", e.to_string()),
+                            Err(e) => warn!("Could not submit share — pool connection dropped ({}); reconnecting", e),
                         };
                         if let BlockSeed::FullBlock(_) = block_seed {
                             state = None;

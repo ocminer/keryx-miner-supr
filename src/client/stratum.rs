@@ -27,6 +27,7 @@ use statum_codec::NewLineJsonCodec;
 use std::sync::OnceLock;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::task;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -140,6 +141,13 @@ pub struct StratumHandler {
     shares_stats: Arc<ShareStats>,
     block_channel: Sender<BlockSeed>,
     block_handle: BlockHandle,
+    /// Signalled when the pool connection's WRITE side dies (the socket-sink
+    /// forwarder ends, or a share submit fails). The read loop (`listen`) is
+    /// otherwise blind to a half-open socket and would block forever on
+    /// `try_next()` while every found share fails with "channel closed" — the
+    /// "0 pool hashrate until restart" bug. `listen` selects on this to bail out
+    /// and let main's reconnect loop re-establish + re-subscribe.
+    conn_dead: Arc<Notify>,
 
     /// IPFS Kubo API URL for uploading inference results (e.g. "http://127.0.0.1:5001").
     ipfs_url: String,
@@ -208,10 +216,39 @@ impl Client for StratumHandler {
 
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
         info!("Waiting for stuff");
+        // A half-open pool socket (peer vanished without RST/FIN) leaves the read
+        // half blocked on try_next() forever while the write half is dead — every
+        // found share then fails to submit and pool hashrate reads 0 until a manual
+        // restart. Two backstops force a reconnect:
+        //   1. conn_dead — fired the instant the write half dies (sink forwarder
+        //      ends, or a submit can't be forwarded). Immediate detection.
+        //   2. IDLE_TIMEOUT — no pool message at all for this long. Covers the
+        //      case where writes still buffer into a dead socket (no write error)
+        //      but the peer never responds. A live keryx pool sends job/notify and
+        //      ACKs our frequent share submits well inside this window.
+        let idle_secs: u64 = std::env::var("KERYX_POOL_IDLE_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(120);
+        let idle_timeout = Duration::from_secs(idle_secs);
+        let conn_dead = self.conn_dead.clone();
         loop {
-            match self.stream.try_next().await? {
-                Some(msg) => self.handle_message(msg, miner).await?,
-                None => return Err("stratum message payload is empty".into()),
+            tokio::select! {
+                biased;
+                _ = conn_dead.notified() => {
+                    return Err("pool connection write side died (submit failed) — reconnecting".into());
+                }
+                res = tokio::time::timeout(idle_timeout, self.stream.try_next()) => {
+                    match res {
+                        Err(_elapsed) => {
+                            return Err(format!("no pool message for {}s (connection stalled) — reconnecting", idle_timeout.as_secs()).into());
+                        }
+                        Ok(Ok(Some(msg))) => self.handle_message(msg, miner).await?,
+                        Ok(Ok(None)) => return Err("stratum message payload is empty".into()),
+                        Ok(Err(e)) => return Err(e.into()),
+                    }
+                }
             }
         }
     }
@@ -235,7 +272,18 @@ impl StratumHandler {
         let client = Framed::new(socket, NewLineJsonCodec::new());
         let (send_channel, recv) = mpsc::channel::<StratumLine>(3);
         let (sink, stream) = client.split();
-        tokio::spawn(async move { ReceiverStream::new(recv).map(Ok).forward(sink).await });
+        // Connection-death signal: when the socket-sink forwarder below ends
+        // (the socket write half errored), or a submit can't be forwarded, fire
+        // this so `listen` stops waiting on a dead read half and reconnects.
+        let conn_dead = Arc::new(Notify::new());
+        {
+            let cd = conn_dead.clone();
+            tokio::spawn(async move {
+                let _ = ReceiverStream::new(recv).map(Ok).forward(sink).await;
+                // forward() only returns on a sink (socket write) error/close.
+                cd.notify_one();
+            });
+        }
 
         let share_state = SHARE_STATS.get_or_init(|| Arc::new(ShareStats::default())).clone();
         let last_stratum_id = Arc::new(AtomicU32::new(0));
@@ -251,6 +299,7 @@ impl StratumHandler {
             share_state.clone(),
             Arc::clone(&current_task_slot),
             Arc::clone(&inference_cache),
+            conn_dead.clone(),
         );
         Ok(Box::new(Self {
             log_handler: task::spawn(Self::log_shares(share_state.clone())),
@@ -269,6 +318,7 @@ impl StratumHandler {
             shares_stats: share_state,
             block_channel,
             block_handle,
+            conn_dead,
             ipfs_url,
             current_task_slot,
             inference_cache,
@@ -283,6 +333,7 @@ impl StratumHandler {
         share_stats: Arc<ShareStats>,
         current_task_slot: Arc<Mutex<Option<CurrentTask>>>,
         inference_cache: InferenceCache,
+        conn_dead: Arc<Notify>,
     ) -> (Sender<BlockSeed>, BlockHandle) {
         let (send, recv) = mpsc::channel::<BlockSeed>(1);
 
@@ -346,6 +397,11 @@ impl StratumHandler {
                 };
 
                 if send_channel.send(line).await.is_err() {
+                    // The socket-sink forwarder is gone → the connection's write
+                    // half is dead. Signal `listen` to reconnect instead of
+                    // silently dropping every future share.
+                    warn!("Share submit could not be forwarded — pool connection write side is dead; triggering reconnect");
+                    conn_dead.notify_one();
                     break;
                 }
             }

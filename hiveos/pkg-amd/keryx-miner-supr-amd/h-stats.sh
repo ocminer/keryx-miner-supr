@@ -77,8 +77,8 @@ stats=$(jq -nc \
   --argjson acc "${acc:-0}" \
   --argjson rej "${rej:-0}" \
   --argjson up "$uptime" \
-  --arg ver "${CUSTOM_VERSION:-0.5.2}" \
+  --arg ver "${CUSTOM_VERSION:-0.5.3}" \
   '{hs:$hs, hs_units:"khs", temp:$temp, fan:$fan, uptime:$up,
     ver:$ver, ar:[$acc,$rej], algo:"keryxhash", bus_numbers:$bus}' 2>/dev/null)
 
-[[ -z "$stats" ]] && stats="{\"hs\":[],\"hs_units\":\"khs\",\"ver\":\"${CUSTOM_VERSION:-0.5.2}\",\"algo\":\"keryxhash\"}"
+[[ -z "$stats" ]] && stats="{\"hs\":[],\"hs_units\":\"khs\",\"ver\":\"${CUSTOM_VERSION:-0.5.3}\",\"algo\":\"keryxhash\"}"
