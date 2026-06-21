@@ -44,7 +44,6 @@ futures = "0.3.21"
 bytes = "1.1.0"
 async-trait = "0.1"
 num = "0.4"
-nix = "0.25"
 hex = "0.4"
 keryx-inference = { path = "inference" }
 keryx-plugin-api = { path = "plugin-api" }
@@ -92,6 +91,11 @@ no-asm = ["keccak"]
 # Single self-contained binary: link the CUDA worker in statically (no
 # libkeryxcuda.so to ship). Build with `cargo build --release --features static-cuda`.
 static-cuda = ["keryxcuda"]
+
+# nix is Unix-only (it won't compile on Windows). All `nix::` usage is already
+# cfg(unix)-gated (signal/pthread freeze-handler), so scope the dependency too.
+[target.'cfg(unix)'.dependencies]
+nix = "0.25"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keccak = "0.1"

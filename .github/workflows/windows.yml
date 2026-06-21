@@ -1,0 +1,177 @@
+name: windows-build
+
+# Windows (MSVC) builds for keryx-miner-supr.
+#  - windows-amd : keryx-miner-supr.exe + keryxopencl.dll   (AMD/OpenCL + CPU, no CUDA toolchain)
+#  - windows-cuda: keryxcuda.dll                            (NVIDIA plugin; drop next to the exe)
+# Both are independent jobs: an AMD artifact is produced even if the CUDA job fails.
+# Triggers: manual, and on a vX.Y.Z tag (assets are attached to the GitHub release).
+#
+# NOTE: the legacy ci.yaml / deploy.yaml in this dir are stale upstream (kaspa-*) workflows
+# and do not build this fork. This file supersedes them for Windows.
+
+on:
+  workflow_dispatch:        # manual run on any branch (use this to iterate the workflow)
+  push:
+    tags: ['v*']            # release builds — assets attach to the GitHub release
+  pull_request:
+    paths: ['.github/workflows/windows.yml']   # test the workflow itself on a PR
+
+permissions:
+  contents: write          # needed to attach assets to the release on tag builds
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # AMD / OpenCL + CPU — the primary, CUDA-free Windows artifact.
+  # ----------------------------------------------------------------------------
+  windows-amd:
+    name: Windows AMD/OpenCL + CPU (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Keep checked-out line endings as committed (LF) so the .cl / .s / proto
+      # files are byte-identical to Linux builds.
+      - name: Disable autocrlf
+        run: git config --global core.autocrlf false
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: win-amd
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # OpenCL import library + headers (vendor-neutral Khronos ICD loader).
+      # opencl-sys emits `link-lib=OpenCL`; the MSVC linker finds OpenCL.lib via LIB.
+      # At runtime the user's AMD driver provides the actual OpenCL.dll.
+      - name: Install OpenCL (vcpkg)
+        shell: pwsh
+        run: |
+          vcpkg install opencl:x64-windows
+          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          "LIB=$root\lib;$env:LIB"         | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "INCLUDE=$root\include;$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build binary + OpenCL plugin
+        shell: pwsh
+        run: cargo build --release --target $env:TARGET -p keryx-miner-supr -p keryxopencl
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          $rel = "target\$env:TARGET\release"
+          $out = "dist-win-amd"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "$rel\keryx-miner-supr.exe" $out\
+          Copy-Item "$rel\keryxopencl.dll"      $out\
+          @"
+          keryx-miner-supr — Windows (AMD/OpenCL + CPU)
+
+          Files:
+            keryx-miner-supr.exe  - the miner
+            keryxopencl.dll       - OpenCL worker (auto-loaded; mines on AMD GPUs)
+
+          Keep both files in the same folder. The miner dlopens keryxopencl.dll at
+          startup; on a box with an AMD OpenCL platform it self-enables. Requires the
+          AMD GPU driver (provides OpenCL.dll) installed on the machine.
+
+          For NVIDIA GPUs, also drop keryxcuda.dll (from the windows-cuda artifact)
+          into this folder.
+
+          Example:
+            keryx-miner-supr.exe -s stratum+tcp://krx.suprnova.cc:4401 -a <keryx-address>.<worker> --light
+          "@ | Out-File -FilePath "$out\README-windows.txt" -Encoding utf8
+          Compress-Archive -Path "$out\*" -DestinationPath "keryx-miner-supr-windows-amd.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keryx-miner-supr-windows-amd
+          path: keryx-miner-supr-windows-amd.zip
+          if-no-files-found: error
+
+      - name: Attach to release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: keryx-miner-supr-windows-amd.zip
+
+  # ----------------------------------------------------------------------------
+  # NVIDIA / CUDA plugin — heavier (needs the CUDA toolkit). Independent of the
+  # AMD job. cust 0.3 is old; if this needs iteration the AMD artifact still ships.
+  # ----------------------------------------------------------------------------
+  windows-cuda:
+    name: Windows NVIDIA/CUDA plugin (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disable autocrlf
+        run: git config --global core.autocrlf false
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: win-cuda
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The CUDA toolkit provides cudart + nvrtc (for cust) AND OpenCL.lib on Windows.
+      # The mining PTX is pre-generated (include_str!) so nvcc isn't strictly needed,
+      # but cust_raw links the driver/runtime libs the toolkit installs.
+      - name: Install CUDA toolkit
+        id: cuda
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.5.1'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "nvrtc", "nvrtc_dev"]'
+
+      - name: Build CUDA plugin
+        shell: pwsh
+        run: cargo build --release --target $env:TARGET -p keryxcuda
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          $rel = "target\$env:TARGET\release"
+          $out = "dist-win-cuda"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "$rel\keryxcuda.dll" $out\
+          @"
+          keryx-miner-supr — Windows NVIDIA/CUDA plugin
+
+          keryxcuda.dll - CUDA worker. Drop this into the SAME folder as
+          keryx-miner-supr.exe (from the windows-amd artifact). The miner auto-loads
+          it and mines on NVIDIA GPUs. Requires an NVIDIA driver.
+          "@ | Out-File -FilePath "$out\README-cuda.txt" -Encoding utf8
+          Compress-Archive -Path "$out\*" -DestinationPath "keryxcuda-windows.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keryxcuda-windows
+          path: keryxcuda-windows.zip
+          if-no-files-found: error
+
+      - name: Attach to release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: keryxcuda-windows.zip
