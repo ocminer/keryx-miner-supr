@@ -32,7 +32,7 @@ registers from the unroll alone, so it gets an arch-gated
 `__launch_bounds__(512, 2)` to force the same 64-reg / 2-blocks-per-SM layout
 (**154 → 188 MH/s, +22 %**). The 170HX is occupancy-capped there (the ~50-reg
 Keccak state forbids a 3rd block) and its undersized blower is the wall for
-sustained runs — see `HANDOFF_OPTIMIZATION.md` for the thermal notes.
+sustained runs.
 
 ## Build
 
