@@ -17,3 +17,21 @@ hiveos/dist-amd/
 /dist-pkg/
 /keryx-miner-supr-*-universal.tar.gz
 /amd-glibc-build.log
+
+# ── Internal notes — NEVER commit to this PUBLIC repo ──────────────────────
+# Handoff / static-memory / optimization / deployment notes can carry infra
+# secrets (server IPs, wallets, ntfy topics). They belong in local files only.
+# (Operator-mandated after the 2026-06-21 HANDOFF_OPTIMIZATION.md leak.)
+HANDOFF*.md
+*HANDOFF*.md
+*handoff*.md
+*_handoff*
+MEMORY.md
+*-memory.md
+*_memory.md
+OPTIMIZATION_*.md
+*_OPTIMIZATION.md
+DEPLOY_NOTES*.md
+/handoff/
+/memory/
+/.claude/

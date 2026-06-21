@@ -434,22 +434,25 @@ async fn main() -> Result<(), Error> {
         info!("--cpu-inference mode: OPoI inference runs on CPU, GPU stays dedicated to hashing.");
     }
     info!("OPoI Phase-3 active — {} model(s) supported.", specs.len());
-    info!("Prefetching model files before mining starts…");
-    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs)).await {
-        Ok(Ok(())) => info!("Model files ready — starting mining."),
-        Ok(Err(e)) => {
-            // suprnova test-fork: per-share OPoI `tag_fixed` is baked into the binary and
-            // works without LLM weights. Without the weights the miner cannot answer
-            // AiRequest tasks — that just leaves the inference-reward escrow unclaimed.
-            // Standard PoW + per-share tag still flows, which is what we want to validate.
-            warn!("Model prefetch failed — continuing without LLM weights: {}", e);
-            warn!("AiRequest tasks will be skipped; standard PoW + OPoI tag continue normally.");
+    // Prefetch model files in the BACKGROUND, not blocking startup. The OPoI hard gate
+    // (client/stratum.rs, client/grpc.rs) already keeps PoW suspended until models are
+    // ready and un-suspends itself once the (one-time, ~GB) download completes — so we
+    // don't need to block here. Blocking was actively harmful: the worker/plugin setup
+    // below runs only AFTER prefetch returned, so a rig whose OpenCL stack can't create
+    // a GPU worker would download the whole model first and ONLY THEN exit with
+    // "No workers specified" (reported as a HiveOS "black screen"). Backgrounding lets
+    // that worker error surface immediately, and lets the miner connect to the pool
+    // while the download runs.
+    info!("Prefetching model files in the background — PoW stays OPoI-gated until they're ready…");
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs)).await {
+            Ok(Ok(())) => info!("Model files ready — OPoI inference available; mining un-gates."),
+            // per-share OPoI `tag_fixed` is baked in and works without LLM weights; only
+            // AiRequest tasks need them, so a download failure just leaves escrow unclaimed.
+            Ok(Err(e)) => warn!("Model prefetch failed — AiRequest tasks will be skipped: {}", e),
+            Err(e) => warn!("Model prefetch task panicked — AiRequest tasks will be skipped: {}", e),
         }
-        Err(e) => {
-            warn!("Model prefetch task panicked: {}", e);
-            warn!("AiRequest tasks will be skipped; standard PoW + OPoI tag continue normally.");
-        }
-    }
+    });
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
     if opt.cpu_inference {
