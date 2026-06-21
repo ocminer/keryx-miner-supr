@@ -40,7 +40,7 @@ uses the template below), set **Miner = Custom**, then open **Setup Miner Config
 | **Hash algorithm** | `keryxhash` |
 | **Wallet and worker template** | `keryx:YOUR_KERYX_ADDRESS.%WORKER_NAME%` |
 | **Pool URL** | `stratum+tcp://krx.suprnova.cc:4401` |
-| **Pass** | `x` |
+| **Pass** | *(leave blank — keryx is wallet-only; any password is ignored by the miner)* |
 | **Extra config arguments** | `--light --cpu-inference --cuda-device 0` |
 
 Keep the `stratum+tcp://` scheme on the Pool URL — without it the miner falls
