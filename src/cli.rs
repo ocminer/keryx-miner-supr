@@ -92,6 +92,13 @@ pub struct Opt {
     #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22211]")]
     port: Option<u16>,
 
+    #[clap(
+        long = "pool-password",
+        default_value = "x",
+        help = "Stratum pool password (sent in mining.authorize). Most keryx pools ignore it; on suprnova set e.g. 'd=16' for static difficulty 16. Do NOT use -p for this — -p is --port."
+    )]
+    pub pool_password: String,
+
     #[clap(long, help = "Use testnet instead of mainnet [default: false]")]
     testnet: bool,
 

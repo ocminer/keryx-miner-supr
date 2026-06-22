@@ -128,6 +128,7 @@ pub struct StratumHandler {
     send_channel: Sender<StratumLine>,
     stream: Pin<Box<dyn Stream<Item = Result<StratumLine, NewLineJsonCodecError>>>>,
     miner_address: String,
+    pool_password: String,
     mine_when_not_synced: bool,
     block_template_ctr: Arc<AtomicU16>,
 
@@ -186,7 +187,7 @@ impl Client for StratumHandler {
                 id,
                 payload: StratumLinePayload::StratumCommand(StratumCommand::Authorize((
                     pay_address.clone(),
-                    "x".into(),
+                    self.pool_password.clone(),
                 ))),
                 jsonrpc: None,
                 error: None,
@@ -262,6 +263,7 @@ impl StratumHandler {
     pub async fn connect(
         address: String,
         miner_address: String,
+        pool_password: String,
         mine_when_not_synced: bool,
         block_template_ctr: Option<Arc<AtomicU16>>,
         ipfs_url: String,
@@ -306,6 +308,7 @@ impl StratumHandler {
             stream: Box::pin(stream),
             send_channel,
             miner_address,
+            pool_password,
             mine_when_not_synced,
             block_template_ctr: block_template_ctr
                 .unwrap_or_else(|| Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16))),
