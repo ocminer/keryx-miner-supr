@@ -6,7 +6,7 @@
 # Unlike hiveos/package.sh (single static-cuda NVIDIA binary), the AMD payload
 # is the dynamic binary PLUS libkeryxopencl.so dlopened next to it.
 #
-# Output: hiveos/dist-amd/keryx-miner-supr-amd-<version>-hiveos.tar.gz
+# Output: hiveos/dist-amd/keryx-miner-supr-amd-<version>.tar.gz
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,7 +30,14 @@ cp "$DIST/$BIN" "$DEST/"
 cp "$DIST/libkeryxopencl.so" "$DEST/"
 chmod +x "$DEST"/h-*.sh "$DEST/$BIN"
 
-TARBALL="$DIST/${NAME}-${VERSION}-hiveos.tar.gz"
+# HiveOS custom-get derives the miner NAME by stripping the LAST hyphen-delimited
+# field as the "version": basename | awk -F- '{print $NF}'. So the archive MUST be
+# named "<NAME>-<VERSION>.tar.gz" with NO extra hyphenated suffix and NO hyphen in
+# the version, or it mis-parses the name and the install dir won't match the tar's
+# internal "$NAME/" folder (chown/sed fail -> "Miner screen is not running").
+# A "-hiveos" suffix here is exactly that bug — DO NOT add it. (NVIDIA build-release.sh
+# documents the same rule.) e.g. keryx-miner-supr-amd-0.5.4.tar.gz -> NAME=keryx-miner-supr-amd.
+TARBALL="$DIST/${NAME}-${VERSION}.tar.gz"
 tar -czf "$TARBALL" -C "$STAGE" "$NAME"
 echo ">> Wrote $TARBALL"
 tar -tzf "$TARBALL"
