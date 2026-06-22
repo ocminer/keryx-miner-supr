@@ -328,7 +328,12 @@ impl<'gpu> CudaGPUWorker<'gpu> {
             _context,
             _module,
             start_event: Event::new(EventFlags::DEFAULT)?,
-            stop_event: Event::new(EventFlags::DEFAULT)?,
+            // BLOCKING_SYNC makes stop_event.synchronize() sleep the thread instead of
+            // busy-waiting a CPU core. cuEventSynchronize only blocks if the EVENT has this
+            // flag — the context's SCHED_BLOCKING_SYNC does NOT apply to event sync. Without
+            // it the miner pins one core at 100% (the reported "high CPU"); now the default
+            // (blocking_sync=true) yields, and --cuda-no-blocking-sync keeps the low-latency spin.
+            stop_event: Event::new(if blocking_sync { EventFlags::BLOCKING_SYNC } else { EventFlags::DEFAULT })?,
             workload: chosen_workload as usize,
             stream,
             rand_state,
