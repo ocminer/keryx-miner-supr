@@ -246,7 +246,12 @@ impl Client for StratumHandler {
                             return Err(format!("no pool message for {}s (connection stalled) — reconnecting", idle_timeout.as_secs()).into());
                         }
                         Ok(Ok(Some(msg))) => self.handle_message(msg, miner).await?,
-                        Ok(Ok(None)) => return Err("stratum message payload is empty".into()),
+                        // try_next() == Ok(None) is a clean end-of-stream: the pool
+                        // closed the TCP connection (sent FIN with no data pending).
+                        // It is NOT a malformed/empty JSON payload — the old wording
+                        // ("stratum message payload is empty") alarmed operators over
+                        // what is a routine pool-initiated disconnect + reconnect.
+                        Ok(Ok(None)) => return Err("pool closed the connection (EOF) — reconnecting".into()),
                         Ok(Err(e)) => return Err(e.into()),
                     }
                 }
@@ -270,6 +275,40 @@ impl StratumHandler {
     ) -> Result<Box<Self>, Error> {
         info!("Connecting to {}", address);
         let socket = TcpStream::connect(address).await?;
+
+        // Keep the pool connection warm. Pools (and the NAT/firewalls between us)
+        // drop connections that look idle; on a vardiff'd or high-diff rig we can
+        // go minutes between `mining.submit` lines, so without keepalive traffic
+        // the path can be torn down and we see a clean EOF (logged historically as
+        // the misleading "stratum message payload is empty") followed by a full
+        // reconnect/handshake every few minutes. SO_KEEPALIVE makes the kernel
+        // emit probes on an otherwise-silent socket: it refreshes NAT/conntrack
+        // state and detects a genuinely half-open peer quickly. Tunables let an
+        // operator widen/narrow the cadence without a rebuild.
+        //   - KERYX_TCP_KEEPALIVE_SECS=0 disables it entirely.
+        //   - default: first probe after 45s idle, then every 15s.
+        {
+            let ka_idle: u64 = std::env::var("KERYX_TCP_KEEPALIVE_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(45);
+            if ka_idle > 0 {
+                let ka_intvl: u64 = std::env::var("KERYX_TCP_KEEPALIVE_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(15);
+                let keepalive = socket2::TcpKeepalive::new()
+                    .with_time(Duration::from_secs(ka_idle))
+                    .with_interval(Duration::from_secs(ka_intvl));
+                let sref = socket2::SockRef::from(&socket);
+                if let Err(e) = sref.set_tcp_keepalive(&keepalive) {
+                    warn!("could not enable TCP keepalive on the pool socket: {e}");
+                }
+                // Low-latency share submits: don't let Nagle hold back small frames.
+                let _ = sref.set_nodelay(true);
+            }
+        }
 
         let client = Framed::new(socket, NewLineJsonCodec::new());
         let (send_channel, recv) = mpsc::channel::<StratumLine>(3);

@@ -1565,6 +1565,7 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "sha3",
+ "socket2 0.5.10",
  "tar",
  "time",
  "tokenizers",

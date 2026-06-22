@@ -45,6 +45,10 @@ bytes = "1.1.0"
 async-trait = "0.1"
 num = "0.4"
 nix = "0.25"
+# TCP keepalive on the stratum socket (SO_KEEPALIVE) — keeps NAT/firewall state
+# warm and detects a half-open pool socket fast. socket2 is already in the tree
+# transitively (via tokio/mio); pin it as a direct dep so we can set keepalive.
+socket2 = "0.5"
 hex = "0.4"
 keryx-inference = { path = "inference" }
 keryx-plugin-api = { path = "plugin-api" }
