@@ -456,6 +456,27 @@ async fn main() -> Result<(), Error> {
             Err(e) => warn!("Model prefetch task panicked — AiRequest tasks will be skipped: {}", e),
         }
     });
+
+    // PoM (AMD): register the tier-0 Gemma-3-4B possession model and background-fetch its GGUF
+    // (same CID the OPoI path uses). The mining loop builds the WeightIndex + GPU residency
+    // lazily (pom_opencl::ensure_installed) on the first PoM-active job (DAA >= activation);
+    // pre-fork it just sits registered. tier 0 fits the 16 GB AMD cards (2.48 GiB).
+    #[cfg(feature = "pom-opencl")]
+    {
+        let gguf = keryx_miner::slm::gguf_path_for(&keryx_miner::models::GEMMA_3_4B);
+        keryx_miner::pom_opencl::set_mining_tier(gguf.to_string_lossy().into_owned(), 0);
+        info!("PoM(AMD): registered tier 0 (Gemma-3-4B) at {}", gguf.display());
+        let pom_specs: &'static [&'static keryx_miner::models::ModelSpec] =
+            &[&keryx_miner::models::GEMMA_3_4B];
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(pom_specs)).await {
+                Ok(Ok(())) => info!("PoM(AMD): tier-0 Gemma GGUF ready."),
+                Ok(Err(e)) => warn!("PoM(AMD): tier model download failed: {}", e),
+                Err(e) => warn!("PoM(AMD): tier model download task panicked: {}", e),
+            }
+        });
+    }
+
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
     if opt.cpu_inference {

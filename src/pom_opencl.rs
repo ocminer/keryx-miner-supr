@@ -97,9 +97,31 @@ pub fn install(blob: &[u64], n_chunks: u64) -> Result<(), String> {
 
 pub fn is_installed() -> bool { POM.lock().unwrap().is_some() }
 
-/// AMD: the OpenCL weight buffer is dedicated to mining and never evicted (unlike NVIDIA where
-/// inference can reclaim the candle VRAM), so this is a no-op once installed.
-pub fn ensure_installed() {}
+/// Registered mining tier (GGUF path, tier index). Set once at startup via set_mining_tier;
+/// the first PoM-active job lazily builds the index + GPU residency via ensure_installed.
+static TIER: Mutex<Option<(String, u8)>> = Mutex::new(None);
+
+/// Register the tier to mine (GGUF path on disk, POM_TIERS index). Cheap — no I/O. The heavy
+/// load_tier (build the Merkle tree + upload the blob) runs lazily on the first PoM-active job.
+pub fn set_mining_tier(gguf_path: String, tier: u8) {
+    *TIER.lock().unwrap() = Some((gguf_path, tier));
+}
+
+/// Lazily build + install the registered tier on the first PoM-active iteration. Idempotent.
+/// (Unlike NVIDIA, the AMD OpenCL buffer is never evicted, so this only does work once.)
+pub fn ensure_installed() {
+    if is_installed() {
+        return;
+    }
+    let tier = TIER.lock().unwrap().clone();
+    match tier {
+        Some((path, t)) => match load_tier(&path, t) {
+            Ok(()) => log::info!("PoM: tier {t} installed (GPU-resident)."),
+            Err(e) => log::warn!("PoM: load_tier failed ({path}): {e} — is the model GGUF downloaded?"),
+        },
+        None => log::warn!("PoM: no mining tier registered (set_mining_tier not called)."),
+    }
+}
 
 /// Grind one batch of `batch` nonces from `nonce_base`. Returns the lowest nonce whose
 /// pom_pow_value <= target, or None. pph/target are the 32-byte LE forms from State.

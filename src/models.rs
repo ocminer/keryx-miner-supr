@@ -44,6 +44,25 @@ pub const TINYLLAMA: ModelSpec = ModelSpec {
     dir_name: "TinyLlama-1.1B",
 };
 
+/// PoM tier 0 — Gemma-3-4B-it-abliterated Q4_K_M. Possession model for the baseline tier
+/// (node-pinned R_T 846caa40…, N=77_604_776 chunks, ~2.48 GiB). `format` = Gguf for PoM
+/// possession (GGUF downloaded + WeightIndex-parsed; Gemma inference serving is a separate
+/// OPoI concern). model_id = sha2-256(weight CID) = CIDv0[2..34].
+pub const GEMMA_3_4B: ModelSpec = ModelSpec {
+    name: "gemma-3-4b",
+    model_id: [
+        0xad, 0x50, 0xad, 0x0b, 0xd4, 0x61, 0xd8, 0xab,
+        0x44, 0xef, 0xc0, 0x21, 0x49, 0x89, 0xeb, 0x33,
+        0x29, 0x16, 0x85, 0xef, 0x4a, 0xde, 0x22, 0xa0,
+        0xf4, 0xf2, 0x17, 0xd0, 0x32, 0x66, 0xd8, 0x37,
+    ],
+    format: ModelFormat::Gguf,
+    tokenizer_cid: "QmTh2MsVfAvWp7grN9rvkF9NkMkCW2PhWez2WbNh81KRXD",
+    config_cid: "",
+    weight_cids: &["Qma1CbFzWTNhy2ReVjDG1GvM5q2Uy4VhqTbnS9c641jUQ6"],
+    dir_name: "Gemma-3-4B",
+};
+
 pub const DEEPSEEK_R1_8B: ModelSpec = ModelSpec {
     name: "deepseek-r1-8b",
     // sha2-256(QmYK1faUGNMYZ2UKeSpUoUoFpRarZQEwfPCHbYNG2ib2mR)

@@ -92,6 +92,12 @@ fn model_dir(spec: &ModelSpec) -> std::path::PathBuf {
     exe_dir.join("models").join(spec.dir_name)
 }
 
+/// Path to a model's GGUF (`<exe_dir>/models/<dir_name>/model.gguf`). PoM points the
+/// WeightIndex + GPU blob loader at this resident tier file.
+pub fn gguf_path_for(spec: &ModelSpec) -> std::path::PathBuf {
+    model_dir(spec).join("model.gguf")
+}
+
 fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
     eprintln!("[keryx-miner] Downloading {} ...", url);
     let response = ureq::get(url)
