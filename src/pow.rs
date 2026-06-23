@@ -13,6 +13,7 @@ use crate::{
     target::{self, Uint256},
     Error, Hash,
 };
+use keryx_miner::pom::{self, WeightIndex};
 use keryx_miner::Worker;
 
 mod hasher;
@@ -64,6 +65,8 @@ pub struct State {
     matrix: Arc<Matrix>,
     pub target: Uint256,
     pub pow_hash_header: [u8; 72],
+    /// Block DAA score — gates the PoM possession path (vs legacy kHeavyHash).
+    pub daa_score: u64,
     block: Arc<BlockSeed>,
     // PRE_POW_HASH || TIME || 32 zero byte padding; without NONCE
     hasher: PowHasher,
@@ -128,6 +131,7 @@ impl State {
             matrix,
             target: header_target,
             pow_hash_header,
+            daa_score,
             block: Arc::new(block_seed),
             hasher,
             nonce_mask,
@@ -166,6 +170,46 @@ impl State {
             }
             block_seed
         })
+    }
+
+    /// PoM (post-fork) path. If the resident tier `index` yields `pom_pow_value <= target`
+    /// for `nonce`, build the possession proof, set the nonce, attach the borsh-encoded proof,
+    /// and return the full block to submit. Solo only — a pool `PartialBlock` can't carry a
+    /// per-miner proof (the pool attaches it from the stratum submit line instead).
+    pub fn generate_block_if_pom(&self, nonce: u64, index: &WeightIndex, tier: u8) -> Option<BlockSeed> {
+        let mut pph = [0u8; 32];
+        pph.copy_from_slice(&self.pow_hash_header[0..32]);
+        let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
+
+        let seed = pom::pom_block_seed(&pph, timestamp, nonce);
+        let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o));
+        if !pom::le_leq(&pom::pom_pow_value(final_state, &pph), &self.target.to_le_bytes()) {
+            return None;
+        }
+
+        let proof = pom::build_proof(
+            tier,
+            &pph,
+            nonce,
+            seed,
+            index.n_chunks,
+            pom::POM_WALK_STEPS,
+            pom::POM_OPENINGS,
+            |o| index.read_chunk(o),
+            |o| index.merkle_path(o),
+        );
+        let bytes = borsh::to_vec(&proof).ok()?;
+
+        let mut block_seed = (*self.block).clone();
+        match block_seed {
+            BlockSeed::FullBlock(ref mut block) => {
+                let header = block.header.as_mut().expect("We checked that a header exists on creation");
+                header.nonce = nonce;
+                block.pom_proof = bytes; // plain bytes field (empty = none on the wire)
+            }
+            BlockSeed::PartialBlock { .. } => return None,
+        }
+        Some(block_seed)
     }
 
     pub fn load_to_gpu(&self, gpu_work: &mut dyn Worker) {
