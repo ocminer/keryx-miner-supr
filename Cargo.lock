@@ -1611,6 +1611,7 @@ dependencies = [
  "num",
  "num_cpus",
  "once_cell",
+ "opencl3",
  "parking_lot",
  "prost",
  "rand 0.8.6",

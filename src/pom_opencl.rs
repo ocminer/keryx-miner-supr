@@ -15,7 +15,7 @@ use opencl3::program::Program;
 use opencl3::types::{cl_ulong, CL_BLOCKING};
 
 pub const POM_WALK_STEPS: u32 = 256;
-const POM_SRC: &str = include_str!("../resources/pom_mine.cl");
+const POM_SRC: &str = include_str!("../plugins/opencl/resources/pom_mine.cl");
 
 pub struct PomMiner {
     _context: Arc<Context>,

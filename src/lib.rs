@@ -11,6 +11,8 @@ pub mod slm;
 // `keryx_miner::Error`, `keryx_miner::xoshiro256starstar` and
 // `keryx_miner::declare_plugin!` keep resolving for the rest of the tree.
 pub mod pom;
+#[cfg(feature = "pom-opencl")]
+pub mod pom_opencl;
 pub use keryx_plugin_api::{declare_plugin, xoshiro256starstar, Error, Plugin, Worker, WorkerSpec};
 
 #[derive(Default)]
