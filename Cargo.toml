@@ -102,6 +102,10 @@ no-asm = ["keccak"]
 static-cuda = ["keryxcuda"]
 # AMD PoM: link the OpenCL search driver into the main binary (build-amd enables this).
 pom-opencl = ["dep:opencl3"]
+# NVIDIA PoM: candle-CUDA `pom_gpu` driver (vendored from upstream). PLACEHOLDER — the NVIDIA
+# bring-over must add the candle cuda feature + build.rs PTX compile here. See
+# POM_NVIDIA_BRINGOVER.md. Declared now so the driver-seam cfgs in miner.rs/main.rs are known.
+pom-cuda = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keccak = "0.1"

@@ -461,11 +461,16 @@ async fn main() -> Result<(), Error> {
     // (same CID the OPoI path uses). The mining loop builds the WeightIndex + GPU residency
     // lazily (pom_opencl::ensure_installed) on the first PoM-active job (DAA >= activation);
     // pre-fork it just sits registered. tier 0 fits the 16 GB AMD cards (2.48 GiB).
-    #[cfg(feature = "pom-opencl")]
+    #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
     {
+        // Driver seam: AMD = OpenCL, NVIDIA = candle-CUDA (same set_mining_tier interface).
+        #[cfg(feature = "pom-opencl")]
+        use keryx_miner::pom_opencl as pom_driver;
+        #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+        use keryx_miner::pom_gpu as pom_driver;
         let gguf = keryx_miner::slm::gguf_path_for(&keryx_miner::models::GEMMA_3_4B);
-        keryx_miner::pom_opencl::set_mining_tier(gguf.to_string_lossy().into_owned(), 0);
-        info!("PoM(AMD): registered tier 0 (Gemma-3-4B) at {}", gguf.display());
+        pom_driver::set_mining_tier(gguf.to_string_lossy().into_owned(), 0);
+        info!("PoM: registered tier 0 (Gemma-3-4B) at {}", gguf.display());
         if keryx_miner::pom::is_activation_overridden() {
             warn!(
                 "PoM(AMD): ACTIVATION DAA OVERRIDDEN to {} via KERYX_POM_ACTIVATION_DAA — staging/testing ONLY, NOT for production!",

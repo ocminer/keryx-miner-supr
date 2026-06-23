@@ -304,10 +304,16 @@ impl MinerManager {
                 let mut state = None;
                 // PoM (post-fork): nonce cursor + per-launch batch. The kernel grinds the whole
                 // batch before returning, so blocks/sec is capped at hashrate / POM_BATCH.
-                #[cfg(feature = "pom-opencl")]
+                #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
                 let mut pom_nonce: u64 = thread_rng().next_u64();
-                #[cfg(feature = "pom-opencl")]
+                #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
                 const POM_BATCH: u64 = 1 << 20;
+                // Driver seam: AMD = OpenCL, NVIDIA = candle-CUDA. Both expose the same interface
+                // (is_installed / ensure_installed / mine / set_mining_tier). OpenCL wins if both on.
+                #[cfg(feature = "pom-opencl")]
+                use keryx_miner::pom_opencl as pom_driver;
+                #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+                use keryx_miner::pom_gpu as pom_driver;
 
                 loop {
                     nonces[0] = 0;
@@ -327,7 +333,7 @@ impl MinerManager {
                     // PoM possession mining (post-fork): grind the data-dependent walk on the GPU
                     // over the resident tier weights instead of kHeavyHash. On a winning nonce we
                     // build the proof (host) and submit; the legacy plugin path below is skipped.
-                    #[cfg(feature = "pom-opencl")]
+                    #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
                     if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::activation_daa()) {
                         let (pph, time, target_le) = {
                             let s = state.as_ref().unwrap();
@@ -335,10 +341,10 @@ impl MinerManager {
                             pph.copy_from_slice(&s.pow_hash_header[0..32]);
                             (pph, u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap()), s.target.to_le_bytes())
                         };
-                        if !keryx_miner::pom_opencl::is_installed() {
-                            keryx_miner::pom_opencl::ensure_installed();
+                        if !pom_driver::is_installed() {
+                            let _ = pom_driver::ensure_installed();
                         }
-                        let found = keryx_miner::pom_opencl::mine(&pph, time, &target_le, pom_nonce, POM_BATCH);
+                        let found = pom_driver::mine(&pph, time, &target_le, pom_nonce, POM_BATCH);
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
