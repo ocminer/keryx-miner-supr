@@ -1,3 +1,6 @@
+mod pom;
+#[allow(dead_code)]
+pub use pom::PomMiner;
 use clap::{ArgMatches, FromArgMatches};
 use keryx_miner::declare_plugin;
 use keryx_miner::{Plugin, Worker, WorkerSpec};
