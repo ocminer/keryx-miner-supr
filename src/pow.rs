@@ -34,6 +34,9 @@ pub enum BlockSeed {
         nonce_mask: u64,
         nonce_fixed: u64,
         hash: Option<String>,
+        /// PoM (post-fork): borsh-encoded possession proof for this share. Empty pre-fork /
+        /// legacy kHeavyHash. The stratum client hex-encodes it into `mining.submit` params[5].
+        pom_proof: Vec<u8>,
     },
 }
 
@@ -174,8 +177,8 @@ impl State {
 
     /// PoM (post-fork) path. If the resident tier `index` yields `pom_pow_value <= target`
     /// for `nonce`, build the possession proof, set the nonce, attach the borsh-encoded proof,
-    /// and return the full block to submit. Solo only — a pool `PartialBlock` can't carry a
-    /// per-miner proof (the pool attaches it from the stratum submit line instead).
+    /// and return the block/share to submit. Solo (`FullBlock`) sets `RpcBlock.pomProof`; pool
+    /// (`PartialBlock`) carries the proof bytes so the stratum client puts them at `params[5]`.
     pub fn generate_block_if_pom(&self, nonce: u64, index: &WeightIndex, tier: u8) -> Option<BlockSeed> {
         let mut pph = [0u8; 32];
         pph.copy_from_slice(&self.pow_hash_header[0..32]);
@@ -207,7 +210,10 @@ impl State {
                 header.nonce = nonce;
                 block.pom_proof = bytes; // plain bytes field (empty = none on the wire)
             }
-            BlockSeed::PartialBlock { .. } => return None,
+            BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut pom_proof, .. } => {
+                *header_nonce = nonce;
+                *pom_proof = bytes; // stratum client hex-encodes this into mining.submit params[5]
+            }
         }
         Some(block_seed)
     }

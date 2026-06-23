@@ -47,6 +47,10 @@ pub(crate) enum MiningNotify {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum MiningSubmit {
+    // 6-element (PoM, post-fork): address, job_id, nonce, opoi_tag, ipfs_cid (or ""),
+    // pom_proof_hex. Fixed slot layout — CID stays at params[4] even when empty so the
+    // proof is always params[5]. See POM_STRATUM_RECIPE.md (pool side reconciled).
+    MiningSubmitWithPom((String, String, String, String, String, String)),
     // 5-element: address, job_id, nonce, opoi_tag, ipfs_cid (Phase 2 full inference submit)
     MiningSubmitWithCID((String, String, String, String, String)),
     MiningSubmitWithTag((String, String, String, String)), // address, job_id, nonce, opoi_tag

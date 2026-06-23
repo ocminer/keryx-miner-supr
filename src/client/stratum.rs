@@ -382,8 +382,8 @@ impl StratumHandler {
         let handle = tokio::spawn(async move {
             let mut recv_stream = ReceiverStream::new(recv);
             while let Some(seed) = recv_stream.next().await {
-                let (nonce, job_id) = match seed {
-                    BlockSeed::PartialBlock { nonce, id, .. } => (nonce, id),
+                let (nonce, job_id, pom_proof) = match seed {
+                    BlockSeed::PartialBlock { nonce, id, pom_proof, .. } => (nonce, id, pom_proof),
                     BlockSeed::FullBlock(_) => unreachable!(),
                 };
                 let msg_id = last_stratum_id.fetch_add(1, Ordering::SeqCst);
@@ -406,7 +406,34 @@ impl StratumHandler {
                     }
                 };
 
-                let line = if let Some(cid) = cid_opt {
+                let line = if !pom_proof.is_empty() {
+                    // PoM (post-fork): fixed 6-slot submit — proof always at params[5], CID-or-empty
+                    // at params[4]. Matches POM_STRATUM_RECIPE.md (pool relays params[5] → RpcBlock
+                    // .pomProof; it does not verify). hex is lowercase per hex::encode.
+                    let proof_hex = hex::encode(&pom_proof);
+                    let cid = cid_opt.unwrap_or_default();
+                    info!(
+                        "PoM: submitting share with proof ({} B, {} hex chars) for job {}",
+                        pom_proof.len(),
+                        proof_hex.len(),
+                        job_id
+                    );
+                    StratumLine {
+                        id: Some(msg_id),
+                        payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
+                            MiningSubmit::MiningSubmitWithPom((
+                                miner_address.clone(),
+                                job_id,
+                                nonce_hex,
+                                opoi_tag,
+                                cid,
+                                proof_hex,
+                            )),
+                        )),
+                        jsonrpc: None,
+                        error: None,
+                    }
+                } else if let Some(cid) = cid_opt {
                     info!("OPoI Phase 2: submitting share with CID for job {}", job_id);
                     StratumLine {
                         id: Some(msg_id),
@@ -529,6 +556,7 @@ impl StratumHandler {
                                         nonce_mask: self.nonce_mask,
                                         nonce_fixed: self.nonce_fixed,
                                         hash: None,
+                                        pom_proof: Vec::new(),
                                     }))
                                     .await
                             }
@@ -563,6 +591,7 @@ impl StratumHandler {
                                     nonce_mask: self.nonce_mask,
                                     nonce_fixed: self.nonce_fixed,
                                     hash: None,
+                                    pom_proof: Vec::new(),
                                 }))
                                 .await
                         }
@@ -593,6 +622,7 @@ impl StratumHandler {
                                     nonce_mask: self.nonce_mask,
                                     nonce_fixed: self.nonce_fixed,
                                     hash: None,
+                                    pom_proof: Vec::new(),
                                 }))
                                 .await
                         }

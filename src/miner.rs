@@ -356,6 +356,18 @@ impl MinerManager {
                                 }
                             }
                         }
+                        // Pick up a newer job before grinding the next batch. The kHeavyHash path
+                        // polls this at the loop tail, but the PoM branch `continue`s before
+                        // reaching it — without this it would grind a stale template forever.
+                        if state.is_some() {
+                            if let Some(new_cmd) = block_channel.get_changed()? {
+                                state = match new_cmd {
+                                    Some(WorkerCommand::Job(s)) => Some(s),
+                                    Some(WorkerCommand::Close) => return Ok(()),
+                                    None => None,
+                                };
+                            }
+                        }
                         continue;
                     }
                     let state_ref = match &state {
