@@ -10,6 +10,7 @@ pub mod slm;
 // share it without a Cargo cycle. Re-export it here so `keryx_miner::Plugin`,
 // `keryx_miner::Error`, `keryx_miner::xoshiro256starstar` and
 // `keryx_miner::declare_plugin!` keep resolving for the rest of the tree.
+pub mod pom;
 pub use keryx_plugin_api::{declare_plugin, xoshiro256starstar, Error, Plugin, Worker, WorkerSpec};
 
 #[derive(Default)]

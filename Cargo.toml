@@ -50,6 +50,9 @@ nix = "0.25"
 # transitively (via tokio/mio); pin it as a direct dep so we can set keepalive.
 socket2 = "0.5"
 hex = "0.4"
+# Proof-of-Model: possession proof construction (borsh wire-format must match the node).
+borsh = { version = "1", features = ["derive"] }
+blake3 = "1"
 keryx-inference = { path = "inference" }
 keryx-plugin-api = { path = "plugin-api" }
 # Optional: compile the CUDA worker straight into the binary instead of loading

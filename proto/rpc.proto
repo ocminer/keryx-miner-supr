@@ -23,6 +23,9 @@ message RpcBlock {
   RpcBlockHeader header = 1;
   repeated RpcTransaction transactions = 2;
   RpcBlockVerboseData verboseData = 3;
+  // Proof-of-Model possession witness (borsh-encoded PomProof); field number MUST match
+  // the node's RpcBlock.pomProof (4). Empty = not on the wire. Attached on submit when PoM active.
+  bytes pomProof = 4;
 }
 
 message RpcBlockHeader {
