@@ -894,4 +894,68 @@ mod tests {
         eprintln!("{vector}");
         eprintln!("submit JSON ({} bytes) -> {out}_submit.json", submit.len());
     }
+
+    /// Mode B: build a proof bound to a REAL staging header's pre_pow_hash + timestamp (supplied via
+    /// env), so the pool can reconstruct an RpcRawBlock and submit it to keryxd. Mines at an easy
+    /// test target (network diff is infeasible here), verifies locally, and writes the
+    /// `{nonce_u64_dec, pom_proof_hex_lowercase, notes}` reply JSON.
+    /// Run: KERYX_GEMMA_GGUF=… KERYX_POM_B_PPH=<64hex> KERYX_POM_B_TIME=<u64> \
+    ///      cargo test --release -p keryx-miner-supr --features pom-opencl emit_mode_b_proof -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[cfg(feature = "pom-opencl")]
+    fn emit_mode_b_proof() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        let pph_v = hex::decode(std::env::var("KERYX_POM_B_PPH").expect("set KERYX_POM_B_PPH (64 hex)").trim())
+            .expect("KERYX_POM_B_PPH must be hex");
+        assert_eq!(pph_v.len(), 32, "pre_pow_hash must be 32 bytes");
+        let mut pph = [0u8; 32];
+        pph.copy_from_slice(&pph_v);
+        let time: u64 = std::env::var("KERYX_POM_B_TIME").expect("set KERYX_POM_B_TIME").trim().parse().expect("u64");
+
+        crate::pom_opencl::load_tier(&path, 0).expect("load_tier(real Gemma)");
+        let (idx, tier) = active_index().expect("index installed");
+        let mut target = [0xffu8; 32]; // easy test target — finds a winner in a few batches
+        target[24..32].copy_from_slice(&0x0010_0000_0000_0000u64.to_le_bytes());
+        let mut base = 0u64;
+        let mut found = None;
+        for _ in 0..2048 {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16) {
+                found = Some(n);
+                break;
+            }
+            base = base.wrapping_add(1 << 16);
+        }
+        let nonce = found.expect("GPU found no winner");
+        let seed = pom_block_seed(&pph, time, nonce);
+        let final_state = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o));
+        let pow_value = pom_pow_value(final_state, &pph);
+        assert!(le_leq(&pow_value, &target), "pow_value must satisfy the easy target");
+        let proof = build_proof(
+            *tier, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS,
+            |o| idx.read_chunk(o), |o| idx.merkle_path(o),
+        );
+        assert!(
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target),
+            "Mode B proof MUST verify locally before handoff"
+        );
+        let proof_hex = hex::encode(borsh::to_vec(&proof).expect("borsh"));
+        let notes = format!(
+            "bound to real staging pre_pow_hash {pph} + timestamp {time}; tier {tier}; mined at EASY test \
+             target {tgt} (NOT network bits — infeasible here); pom_pow_value {powv} (<= test target); \
+             verify_proof PASS locally; R_T {rt}. Pre-fork the daemon won't call verify_pom_proof, so expect \
+             InvalidPoW/LowDiff on kHeavyHash = GREEN (wire clean). For an override-verify green, pass THIS \
+             easy target to verify_pom_proof (not the header bits).",
+            pph = hex::encode(pph), time = time, tier = *tier, tgt = hex::encode(target),
+            powv = hex::encode(pow_value), rt = hex::encode(idx.r_t),
+        );
+        let json = format!(
+            "{{\n  \"nonce_u64_dec\": \"{}\",\n  \"pom_proof_hex_lowercase\": \"{}\",\n  \"notes\": \"{}\"\n}}\n",
+            nonce, proof_hex, notes,
+        );
+        let out = std::env::var("KERYX_POM_B_OUT").unwrap_or_else(|_| "/tmp/pom_mode_b".into());
+        std::fs::write(format!("{out}.json"), &json).unwrap();
+        eprintln!("Mode B: nonce {nonce} ({} hex-char proof) -> {out}.json", proof_hex.len());
+        eprintln!("{notes}");
+    }
 }
