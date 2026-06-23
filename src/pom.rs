@@ -750,8 +750,8 @@ mod tests {
     #[test]
     #[ignore = "needs Gemma-3-4B GGUF on disk"]
     fn weight_index_matches_pinned_gemma() {
-        let path = "/home/slash/KERYX-KRX/claude/keryx-miner/target/release/models/Gemma-3-4B/model.gguf";
-        let idx = WeightIndex::build_from_gguf(path).expect("build index");
+        let path = std::env::var("KERYX_GEMMA_GGUF").unwrap_or_else(|_| "/home/slash/KERYX-KRX/claude/keryx-miner/target/release/models/Gemma-3-4B/model.gguf".to_string());
+        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
         assert_eq!(idx.n_chunks, 77_604_776, "chunk count must match pinned GEMMA_3_4B_POM_CHUNKS");
         let pinned: [u8; 32] = [
             0x84, 0x6c, 0xaa, 0x40, 0x0c, 0xf0, 0x14, 0x13, 0x21, 0x18, 0x49, 0x5d, 0x22, 0xe4, 0xbf, 0xa2,
