@@ -26,6 +26,10 @@ pub struct PomMiner {
     pub n_chunks: u64,
 }
 
+// OpenCL handles are plain cl_* pointers usable from any single thread; the global Mutex
+// serializes all access (one mining thread), so sending the miner across threads is sound.
+unsafe impl Send for PomMiner {}
+
 impl PomMiner {
     /// `blob` = the tier in canonical chunk order, N*4 little-endian u64.
     pub fn new(device: Device, blob: &[u64], n_chunks: u64) -> Result<Self, String> {
@@ -64,4 +68,71 @@ impl PomMiner {
         self.queue.enqueue_read_buffer(&self.winner, CL_BLOCKING, 0, &mut w, &[]).ok()?;
         if w[0] == u64::MAX { None } else { Some(w[0]) }
     }
+}
+
+// ============================================================================
+// Module interface mirroring upstream `pom_gpu` (candle-CUDA) so miner.rs calls
+// are identical: load_tier() once at startup, then mine() in the GPU loop.
+// AMD-specific: weights are loaded into our own OpenCL buffer (candle is CPU here).
+// ============================================================================
+use std::sync::Mutex;
+
+static POM: Mutex<Option<PomMiner>> = Mutex::new(None);
+
+fn words(b: &[u8; 32]) -> [u64; 4] {
+    let mut w = [0u64; 4];
+    for i in 0..4 { w[i] = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()); }
+    w
+}
+
+/// Install the resident tier into the first OpenCL GPU. `blob` = N*4 LE u64 (canonical order).
+pub fn install(blob: &[u64], n_chunks: u64) -> Result<(), String> {
+    let dev_ids = opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU)
+        .map_err(|e| e.to_string())?;
+    let id = *dev_ids.first().ok_or("PoM: no OpenCL GPU device")?;
+    let miner = PomMiner::new(opencl3::device::Device::new(id), blob, n_chunks)?;
+    *POM.lock().unwrap() = Some(miner);
+    Ok(())
+}
+
+pub fn is_installed() -> bool { POM.lock().unwrap().is_some() }
+
+/// AMD: the OpenCL weight buffer is dedicated to mining and never evicted (unlike NVIDIA where
+/// inference can reclaim the candle VRAM), so this is a no-op once installed.
+pub fn ensure_installed() {}
+
+/// Grind one batch of `batch` nonces from `nonce_base`. Returns the lowest nonce whose
+/// pom_pow_value <= target, or None. pph/target are the 32-byte LE forms from State.
+pub fn mine(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64) -> Option<u64> {
+    let p = words(pph);
+    let t = words(target_le);
+    let mut g = POM.lock().unwrap();
+    g.as_mut()?.mine(p, time, t, nonce_base, batch)
+}
+
+/// Build the resident tier from a GGUF: WeightIndex (proof side, CPU/disk) + the contiguous
+/// GPU blob (search side), register both. `tier` is the POM_TIERS slice index.
+/// Call once at startup when PoM mining for this tier.
+pub fn load_tier(gguf_path: &str, tier: u8) -> Result<(), String> {
+    log::info!("PoM: building WeightIndex from {gguf_path} (tier {tier})…");
+    let index = crate::pom::WeightIndex::build_from_gguf(gguf_path).map_err(|e| e.to_string())?;
+    let n = index.n_chunks;
+    log::info!(
+        "PoM: tier {tier} loaded — {n} chunks, computed R_T = {} (must match the node's pinned root)",
+        hex32(&index.r_t)
+    );
+    // Build the contiguous GPU blob in canonical chunk order. read_chunk guarantees the SAME
+    // indexing the proof side uses. TODO(perf): bulk-read for the big tiers (this is O(N) preads).
+    let mut blob: Vec<u64> = Vec::with_capacity((n * 4) as usize);
+    for off in 0..n { blob.extend_from_slice(&index.read_chunk(off)); }
+    crate::pom::set_index(index, tier);
+    install(&blob, n)?;
+    log::info!("PoM: tier {tier} resident on GPU ({} MiB).", (n * 32) / (1024 * 1024));
+    Ok(())
+}
+
+fn hex32(b: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for x in b { s.push_str(&format!("{x:02x}")); }
+    s
 }

@@ -302,6 +302,12 @@ impl MinerManager {
                 let mut nonces = vec![0u64; 1];
 
                 let mut state = None;
+                // PoM (post-fork): nonce cursor + per-launch batch. The kernel grinds the whole
+                // batch before returning, so blocks/sec is capped at hashrate / POM_BATCH.
+                #[cfg(feature = "pom-opencl")]
+                let mut pom_nonce: u64 = thread_rng().next_u64();
+                #[cfg(feature = "pom-opencl")]
+                const POM_BATCH: u64 = 1 << 20;
 
                 loop {
                     nonces[0] = 0;
@@ -317,6 +323,40 @@ impl MinerManager {
                                 return Ok(());
                             }
                         };
+                    }
+                    // PoM possession mining (post-fork): grind the data-dependent walk on the GPU
+                    // over the resident tier weights instead of kHeavyHash. On a winning nonce we
+                    // build the proof (host) and submit; the legacy plugin path below is skipped.
+                    #[cfg(feature = "pom-opencl")]
+                    if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
+                        let (pph, time, target_le) = {
+                            let s = state.as_ref().unwrap();
+                            let mut pph = [0u8; 32];
+                            pph.copy_from_slice(&s.pow_hash_header[0..32]);
+                            (pph, u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap()), s.target.to_le_bytes())
+                        };
+                        if !keryx_miner::pom_opencl::is_installed() {
+                            keryx_miner::pom_opencl::ensure_installed();
+                        }
+                        let found = keryx_miner::pom_opencl::mine(&pph, time, &target_le, pom_nonce, POM_BATCH);
+                        pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
+                        hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                        worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                        if let Some(nonce) = found {
+                            let built = state.as_ref().and_then(|s| {
+                                keryx_miner::pom::active_index().and_then(|(idx, tier)| s.generate_block_if_pom(nonce, idx, *tier))
+                            });
+                            if let Some(block_seed) = built {
+                                match send_channel.blocking_send(block_seed.clone()) {
+                                    Ok(()) => block_seed.report_block(),
+                                    Err(e) => warn!("Could not submit PoM block — pool connection dropped ({}); reconnecting", e),
+                                }
+                                if let BlockSeed::FullBlock(_) = block_seed {
+                                    state = None;
+                                }
+                            }
+                        }
+                        continue;
                     }
                     let state_ref = match &state {
                         Some(s) => {
