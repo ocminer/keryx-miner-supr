@@ -38,8 +38,10 @@ docker run --rm \
 
     echo ">> building libkeryxopencl.so ..."
     cargo build -p keryxopencl --release
-    echo ">> building keryx-miner-supr (dynamic, CUDA-free) ..."
-    cargo build --release --bin keryx-miner-supr
+    echo ">> building keryx-miner-supr (dynamic, CUDA-free, PoM/OpenCL) ..."
+    # pom-opencl REQUIRED post-fork: without it the PoM mining path is compiled out
+    # and AMD mines the dead kHeavyHash algo -> zero valid blocks.
+    cargo build --release --bin keryx-miner-supr --features pom-opencl
 
     cp target-hiveos-amd/release/keryx-miner-supr     /src/hiveos/dist-amd/
     cp target-hiveos-amd/release/libkeryxopencl.so    /src/hiveos/dist-amd/

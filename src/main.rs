@@ -466,6 +466,12 @@ async fn main() -> Result<(), Error> {
         let gguf = keryx_miner::slm::gguf_path_for(&keryx_miner::models::GEMMA_3_4B);
         keryx_miner::pom_opencl::set_mining_tier(gguf.to_string_lossy().into_owned(), 0);
         info!("PoM(AMD): registered tier 0 (Gemma-3-4B) at {}", gguf.display());
+        if keryx_miner::pom::is_activation_overridden() {
+            warn!(
+                "PoM(AMD): ACTIVATION DAA OVERRIDDEN to {} via KERYX_POM_ACTIVATION_DAA — staging/testing ONLY, NOT for production!",
+                keryx_miner::pom::activation_daa()
+            );
+        }
         let pom_specs: &'static [&'static keryx_miner::models::ModelSpec] =
             &[&keryx_miner::models::GEMMA_3_4B];
         tokio::spawn(async move {

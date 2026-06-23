@@ -60,8 +60,10 @@ fi
 echo "[build-amd] building libkeryxopencl.so ..."
 cargo build -p keryxopencl --release
 
-echo "[build-amd] building keryx-miner-supr (dynamic, CUDA-free) ..."
-cargo build --release --bin keryx-miner-supr
+echo "[build-amd] building keryx-miner-supr (dynamic, CUDA-free, PoM/OpenCL) ..."
+# pom-opencl is REQUIRED post-fork: without it the Proof-of-Model mining path is
+# compiled out and AMD mines the dead kHeavyHash algo -> zero valid blocks.
+cargo build --release --bin keryx-miner-supr --features pom-opencl
 
 mkdir -p dist-amd
 cp -f target/release/keryx-miner-supr dist-amd/

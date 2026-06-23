@@ -328,7 +328,7 @@ impl MinerManager {
                     // over the resident tier weights instead of kHeavyHash. On a winning nonce we
                     // build the proof (host) and submit; the legacy plugin path below is skipped.
                     #[cfg(feature = "pom-opencl")]
-                    if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
+                    if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::activation_daa()) {
                         let (pph, time, target_le) = {
                             let s = state.as_ref().unwrap();
                             let mut pph = [0u8; 32];

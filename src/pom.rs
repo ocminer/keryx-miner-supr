@@ -566,6 +566,23 @@ fn finalize_disk_tree(
 /// MAINNET_PARAMS.pom_activation = new(37_780_000).
 pub const POM_ACTIVATION_DAA: u64 = 37_780_000;
 
+/// Effective PoM activation DAA. Defaults to the consensus `POM_ACTIVATION_DAA`. Overridable via
+/// the `KERYX_POM_ACTIVATION_DAA` env var for STAGING / pre-fork live-path testing only (e.g. set
+/// to 0 to force PoM on regardless of the job's daa_score). Read once. `is_activation_overridden`
+/// lets startup warn loudly so an override can never be used silently in production.
+pub fn activation_daa() -> u64 {
+    *ACTIVATION_DAA.get_or_init(|| {
+        std::env::var("KERYX_POM_ACTIVATION_DAA")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(POM_ACTIVATION_DAA)
+    })
+}
+pub fn is_activation_overridden() -> bool {
+    activation_daa() != POM_ACTIVATION_DAA
+}
+static ACTIVATION_DAA: OnceLock<u64> = OnceLock::new();
+
 /// The resident tier weight index + tier id, installed once at startup when PoM is enabled.
 static POM_INDEX: OnceLock<(WeightIndex, u8)> = OnceLock::new();
 
