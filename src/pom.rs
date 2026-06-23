@@ -802,4 +802,79 @@ mod tests {
             idx.n_chunks
         );
     }
+
+    /// Emit a REAL `mining.submit` wire (params[5] = borsh PomProof hex) built over the real
+    /// Gemma-3-4B tier, for the pool to replay through `_submitBlock` → keryxd `verify_pom_proof`
+    /// in isolation. The proof is verified LOCALLY first, so this is a known-good vector. Writes
+    /// `<KERYX_SAMPLE_OUT>_submit.json` + `_vector.txt` (default prefix /tmp/pom_sample).
+    /// Run: KERYX_GEMMA_GGUF=… cargo test --features pom-opencl emit_sample_submit_wire -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[cfg(feature = "pom-opencl")]
+    fn emit_sample_submit_wire() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        crate::pom_opencl::load_tier(&path, 0).expect("load_tier(real Gemma)");
+        let (idx, tier) = active_index().expect("index installed by load_tier");
+        // Deterministic, clearly-synthetic header inputs — NOT a real chain header. The pool feeds
+        // these (pph, timestamp, nonce, tier, target) into verify_pom_proof / a synthetic header.
+        let pph = blake(b"keryx-pom-sample-submit-wire-v1");
+        let time = 1_700_000_000u64;
+        let mut target = [0xffu8; 32]; // easy share target -> GPU finds a winner within a few batches
+        target[24..32].copy_from_slice(&0x0010_0000_0000_0000u64.to_le_bytes());
+        let mut base = 0u64;
+        let mut found = None;
+        for _ in 0..1024 {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16) {
+                found = Some(n);
+                break;
+            }
+            base = base.wrapping_add(1 << 16);
+        }
+        let nonce = found.expect("GPU found no winner over the real tier");
+        let seed = pom_block_seed(&pph, time, nonce);
+        let final_state = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o));
+        let pow_value = pom_pow_value(final_state, &pph);
+        assert!(le_leq(&pow_value, &target), "pow_value must satisfy the share target");
+        let proof = build_proof(
+            *tier, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS,
+            |o| idx.read_chunk(o), |o| idx.merkle_path(o),
+        );
+        assert!(
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target),
+            "sample proof MUST verify locally before handoff"
+        );
+        let proof_bytes = borsh::to_vec(&proof).expect("borsh");
+        let proof_hex = hex::encode(&proof_bytes);
+        let nonce_hex = format!("{:016x}", nonce);
+        let opoi_tag = keryx_inference::tag_fixed(nonce);
+        // Placeholder worker — NOT a real wallet (the live miner fills the real address).
+        let worker = "keryx:SAMPLE_WORKER_PLACEHOLDER.amd-pom";
+        let job_id = "sample-job-1";
+        let submit = format!(
+            r#"{{"id":1,"method":"mining.submit","params":["{}","{}","{}","{}","","{}"]}}"#,
+            worker, job_id, nonce_hex, opoi_tag, proof_hex
+        );
+        let out = std::env::var("KERYX_SAMPLE_OUT").unwrap_or_else(|_| "/tmp/pom_sample".into());
+        std::fs::write(format!("{out}_submit.json"), &submit).unwrap();
+        let vector = format!(
+            "PoM sample verification vector — tier {tier}, REAL Gemma-3-4B (verify_proof: PASS)\n\
+             pre_pow_hash (32B hex): {pph}\n\
+             timestamp (u64):        {time}\n\
+             nonce (u64):            {nonce}   (nonceHex {nonce_hex})\n\
+             tier (u8):              {tier}\n\
+             target (32B LE hex):    {target}\n\
+             pom_pow_value (32B hex):{powv}   (<= target ✓)\n\
+             n_chunks:               {nc}\n\
+             R_T tier root (hex):    {rt}\n\
+             proof bytes:            {plen}   (params[5] hex chars {phlen})\n\
+             submit params layout:   [worker, jobId, nonceHex, opoiTag, ipfsCID(\"\"), pomProofHex]\n\
+             NOTE: worker is a placeholder; pph/time/nonce are synthetic test inputs (not a chain header).\n",
+            tier = *tier, pph = hex::encode(pph), time = time, nonce = nonce, nonce_hex = nonce_hex,
+            target = hex::encode(target), powv = hex::encode(pow_value), nc = idx.n_chunks,
+            rt = hex::encode(idx.r_t), plen = proof_bytes.len(), phlen = proof_hex.len(),
+        );
+        std::fs::write(format!("{out}_vector.txt"), &vector).unwrap();
+        eprintln!("{vector}");
+        eprintln!("submit JSON ({} bytes) -> {out}_submit.json", submit.len());
+    }
 }
