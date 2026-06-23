@@ -766,4 +766,40 @@ mod tests {
         let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, 256, 32, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
         assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, 256, 32, &idx.r_t, &[0xff; 32]));
     }
+
+    /// Full AMD path on the REAL tier: load_tier (WeightIndex + GPU blob + PomMiner) -> GPU mine
+    /// over the resident Gemma weights -> build proof from the resident index -> verify vs pinned R_T.
+    /// Proves the GPU blob and the proof-side WeightIndex are the same canonical chunks.
+    #[test]
+    #[ignore]
+    #[cfg(feature = "pom-opencl")]
+    fn gpu_real_tier_end_to_end() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        crate::pom_opencl::load_tier(&path, 0).expect("load_tier(real Gemma)");
+        let (idx, tier) = active_index().expect("index installed by load_tier");
+        let pph = blake(b"gpu-real-e2e");
+        let time = 1_700_000_000u64;
+        let mut target = [0xffu8; 32]; // ~1/4096 on the high word -> winner within a few batches
+        target[24..32].copy_from_slice(&0x0010_0000_0000_0000u64.to_le_bytes());
+        let mut base = 0u64;
+        let mut found = None;
+        for _ in 0..512 {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16) {
+                found = Some(n);
+                break;
+            }
+            base = base.wrapping_add(1 << 16);
+        }
+        let nonce = found.expect("GPU found no winner over the real tier");
+        let seed = pom_block_seed(&pph, time, nonce);
+        let proof = build_proof(*tier, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        assert!(
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target),
+            "real-tier GPU proof must verify against the pinned R_T"
+        );
+        eprintln!(
+            "GPU mined nonce {nonce} over the REAL Gemma-3-4B tier ({} chunks); proof verifies vs pinned R_T 846caa40… ✅",
+            idx.n_chunks
+        );
+    }
 }
