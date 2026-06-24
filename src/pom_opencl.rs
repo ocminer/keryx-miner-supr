@@ -107,11 +107,22 @@ pub fn set_mining_tier(gguf_path: String, tier: u8) {
     *TIER.lock().unwrap() = Some((gguf_path, tier));
 }
 
-/// Lazily build + install the registered tier on the first PoM-active iteration. Idempotent.
+/// Serializes the one-time tier build so concurrent first-time callers (the PoM loop runs one
+/// mining thread PER GPU) don't both run build_from_gguf and collide on the shared on-disk Merkle
+/// scratch ("failed to fill whole buffer"). The loser waits, then sees is_installed() and returns.
+/// Single-GPU AMD boxes never trip this; multi-GPU rigs do. Mirrors pom_gpu's BUILD_LOCK.
+static BUILD_LOCK: Mutex<()> = Mutex::new(());
+
+/// Lazily build + install the registered tier on the first PoM-active iteration. Idempotent and
+/// safe to call concurrently from every GPU mining thread.
 /// (Unlike NVIDIA, the AMD OpenCL buffer is never evicted, so this only does work once.)
 pub fn ensure_installed() {
     if is_installed() {
         return;
+    }
+    let _build = BUILD_LOCK.lock().unwrap(); // only one thread builds the tier
+    if is_installed() {
+        return; // another thread built + installed it while we waited
     }
     let tier = TIER.lock().unwrap().clone();
     match tier {
