@@ -13,6 +13,8 @@ pub mod slm;
 pub mod pom;
 #[cfg(feature = "pom-opencl")]
 pub mod pom_opencl;
+#[cfg(feature = "pom-cuda")]
+pub mod pom_gpu;
 pub use keryx_plugin_api::{declare_plugin, xoshiro256starstar, Error, Plugin, Worker, WorkerSpec};
 
 #[derive(Default)]

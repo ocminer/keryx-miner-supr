@@ -820,6 +820,52 @@ mod tests {
         );
     }
 
+    /// CUDA variant: run the pom_mine kernel (cudarc) over the real Gemma-3-4B tier resident in
+    /// NVIDIA VRAM, build the proof from the resident WeightIndex, verify vs the pinned R_T, and
+    /// assert the consensus N + R_T. Proves the CUDA search reads the SAME canonical chunks as the
+    /// proof side (i.e. the NVIDIA path is byte-exact with consensus).
+    /// Run: KERYX_GEMMA_GGUF=… cargo test --release --features pom-cuda gpu_real_tier_end_to_end_cuda -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[cfg(feature = "pom-cuda")]
+    fn gpu_real_tier_end_to_end_cuda() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        crate::pom_gpu::load_tier(&path, 0).expect("load_tier(real Gemma)");
+        let (idx, tier) = active_index().expect("index installed by load_tier");
+        // Consensus invariants for tier 0 (Gemma-3-4B) — the whole point of the test.
+        let pinned_rt: [u8; 32] = [
+            0x84, 0x6c, 0xaa, 0x40, 0x0c, 0xf0, 0x14, 0x13, 0x21, 0x18, 0x49, 0x5d, 0x22, 0xe4,
+            0xbf, 0xa2, 0x42, 0x45, 0x4e, 0xac, 0x0d, 0x83, 0x5c, 0x3f, 0x8e, 0x63, 0x47, 0xd0,
+            0x13, 0x9d, 0x1b, 0x7e,
+        ];
+        assert_eq!(idx.n_chunks, 77_604_776, "Gemma-3-4B tier N must be 77,604,776");
+        assert_eq!(idx.r_t, pinned_rt, "R_T must match the node-pinned Gemma root 846caa40…");
+        let pph = blake(b"gpu-real-e2e-cuda");
+        let time = 1_700_000_000u64;
+        let mut target = [0xffu8; 32]; // ~1/4096 on the high word -> winner within a few batches
+        target[24..32].copy_from_slice(&0x0010_0000_0000_0000u64.to_le_bytes());
+        let mut base = 0u64;
+        let mut found = None;
+        for _ in 0..512 {
+            if let Some(n) = crate::pom_gpu::mine(&pph, time, &target, base, 1 << 16) {
+                found = Some(n);
+                break;
+            }
+            base = base.wrapping_add(1 << 16);
+        }
+        let nonce = found.expect("CUDA GPU found no winner over the real tier");
+        let seed = pom_block_seed(&pph, time, nonce);
+        let proof = build_proof(*tier, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        assert!(
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target),
+            "real-tier CUDA GPU proof must verify against the pinned R_T"
+        );
+        eprintln!(
+            "CUDA mined nonce {nonce} over the REAL Gemma-3-4B tier ({} chunks); proof verifies vs pinned R_T 846caa40… ✅",
+            idx.n_chunks
+        );
+    }
+
     /// Emit a REAL `mining.submit` wire (params[5] = borsh PomProof hex) built over the real
     /// Gemma-3-4B tier, for the pool to replay through `_submitBlock` → keryxd `verify_pom_proof`
     /// in isolation. The proof is verified LOCALLY first, so this is a known-good vector. Writes
