@@ -1,23 +1,24 @@
-//! Proof-of-Model GPU mining on NVIDIA — cudarc driver (CUDA analog of `crate::pom_opencl`).
+//! Proof-of-Model GPU mining — runs the `pom_mine` kernel in candle's CUDA context over the
+//! resident weight blob to find a winning nonce. Foundation for the live mining loop (§6/3b).
 //!
-//! Holds the tier weight blob resident in one device buffer (N*4 LE u64, canonical chunk order
-//! from `pom::WeightIndex::read_chunk` — the SAME bytes the proof side uses). `mine()` launches
-//! the `pom_mine` kernel over a nonce batch and returns the lowest passing nonce; the host then
-//! re-verifies + builds the proof. Exposes the SAME free-function interface as `pom_opencl` so
-//! `miner.rs`/`main.rs` drive AMD (OpenCL) and NVIDIA (CUDA) identically.
+//! Loads the mining tier's GGUF raw (so we get per-tensor device pointers for the gather, like
+//! `pom-q4-probe`) and builds the chunk-prefix gather index on the GPU. NOTE: this is a second
+//! VRAM copy of the model (the inference engine holds its own). Fine for small tiers on the
+//! testnet; the big tiers will share buffers later.
 //!
-//! Uses cudarc directly (NOT candle's CUDA backend): the supr fork's candle is CPU-only and pins
-//! cudarc 0.13.9, whose API differs from upstream's candle-gather `pom_gpu`. A dedicated
-//! contiguous blob + a simple indexing kernel (vs upstream's per-tensor gather) is the proven AMD
-//! approach and avoids the candle/cudarc version entanglement — same chunk bytes, byte-exact folds.
+//! The kernel's seed/pow folds are byte-identical to `pom::pom_block_seed`/`pom::pom_pow_value`,
+//! so a nonce found here builds a `PomProof` (host) the node accepts.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig};
-use cudarc::nvrtc::Ptx;
 use log::info;
 
-const PTX_SRC: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine.ptx"));
+use candle_core::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use candle_core::quantized::{gguf_file, QTensor};
+use candle_core::{CudaDevice, Device};
+
+const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine.ptx"));
+const CHUNK_BYTES: usize = 32;
 
 fn words4(b: &[u8; 32]) -> [u64; 4] {
     let mut w = [0u64; 4];
@@ -28,145 +29,264 @@ fn words4(b: &[u8; 32]) -> [u64; 4] {
 }
 
 pub struct PomGpuMiner {
-    dev: Arc<CudaDevice>,
-    func: CudaFunction,
-    weights: CudaSlice<u64>,
-    pub n_chunks: u64,
+    cuda: CudaDevice,
+    stream: Arc<CudaStream>,
+    bases_dev: CudaSlice<u64>,
+    prefix_dev: CudaSlice<u64>,
+    t_count: u32,
+    n_total_chunks: u64,
+    _tensors: Vec<QTensor>, // raw-loaded tensors kept alive so the gather pointers stay valid
+    _shared: Vec<Arc<QTensor>>, // shared-with-inference tensors kept alive (zero-dup, Option C)
 }
 
-// cudarc handles are bound to the device/thread; the global Mutex serializes access (single
-// mining thread), so sending the miner across threads is sound.
-unsafe impl Send for PomGpuMiner {}
-
 impl PomGpuMiner {
-    /// `blob` = the tier in canonical chunk order, N*4 little-endian u64. Uploads it to GPU 0.
-    pub fn new(blob: Vec<u64>, n_chunks: u64) -> Result<Self, String> {
-        let dev = CudaDevice::new(0).map_err(|e| e.to_string())?;
-        dev.load_ptx(Ptx::from_src(PTX_SRC), "pom_mine_mod", &["pom_mine"]).map_err(|e| e.to_string())?;
-        let func = dev.get_func("pom_mine_mod", "pom_mine").ok_or("PoM: pom_mine kernel not found")?;
-        let weights = dev.htod_copy(blob).map_err(|e| e.to_string())?;
-        Ok(Self { dev, func, weights, n_chunks })
+    /// Load the mining model's GGUF into candle (device 0), build the gather index, load the kernel.
+    pub fn load(gguf_path: &str) -> candle_core::Result<Self> {
+        let device = Device::new_cuda(0)?;
+        let cuda = match &device {
+            Device::Cuda(c) => c.clone(),
+            _ => return Err(candle_core::Error::Msg("PoM GPU: not a CUDA device".into())),
+        };
+        let stream = cuda.cuda_stream();
+
+        let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::wrap)?;
+        let content = gguf_file::Content::read(&mut file)?;
+        let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
+        names.sort(); // canonical order — matches pom-rt-builder / the node R_T
+
+        let mut tensors: Vec<QTensor> = Vec::with_capacity(names.len());
+        let mut bases: Vec<u64> = Vec::new();
+        let mut prefix: Vec<u64> = vec![0];
+        for name in &names {
+            let qt = content.tensor(&mut file, name, &device)?;
+            let chunks = (qt.storage_size_in_bytes() / CHUNK_BYTES) as u64;
+            if chunks == 0 {
+                tensors.push(qt);
+                continue;
+            }
+            bases.push(qt.device_ptr()? as usize as u64);
+            prefix.push(prefix.last().unwrap() + chunks);
+            tensors.push(qt);
+        }
+        let n_total_chunks = *prefix.last().unwrap();
+        if n_total_chunks == 0 {
+            return Err(candle_core::Error::Msg("PoM GPU: model produced 0 chunks".into()));
+        }
+
+        let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
+        let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
+        // Warm the module cache so mine() never compiles on the hot path.
+        let _ = cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?;
+
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: tensors, _shared: Vec::new() })
+    }
+
+    /// Zero-dup load (Option C): build the gather over the SAME canonical name-sorted layout as
+    /// `R_T`, but for each tensor reuse the inference engine's resident VRAM buffer when it holds
+    /// it quantized (`shared`, the big matrices) instead of loading a second copy. Only the
+    /// dequantized-in-inference tensors (token_embd, norms) are read raw here — small. `device`
+    /// MUST be the same candle device the `shared` tensors live on (pointers are context-bound).
+    pub fn load_shared(
+        gguf_path: &str,
+        device: &Device,
+        shared: &std::collections::HashMap<String, Arc<QTensor>>,
+    ) -> candle_core::Result<Self> {
+        let cuda = match device {
+            Device::Cuda(c) => c.clone(),
+            _ => return Err(candle_core::Error::Msg("PoM GPU: shared load requires a CUDA device".into())),
+        };
+        let stream = cuda.cuda_stream();
+
+        let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::wrap)?;
+        let content = gguf_file::Content::read(&mut file)?;
+        let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
+        names.sort(); // canonical order — must match pom-rt-builder / the node R_T
+
+        let mut raw: Vec<QTensor> = Vec::new();
+        let mut kept_shared: Vec<Arc<QTensor>> = Vec::new();
+        let mut bases: Vec<u64> = Vec::new();
+        let mut prefix: Vec<u64> = vec![0];
+        let mut shared_hits = 0usize;
+        for name in &names {
+            let (ptr, chunks) = if let Some(qt) = shared.get(name) {
+                // Matrix already resident for inference → reuse its buffer (zero dup).
+                let c = (qt.storage_size_in_bytes() / CHUNK_BYTES) as u64;
+                let p = qt.device_ptr()? as usize as u64;
+                kept_shared.push(qt.clone());
+                shared_hits += 1;
+                (p, c)
+            } else {
+                // Dequantized-in-inference (token_embd, norms): read the raw quantized bytes.
+                let qt = content.tensor(&mut file, name, device)?;
+                let c = (qt.storage_size_in_bytes() / CHUNK_BYTES) as u64;
+                if c == 0 {
+                    raw.push(qt);
+                    continue;
+                }
+                let p = qt.device_ptr()? as usize as u64;
+                raw.push(qt);
+                (p, c)
+            };
+            if chunks == 0 {
+                continue;
+            }
+            bases.push(ptr);
+            prefix.push(prefix.last().unwrap() + chunks);
+        }
+        let n_total_chunks = *prefix.last().unwrap();
+        if n_total_chunks == 0 {
+            return Err(candle_core::Error::Msg("PoM GPU: shared load produced 0 chunks".into()));
+        }
+        info!("PoM zero-dup gather: {} shared tensors, {} raw-loaded, N={} chunks", shared_hits, raw.len(), n_total_chunks);
+
+        let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
+        let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
+        let _ = cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?;
+
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: raw, _shared: kept_shared })
     }
 
     pub fn n_chunks(&self) -> u64 {
-        self.n_chunks
+        self.n_total_chunks
     }
 
     /// Search nonces in `[start, start + batch)`. Returns the lowest nonce whose `pom_pow_value`
-    /// is `<= target_le`, or None. pph/target are the 32-byte LE forms from State.
-    pub fn mine(&self, pph: &[u8; 32], time: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
-        let p = words4(pph);
+    /// is `<= target_le`, or None. `target_le` is the header's compact target as 32 LE bytes.
+    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> candle_core::Result<Option<u64>> {
+        let p = words4(pre_pow_hash);
         let t = words4(target_le);
-        let pph_d = self.dev.htod_copy(p.to_vec()).ok()?;
-        let tgt_d = self.dev.htod_copy(t.to_vec()).ok()?;
-        let mut winner_d = self.dev.htod_copy(vec![u64::MAX]).ok()?;
-        let k = crate::pom::POM_WALK_STEPS as u32;
+        let k = crate::pom::POM_WALK_STEPS;
+        let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
         let grid = ((batch + 255) / 256) as u32;
         let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
-        let func = self.func.clone();
-        // 9 args = the launch tuple-arity max in cudarc 0.13.
-        unsafe {
-            func.launch(
-                cfg,
-                (&self.weights, self.n_chunks, k, &pph_d, time, &tgt_d, start, batch, &mut winner_d),
-            )
-            .ok()?;
-        }
-        let w = self.dev.dtoh_sync_copy(&winner_d).ok()?;
-        if w[0] == u64::MAX {
-            None
-        } else {
-            Some(w[0])
-        }
+
+        let func = self.cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?; // cached
+        let mut b = func.builder();
+        b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&self.n_total_chunks).arg(&k)
+            .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3]).arg(&timestamp)
+            .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
+            .arg(&start).arg(&batch).arg(&winner);
+        unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
+        self.stream.synchronize().map_err(candle_core::Error::wrap)?;
+
+        let w = self.stream.clone_dtoh(&winner).map_err(candle_core::Error::wrap)?[0];
+        Ok(if w == u64::MAX { None } else { Some(w) })
     }
 }
 
-// ============================================================================
-// Module interface — mirrors `crate::pom_opencl` so miner.rs/main.rs call the
-// same free functions for AMD (OpenCL) and NVIDIA (CUDA).
-// ============================================================================
-
+// The GPU miner instance. Option (not OnceLock) so it can be uninstalled to free VRAM when an
+// inference for another model needs the GPU (inference has priority over PoW), then reinstalled
+// when mining resumes.
 static MINER: Mutex<Option<PomGpuMiner>> = Mutex::new(None);
 
+/// Install the GPU miner (after loading/sharing the mining model's resident weights).
 pub fn install(m: PomGpuMiner) {
-    *MINER.lock().unwrap() = Some(m);
+    if let Ok(mut g) = MINER.lock() {
+        *g = Some(m);
+    }
 }
 
+/// Drop the GPU miner, releasing its hold on the mining model's VRAM (shared Arcs + gather) so
+/// the inference engine can load another model. Mining is paused during inference anyway.
+pub fn uninstall() {
+    if let Ok(mut g) = MINER.lock() {
+        *g = None;
+    }
+}
+
+/// Whether the GPU miner is currently installed.
 pub fn is_installed() -> bool {
     MINER.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
-/// Grind one batch of `batch` nonces from `nonce_base`. Returns the lowest passing nonce, or None.
-pub fn mine(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64) -> Option<u64> {
+/// True while the GPU miner is being (re)built — a heavy one-time model load that blocks the
+/// mining worker. The PoW stall watchdog treats this like an inference pause, not a crash.
+static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a PoM model load/rebuild is in progress (worker intentionally paused, not stalled).
+pub fn is_loading() -> bool {
+    LOADING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Convenience: search a nonce batch via the installed miner. None if not installed or no winner.
+pub fn mine(pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
     let g = MINER.lock().ok()?;
-    g.as_ref()?.mine(pph, time, target_le, nonce_base, batch)
+    g.as_ref()?.mine(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
 }
 
-/// Registered mining tier (GGUF path, POM_TIERS index). Set once at startup; the first PoM-active
-/// job lazily builds the index + GPU residency via ensure_installed.
-static TIER: Mutex<Option<(String, u8)>> = Mutex::new(None);
+/// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup.
+static MINING_TIER: OnceLock<([u8; 32], String)> = OnceLock::new();
 
-/// Register the tier to mine (GGUF path on disk, POM_TIERS index). Cheap — no I/O.
-pub fn set_mining_tier(gguf_path: String, tier: u8) {
-    *TIER.lock().unwrap() = Some((gguf_path, tier));
+/// Record the mining tier so the miner can be rebuilt after an inference swapped the model away.
+pub fn set_mining_tier(model_id: [u8; 32], gguf_path: String) {
+    let _ = MINING_TIER.set((model_id, gguf_path));
 }
 
-/// Serializes the one-time tier build so that concurrent first-time callers (one mining thread
-/// PER GPU) don't both run build_from_gguf and collide on the shared on-disk Merkle scratch
-/// ("failed to fill whole buffer"). The loser waits, then sees is_installed() == true and returns.
-static BUILD_LOCK: Mutex<()> = Mutex::new(());
-
-/// Lazily build + install the registered tier on the first PoM-active iteration. Idempotent and
-/// safe to call concurrently from every GPU mining thread.
-pub fn ensure_installed() {
+/// Ensure the GPU miner is installed; if an inference evicted the mining model, reload it
+/// (resident again) and rebuild the zero-dup gather. Heavy (model reload) but only when needed —
+/// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
+/// the miner is ready to mine.
+pub fn ensure_installed() -> bool {
     if is_installed() {
-        return;
+        return true;
     }
-    let _build = BUILD_LOCK.lock().unwrap(); // only one thread builds the tier
-    if is_installed() {
-        return; // another thread built + installed it while we waited
-    }
-    let tier = TIER.lock().unwrap().clone();
-    match tier {
-        Some((path, t)) => match load_tier(&path, t) {
-            Ok(()) => info!("PoM: tier {t} installed (CUDA GPU-resident)."),
-            Err(e) => log::warn!("PoM: load_tier failed ({path}): {e} — is the model GGUF downloaded?"),
-        },
-        None => log::warn!("PoM: no mining tier registered (set_mining_tier not called)."),
-    }
+    // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
+    LOADING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ok = ensure_installed_inner();
+    LOADING.store(false, std::sync::atomic::Ordering::Relaxed);
+    ok
 }
 
-/// Build the resident tier from a GGUF: `WeightIndex` (proof side, CPU/disk) + the contiguous GPU
-/// blob (search side), register both. `tier` is the POM_TIERS slice index.
-pub fn load_tier(gguf_path: &str, tier: u8) -> Result<(), String> {
-    info!("PoM: building WeightIndex from {gguf_path} (tier {tier})…");
-    let index = crate::pom::WeightIndex::build_from_gguf(gguf_path).map_err(|e| e.to_string())?;
-    let n = index.n_chunks;
-    info!(
-        "PoM: tier {tier} index ready — {n} chunks, R_T = {} (must match the node's pinned root)",
-        hex32(&index.r_t)
-    );
-    // Contiguous blob in canonical chunk order. read_chunk guarantees the SAME indexing the proof
-    // side uses. TODO(perf): bulk-read for the big tiers (this is O(N) preads).
-    let mut blob: Vec<u64> = Vec::with_capacity((n * 4) as usize);
-    for off in 0..n {
-        blob.extend_from_slice(&index.read_chunk(off));
+fn ensure_installed_inner() -> bool {
+    let (model_id, gguf) = match MINING_TIER.get() {
+        Some(x) => x,
+        None => return false,
+    };
+    // Build the possession index once (host, heavy) the first time PoM activates — deferred from
+    // boot so the pre-PoM legacy phase starts immediately and keeps host/GPU free.
+    if crate::pom::active_index().is_none() {
+        let tier = match crate::models::pom_tier_index(model_id) {
+            Some(t) => t,
+            None => return false,
+        };
+        info!("PoM: building possession index (first PoM activation) — this can take a while…");
+        match crate::pom::WeightIndex::build_from_gguf(gguf) {
+            Ok(idx) => {
+                info!("PoM: weight index ready — N={} chunks", idx.n_chunks);
+                crate::pom::set_index(idx, tier);
+            }
+            Err(e) => {
+                log::error!("PoM: index build failed: {}", e);
+                return false;
+            }
+        }
     }
-    crate::pom::set_index(index, tier);
-    let gm = PomGpuMiner::new(blob, n)?;
-    // N-guard: the GPU blob's chunk count MUST equal the host index's, else blocks get rejected.
-    if gm.n_chunks() != n {
-        return Err(format!("gather N={} != index N={} — refusing to mine (would be rejected)", gm.n_chunks(), n));
+    // Make the mining model resident again (evicts whatever inference loaded), then share it.
+    if !crate::slm::ensure_loaded(model_id) {
+        return false;
     }
-    install(gm);
-    info!("PoM: tier {tier} resident on CUDA GPU ({} MiB).", (n * 32) / (1024 * 1024));
-    Ok(())
-}
-
-fn hex32(b: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
-    for x in b {
-        s.push_str(&format!("{x:02x}"));
+    let m = if let Some((device, shared)) = crate::slm::pom_shared(model_id) {
+        PomGpuMiner::load_shared(gguf, &device, &shared)
+    } else {
+        PomGpuMiner::load(gguf)
+    };
+    match m {
+        Ok(gm) => {
+            let n = gm.n_chunks();
+            // N-guard: the gather must match the host index, else blocks would be rejected.
+            if let Some((idx, _)) = crate::pom::active_index() {
+                if n != idx.n_chunks {
+                    log::error!("PoM: gather N={} != index N={} — refusing to mine (rejected blocks)", n, idx.n_chunks);
+                    return false;
+                }
+            }
+            install(gm);
+            info!("PoM: GPU miner ready — N={} chunks resident (matches index)", n);
+            true
+        }
+        Err(e) => {
+            log::error!("PoM: rebuild failed: {}", e);
+            false
+        }
     }
-    s
 }
