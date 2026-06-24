@@ -868,6 +868,52 @@ mod tests {
         );
     }
 
+    /// Tier-2 (Qwen3-32B) candle-CUDA consensus check: WeightIndex R_T must equal the node-pinned
+    /// tier-2 root e2aa6659…, the GPU gather N must match, and a candle-CUDA-mined nonce must build
+    /// a proof that verifies. Proves the bigger Qwen3 GGUF loads + gathers byte-exact (the 5090 tier).
+    /// Run: KERYX_QWEN3_GGUF=… cargo test --release --features pom-cuda gpu_real_tier_qwen3_cuda -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[cfg(feature = "pom-cuda")]
+    fn gpu_real_tier_qwen3_cuda() {
+        let path = std::env::var("KERYX_QWEN3_GGUF").expect("set KERYX_QWEN3_GGUF");
+        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        // Node-pinned tier-2 (Qwen3-32B) invariants.
+        let pinned_rt: [u8; 32] = [
+            0xe2, 0xaa, 0x66, 0x59, 0xaa, 0xb4, 0x38, 0x7e, 0xb5, 0xfd, 0x79, 0x40, 0x9c, 0x0a,
+            0x1a, 0x68, 0x86, 0x3a, 0x3d, 0xef, 0x3b, 0x66, 0x2c, 0xb4, 0x06, 0x16, 0x97, 0xf0,
+            0xea, 0x87, 0xfa, 0x58,
+        ];
+        assert_eq!(idx.n_chunks, 617_380_448, "Qwen3-32B tier N must be 617,380,448");
+        assert_eq!(idx.r_t, pinned_rt, "R_T must match the node-pinned Qwen3-32B root e2aa6659…");
+        let gm = crate::pom_gpu::PomGpuMiner::load(&path).expect("load candle-CUDA gather (Qwen3)");
+        assert_eq!(gm.n_chunks(), idx.n_chunks, "GPU gather N must equal the proof-side index N");
+        let pph = blake(b"gpu-real-e2e-qwen3");
+        let time = 1_700_000_000u64;
+        let mut target = [0xffu8; 32];
+        target[24..32].copy_from_slice(&0x0010_0000_0000_0000u64.to_le_bytes());
+        let mut base = 0u64;
+        let mut found = None;
+        for _ in 0..512 {
+            if let Some(n) = gm.mine(&pph, time, &target, base, 1 << 16).expect("mine") {
+                found = Some(n);
+                break;
+            }
+            base = base.wrapping_add(1 << 16);
+        }
+        let nonce = found.expect("CUDA GPU found no winner over the Qwen3 tier");
+        let seed = pom_block_seed(&pph, time, nonce);
+        let proof = build_proof(2, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        assert!(
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target),
+            "Qwen3 tier-2 CUDA GPU proof must verify against the pinned R_T"
+        );
+        eprintln!(
+            "candle-CUDA mined nonce {nonce} over the REAL Qwen3-32B tier ({} chunks); proof verifies vs pinned R_T e2aa6659… ✅",
+            idx.n_chunks
+        );
+    }
+
     /// Emit a REAL `mining.submit` wire (params[5] = borsh PomProof hex) built over the real
     /// Gemma-3-4B tier, for the pool to replay through `_submitBlock` → keryxd `verify_pom_proof`
     /// in isolation. The proof is verified LOCALLY first, so this is a known-good vector. Writes
