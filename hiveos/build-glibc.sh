@@ -37,7 +37,11 @@ docker run --rm \
 
     # static-cuda: the CUDA worker is linked into the binary, so the HiveOS
     # payload is ONE executable (no libkeryx*.so to ship).
-    cargo build --release --features static-cuda
+    # pom-cuda: the Proof-of-Model CUDA search driver (post-fork algo). WITHOUT it
+    # the miner mines the dead kHeavyHash algo after the PoM hardfork.
+    # NOTE: pom-cuda's cudarc 0.13.9 supports CUDA <= 12.8 — the build image's
+    # CUDA toolkit must be 12.8 or older (12.9+ panics "Unsupported cuda toolkit").
+    cargo build --release --features static-cuda,pom-cuda
     # Make artifacts readable by the host (uid 1000) after a root build.
     cp target-hiveos/release/keryx-miner-supr /src/hiveos/dist/
     chmod -R a+rX /src/hiveos/dist

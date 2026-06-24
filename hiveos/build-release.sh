@@ -31,15 +31,20 @@ docker run --rm -v "$REPO":/src -w /src -e DEBIAN_FRONTEND=noninteractive "$IMAG
     export RUSTFLAGS="-L /usr/local/cuda/lib64/stubs"
     export CARGO_TARGET_DIR=/src/target-hiveos
 
+    # pom-cuda = the Proof-of-Model CUDA search driver (post-fork algo); without it
+    # the binary mines the dead kHeavyHash algo after the PoM hardfork.
+    # NOTE: pom-cuda's cudarc 0.13.9 requires the build image's CUDA toolkit be
+    # <= 12.8 (12.9+ panics "Unsupported cuda toolkit version").
+
     # 1) dynamic ("normal") — binary + both plugin .so
-    cargo build --release
+    cargo build --release --features pom-cuda
     cp target-hiveos/release/keryx-miner-supr \
        target-hiveos/release/libkeryxcuda.so \
        target-hiveos/release/libkeryxopencl.so \
        /src/hiveos/dist/linux-stage/
 
     # 2) static-cuda (HiveOS) — single binary (overwrites the dynamic one)
-    cargo build --release --features static-cuda
+    cargo build --release --features static-cuda,pom-cuda
     cp target-hiveos/release/keryx-miner-supr /src/hiveos/dist/keryx-miner-supr
     chmod -R a+rX /src/hiveos/dist
 '
