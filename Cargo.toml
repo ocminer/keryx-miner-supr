@@ -71,9 +71,9 @@ semver = "1.0"
 # host. At runtime the miner already detects no-CUDA via `GpuProbe::NoCuda` and falls back
 # to CPU. Only matters for LLM inference on AiRequest tasks; per-share `tag_fixed` MLP is
 # baked in from `inference/` and works either way.
-candle-core = { version = "0.8" }
-candle-transformers = { version = "0.8" }
-candle-nn = { version = "0.8" }
+candle-core = { version = "0.9" }
+candle-transformers = { version = "0.9" }
+candle-nn = { version = "0.9" }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 ureq = { version = "2", features = ["tls"] }
 base64 = "0.22"
