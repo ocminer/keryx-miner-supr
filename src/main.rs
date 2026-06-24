@@ -181,6 +181,52 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
 }
 
+/// GPU 0 total VRAM (MB) via nvidia-smi, or None (AMD/CPU-only machines).
+fn query_vram_mb() -> Option<u64> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse::<u64>().ok())
+}
+
+/// OPoI capability gate (layer A): drop models GPU 0 cannot serve, so `ai:cap` never promises a
+/// model the miner would fail to load. Skipped when nvidia-smi is unavailable (CPU/AMD setups).
+fn filter_specs_by_vram(
+    specs: &'static [&'static keryx_miner::models::ModelSpec],
+) -> &'static [&'static keryx_miner::models::ModelSpec] {
+    let Some(gpu0_mb) = query_vram_mb() else {
+        log::warn!("Cannot query GPU VRAM (nvidia-smi) — skipping the model capability gate.");
+        return specs;
+    };
+    let kept: Vec<&'static keryx_miner::models::ModelSpec> = specs
+        .iter()
+        .copied()
+        .filter(|spec| {
+            if spec.min_vram_mb <= gpu0_mb {
+                true
+            } else {
+                log::warn!(
+                    "✗  '{}' needs ≥{} MB VRAM but only {} MB on GPU 0 — not announced/downloaded.",
+                    spec.name, spec.min_vram_mb, gpu0_mb
+                );
+                false
+            }
+        })
+        .collect();
+    if kept.len() == specs.len() {
+        specs
+    } else {
+        Box::leak(kept.into_boxed_slice())
+    }
+}
+
 async fn get_client(
     keryxd_address: String,
     mining_address: String,
@@ -410,82 +456,81 @@ async fn main() -> Result<(), Error> {
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
     check_gpu_power_limit(opt.high || opt.very_high, opt.very_high);
 
-    let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.very_high {
-        info!("--very-high mode: loading all 4 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + LLaMA-70B).");
-        &[
-            &keryx_miner::models::TINYLLAMA,
-            &keryx_miner::models::DEEPSEEK_R1_8B,
-            &keryx_miner::models::DEEPSEEK_R1_32B,
-            &keryx_miner::models::LLAMA_3_3_70B,
-        ]
+    // PoM (OPoI v2): one flag = one tier. Each GPU mines AND serves exactly the single model it
+    // proves possession of (multi-tier coverage is a network property, not per-GPU).
+    //   --light → Gemma-3-4B   default → Dolphin-8B   --high → Qwen3-32B   --very-high → Llama-3.3-70B
+    let tier = if opt.very_high {
+        info!("--very-high mode: top tier — mines Llama-3.3-70B under PoM.");
+        keryx_miner::models::Tier::VeryHigh
     } else if opt.high {
-        info!("--high mode: loading TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B.");
-        &[
-            &keryx_miner::models::TINYLLAMA,
-            &keryx_miner::models::DEEPSEEK_R1_8B,
-            &keryx_miner::models::DEEPSEEK_R1_32B,
-        ]
+        info!("--high mode: high tier — mines Qwen3-32B under PoM.");
+        keryx_miner::models::Tier::High
     } else if opt.light {
-        info!("--light mode: loading TinyLlama only.");
-        &[&keryx_miner::models::TINYLLAMA]
+        info!("--light mode: baseline tier — mines Gemma-3-4B under PoM.");
+        keryx_miner::models::Tier::Light
     } else {
-        &[&keryx_miner::models::TINYLLAMA, &keryx_miner::models::DEEPSEEK_R1_8B]
+        info!("default mode: mines Dolphin-8B under PoM.");
+        keryx_miner::models::Tier::Default
     };
-    keryx_miner::slm::init_supported(specs);
-    keryx_miner::slm::set_cpu_inference(opt.cpu_inference);
-    if opt.cpu_inference {
-        info!("--cpu-inference mode: OPoI inference runs on CPU, GPU stays dedicated to hashing.");
-    }
-    info!("OPoI Phase-3 active — {} model(s) supported.", specs.len());
-    // Prefetch model files in the BACKGROUND, not blocking startup. The OPoI hard gate
-    // (client/stratum.rs, client/grpc.rs) already keeps PoW suspended until models are
-    // ready and un-suspends itself once the (one-time, ~GB) download completes — so we
-    // don't need to block here. Blocking was actively harmful: the worker/plugin setup
-    // below runs only AFTER prefetch returned, so a rig whose OpenCL stack can't create
-    // a GPU worker would download the whole model first and ONLY THEN exit with
-    // "No workers specified" (reported as a HiveOS "black screen"). Backgrounding lets
-    // that worker error surface immediately, and lets the miner connect to the pool
-    // while the download runs.
+    // OPoI v2 hardfork: the lineup is DAA-gated (mirrors the node's opoi_v2_activation). Stage BOTH
+    // lineups for this tier, each VRAM-filtered (capability gate), so the chain crossing H hot-swaps
+    // without a restart: legacy (daa<H) served now, uncensored (daa>=H) swapped in at H.
+    let specs_v1 = filter_specs_by_vram(keryx_miner::models::specs_for(0, tier));
+    let specs_v2 = filter_specs_by_vram(
+        keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
+    );
+    // PoM: the highest-VRAM v2 model with a pinned R_T is the tier this GPU proves possession of.
+    let pom_spec = specs_v2
+        .iter()
+        .copied()
+        .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id).is_some())
+        .max_by_key(|s| s.min_vram_mb);
+    keryx_miner::slm::set_v2_lineup(specs_v2);
+    keryx_miner::slm::init_supported(specs_v1);
+    info!(
+        "OPoI Phase-3 — {} legacy + {} uncensored model(s) staged, DAA-gated at {}.",
+        specs_v1.len(), specs_v2.len(), keryx_miner::models::OPOI_V2_ACTIVATION_DAA
+    );
+    // Prefetch BOTH lineups in the BACKGROUND (suprnova: backgrounded so a worker/plugin error
+    // surfaces immediately instead of after a multi-GB download — the HiveOS "black screen" fix).
+    // The OPoI hard gate keeps PoW suspended until the files are ready and un-suspends itself.
     info!("Prefetching model files in the background — PoW stays OPoI-gated until they're ready…");
     tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs)).await {
-            Ok(Ok(())) => info!("Model files ready — OPoI inference available; mining un-gates."),
-            // per-share OPoI `tag_fixed` is baked in and works without LLM weights; only
-            // AiRequest tasks need them, so a download failure just leaves escrow unclaimed.
+        let _ = tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await;
+        match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v2)).await {
+            Ok(Ok(())) => info!("Model files ready (legacy + uncensored) — OPoI inference available."),
             Ok(Err(e)) => warn!("Model prefetch failed — AiRequest tasks will be skipped: {}", e),
             Err(e) => warn!("Model prefetch task panicked — AiRequest tasks will be skipped: {}", e),
         }
     });
 
-    // PoM (AMD): register the tier-0 Gemma-3-4B possession model and background-fetch its GGUF
-    // (same CID the OPoI path uses). The mining loop builds the WeightIndex + GPU residency
-    // lazily (pom_opencl::ensure_installed) on the first PoM-active job (DAA >= activation);
-    // pre-fork it just sits registered. tier 0 fits the 16 GB AMD cards (2.48 GiB).
+    // PoM possession setup is LAZY: the index + GPU walk are built by the mining loop on the first
+    // PoM-active job (DAA >= activation). Here we only record cheap config — which tier this GPU
+    // mines, picked by VRAM. Driver seam: AMD = OpenCL (gguf,tier); NVIDIA = candle-CUDA (model_id,gguf)
+    // with zero-dup VRAM sharing.
     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
-    {
-        // Driver seam: AMD = OpenCL, NVIDIA = candle-CUDA (same set_mining_tier interface).
+    if let Some(spec) = pom_spec {
+        let tier_idx = keryx_miner::models::pom_tier_index(&spec.model_id).expect("pom_spec has a tier");
+        let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         #[cfg(feature = "pom-opencl")]
-        use keryx_miner::pom_opencl as pom_driver;
+        keryx_miner::pom_opencl::set_mining_tier(gpath, tier_idx);
         #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
-        use keryx_miner::pom_gpu as pom_driver;
-        let gguf = keryx_miner::slm::gguf_path_for(&keryx_miner::models::GEMMA_3_4B);
-        pom_driver::set_mining_tier(gguf.to_string_lossy().into_owned(), 0);
-        info!("PoM: registered tier 0 (Gemma-3-4B) at {}", gguf.display());
+        {
+            // Force the single-device split loader so the mining tier exposes its quant tensors
+            // for zero-dup VRAM sharing with inference (avoids a 2nd full copy on the big tiers).
+            keryx_miner::slm::set_pom_force_split(true);
+            keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
+        }
+        info!(
+            "PoM: configured for tier {} ({}); possession index + GPU walk load lazily at DAA {}.",
+            tier_idx, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA
+        );
         if keryx_miner::pom::is_activation_overridden() {
             warn!(
-                "PoM(AMD): ACTIVATION DAA OVERRIDDEN to {} via KERYX_POM_ACTIVATION_DAA — staging/testing ONLY, NOT for production!",
+                "PoM: ACTIVATION DAA OVERRIDDEN to {} via KERYX_POM_ACTIVATION_DAA — staging/testing ONLY!",
                 keryx_miner::pom::activation_daa()
             );
         }
-        let pom_specs: &'static [&'static keryx_miner::models::ModelSpec] =
-            &[&keryx_miner::models::GEMMA_3_4B];
-        tokio::spawn(async move {
-            match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(pom_specs)).await {
-                Ok(Ok(())) => info!("PoM(AMD): tier-0 Gemma GGUF ready."),
-                Ok(Err(e)) => warn!("PoM(AMD): tier model download failed: {}", e),
-                Err(e) => warn!("PoM(AMD): tier model download task panicked: {}", e),
-            }
-        });
     }
 
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner

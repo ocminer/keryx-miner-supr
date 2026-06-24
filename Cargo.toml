@@ -54,9 +54,6 @@ hex = "0.4"
 borsh = { version = "1", features = ["derive"] }
 blake3 = "1"
 opencl3 = { version = "0.6", optional = true }
-# NVIDIA PoM search driver. Pin = candle 0.8.4's cudarc (0.13.9) so there's one cudarc in the
-# tree. cuda-version-from-build-system detects the toolkit via nvcc (use CUDA 12.8 — 0.13.9's max).
-cudarc = { version = "0.13", optional = true, default-features = false, features = ["std", "driver", "cuda-version-from-build-system", "dynamic-linking"] }
 keryx-inference = { path = "inference" }
 keryx-plugin-api = { path = "plugin-api" }
 # Optional: compile the CUDA worker straight into the binary instead of loading
@@ -105,11 +102,10 @@ no-asm = ["keccak"]
 static-cuda = ["keryxcuda"]
 # AMD PoM: link the OpenCL search driver into the main binary (build-amd enables this).
 pom-opencl = ["dep:opencl3"]
-# NVIDIA PoM: cudarc-direct `pom_gpu` search driver (contiguous weight blob) + build.rs compiles
-# src/pom_mine.cu -> PTX. Uses cudarc directly, NOT candle's CUDA backend — the supr fork's candle
-# is CPU-only and pins cudarc 0.13.9, so the search reuses the shared WeightIndex chunks in one
-# device buffer (same proven approach as pom-opencl). candle inference stays on CPU as before.
-pom-cuda = ["dep:cudarc"]
+# NVIDIA PoM (full parity): upstream's candle-CUDA `pom_gpu` driver (per-tensor gather + zero-dup
+# VRAM sharing with the inference engine) + build.rs compiles src/pom_mine.cu -> PTX. Enables
+# candle's CUDA backend (candle 0.9 -> cudarc 0.16). AMD/default stays candle-CPU.
+pom-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keccak = "0.1"
