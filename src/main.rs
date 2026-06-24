@@ -181,28 +181,40 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
 }
 
-/// GPU 0 total VRAM (MB) via nvidia-smi, or None (AMD/CPU-only machines).
+/// GPU 0 total VRAM (MB): nvidia-smi (NVIDIA), else OpenCL CL_DEVICE_GLOBAL_MEM_SIZE (AMD, when the
+/// pom-opencl driver is linked). None on CPU-only machines.
 fn query_vram_mb() -> Option<u64> {
-    let output = std::process::Command::new("nvidia-smi")
+    if let Ok(output) = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    {
+        if output.status.success() {
+            if let Some(mb) = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .and_then(|l| l.trim().parse::<u64>().ok())
+            {
+                return Some(mb);
+            }
+        }
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .and_then(|l| l.trim().parse::<u64>().ok())
+    // AMD: query the OpenCL GPU's global memory so the capability gate works without nvidia-smi.
+    #[cfg(feature = "pom-opencl")]
+    {
+        return keryx_miner::pom_opencl::gpu0_global_mem_mb();
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 /// OPoI capability gate (layer A): drop models GPU 0 cannot serve, so `ai:cap` never promises a
-/// model the miner would fail to load. Skipped when nvidia-smi is unavailable (CPU/AMD setups).
+/// model the miner would fail to load. VRAM comes from nvidia-smi (NVIDIA) or OpenCL (AMD); the
+/// gate is skipped only on CPU-only hosts where neither is available.
 fn filter_specs_by_vram(
     specs: &'static [&'static keryx_miner::models::ModelSpec],
 ) -> &'static [&'static keryx_miner::models::ModelSpec] {
     let Some(gpu0_mb) = query_vram_mb() else {
-        log::warn!("Cannot query GPU VRAM (nvidia-smi) — skipping the model capability gate.");
+        log::warn!("Cannot query GPU VRAM (no nvidia-smi / OpenCL GPU) — skipping the model capability gate.");
         return specs;
     };
     let kept: Vec<&'static keryx_miner::models::ModelSpec> = specs

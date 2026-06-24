@@ -97,6 +97,16 @@ pub fn install(blob: &[u64], n_chunks: u64) -> Result<(), String> {
 
 pub fn is_installed() -> bool { POM.lock().unwrap().is_some() }
 
+/// GPU 0 total global memory in MB via OpenCL (CL_DEVICE_GLOBAL_MEM_SIZE) — the AMD analog of
+/// nvidia-smi's `memory.total`, so the model VRAM capability gate (filter_specs_by_vram) works on
+/// AMD too. None if there is no OpenCL GPU.
+pub fn gpu0_global_mem_mb() -> Option<u64> {
+    let dev_ids = opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU).ok()?;
+    let id = *dev_ids.first()?;
+    let bytes = opencl3::device::Device::new(id).global_mem_size().ok()?;
+    Some(bytes / (1024 * 1024))
+}
+
 /// Registered mining tier (GGUF path, tier index). Set once at startup via set_mining_tier;
 /// the first PoM-active job lazily builds the index + GPU residency via ensure_installed.
 static TIER: Mutex<Option<(String, u8)>> = Mutex::new(None);
