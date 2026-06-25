@@ -215,6 +215,19 @@ pub const LLAMA_3_3_70B_OFFICIAL: ModelSpec = ModelSpec {
 /// MAINNET_PARAMS.opoi_v2_activation = new(37_780_000).
 pub const OPOI_V2_ACTIVATION_DAA: u64 = 37_780_000;
 
+/// Effective OPoI v2 (lineup) activation DAA. Defaults to the consensus constant. STAGING ONLY:
+/// when the PoM PoW activation is overridden (`KERYX_POM_ACTIVATION_DAA`), the lineup activation
+/// moves to match it, so both the PoW switch and the v2 model swap fire together. This lets a
+/// patched-low-`pom_activation` testnet exercise the FULL post-fork path (PoM-PoW + v2 weights
+/// resident + proof) at low DAA. Production (no override) is byte-identical to the constant.
+pub fn opoi_v2_activation_daa() -> u64 {
+    if crate::pom::is_activation_overridden() {
+        crate::pom::activation_daa()
+    } else {
+        OPOI_V2_ACTIVATION_DAA
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Light,

@@ -159,20 +159,46 @@ impl State {
 
     #[inline(always)]
     pub fn generate_block_if_pow(&self, nonce: u64) -> Option<BlockSeed> {
-        self.check_pow(nonce).then(|| {
-            let mut block_seed = (*self.block).clone();
-            match block_seed {
-                BlockSeed::FullBlock(ref mut block) => {
-                    let header = &mut block.header.as_mut().expect("We checked that a header exists on creation");
-                    header.nonce = nonce;
-                }
-                BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut hash, .. } => {
-                    *header_nonce = nonce;
-                    *hash = Some(format!("{:x}", self.calculate_pow(nonce)))
+        if !self.check_pow(nonce) {
+            return None;
+        }
+        let mut block_seed = (*self.block).clone();
+        match block_seed {
+            BlockSeed::FullBlock(ref mut block) => {
+                let header = &mut block.header.as_mut().expect("We checked that a header exists on creation");
+                header.nonce = nonce;
+            }
+            BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut hash, .. } => {
+                *header_nonce = nonce;
+                *hash = Some(format!("{:x}", self.calculate_pow(nonce)))
+            }
+        }
+        // PoM PASSTHROUGH (pre-fork live test): keep the kHeavyHash nonce above (the only valid PoW
+        // pre-fork) but also attach a PomProof so the wire envelope can be exercised. The proof is
+        // built from the HOST possession index (no GPU model needed); its pom_pow_value need not meet
+        // target — pre-fork the daemon stores it without verifying. No-op unless the index is ready.
+        #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
+        if pom::passthrough_enabled() {
+            if let Some((index, tier)) = pom::active_index() {
+                let mut pph = [0u8; 32];
+                pph.copy_from_slice(&self.pow_hash_header[0..32]);
+                let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
+                let seed = pom::pom_block_seed(&pph, timestamp, nonce);
+                let proof = pom::build_proof(
+                    *tier, &pph, nonce, seed, index.n_chunks, pom::POM_WALK_STEPS, pom::POM_OPENINGS,
+                    |o| index.read_chunk(o), |o| index.merkle_path(o),
+                );
+                if let Ok(bytes) = borsh::to_vec(&proof) {
+                    let n = bytes.len();
+                    match block_seed {
+                        BlockSeed::FullBlock(ref mut block) => block.pom_proof = bytes,
+                        BlockSeed::PartialBlock { ref mut pom_proof, .. } => *pom_proof = bytes,
+                    }
+                    log::info!("PoM passthrough: attached proof ({} B) to kHeavyHash share", n);
                 }
             }
-            block_seed
-        })
+        }
+        Some(block_seed)
     }
 
     /// PoM (post-fork) path. If the resident tier `index` yields `pom_pow_value <= target`

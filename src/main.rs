@@ -524,6 +524,24 @@ async fn main() -> Result<(), Error> {
     if let Some(spec) = pom_spec {
         let tier_idx = keryx_miner::models::pom_tier_index(&spec.model_id).expect("pom_spec has a tier");
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+        // PoM PASSTHROUGH live test (KERYX_POM_PASSTHROUGH): build the HOST possession index in the
+        // background so kHeavyHash shares can carry a PomProof (daemon stores it pre-fork). Heavy
+        // (~minutes) — backgrounded so mining starts immediately; shares before it is ready submit
+        // without a proof. No GPU model needed (proof gen reads the host index).
+        if keryx_miner::pom::passthrough_enabled() {
+            warn!("PoM: PASSTHROUGH mode (KERYX_POM_PASSTHROUGH) — kHeavyHash shares will carry a PomProof for the pre-fork wire test.");
+            let gpath_pt = gpath.clone();
+            std::thread::spawn(move || {
+                info!("PoM passthrough: building host possession index for proof attachment…");
+                match keryx_miner::pom::WeightIndex::build_from_gguf(&gpath_pt) {
+                    Ok(idx) => {
+                        info!("PoM passthrough: index ready — N={} chunks; shares now carry a proof.", idx.n_chunks);
+                        keryx_miner::pom::set_index(idx, tier_idx);
+                    }
+                    Err(e) => warn!("PoM passthrough: index build failed ({}) — shares submit without a proof.", e),
+                }
+            });
+        }
         #[cfg(feature = "pom-opencl")]
         keryx_miner::pom_opencl::set_mining_tier(gpath, tier_idx);
         #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]

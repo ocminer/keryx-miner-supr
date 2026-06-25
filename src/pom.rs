@@ -583,6 +583,22 @@ pub fn is_activation_overridden() -> bool {
 }
 static ACTIVATION_DAA: OnceLock<u64> = OnceLock::new();
 
+/// PoM PASSTHROUGH live-test mode (`KERYX_POM_PASSTHROUGH=1`). When set, the miner keeps mining
+/// kHeavyHash (the only valid PoW pre-fork) but ALSO attaches a `PomProof` to each winning share so
+/// the wire envelope — stratum 6th param → pool passthrough → daemon `RpcRawBlock.body.pom_proof` —
+/// can be exercised before the fork. The proof's `pom_pow_value` need NOT meet target here (the
+/// nonce came from kHeavyHash search); pre-fork the daemon stores it without verifying. Read once.
+/// Production default (unset) is unchanged. Requires the host possession index to be built.
+pub fn passthrough_enabled() -> bool {
+    *PASSTHROUGH.get_or_init(|| {
+        std::env::var("KERYX_POM_PASSTHROUGH")
+            .ok()
+            .map(|s| matches!(s.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    })
+}
+static PASSTHROUGH: OnceLock<bool> = OnceLock::new();
+
 /// The resident tier weight index + tier id, installed once at startup when PoM is enabled.
 static POM_INDEX: OnceLock<(WeightIndex, u8)> = OnceLock::new();
 

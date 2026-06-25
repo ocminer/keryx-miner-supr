@@ -530,6 +530,11 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
+                            // OPoI v2 hardfork: advance the served lineup when the chain crosses H.
+                            // Upstream drives this from the solo grpc job loop (grpc.rs); stratum is
+                            // OUR job source, so the swap MUST be driven here or the v2 (uncensored)
+                            // models never load and post-fork PoM-PoW has no weights resident.
+                            keryx_miner::slm::advance_lineup_if_due(daa_score);
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
                             if keryx_miner::slm::loaded_model_ids().is_empty() {
@@ -570,6 +575,10 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
+                            // OPoI v2 hardfork: advance the served lineup when the chain crosses H.
+                            // Stratum is our job source (upstream drives this from solo grpc.rs), so the
+                            // swap MUST happen here or post-fork PoM-PoW has no v2 weights resident.
+                            keryx_miner::slm::advance_lineup_if_due(daa_score);
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
                             if keryx_miner::slm::loaded_model_ids().is_empty() {

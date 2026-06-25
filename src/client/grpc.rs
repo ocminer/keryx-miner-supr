@@ -544,6 +544,10 @@ impl KeryxdHandler {
                     if daa > self.last_known_daa {
                         self.last_known_daa = daa;
                     }
+                    // OPoI v2 hardfork: advance the served lineup when the chain crosses H, so the
+                    // uncensored (v2) models load and post-fork PoM-PoW has weights resident. Solo
+                    // path (mirrors the stratum notify handlers). Cheap + idempotent per template.
+                    keryx_miner::slm::advance_lineup_if_due(daa);
                 }
                 // Handle node-issued inference challenge: spawn an inference task if a new
                 // challenge arrived and no challenge is already in flight.

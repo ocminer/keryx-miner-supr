@@ -852,7 +852,7 @@ static SEEN_PRE_H: AtomicBool = AtomicBool::new(false);
 /// PoW never stops; `ai:cap` follows `loaded_model_ids()` as the v2 files land.
 /// Idempotent and cheap to call on every block template.
 pub fn advance_lineup_if_due(daa: u64) {
-    if daa < crate::models::OPOI_V2_ACTIVATION_DAA {
+    if daa < crate::models::opoi_v2_activation_daa() {
         SEEN_PRE_H.store(true, AtomicOrdering::SeqCst);
         return;
     }
@@ -1061,7 +1061,16 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = match specs.iter().find(|s| &s.model_id == model_id) {
         Some(s) => s,
-        None => return false,
+        None => {
+            // Not in the ACTIVE lineup — e.g. asked to load a v2 model while the chain is still
+            // pre-H (lineup not yet advanced). Was a silent bail; log it so a stuck PoM load is
+            // diagnosable instead of looking like a hang.
+            log::warn!(
+                "SlmEngine: ensure_loaded — model {} not in the active lineup ({} spec(s)); lineup not advanced yet?",
+                hex::encode(&model_id[..4]), specs.len()
+            );
+            return false;
+        }
     };
     let mut guard = match ENGINE.lock() {
         Ok(g) => g,
