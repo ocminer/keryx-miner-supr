@@ -184,7 +184,9 @@ jobs:
   # ----------------------------------------------------------------------------
   windows-cuda-pom:
     name: Windows NVIDIA PoM (candle-CUDA, MSVC)
-    runs-on: windows-latest
+    # Pinned to windows-2022 (VS 2022): CUDA 12.5 nvcc only supports VS 2017-2022,
+    # and windows-latest now ships a newer VS that nvcc rejects (host_config.h check).
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
