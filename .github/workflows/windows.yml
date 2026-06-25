@@ -217,7 +217,7 @@ jobs:
       - name: Build static-cuda + pom-cuda (self-contained PoM exe)
         shell: pwsh
         env:
-          CUDA_COMPUTE_CAP: "120"
+          CUDA_COMPUTE_CAP: "80"
         run: |
           Write-Host "CUDA_PATH=$env:CUDA_PATH"
           & "$env:CUDA_PATH\bin\nvcc.exe" --version
