@@ -35,3 +35,6 @@ DEPLOY_NOTES*.md
 /handoff/
 /memory/
 /.claude/
+
+# release archives (build artifacts — never commit)
+*-nvidia-release.zip
