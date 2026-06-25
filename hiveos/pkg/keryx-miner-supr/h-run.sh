@@ -17,9 +17,11 @@ if [[ -z "$CLI_ARGS" ]]; then . h-config.sh; . "$CUSTOM_CONFIG_FILENAME"; fi
 
 mkdir -p "$(dirname "$CUSTOM_LOG_BASENAME")"
 
-# This is the single static-cuda binary (CUDA worker linked in) — no plugin
-# .so to find. libcuda.so.1 comes from the installed NVIDIA driver on the rig.
-export LD_LIBRARY_PATH="$(pwd):/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Single static-cuda binary (kHeavyHash CUDA worker linked in). The full-parity
+# PoM build also needs candle's CUDA RUNTIME (libcublas/cublasLt/curand) for the
+# OPoI inference GEMMs; HiveOS rigs ship only the driver libcuda, so those libs
+# are bundled in ./lib here. libcuda.so.1 comes from the installed NVIDIA driver.
+export LD_LIBRARY_PATH="$(pwd):$(pwd)/lib:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 echo "[keryx-miner-supr] launching: ./keryx-miner-supr $CLI_ARGS"
 # tee (not exec) so the log file exists for h-stats.sh.

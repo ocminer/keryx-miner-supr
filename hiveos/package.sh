@@ -26,6 +26,17 @@ cp "$PKG"/h-manifest.conf "$PKG"/h-config.sh "$PKG"/h-run.sh "$PKG"/h-stats.sh "
 cp "$DIST"/keryx-miner-supr "$DEST/"
 chmod +x "$DEST"/h-*.sh "$DEST"/keryx-miner-supr
 
+# Bundle candle's CUDA runtime libs (the full-parity PoM build links cuBLAS/cuRAND
+# for OPoI inference; HiveOS rigs ship only the driver libcuda). h-run.sh adds
+# ./lib to LD_LIBRARY_PATH. cudart is statically linked, so it is not bundled.
+CUDA_LIB=/usr/local/cuda-12.8/targets/x86_64-linux/lib
+mkdir -p "$DEST/lib"
+for l in libcublas.so.12 libcublasLt.so.12 libcurand.so.10; do
+  [[ -f "$CUDA_LIB/$l" ]] || { echo "ERROR: $CUDA_LIB/$l missing — install the CUDA 12.8 runtime"; exit 1; }
+  cp -L "$CUDA_LIB/$l" "$DEST/lib/"
+done
+echo ">> bundled CUDA runtime libs ($(du -sh "$DEST/lib" | cut -f1)): $(ls "$DEST/lib")"
+
 TARBALL="$DIST/${NAME}-${VERSION}.tar.gz"
 tar -czf "$TARBALL" -C "$STAGE" "$NAME"
 echo ">> Wrote $TARBALL"
