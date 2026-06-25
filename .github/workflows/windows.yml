@@ -175,3 +175,86 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: keryxcuda-windows.zip
+
+  # ----------------------------------------------------------------------------
+  # NVIDIA Proof-of-Model — self-contained .exe with candle-CUDA (PoM, post-fork)
+  # + the static kHeavyHash worker (pre-fork). Bundles the cuBLAS/cuRAND runtime
+  # DLLs next to the exe. EXPERIMENTAL: candle-CUDA on Windows/MSVC. Independent
+  # job — failure here does NOT block the kHeavyHash artifacts above.
+  # ----------------------------------------------------------------------------
+  windows-cuda-pom:
+    name: Windows NVIDIA PoM (candle-CUDA, MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disable autocrlf
+        run: git config --global core.autocrlf false
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: win-cuda-pom
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Full CUDA toolkit: candle-CUDA needs nvcc + cudart + cuBLAS + cuBLASLt +
+      # cuRAND (link import libs + headers). Install everything to be safe.
+      - name: Install CUDA toolkit (full)
+        id: cuda
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.5.1'
+          method: 'network'
+
+      - name: Build static-cuda + pom-cuda (self-contained PoM exe)
+        shell: pwsh
+        env:
+          CUDA_COMPUTE_CAP: "120"
+        run: |
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version
+          cargo build --release --target $env:TARGET --features static-cuda,pom-cuda -p keryx-miner-supr
+
+      - name: Stage artifact (exe + bundled CUDA runtime DLLs)
+        shell: pwsh
+        run: |
+          $rel = "target\$env:TARGET\release"
+          $out = "dist-win-cuda-pom"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "$rel\keryx-miner-supr.exe" $out\
+          $cudaBin = "$env:CUDA_PATH\bin"
+          foreach ($pat in @("cublas64_*.dll","cublasLt64_*.dll","curand64_*.dll","cudart64_*.dll")) {
+            Get-ChildItem -Path $cudaBin -Filter $pat -ErrorAction SilentlyContinue | Copy-Item -Destination $out
+          }
+          @"
+          keryx-miner-supr — Windows NVIDIA (Proof-of-Model)
+
+          Self-contained PoM miner. Keep the bundled *.dll next to the .exe.
+          Requires an NVIDIA driver (R535+). Mines kHeavyHash pre-fork and
+          auto-switches to PoM at the hardfork.
+
+          Example:
+            keryx-miner-supr.exe -s stratum+tcp://krx.suprnova.cc:4401 -a <keryx-address>.<worker> --light
+          "@ | Out-File -FilePath "$out\README-nvidia-pom.txt" -Encoding utf8
+          Get-ChildItem $out | Format-Table Name,Length
+          Compress-Archive -Path "$out\*" -DestinationPath "keryx-miner-supr-windows-nvidia-pom.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keryx-miner-supr-windows-nvidia-pom
+          path: keryx-miner-supr-windows-nvidia-pom.zip
+          if-no-files-found: error
+
+      - name: Attach to release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: keryx-miner-supr-windows-nvidia-pom.zip
