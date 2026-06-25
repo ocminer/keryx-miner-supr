@@ -1,84 +1,108 @@
 #!/usr/bin/env bash
 # HiveOS stats reporter for keryx-miner-supr.
-# Sourced by the HiveOS agent; must export `khs` (total kH/s) and `stats` (JSON).
-# Hashrate + shares come from the miner log; temps/fans come from the agent's
-# $gpu_stats JSON.
+# Ported from the upstream keryx-miner integration (the version that reports
+# temps/fans correctly): reads the agent's $GPU_STATS_JSON for per-GPU
+# busids/brand/temp/fan, brand-filters to the miner's GPUs, and emits aligned
+# hs[]/temp[]/fan[]/bus_numbers[] arrays. Hashrate is parsed from the miner log.
+#
+# Our log lines carry the GPU name, e.g.:
+#   "... [INFO ] Device #0 (NVIDIA GeForce RTX 5090): 3.28 Ghash/s"
+# so the per-device grep matches "Device #N " (space) rather than "Device #N:".
 
-. /hive/miners/custom/keryx-miner-supr/h-manifest.conf 2>/dev/null
-log="${CUSTOM_LOG_BASENAME}.log"
+. /hive/miners/custom/keryx-miner-supr/h-manifest.conf
 
-khs=0
-stats=""
+# Log format: "2026-05-09 12:00:00.000+02:00 [INFO ] Current hashrate is 5.23 Ghash/s"
+stats_raw=`cat $CUSTOM_LOG_BASENAME.log | grep "Current hashrate is" | tail -n 1`
 
-if [[ -f "$log" ]]; then
-  tailbuf=$(tail -n 400 "$log" 2>/dev/null)
+maxDelay=120
+time_now=`date +%s`
 
-  # --- per-device hashrates (-> kH/s) -------------------------------------
-  # Lines look like: "Device #0 (NVIDIA GeForce RTX 5090): 3.28 Ghash/s"
-  hs_json=$(awk '
-    /Device #[0-9]+ .*: [0-9.]+ [GMk]?hash\/s/ {
-      for (i=1;i<=NF;i++) {
-        if ($i ~ /^[0-9.]+$/ && $(i+1) ~ /hash\/s/) { val=$i; unit=$(i+1) }
-      }
-      mult = 1
-      if (unit ~ /^Ghash/) mult = 1000000
-      else if (unit ~ /^Mhash/) mult = 1000
-      else if (unit ~ /^khash/) mult = 1
-      else if (unit ~ /^hash/)  mult = 0.001
-      match($0, /Device #([0-9]+)/, m)
-      dev[m[1]] = val * mult         # kH/s, keep latest per device
-    }
-    END {
-      n=0; for (d in dev) n++
-      printf "["
-      for (i=0;i<n;i++) { printf "%s%.0f", (i?",":""), dev[i]+0 }
-      printf "]"
-    }' <<< "$tailbuf")
-  [[ -z "$hs_json" || "$hs_json" == "[]" ]] && hs_json="[]"
+# Parse timestamp from fields $1 (date) and $2 (time), strip timezone offset for date parsing
+datetime_rep=`echo $stats_raw | awk '{split($2,t,/[+-][0-9]{2}:[0-9]{2}$/); print $1, t[1]}'`
+time_rep=`date -d "$datetime_rep" +%s 2>/dev/null || echo 0`
+diffTime=`echo $((time_now-time_rep)) | tr -d '-'`
 
-  # --- total hashrate (-> kH/s) -------------------------------------------
-  read tval tunit < <(grep -oE 'Current hashrate is [0-9.]+ [GMk]?hash/s' <<< "$tailbuf" \
-                        | tail -n1 | grep -oE '[0-9.]+ [GMk]?hash/s')
-  case "$tunit" in
-    Ghash/s) khs=$(awk "BEGIN{printf \"%.0f\", $tval*1000000}") ;;
-    Mhash/s) khs=$(awk "BEGIN{printf \"%.0f\", $tval*1000}") ;;
-    khash/s) khs=$(awk "BEGIN{printf \"%.0f\", $tval}") ;;
-    hash/s)  khs=$(awk "BEGIN{printf \"%.0f\", $tval/1000}") ;;
-    *)       khs=0 ;;
-  esac
-  # Fall back to summing per-device if the total line wasn't found.
-  if [[ "$khs" == "0" && "$hs_json" != "[]" ]]; then
-    khs=$(echo "$hs_json" | jq 'add // 0' 2>/dev/null)
-  fi
+if [ "$diffTime" -lt "$maxDelay" ]; then
+        # Value is second-to-last field (before unit), unit is last field
+        total_hashrate=`echo $stats_raw | awk '{print $(NF-1)}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
+        if [[ $stats_raw == *"Thash"* ]]; then
+                total_hashrate=$(($total_hashrate*1000000000))
+        elif [[ $stats_raw == *"Ghash"* ]]; then
+                total_hashrate=$(($total_hashrate*1000000))
+        elif [[ $stats_raw == *"Mhash"* ]]; then
+                total_hashrate=$(($total_hashrate*1000))
+        fi
 
-  # --- accepted / rejected shares -----------------------------------------
-  acc=$(grep -oE 'Accepted: [0-9]+' <<< "$tailbuf" | tail -n1 | grep -oE '[0-9]+')
-  [[ -z "$acc" ]] && acc=$(grep -c 'Share accepted' <<< "$tailbuf")
-  rej=$(grep -ciE 'reject|invalid share' <<< "$tailbuf")
-  [[ -z "$acc" ]] && acc=0
-  [[ -z "$rej" ]] && rej=0
+        # GPU status — from the HiveOS agent's gpu-stats (temps/fans/busids/brand).
+        readarray -t gpu_stats < <( jq --slurp -r -c '.[] | .busids, .brand, .temp, .fan | join(" ")' $GPU_STATS_JSON 2>/dev/null)
+        busids=(${gpu_stats[0]})
+        brands=(${gpu_stats[1]})
+        temps=(${gpu_stats[2]})
+        fans=(${gpu_stats[3]})
+        gpu_count=${#busids[@]}
+
+        hash_arr=()
+        busid_arr=()
+        fan_arr=()
+        temp_arr=()
+
+        if [ $(gpu-detect NVIDIA) -gt 0 ]; then
+                BRAND_MINER="nvidia"
+        elif [ $(gpu-detect AMD) -gt 0 ]; then
+                BRAND_MINER="amd"
+        fi
+
+        for(( i=0; i < gpu_count; i++ )); do
+                [[ "${brands[i]}" != $BRAND_MINER ]] && continue
+                [[ "${busids[i]}" =~ ^([A-Fa-f0-9]+): ]]
+                busid_arr+=($((16#${BASH_REMATCH[1]})))
+                temp_arr+=(${temps[i]})
+                fan_arr+=(${fans[i]})
+                # Per-device line: "... [INFO ] Device #N (<name>): 5.23 Ghash/s"
+                gpu_raw=`cat $CUSTOM_LOG_BASENAME.log | grep "Device #$i " | tail -n 1`
+                if [[ -n "$gpu_raw" ]]; then
+                        hashrate=`echo $gpu_raw | awk '{print $(NF-1)}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
+                        if [[ $gpu_raw == *"Thash"* ]]; then
+                                hashrate=$(($hashrate*1000000000))
+                        elif [[ $gpu_raw == *"Ghash"* ]]; then
+                                hashrate=$(($hashrate*1000000))
+                        elif [[ $gpu_raw == *"Mhash"* ]]; then
+                                hashrate=$(($hashrate*1000))
+                        fi
+                else
+                        hashrate=0
+                fi
+                [[ -z "$hashrate" ]] && hashrate=0
+                hash_arr+=($hashrate)
+        done
+
+        hash_json=`printf '%s\n' "${hash_arr[@]}" | jq -cs '.'`
+        bus_numbers=`printf '%s\n' "${busid_arr[@]}" | jq -cs '.'`
+        fan_json=`printf '%s\n' "${fan_arr[@]}" | jq -cs '.'`
+        temp_json=`printf '%s\n' "${temp_arr[@]}" | jq -cs '.'`
+
+        uptime=$(( `date +%s` - `stat -c %Y $CUSTOM_CONFIG_FILENAME 2>/dev/null || date +%s` ))
+        [[ $uptime -lt 0 ]] && uptime=0
+
+        stats=$(jq -nc \
+                --argjson hs "$hash_json" \
+                --arg ver "$CUSTOM_VERSION" \
+                --argjson bus_numbers "$bus_numbers" \
+                --argjson fan "$fan_json" \
+                --argjson temp "$temp_json" \
+                --arg uptime "$uptime" \
+                '{ hs: $hs, hs_units: "khs", algo: "heavyhash", ver: $ver, $uptime, $bus_numbers, $temp, $fan }')
+        khs=$total_hashrate
 else
-  hs_json="[]"; acc=0; rej=0
+        khs=0
+        stats="null"
 fi
 
-# --- temps / fans / bus from the agent ------------------------------------
-temp=$(jq -c '.temp' <<< "$gpu_stats" 2>/dev/null); [[ -z "$temp" || "$temp" == "null" ]] && temp="[]"
-fan=$(jq -c '.fan'  <<< "$gpu_stats" 2>/dev/null); [[ -z "$fan"  || "$fan"  == "null" ]] && fan="[]"
-busn=$(jq -c '.busids' <<< "$gpu_stats" 2>/dev/null); [[ -z "$busn" || "$busn" == "null" ]] && busn="[]"
+echo "Log file : $CUSTOM_LOG_BASENAME.log"
+echo "Time since last log entry : $diffTime"
+echo "Raw stats : $stats_raw"
+echo "KHS : $khs"
+echo "Output : $stats"
 
-uptime=$(( $(date +%s) - $(stat -c %Y "$log" 2>/dev/null || date +%s) ))
-[[ $uptime -lt 0 ]] && uptime=0
-
-stats=$(jq -nc \
-  --argjson hs "$hs_json" \
-  --argjson temp "$temp" \
-  --argjson fan "$fan" \
-  --argjson bus "$busn" \
-  --argjson acc "${acc:-0}" \
-  --argjson rej "${rej:-0}" \
-  --argjson up "$uptime" \
-  --arg ver "${CUSTOM_VERSION:-0.6.0}" \
-  '{hs:$hs, hs_units:"khs", temp:$temp, fan:$fan, uptime:$up,
-    ver:$ver, ar:[$acc,$rej], algo:"keryxhash", bus_numbers:$bus}' 2>/dev/null)
-
-[[ -z "$stats" ]] && stats="{\"hs\":[],\"hs_units\":\"khs\",\"ver\":\"${CUSTOM_VERSION:-0.6.0}\",\"algo\":\"keryxhash\"}"
+[[ -z $khs ]] && khs=0
+[[ -z $stats ]] && stats="null"
