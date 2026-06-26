@@ -821,9 +821,30 @@ fn sample_next(logits: &Tensor, lp: &mut LogitsProcessor, context: &[u32]) -> Re
 /// inference challenge. The `--cpu-inference` CLI flag is retained as a deprecated no-op so existing
 /// HiveOS/mmpOS flight-sheets don't error.
 pub fn cpu_inference_enabled() -> bool {
-    false
+    // AMD/OpenCL build: candle 0.9 has no AMD-GPU backend (CPU/CUDA/Metal only), so OPoI inference
+    // is FORCED onto the CPU — slow, but the only path that runs on AMD at all. The OpenCL kernel
+    // keeps the GPU busy on PoW meanwhile (the stratum/grpc CPU-mode plumbing keys off this == true,
+    // so it won't pause hashing during the CPU challenge). NVIDIA keeps GPU (CUDA) inference.
+    #[cfg(feature = "pom-opencl")]
+    {
+        true
+    }
+    #[cfg(not(feature = "pom-opencl"))]
+    {
+        false
+    }
 }
 pub fn set_cpu_inference(_on: bool) {}
+
+/// Device for OPoI inference: `Device::Cpu` when `cpu_inference_enabled()` (AMD/OpenCL build),
+/// else CUDA device 0 (NVIDIA). Single chokepoint for the 3 inference sites.
+fn inference_device() -> candle_core::Result<Device> {
+    if cpu_inference_enabled() {
+        Ok(Device::Cpu)
+    } else {
+        Device::new_cuda(0)
+    }
+}
 
 /// Register the set of models this miner currently serves (drives `ai:cap`).
 pub fn init_supported(specs: &'static [&'static ModelSpec]) {
@@ -920,7 +941,7 @@ pub fn probe_gpu_inference() -> GpuProbe {
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let probe = std::panic::catch_unwind(|| {
-        let device = Device::new_cuda(0)?;
+        let device = inference_device()?;
         let a = Tensor::new(&[[1f32, 2.0], [3.0, 4.0]], &device)?;
         let b = Tensor::new(&[[5f32, 6.0], [7.0, 8.0]], &device)?;
         a.matmul(&b)?.to_vec2::<f32>()?;
@@ -1014,10 +1035,13 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             #[cfg(feature = "pom-cuda")]
             crate::pom_gpu::uninstall();
             *guard = None;
-            let device = match Device::new_cuda(0) {
-                Ok(d) => { log::info!("SlmEngine: CUDA device 0 active"); d }
+            let device = match inference_device() {
+                Ok(d) => {
+                    log::info!("SlmEngine: inference device active ({})", if cpu_inference_enabled() { "CPU" } else { "CUDA:0" });
+                    d
+                }
                 Err(e) => {
-                    log::error!("SlmEngine: CUDA device unavailable ({e}) — inference is GPU-only, cannot load '{}'", spec.name);
+                    log::error!("SlmEngine: inference device unavailable ({e}) — cannot load '{}'", spec.name);
                     return None;
                 }
             };
@@ -1084,10 +1108,10 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
         return true; // already resident
     }
     *guard = None;
-    let device = match Device::new_cuda(0) {
+    let device = match inference_device() {
         Ok(d) => d,
         Err(e) => {
-            log::error!("SlmEngine: ensure_loaded CUDA unavailable ({e}) — inference is GPU-only, cannot load '{}'", spec.name);
+            log::error!("SlmEngine: ensure_loaded inference device unavailable ({e}) — cannot load '{}'", spec.name);
             return false;
         }
     };

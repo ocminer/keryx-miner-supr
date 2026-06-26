@@ -471,6 +471,16 @@ async fn main() -> Result<(), Error> {
     // PoM (OPoI v2): one flag = one tier. Each GPU mines AND serves exactly the single model it
     // proves possession of (multi-tier coverage is a network property, not per-GPU).
     //   --light → Gemma-3-4B   default → Dolphin-8B   --high → Qwen3-32B   --very-high → Llama-3.3-70B
+    // AMD: OPoI inference is CPU-only (candle has no AMD-GPU backend), so force the lightest tier
+    // (Gemma-3-4B) regardless of flags — the smallest model the CPU can serve, and its 2.48 GiB PoM
+    // blob also fits low-VRAM AMD cards. NVIDIA keeps the flag-selected tier (GPU inference).
+    #[cfg(feature = "pom-opencl")]
+    let tier = {
+        let _ = (opt.very_high, opt.high, opt.light);
+        info!("AMD/OpenCL: forcing --light tier (Gemma-3-4B) — CPU inference + smallest PoM tier; --high/--very-high ignored on AMD.");
+        keryx_miner::models::Tier::Light
+    };
+    #[cfg(not(feature = "pom-opencl"))]
     let tier = if opt.very_high {
         info!("--very-high mode: top tier — mines Llama-3.3-70B under PoM.");
         keryx_miner::models::Tier::VeryHigh
@@ -565,8 +575,8 @@ async fn main() -> Result<(), Error> {
 
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
-    if opt.cpu_inference {
-        info!("--cpu-inference: skipping GPU inference probe (inference runs on CPU).");
+    if opt.cpu_inference || keryx_miner::slm::cpu_inference_enabled() {
+        info!("CPU inference mode — skipping the GPU/cuBLAS probe (OPoI inference runs on the CPU).");
     } else {
     info!("Probing GPU inference (cuBLAS) before mining…");
     match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
