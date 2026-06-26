@@ -26,7 +26,7 @@ docker run --rm -v "$REPO":/src -w /src -e DEBIAN_FRONTEND=noninteractive "$IMAG
         protobuf-compiler cmake libssl-dev ocl-icd-opencl-dev >/dev/null
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal >/dev/null
     . "$HOME/.cargo/env"
-    export CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda CUDA_COMPUTE_CAP=120
+    export CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda CUDA_COMPUTE_CAP=80
     export PATH=/usr/local/cuda/bin:$PATH
     export RUSTFLAGS="-L /usr/local/cuda/lib64/stubs"
     export CARGO_TARGET_DIR=/src/target-hiveos

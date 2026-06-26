@@ -29,7 +29,7 @@ docker run --rm \
     . "$HOME/.cargo/env"
 
     export CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda
-    export CUDA_COMPUTE_CAP=120
+    export CUDA_COMPUTE_CAP=80
     export PATH=/usr/local/cuda/bin:$PATH
     # Link cust against the toolkit libcuda stub (driver provides it at runtime).
     export RUSTFLAGS="-L /usr/local/cuda/lib64/stubs"
