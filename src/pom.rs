@@ -1068,4 +1068,34 @@ mod tests {
         eprintln!("Mode B: nonce {nonce} ({} hex-char proof) -> {out}.json", proof_hex.len());
         eprintln!("{notes}");
     }
+
+    /// Validate + benchmark candle's CPU backend on the AMD OPoI inference model (Gemma-3-4B, the
+    /// post-fork --light tier). Proves candle CPU can load + generate the Gemma3 quantized arch (the
+    /// AMD inference path) and reports the real tok/s on this box. Needs the model staged at
+    /// `<test-exe-dir>/models/Gemma-3-4B/` (symlink target/release/deps/models -> ../models).
+    /// Run: cargo test --release -p keryx-miner-supr --features pom-opencl cpu_inference_bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    #[cfg(feature = "pom-opencl")]
+    fn cpu_inference_bench() {
+        crate::slm::init_supported(&[&crate::models::GEMMA_3_4B]);
+        let id = crate::models::GEMMA_3_4B.model_id;
+        assert!(crate::slm::cpu_inference_enabled(), "pom-opencl build must force CPU inference");
+        // First call loads the 2.48 GiB GGUF into RAM on CPU (one-time) + a short generation.
+        let t_load = std::time::Instant::now();
+        let warm = crate::slm::load_and_run_inference(&id, "Hello", 8);
+        let load_s = t_load.elapsed().as_secs_f64();
+        assert!(warm.is_some(), "candle CPU failed to load/run Gemma-3-4B — AMD inference path broken");
+        // Second call: model resident -> the per-challenge generation rate.
+        let n = 48usize;
+        let t = std::time::Instant::now();
+        let out = crate::slm::load_and_run_inference(&id, "The capital of France is", n);
+        let s = t.elapsed().as_secs_f64();
+        let text = out.expect("CPU inference returned None on the resident call");
+        let sample: String = text.chars().take(120).collect();
+        eprintln!("=== Gemma-3-4B CPU inference on this box ===");
+        eprintln!("  load (first call, 2.48 GiB GGUF -> RAM): {:.1}s", load_s);
+        eprintln!("  resident gen: {} tokens in {:.1}s => ~{:.2} tok/s", n, s, n as f64 / s);
+        eprintln!("  sample: {:?}", sample);
+    }
 }
