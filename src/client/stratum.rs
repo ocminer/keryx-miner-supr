@@ -120,6 +120,13 @@ impl Display for ShareStats {
     }
 }
 
+/// Last real DAA score seen on a job that carries one (WithTask / ShortV2). The plain `Short`
+/// notify variant carries NO daa_score; without this it pinned daa to the SALT-v4 era
+/// (21,932,751) — which is BELOW the PoM activation (37,780,000), so a miner fed only `Short`
+/// jobs never crosses `daa >= activation_daa()` and keeps hashing kHeavyHash post-fork (empty
+/// PoM proof). Remembering the last real daa lets `Short` inherit it so PoM still activates.
+static LAST_DAA_SCORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[allow(dead_code)]
 pub struct StratumHandler {
     log_handler: JoinHandle<()>,
@@ -535,6 +542,7 @@ impl StratumHandler {
                             // OUR job source, so the swap MUST be driven here or the v2 (uncensored)
                             // models never load and post-fork PoM-PoW has no weights resident.
                             keryx_miner::slm::advance_lineup_if_due(daa_score);
+                            LAST_DAA_SCORE.store(daa_score, std::sync::atomic::Ordering::Relaxed);
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
                             if keryx_miner::slm::loaded_model_ids().is_empty() {
@@ -579,6 +587,7 @@ impl StratumHandler {
                             // Stratum is our job source (upstream drives this from solo grpc.rs), so the
                             // swap MUST happen here or post-fork PoM-PoW has no v2 weights resident.
                             keryx_miner::slm::advance_lineup_if_due(daa_score);
+                            LAST_DAA_SCORE.store(daa_score, std::sync::atomic::Ordering::Relaxed);
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
                             if keryx_miner::slm::loaded_model_ids().is_empty() {
@@ -624,8 +633,11 @@ impl StratumHandler {
                                     timestamp,
                                     // Short stratum notify carries no daa_score; pin it to the
                                     // current salt era so the host generates the right matrix.
-                                    // Post-relaunch the chain is on SALT v4, so force v4.
-                                    daa_score: crate::pow::heavy_hash::POW_SALT_V4_ACTIVATION_DAA,
+                                    // Post-relaunch the chain is on SALT v4. Inherit the last
+                                    // real daa (from WithTask/ShortV2) so post-fork PoM still
+                                    // activates on Short-only pools; floor at SALT-v4 era.
+                                    daa_score: LAST_DAA_SCORE.load(std::sync::atomic::Ordering::Relaxed)
+                                        .max(crate::pow::heavy_hash::POW_SALT_V4_ACTIVATION_DAA),
                                     nonce: 0,
                                     target: self.target_pool,
                                     nonce_mask: self.nonce_mask,

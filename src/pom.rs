@@ -800,6 +800,32 @@ mod tests {
         assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, 256, 32, &idx.r_t, &[0xff; 32]));
     }
 
+    // Emit POM_SAMPLE_submit.json for the CANONICAL VECTOR that the node-built `pom-verify-test`
+    // expects (pph=4d27ef7d…, ts=1_700_000_000, nonce=1366), so we can run the chain-exact
+    // `verify_pom_proof` on a proof OUR build_proof produces over the real Gemma tier.
+    // Run: KERYX_GEMMA_GGUF=…/Gemma-3-4B/model.gguf cargo test --lib emit_canonical_pom_sample -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs Gemma-3-4B GGUF on disk; emits /home/marcel/POM_SAMPLE_submit.json"]
+    fn emit_canonical_pom_sample() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        assert_eq!(idx.n_chunks, 77_604_776);
+        let pph: [u8; 32] = [
+            0x4d, 0x27, 0xef, 0x7d, 0x41, 0xb8, 0x1e, 0xd8, 0xf8, 0xef, 0xe0, 0xca, 0x6f, 0xf2, 0xa7, 0x7a,
+            0x69, 0x6e, 0xd0, 0x0e, 0xdb, 0x6d, 0x4d, 0x01, 0x5a, 0xd3, 0xab, 0xd8, 0xfd, 0xe5, 0x18, 0xa2,
+        ];
+        let ts: u64 = 1_700_000_000;
+        let nonce: u64 = 1366;
+        let seed = pom_block_seed(&pph, ts, nonce);
+        let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        let bytes = borsh::to_vec(&proof).expect("borsh");
+        let hexs: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        println!("proof: {} bytes, pow_value={}", bytes.len(), proof.pow_value.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+        let json = format!("{{\"id\":1,\"method\":\"mining.submit\",\"params\":[\"a\",\"j\",\"{:016x}\",\"tag\",\"\",\"{}\"]}}", nonce, hexs);
+        std::fs::write("/home/marcel/POM_SAMPLE_submit.json", json).expect("write sample");
+        println!("WROTE /home/marcel/POM_SAMPLE_submit.json");
+    }
+
     /// Full AMD path on the REAL tier: load_tier (WeightIndex + GPU blob + PomMiner) -> GPU mine
     /// over the resident Gemma weights -> build proof from the resident index -> verify vs pinned R_T.
     /// Proves the GPU blob and the proof-side WeightIndex are the same canonical chunks.
