@@ -26,10 +26,23 @@ docker run --rm -v "$REPO":/src -w /src -e DEBIAN_FRONTEND=noninteractive "$IMAG
         protobuf-compiler cmake libssl-dev ocl-icd-opencl-dev >/dev/null
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal >/dev/null
     . "$HOME/.cargo/env"
-    export CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda CUDA_COMPUTE_CAP=80
+    # CUDA_COMPUTE_CAP=70: lowest arch candle-kernels 0.9.2 compiles for; its
+    # `.target sm_70` PTX forward-JITs to the whole fleet sm_70→sm_120 (Volta,
+    # Turing, 3070/Ampere, Ada, Hopper, 5090). Was 80 (re-broke Volta/Turing).
+    # Pascal sm_61 fails to compile (reduce.cu half atomicAdd) → --cpu-inference.
+    export CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda CUDA_COMPUTE_CAP=70
     export PATH=/usr/local/cuda/bin:$PATH
     export RUSTFLAGS="-L /usr/local/cuda/lib64/stubs"
     export CARGO_TARGET_DIR=/src/target-hiveos
+
+    # candle-kernels stale-PTX guard: bindgen_cuda skips nvcc when its OUT_DIR .ptx
+    # is newer than the .cu source, so `cargo clean -p candle-kernels` ALONE does
+    # NOT regenerate the PTX after CUDA_COMPUTE_CAP changes — the old-arch .ptx
+    # survives in build/candle-kernels-*/out and gets reused. Nuke the whole
+    # candle-kernels build + fingerprint so the new sm_70 PTX is emitted fresh.
+    rm -rf target-hiveos/release/build/candle-kernels-* \
+           target-hiveos/release/.fingerprint/candle-kernels-* \
+           target-hiveos/release/deps/*candle_kernels* 2>/dev/null || true
 
     # pom-cuda = the Proof-of-Model CUDA search driver (post-fork algo); without it
     # the binary mines the dead kHeavyHash algo after the PoM hardfork.

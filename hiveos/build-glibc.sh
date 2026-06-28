@@ -29,7 +29,14 @@ docker run --rm \
     . "$HOME/.cargo/env"
 
     export CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda
-    export CUDA_COMPUTE_CAP=80
+    # candle inference kernels are emitted as `.target sm_NN` PTX (bindgen_cuda
+    # only takes ONE compute_cap → no fatbin), and PTX is forward-compatible only:
+    # it JITs on sm >= NN. CUDA_COMPUTE_CAP=70 is the LOWEST arch candle-kernels
+    # 0.9.2 compiles for (reduce.cu needs sm_70+ half atomicAdd; sm_61 fails) →
+    # the resulting sm_70 PTX JITs across the whole fleet sm_70(Volta)→sm_75
+    # (Turing)→sm_80/86 (3070/Ampere)→sm_89 (Ada)→sm_90 (Hopper)→sm_120 (5090).
+    # Was 80 (re-broke Volta/Turing). Pascal sm_61 cannot run GPU inference → --cpu-inference.
+    export CUDA_COMPUTE_CAP=70
     export PATH=/usr/local/cuda/bin:$PATH
     # Link cust against the toolkit libcuda stub (driver provides it at runtime).
     export RUSTFLAGS="-L /usr/local/cuda/lib64/stubs"
