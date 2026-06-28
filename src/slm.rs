@@ -12,6 +12,7 @@ use candle_transformers::models::quantized_llama::ModelWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3Weights;
 use candle_transformers::models::quantized_gemma3::ModelWeights as Gemma3Weights;
+use crate::quantized_gemma3_split::ModelWeights as Gemma3SplitWeights;
 use crate::quantized_llama_split::ModelWeights as SplitWeights;
 use crate::quantized_qwen3_split::ModelWeights as Qwen3SplitWeights;
 use std::io::{Read, Write};
@@ -102,6 +103,10 @@ enum ModelInner {
     QuantizedQwen3Split(Qwen3SplitWeights),
     /// GGUF Gemma-3-arch model (Gemma-3-4B, baseline tier). Single-device only.
     QuantizedGemma3(Gemma3Weights),
+    /// GGUF Gemma-3-arch model via the single-device split fork (exposes quant tensors
+    /// for PoM zero-dup, so the possession walk shares the inference weights in place
+    /// instead of loading a 2nd copy — the fix that lets 8 GB cards do GPU inference).
+    QuantizedGemma3Split(Gemma3SplitWeights),
     /// GGUF Qwen2-arch model (legacy DeepSeek-R1-32B, pre-OPoI-v2 lineup). Single-device.
     QuantizedQwen2(Qwen2Weights),
 }
@@ -457,14 +462,28 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .with_context(|| format!("open {}", gguf_path.display()))?;
             let content = gguf_file::Content::read(&mut gguf_file)
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
-            // Gemma-3-4B is the baseline tier — always loaded single-device (no split loader).
-            let model = Gemma3Weights::from_gguf(content, &mut gguf_file, &device)
-                .map_err(|e| anyhow!("load gemma3 gguf weights: {}", e))?;
+            // PoM zero-dup: Gemma-3-4B is a NON-split GGUF (baseline tier), so without this
+            // the possession walk loads a SECOND VRAM copy → OOM on 8 GB cards. Load via the
+            // single-device split fork (exposes quant tensors) so the walk shares this copy.
+            // Otherwise (CPU inference / non-PoM) a regular single-device load.
+            let inner = if pom_force_split() && device.is_cuda() {
+                log::info!(
+                    "SlmEngine: PoM zero-dup — loading '{}' (Gemma3) via single-device split loader",
+                    spec.name
+                );
+                let model = Gemma3SplitWeights::from_gguf(content, &mut gguf_file, &device)
+                    .map_err(|e| anyhow!("load gemma3 gguf weights (pom split): {}", e))?;
+                ModelInner::QuantizedGemma3Split(model)
+            } else {
+                let model = Gemma3Weights::from_gguf(content, &mut gguf_file, &device)
+                    .map_err(|e| anyhow!("load gemma3 gguf weights: {}", e))?;
+                ModelInner::QuantizedGemma3(model)
+            };
             let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
             log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
                 model_id: spec.model_id, name: spec.name,
-                inner: ModelInner::QuantizedGemma3(model),
+                inner,
                 tokenizer, device, stop_token_ids, stop_strings,
             })
         }
@@ -687,6 +706,30 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
             }
         }
         ModelInner::QuantizedGemma3(model) => {
+            for step in 0..max_steps {
+                let (input_ids, pos) = if step == 0 {
+                    (all_tokens.as_slice(), 0usize)
+                } else {
+                    let last = all_tokens.len() - 1;
+                    (&all_tokens[last..], last)
+                };
+                let input = Tensor::new(input_ids, &engine.device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| anyhow!("input tensor: {}", e))?;
+                let logits = model.forward(&input, pos)
+                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let next = sample_next(&logits, &mut lp, &all_tokens)?;
+                if engine.stop_token_ids.contains(&next) { break; }
+                all_tokens.push(next);
+                generated.push(next);
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+            }
+        }
+        ModelInner::QuantizedGemma3Split(model) => {
+            // Reset the KV cache so a new prompt doesn't attend to the previous request's
+            // residual keys. (The fork's per-prompt index_pos restarts at 0, which the
+            // forward already treats as fresh, but reset explicitly for parity/safety.)
+            model.clear_kv_cache();
             for step in 0..max_steps {
                 let (input_ids, pos) = if step == 0 {
                     (all_tokens.as_slice(), 0usize)
@@ -1159,6 +1202,7 @@ pub fn pom_shared(
     match &e.inner {
         ModelInner::QuantizedQwen3Split(m) => Some((e.device.clone(), m.pom_quant_tensors())),
         ModelInner::QuantizedSplit(m) => Some((e.device.clone(), m.pom_quant_tensors())),
+        ModelInner::QuantizedGemma3Split(m) => Some((e.device.clone(), m.pom_quant_tensors())),
         _ => None,
     }
 }
