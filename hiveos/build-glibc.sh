@@ -42,6 +42,14 @@ docker run --rm \
     export RUSTFLAGS="-L /usr/local/cuda/lib64/stubs"
     export CARGO_TARGET_DIR=/src/target-hiveos
 
+    # candle-kernels stale-PTX guard: bindgen_cuda reuses its OUT_DIR .ptx if it is
+    # newer than the .cu source, so `cargo clean -p candle-kernels` alone does NOT
+    # re-emit PTX after CUDA_COMPUTE_CAP changes. Nuke the candle-kernels build dir
+    # so the fresh sm_70 PTX is generated.
+    rm -rf target-hiveos/release/build/candle-kernels-* \
+           target-hiveos/release/.fingerprint/candle-kernels-* \
+           target-hiveos/release/deps/*candle_kernels* 2>/dev/null || true
+
     # static-cuda: the CUDA worker is linked into the binary, so the HiveOS
     # payload is ONE executable (no libkeryx*.so to ship).
     # pom-cuda: the Proof-of-Model CUDA search driver (post-fork algo). WITHOUT it
