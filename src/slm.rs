@@ -1018,6 +1018,17 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
 
+    // AMD: prefer the Vulkan llama.cpp GPU server (candle has no AMD-GPU backend). The OPoI text is
+    // user-facing only (consensus checks the fixed-point `model_fixed` commitment separately), so a
+    // non-candle engine is fine. Falls through to candle-CPU below if the GPU server isn't available.
+    #[cfg(feature = "pom-opencl")]
+    if crate::llama_vulkan::available() {
+        if let Some(text) = crate::llama_vulkan::generate(prompt, max_tokens) {
+            return Some(text);
+        }
+        log::warn!("SlmEngine: Vulkan GPU inference returned nothing — falling back to candle-CPU for this challenge.");
+    }
+
     // catch_unwind prevents any internal panic (cudarc, candle, OOM…) from permanently
     // poisoning ENGINE. Without this, one panic bricks inference for the entire session.
     let result = std::panic::catch_unwind(|| {

@@ -697,6 +697,34 @@ async fn main() -> Result<(), Error> {
                 }
             });
         }
+        // AMD GPU inference: bring up the Vulkan llama.cpp server once the model GGUF is on disk
+        // (background — download + VRAM load is slow). If it can't come up (no bundled llama-server,
+        // no Vulkan ICD, no AMD GPU, OOM), OPoI inference transparently falls back to candle-CPU.
+        #[cfg(feature = "pom-opencl")]
+        {
+            let gpath_llama = gpath.clone();
+            std::thread::spawn(move || {
+                let port: u16 = std::env::var("KERYX_LLAMA_PORT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(18099);
+                let ok_marker = std::path::Path::new(&gpath_llama).parent().map(|d| d.join(".ok"));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+                loop {
+                    let ready = std::path::Path::new(&gpath_llama).exists()
+                        && ok_marker.as_ref().map_or(true, |m| m.exists());
+                    if ready {
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        warn!("PoM(AMD): model GGUF not ready in 30 min — OPoI inference stays on candle-CPU.");
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+                keryx_miner::llama_vulkan::try_start(&gpath_llama, port);
+            });
+        }
         #[cfg(feature = "pom-opencl")]
         keryx_miner::pom_opencl::set_mining_tier(gpath, tier_idx);
         #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
