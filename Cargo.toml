@@ -127,3 +127,12 @@ sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 [workspace]
 members = ["inference", "plugin-api", "plugins/*"]
 default-members = [".", "plugins/cuda", "plugins/opencl"]
+
+# Vendored candle-kernels with a one-line build.rs patch: the OPoI inference PTX
+# (build_ptx) is emitted at CUDA_COMPUTE_CAP (we ship 70 → forward-JITs sm_70→
+# sm_120, the whole fleet), while the dead-code MOE WMMA FFI lib (build_lib) is
+# pinned to sm_80 because its bf16 tensor-core fragments won't compile below 80.
+# Stock candle-kernels uses ONE compute_cap for both, which forced the floor to
+# sm_80 and broke GPU inference on Volta/Turing. See vendor/candle-kernels/build.rs.
+[patch.crates-io]
+candle-kernels = { path = "vendor/candle-kernels" }
