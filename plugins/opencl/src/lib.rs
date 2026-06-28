@@ -175,6 +175,13 @@ impl WorkerSpec for OpenCLWorkerSpec {
             .unwrap(),
         )
     }
+
+    // The raw cl_device_id for this GPU, so the AMD PoM driver can build a per-card resident
+    // tier + miner (each GPU mines PoM on its own buffer/thread instead of all funneling onto
+    // device 0 through one global lock).
+    fn opencl_device_id(&self) -> Option<usize> {
+        Some(self.device_id.id() as usize)
+    }
 }
 
 declare_plugin!(OpenCLPlugin, OpenCLPlugin::new, OpenCLOpt);
