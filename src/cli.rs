@@ -10,7 +10,7 @@ pub struct Opt {
 
     #[clap(
         long = "light",
-        help = "Model tier: TinyLlama only — any GPU (6GB+ VRAM)",
+        help = "Model tier: Gemma-3-4B — any GPU (6 GB+ VRAM)",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["high", "very_high"]
     )]
@@ -18,7 +18,7 @@ pub struct Opt {
 
     #[clap(
         long = "high",
-        help = "Model tier: TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B — RTX 3090 / 4090 (24GB+)",
+        help = "Model tier: Qwen3-32B — RTX 3090 / 4090 (24 GB+)",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["light", "very_high"]
     )]
@@ -26,7 +26,7 @@ pub struct Opt {
 
     #[clap(
         long = "very-high",
-        help = "Model tier: TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B + LLaMA-3.3-70B — RTX 5090 (32GB+)",
+        help = "Model tier: Llama-3.3-70B — RTX 5090 / 48 GB+",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["light", "high", "tier"]
     )]

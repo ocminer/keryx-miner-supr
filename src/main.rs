@@ -663,6 +663,23 @@ async fn main() -> Result<(), Error> {
     // The OPoI hard gate keeps PoW suspended until the files are ready and un-suspends itself.
     info!("Prefetching model files in the background — PoW stays OPoI-gated until they're ready…");
     tokio::spawn(async move {
+        // The MINING-TIER model FIRST and on its own — its possession index is what mining needs.
+        // The big inference tiers must NOT fill a small disk (HiveOS system SSD) before it lands.
+        // NOTE: filter_specs_by_vram SKIPS the VRAM gate when the VRAM query fails (e.g. nvidia-smi
+        // not on h-run.sh's PATH), so without this the legacy 32B/70B can download ahead of Gemma
+        // and ENOSPC it out → "index build failed: no such file or directory" on HiveOS. Downloading
+        // the mining tier first guarantees mining works even if the rest later fail on a full disk.
+        if let Some(ps) = pom_spec {
+            let one: &'static [&'static keryx_miner::models::ModelSpec] =
+                Box::leak(vec![ps].into_boxed_slice());
+            match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(one)).await {
+                Ok(Ok(())) => info!("Mining-tier model '{}' ready — PoM can build its possession index.", ps.dir_name),
+                Ok(Err(e)) => warn!("Mining-tier model '{}' prefetch failed: {} — PoM index build will wait + retry.", ps.dir_name, e),
+                Err(e) => warn!("Mining-tier model prefetch task panicked: {}", e),
+            }
+        }
+        // Then the rest (best-effort) for OPoI inference. A failure here (e.g. small disk) only skips
+        // inference tasks — mining already has its model.
         let _ = tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await;
         match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v2)).await {
             Ok(Ok(())) => info!("Model files ready (legacy + uncensored) — OPoI inference available."),
