@@ -11,7 +11,11 @@ cd "$(dirname "$0")"
 REPO="$(pwd)"
 
 NAME="keryx-miner-supr"
-VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+# Derive the release label from the HiveOS h-manifest (the canonical release
+# version, e.g. 0.6.3.1), NOT Cargo.toml — cargo can't express a 4-part version,
+# so Cargo.toml stays at the 3-part base (0.6.3) and would mis-name the tarball.
+VERSION=$(grep -m1 '^CUSTOM_VERSION=' "$REPO/hiveos/pkg/keryx-miner-supr/h-manifest.conf" | cut -d= -f2)
+[[ -n "$VERSION" ]] || VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 PKG="${NAME}-mmpos_${VERSION}"
 BIN="$REPO/hiveos/dist/keryx-miner-supr"
 SRC="$REPO/mmpos/keryx-miner-supr"
