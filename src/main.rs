@@ -748,6 +748,10 @@ async fn main() -> Result<(), Error> {
 
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
+    if opt.cpu_inference {
+        // Explicit operator opt-out: force OPoI inference onto the CPU for the whole session.
+        keryx_miner::slm::set_cpu_inference(true);
+    }
     if opt.cpu_inference || keryx_miner::slm::cpu_inference_enabled() {
         info!("CPU inference mode — skipping the GPU/cuBLAS probe (OPoI inference runs on the CPU).");
     } else {
