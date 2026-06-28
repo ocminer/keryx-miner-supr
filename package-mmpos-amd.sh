@@ -37,6 +37,14 @@ mkdir -p "$DEST"
 
 cp "$BIN" "$DEST/keryx-miner-supr"
 cp "$PLUGIN" "$DEST/libkeryxopencl.so"
+# Vulkan GPU inference (optional): bundle llama-server + its ggml/llama .so (miner spawns it for
+# OPoI inference on the AMD GPU; absent / no Vulkan ICD → CPU fallback).
+if [[ -f "$DIST/llama-server" ]]; then
+  cp -P "$DIST/llama-server" "$DEST/"
+  cp -P "$DIST"/lib{ggml,llama,mtmd}*.so* "$DEST/" 2>/dev/null || true
+  chmod +x "$DEST/llama-server"
+  echo ">> bundled Vulkan GPU inference (llama-server + ggml/llama libs)"
+fi
 cp "$SRC/mmp-external.conf" "$SRC/mmp-launch.sh" "$SRC/mmp-stats.sh" "$DEST/"
 chmod +x "$DEST/keryx-miner-supr" "$DEST"/*.sh
 

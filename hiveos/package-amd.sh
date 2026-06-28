@@ -28,6 +28,14 @@ mkdir -p "$DEST"
 cp "$PKG"/h-manifest.conf "$PKG"/h-config.sh "$PKG"/h-run.sh "$PKG"/h-stats.sh "$DEST/"
 cp "$DIST/$BIN" "$DEST/"
 cp "$DIST/libkeryxopencl.so" "$DEST/"
+# Vulkan GPU inference (optional): bundle llama-server + its ggml/llama .so. The miner spawns it
+# for OPoI inference on the AMD GPU; if absent (or no Vulkan ICD on the rig), it falls back to CPU.
+if [[ -f "$DIST/llama-server" ]]; then
+  cp -P "$DIST/llama-server" "$DEST/"
+  cp -P "$DIST"/lib{ggml,llama,mtmd}*.so* "$DEST/" 2>/dev/null || true
+  chmod +x "$DEST/llama-server"
+  echo ">> bundled Vulkan GPU inference (llama-server + $(ls "$DEST"/lib{ggml,llama,mtmd}*.so* 2>/dev/null | wc -l) libs)"
+fi
 chmod +x "$DEST"/h-*.sh "$DEST/$BIN"
 
 # HiveOS custom-get derives the miner NAME by stripping the LAST hyphen-delimited
