@@ -540,6 +540,87 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
     }
 }
 
+/// Run `load_engine` but catch BOTH a `Result::Err` AND a panic. candle/cudarc can either return an
+/// error (clean OOM / file error) or *panic* (CUDA_ERROR_INVALID_PTX from a too-high-arch dequant
+/// kernel, a cudarc launch failure, etc.) when loading the quantized model on the GPU. We must not
+/// let either crash the miner — instead we capture the reason for the graceful CPU fallback above.
+fn try_load_engine(spec: &'static ModelSpec, device: Device) -> std::result::Result<SlmEngine, String> {
+    // Test hook (validation only): force the FIRST GPU load to fail so the auto CPU fallback path
+    // can be exercised on a card whose GPU inference actually works. Honoured once, on CUDA only.
+    if device.is_cuda() && std::env::var("KERYX_FORCE_GPU_INFER_FAIL").is_ok() {
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        if !FIRED.swap(true, AtomicOrdering::Relaxed) {
+            return Err(
+                "KERYX_FORCE_GPU_INFER_FAIL=1 — simulated GPU model-load failure (test hook)".to_string(),
+            );
+        }
+    }
+
+    // Silence candle/cudarc's own panic hook for this load so a forced INVALID_PTX backtrace doesn't
+    // scare the logs; we report our own clean, actionable warning from the fallback.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_engine(spec, device)));
+    std::panic::set_hook(prev_hook);
+    match res {
+        Ok(Ok(engine)) => Ok(engine),
+        Ok(Err(e)) => Err(format!("{}", e)),
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic")
+                .to_string();
+            Err(format!("panic: {}", msg))
+        }
+    }
+}
+
+/// Load the model with an automatic GPU→CPU fallback. On the NVIDIA build, if the GPU (CUDA) model
+/// load fails for ANY reason (wrong-arch PTX / OOM / old driver / cudarc panic), we WARN loudly,
+/// flip the process to CPU inference (`set_cpu_inference(true)`), and reload on `Device::Cpu` so the
+/// miner DEGRADES instead of crashing. The PoW possession walk keeps running on the GPU; only the
+/// (rare) OPoI inference challenge runs slower on the CPU. The happy path (working GPU inference)
+/// stays on the GPU at full speed — this only triggers on an actual failure.
+fn load_engine_with_fallback(spec: &'static ModelSpec) -> Result<SlmEngine> {
+    let device = inference_device()
+        .map_err(|e| anyhow!("inference device unavailable: {}", e))?;
+    let on_cuda = device.is_cuda();
+
+    match try_load_engine(spec, device) {
+        Ok(engine) => Ok(engine),
+        Err(reason) if on_cuda => {
+            // GPU load failed but we were on CUDA → fall back to CPU instead of crashing.
+            log::warn!(
+                "⚠️ GPU inference FAILED to load on this card ({reason}) — falling back to CPU \
+                 inference (MUCH slower). The PoW walk still runs on GPU. To restore full speed: \
+                 (1) update your NVIDIA driver to R525+; (2) ensure the CUDA 12 runtime libs are \
+                 present (the release bundles them); (3) your GPU may be older than the build's \
+                 compute floor (Pascal/1080Ti must use CPU inference). See the release notes."
+            );
+            set_cpu_inference(true);
+            let cpu = Device::Cpu;
+            try_load_engine(spec, cpu).map_err(|e| {
+                anyhow!("CPU inference fallback ALSO failed to load '{}': {}", spec.name, e)
+            }).map(|engine| {
+                log::warn!(
+                    "SlmEngine: '{}' now loaded on CPU (degraded inference); mining (PoW walk) \
+                     continues on the GPU.",
+                    spec.name
+                );
+                engine
+            })
+        }
+        Err(reason) => {
+            // Already on CPU (explicit --cpu-inference / AMD / prior fallback) — nothing left to
+            // fall back to; surface the error to the caller (non-fatal at the call sites).
+            Err(anyhow!("load '{}' on {:?} failed: {}", spec.name,
+                if cpu_inference_enabled() { "CPU" } else { "device" }, reason))
+        }
+    }
+}
+
 // ── Inference ────────────────────────────────────────────────────────────────
 
 fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
@@ -859,25 +940,42 @@ fn sample_next(logits: &Tensor, lp: &mut LogitsProcessor, context: &[u32]) -> Re
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Inference is GPU-only as of OPoI v2 (upstream removed `--cpu-inference`). These shims keep the
-/// suprnova callers (stratum/grpc/main) compiling and behaving GPU-only: hashing pauses during an
-/// inference challenge. The `--cpu-inference` CLI flag is retained as a deprecated no-op so existing
-/// HiveOS/mmpOS flight-sheets don't error.
+/// Runtime CPU-inference flag (NVIDIA/pom-cuda build). Starts false (GPU inference) and is flipped
+/// to true either explicitly via `--cpu-inference` or AUTOMATICALLY when the GPU model load fails
+/// (wrong arch PTX / OOM / old driver) — see `load_engine_with_fallback`. Once set, every
+/// `inference_device()` returns `Device::Cpu` and the stratum/grpc CPU-mode plumbing (which keys
+/// off `cpu_inference_enabled()`) stops pausing the PoW walk during an inference challenge.
+static CPU_INFERENCE: AtomicBool = AtomicBool::new(false);
+
+/// Whether OPoI inference runs on the CPU. True for the AMD/OpenCL build always (candle 0.9 has no
+/// AMD-GPU backend), or for the NVIDIA build once `--cpu-inference` is set or the GPU model load
+/// has fallen back to CPU. The stratum/grpc CPU-mode plumbing keys off this so it won't pause
+/// hashing during a CPU challenge; the PoW walk keeps the GPU busy meanwhile.
 pub fn cpu_inference_enabled() -> bool {
     // AMD/OpenCL build: candle 0.9 has no AMD-GPU backend (CPU/CUDA/Metal only), so OPoI inference
-    // is FORCED onto the CPU — slow, but the only path that runs on AMD at all. The OpenCL kernel
-    // keeps the GPU busy on PoW meanwhile (the stratum/grpc CPU-mode plumbing keys off this == true,
-    // so it won't pause hashing during the CPU challenge). NVIDIA keeps GPU (CUDA) inference.
+    // is FORCED onto the CPU — slow, but the only path that runs on AMD at all.
     #[cfg(feature = "pom-opencl")]
     {
         true
     }
+    // NVIDIA/CUDA build: runtime flag (default GPU, flips to CPU on explicit flag or load failure).
     #[cfg(not(feature = "pom-opencl"))]
     {
-        false
+        CPU_INFERENCE.load(AtomicOrdering::Relaxed)
     }
 }
-pub fn set_cpu_inference(_on: bool) {}
+
+/// Force OPoI inference onto the CPU at runtime (NVIDIA build). Called when the operator passes
+/// `--cpu-inference`, or automatically by the GPU-load fallback. No-op-equivalent on the AMD build
+/// (already CPU-forced at compile time). Evicts any GPU-resident engine so the next load uses CPU.
+pub fn set_cpu_inference(on: bool) {
+    let prev = CPU_INFERENCE.swap(on, AtomicOrdering::Relaxed);
+    if prev != on {
+        // The cached engine (if any) is on the wrong device now — drop it so the next
+        // load_engine/ensure_loaded re-resolves the device via inference_device().
+        evict_engine();
+    }
+}
 
 /// Device for OPoI inference: `Device::Cpu` when `cpu_inference_enabled()` (AMD/OpenCL build),
 /// else CUDA device 0 (NVIDIA). Single chokepoint for the 3 inference sites.
@@ -1096,17 +1194,10 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             #[cfg(feature = "pom-cuda")]
             crate::pom_gpu::uninstall();
             *guard = None;
-            let device = match inference_device() {
-                Ok(d) => {
-                    log::info!("SlmEngine: inference device active ({})", if cpu_inference_enabled() { "CPU" } else { "CUDA:0" });
-                    d
-                }
-                Err(e) => {
-                    log::error!("SlmEngine: inference device unavailable ({e}) — cannot load '{}'", spec.name);
-                    return None;
-                }
-            };
-            match load_engine(spec, device) {
+            log::info!("SlmEngine: inference device active ({})", if cpu_inference_enabled() { "CPU" } else { "CUDA:0" });
+            // Loads on CUDA, and auto-falls-back to CPU (warning + set_cpu_inference) if the GPU
+            // model load fails (wrong-arch PTX / OOM / old driver) — never crashes the miner.
+            match load_engine_with_fallback(spec) {
                 Ok(e) => { *guard = Some(e); }
                 Err(e) => {
                     log::error!("SlmEngine: failed to load '{}': {}", spec.name, e);
@@ -1169,14 +1260,10 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
         return true; // already resident
     }
     *guard = None;
-    let device = match inference_device() {
-        Ok(d) => d,
-        Err(e) => {
-            log::error!("SlmEngine: ensure_loaded inference device unavailable ({e}) — cannot load '{}'", spec.name);
-            return false;
-        }
-    };
-    match load_engine(spec, device) {
+    // Loads on CUDA, auto-falls-back to CPU (warn + set_cpu_inference) if the GPU model load fails.
+    // On CPU fallback the engine is no longer CUDA, so `pom_shared` returns None and the PoM walk
+    // loads its OWN GPU copy via PomGpuMiner::load — the walk keeps mining on the GPU regardless.
+    match load_engine_with_fallback(spec) {
         Ok(e) => {
             *guard = Some(e);
             true
