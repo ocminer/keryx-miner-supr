@@ -24,8 +24,14 @@ docker run --rm --dns 1.1.1.1 --dns 8.8.8.8 -v "$REPO":/src -w /src -e DEBIAN_FR
     apt-get update -qq
     apt-get install -y -qq curl ca-certificates build-essential pkg-config \
         protobuf-compiler cmake libssl-dev ocl-icd-opencl-dev >/dev/null
-    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal >/dev/null
+    # Install rust only if absent. Re-running rustup over an existing /root/.rustup
+    # (e.g. a cached layer) can leave `cargo` off PATH after `. cargo/env`, so the
+    # later `cargo build` silently no-ops and packaging fails with "No such file".
+    if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal >/dev/null
+    fi
     . "$HOME/.cargo/env"
+    command -v cargo >/dev/null || { echo "FATAL: cargo not on PATH after rust setup"; exit 3; }
     # CUDA_COMPUTE_CAP=70: lowest arch candle-kernels 0.9.2 compiles for; its
     # `.target sm_70` PTX forward-JITs to the whole fleet sm_70→sm_120 (Volta,
     # Turing, 3070/Ampere, Ada, Hopper, 5090). Was 80 (re-broke Volta/Turing).
