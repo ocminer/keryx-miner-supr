@@ -172,11 +172,11 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     }
 
     let model_label = if needs_very_high {
-        "LLaMA-3.3-70B (--very-high)"
+        "Llama-3.3-70B (very-high)"
     } else if needs_high {
-        "DeepSeek-R1-32B (--high)"
+        "Qwen3-32B (high)"
     } else {
-        "DeepSeek-R1-8B (default)"
+        "Gemma-3-4B / Dolphin-8B (light/default)"
     };
     log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
 }
@@ -306,7 +306,7 @@ fn select_tier_nvidia(opt: &cli::Opt) -> keryx_miner::models::Tier {
         }
     }
 
-    // Legacy bool flags.
+    // Legacy bool flags pin an explicit tier (override auto).
     if opt.very_high {
         info!("--very-high mode: top tier — mines Llama-3.3-70B under PoM.");
         Tier::VeryHigh
@@ -317,8 +317,14 @@ fn select_tier_nvidia(opt: &cli::Opt) -> keryx_miner::models::Tier {
         info!("--light mode: baseline tier — mines Gemma-3-4B under PoM.");
         Tier::Light
     } else {
-        info!("default mode: mines Dolphin-8B under PoM.");
-        Tier::Default
+        // No tier flag given at all → AUTO is the default: pick the largest tier that fits this
+        // GPU's VRAM (per-process) and is already on disk. Heavier model = higher PoM tier reward
+        // (TIER_REWARD_BPS 82%→100% of the miner cut, active post-fork). The auto resolver is fully
+        // OOM-safe (conservative VRAM margin keeps 8 GB cards on Light) and never blocks on a slow
+        // IPFS fetch (it falls back to the largest fitting tier already downloaded). Pin a tier with
+        // --light / --high / --very-high / --tier <name> to override.
+        info!("no tier flag given — defaulting to AUTO (largest tier that fits this GPU's VRAM). Use --light/--high/--very-high/--tier to pin a tier.");
+        select_tier_auto()
     }
 }
 
@@ -605,21 +611,18 @@ async fn main() -> Result<(), Error> {
     };
 
     // Phase-3 OPoI: load inference models before mining starts.
-    //   (no flag)    → TinyLlama + DeepSeek-R1-8B  [default]
-    //   --light      → TinyLlama only
-    //   --high       → TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B
-    //   --very-high  → all 4 models
-
-    // Warn if GPU power limit is below safe threshold for the selected model tier.
-    // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
-    check_gpu_power_limit(opt.high || opt.very_high, opt.very_high);
+    //   (no flag)    → AUTO: largest PoM tier that fits this GPU's VRAM (per-process)
+    //   --light      → Gemma-3-4B (legacy: TinyLlama)
+    //   --high       → Qwen3-32B  (legacy: + DeepSeek-R1-32B)
+    //   --very-high  → Llama-3.3-70B (legacy: all 4 models)
 
     // PoM (OPoI v2): one flag = one tier. Each GPU mines AND serves exactly the single model it
     // proves possession of (multi-tier coverage is a network property, not per-GPU).
-    //   --light → Gemma-3-4B   default → Dolphin-8B   --high → Qwen3-32B   --very-high → Llama-3.3-70B
+    //   --light → Gemma-3-4B   --high → Qwen3-32B   --very-high → Llama-3.3-70B   (no flag → AUTO)
     // AMD: OPoI inference is CPU-only (candle has no AMD-GPU backend), so force the lightest tier
     // (Gemma-3-4B) regardless of flags — the smallest model the CPU can serve, and its 2.48 GiB PoM
-    // blob also fits low-VRAM AMD cards. NVIDIA keeps the flag-selected tier (GPU inference).
+    // blob also fits low-VRAM AMD cards. NVIDIA: AUTO by default (largest fitting tier), or the
+    // flag-selected tier (GPU inference).
     #[cfg(feature = "pom-opencl")]
     let tier = {
         let _ = (opt.very_high, opt.high, opt.light, &opt.tier);
@@ -628,6 +631,14 @@ async fn main() -> Result<(), Error> {
     };
     #[cfg(not(feature = "pom-opencl"))]
     let tier = select_tier_nvidia(&opt);
+
+    // Warn if GPU power limit is below safe threshold for the RESOLVED model tier (post-auto).
+    // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads. Driven by the
+    // resolved tier (not the raw flags) so an auto-picked High/VeryHigh card gets the right warning.
+    {
+        use keryx_miner::models::Tier;
+        check_gpu_power_limit(matches!(tier, Tier::High | Tier::VeryHigh), matches!(tier, Tier::VeryHigh));
+    }
     // OPoI v2 hardfork: the lineup is DAA-gated (mirrors the node's opoi_v2_activation). Stage BOTH
     // lineups for this tier, each VRAM-filtered (capability gate), so the chain crossing H hot-swaps
     // without a restart: legacy (daa<H) served now, uncensored (daa>=H) swapped in at H.

@@ -4,7 +4,7 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nModel tiers (default: TinyLlama + DeepSeek-8B — RTX 3060 12GB / 3070 / 3080):\n  --light      TinyLlama only — RTX 3060 6GB or any GPU\n  (default)    TinyLlama + DeepSeek-R1-8B — RTX 3060 12GB / 3070 / 3080\n  --high       + DeepSeek-R1-32B — RTX 3090 / 4090 (24GB+)\n  --very-high  + LLaMA-3.3-70B  — RTX 5090 (32GB+)", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nModel tiers (default: AUTO — largest PoM tier that fits this GPU's VRAM = highest tier reward):\n  (default)    auto — largest tier that fits VRAM & is downloaded (8GB->Gemma, 24GB->Qwen3-32B, 32GB->Llama-70B)\n  --light      Gemma-3-4B — any GPU (6GB+)\n  --high       Qwen3-32B — RTX 3090 / 4090 (24GB+)\n  --very-high  Llama-3.3-70B — RTX 5090 / 48GB+\n  --tier <t>   auto | light | default | high | very-high (pins the tier)", term_width = 0)]
 pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
 
@@ -35,7 +35,7 @@ pub struct Opt {
     #[clap(
         long = "tier",
         value_name = "TIER",
-        help = "Model tier: auto | light | default | high | very-high. 'auto' picks the LARGEST tier that fits the GPU's VRAM (per-process: each GPU's own VRAM). Overrides --light/--high/--very-high.",
+        help = "Model tier: auto | light | default | high | very-high. DEFAULT (no flag) is 'auto' — picks the LARGEST tier that fits the GPU's VRAM (per-process) AND is downloaded = highest tier reward. Pass a name to pin a tier; overrides --light/--high/--very-high.",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["light", "high", "very_high"]
     )]
