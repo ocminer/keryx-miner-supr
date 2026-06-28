@@ -23,6 +23,12 @@ pub trait Plugin: Any + Send + Sync {
 pub trait WorkerSpec: Any + Send + Sync {
     fn id(&self) -> String;
     fn build(&self) -> Box<dyn Worker>;
+    /// OpenCL `cl_device_id` (as `usize`) of this worker's GPU, if it is an OpenCL worker.
+    /// Lets the AMD PoM driver make the possession tier resident on THIS exact card so each
+    /// GPU mines PoM independently (own buffer, own thread). `None` for non-OpenCL specs (CUDA).
+    fn opencl_device_id(&self) -> Option<usize> {
+        None
+    }
 }
 
 pub trait Worker {

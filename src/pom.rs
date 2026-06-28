@@ -426,6 +426,32 @@ impl Drop for WeightIndex {
     }
 }
 
+/// Remove `pom-tree-<pid>.bin` files in `dir` left by miner processes that are no longer running.
+/// A clean exit deletes the tree via `Drop`, but a `kill -9` / crash / ENOSPC skips that, leaving
+/// ~5 GB orphans that accumulate across restarts. This sweeps only DEAD-pid files (own pid + any
+/// live pid are kept), so it is safe to run while other miners share the dir.
+fn sweep_dead_pom_trees(dir: &std::path::Path) {
+    let me = std::process::id();
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = name
+            .strip_prefix("pom-tree-")
+            .and_then(|s| s.strip_suffix(".bin"))
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me || std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            continue; // ours, or still running — leave it
+        }
+        if std::fs::remove_file(ent.path()).is_ok() {
+            log::info!("PoM: swept orphan possession tree {name} (dead pid {pid})");
+        }
+    }
+}
+
 impl WeightIndex {
     /// Build from a GGUF on disk (CPU dtoh of each tensor). The bytes are candle's exact quantized
     /// bytes — the same the miner serves in VRAM and the builder pinned in `R_T`. The Merkle tree
@@ -441,6 +467,7 @@ impl WeightIndex {
         let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
         let tree_path = dir.join(format!("pom-tree-{}.bin", std::process::id()));
         let _ = std::fs::remove_file(&tree_path); // clear a stale file from a crashed run
+        sweep_dead_pom_trees(dir); // delete ~5 GB orphan trees left by previously killed/crashed miners
         let mut writer = BufWriter::new(
             OpenOptions::new().read(true).write(true).create(true).truncate(true)
                 .open(&tree_path).map_err(candle_core::Error::wrap)?,

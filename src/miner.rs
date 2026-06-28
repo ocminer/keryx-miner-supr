@@ -296,6 +296,13 @@ impl MinerManager {
     ) -> MinerHandler {
         std::thread::spawn(move || {
             let mut box_ = spec.build();
+            // AMD multi-GPU PoM: bind this thread to its own card so the possession tier is made
+            // resident per-GPU and every card mines (and submits) its own shares — instead of all
+            // GPU threads funneling onto device 0 through one global lock (3 cards ran like 1).
+            #[cfg(feature = "pom-opencl")]
+            if let Some(dev) = spec.opencl_device_id() {
+                keryx_miner::pom_opencl::bind_thread_device(dev);
+            }
             let gpu_work = box_.as_mut();
             (|| {
                 info!("Spawned Thread for GPU {}", gpu_work.id());
