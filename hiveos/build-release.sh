@@ -20,7 +20,7 @@ VERSION=$(grep -m1 '^CUSTOM_VERSION=' "$PKG/h-manifest.conf" | cut -d= -f2)
 mkdir -p "$OUT/linux-stage"
 
 echo ">> Building dynamic + static in $IMAGE (glibc 2.31) ..."
-docker run --rm -v "$REPO":/src -w /src -e DEBIAN_FRONTEND=noninteractive "$IMAGE" bash -euo pipefail -c '
+docker run --rm --dns 1.1.1.1 --dns 8.8.8.8 -v "$REPO":/src -w /src -e DEBIAN_FRONTEND=noninteractive "$IMAGE" bash -euo pipefail -c '
     apt-get update -qq
     apt-get install -y -qq curl ca-certificates build-essential pkg-config \
         protobuf-compiler cmake libssl-dev ocl-icd-opencl-dev >/dev/null
