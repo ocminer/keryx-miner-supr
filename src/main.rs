@@ -184,7 +184,23 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
 /// GPU 0 total VRAM (MB): nvidia-smi (NVIDIA), else OpenCL CL_DEVICE_GLOBAL_MEM_SIZE (AMD, when the
 /// pom-opencl driver is linked). None on CPU-only machines.
 fn query_vram_mb() -> Option<u64> {
-    if let Ok(output) = std::process::Command::new("nvidia-smi")
+    // One process per GPU (CUDA_VISIBLE_DEVICES=<n>): query THIS process's visible GPU, not GPU 0.
+    // nvidia-smi without `-i` always lists GPU 0 first regardless of CUDA_VISIBLE_DEVICES, so on a
+    // mixed rig (e.g. a 5090 at slot 0 + a 3070 at slot 1) the 3070's process would wrongly read the
+    // 5090's 32 GB and auto-pick a tier that OOMs. Pin nvidia-smi to the first visible device id.
+    // (Miners launch with CUDA_DEVICE_ORDER=PCI_BUS_ID, so CUDA's index == nvidia-smi's index.)
+    let mut cmd = std::process::Command::new("nvidia-smi");
+    if let Ok(vis) = std::env::var("CUDA_VISIBLE_DEVICES") {
+        // CUDA_VISIBLE_DEVICES may be a list ("2,3"); the process's GPU 0 is the FIRST entry.
+        if let Some(first) = vis.split(',').next().map(str::trim).filter(|s| !s.is_empty()) {
+            // Only a plain numeric index is safe to forward to `nvidia-smi -i` (UUIDs also work,
+            // but ignore anything unexpected and fall back to the default GPU-0 query).
+            if first.chars().all(|c| c.is_ascii_digit()) {
+                cmd.args(["-i", first]);
+            }
+        }
+    }
+    if let Ok(output) = cmd
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
         .output()
     {
@@ -237,6 +253,136 @@ fn filter_specs_by_vram(
     } else {
         Box::leak(kept.into_boxed_slice())
     }
+}
+
+/// Conservative VRAM headroom (MiB) reserved on top of a model's `min_vram_mb` budget when
+/// auto-selecting a tier. `min_vram_mb` already covers weights + KV-cache + CUDA workspace; this
+/// margin guards against fragmentation / driver overhead / the resident PoM possession walk so the
+/// picked tier loads cleanly. Empirically an 8 GB 3070 OOMs even Gemma on the GPU, so we stay
+/// conservative: 2 GB margin keeps an 8 GB card on Light (the OOM-safe choice).
+#[cfg(not(feature = "pom-opencl"))]
+const AUTO_TIER_HEADROOM_MB: u64 = 2_048;
+
+/// Resolve the model tier for the NVIDIA (pom-cuda) path. `--tier <value>` takes precedence over
+/// the legacy `--light/--high/--very-high` bool flags (clap enforces they are mutually exclusive).
+///
+/// `--tier auto` queries THIS process's visible GPU VRAM (one process per GPU) and picks the
+/// LARGEST tier that fits with `AUTO_TIER_HEADROOM_MB` margin. If the largest-fitting tier's model
+/// is not yet downloaded, it falls back to the largest tier that BOTH fits AND is already on disk,
+/// so the miner starts immediately instead of blocking on a multi-GB IPFS download. (The picked
+/// tier's model is still prefetched in the background by the normal model-fetch path.)
+#[cfg(not(feature = "pom-opencl"))]
+fn select_tier_nvidia(opt: &cli::Opt) -> keryx_miner::models::Tier {
+    use keryx_miner::models::Tier;
+
+    // Explicit string tier (new --tier flag) wins.
+    if let Some(raw) = opt.tier.as_deref() {
+        let t = raw.trim().to_ascii_lowercase();
+        match t.as_str() {
+            "auto" => return select_tier_auto(),
+            "light" => {
+                info!("--tier light: baseline tier — mines Gemma-3-4B under PoM.");
+                return Tier::Light;
+            }
+            "default" => {
+                info!("--tier default: mines Dolphin-8B under PoM.");
+                return Tier::Default;
+            }
+            "high" => {
+                info!("--tier high: high tier — mines Qwen3-32B under PoM.");
+                return Tier::High;
+            }
+            "very-high" | "veryhigh" | "very_high" => {
+                info!("--tier very-high: top tier — mines Llama-3.3-70B under PoM.");
+                return Tier::VeryHigh;
+            }
+            other => {
+                warn!(
+                    "--tier '{}' not recognised (expected auto|light|default|high|very-high) — defaulting to auto.",
+                    other
+                );
+                return select_tier_auto();
+            }
+        }
+    }
+
+    // Legacy bool flags.
+    if opt.very_high {
+        info!("--very-high mode: top tier — mines Llama-3.3-70B under PoM.");
+        Tier::VeryHigh
+    } else if opt.high {
+        info!("--high mode: high tier — mines Qwen3-32B under PoM.");
+        Tier::High
+    } else if opt.light {
+        info!("--light mode: baseline tier — mines Gemma-3-4B under PoM.");
+        Tier::Light
+    } else {
+        info!("default mode: mines Dolphin-8B under PoM.");
+        Tier::Default
+    }
+}
+
+/// `--tier auto` resolution: pick the largest tier that fits this GPU's VRAM, then fall back to the
+/// largest tier whose model is also already downloaded (or trigger nothing — the normal background
+/// prefetch downloads the picked tier's model). Logs every decision.
+#[cfg(not(feature = "pom-opencl"))]
+fn select_tier_auto() -> keryx_miner::models::Tier {
+    use keryx_miner::models::{self, Tier};
+
+    let Some(vram_mb) = query_vram_mb() else {
+        warn!("--tier auto: cannot query GPU VRAM (no nvidia-smi) — falling back to --light (Gemma-3-4B).");
+        return Tier::Light;
+    };
+
+    let (picked, need) = models::auto_select_tier(vram_mb, AUTO_TIER_HEADROOM_MB);
+    info!(
+        "tier auto: {} MiB VRAM -> {} ({:?}, tier {}) — budget {} MiB (weights+KV+workspace + {} MiB margin).",
+        vram_mb,
+        picked.pom_model_name(),
+        picked,
+        models::pom_tier_index(&picked.pom_spec().model_id).unwrap_or(0),
+        need,
+        AUTO_TIER_HEADROOM_MB,
+    );
+
+    // Availability: if the picked tier's model isn't on disk yet, fall back to the largest tier that
+    // BOTH fits AND is already downloaded so mining starts now. The picked-but-missing model is still
+    // background-prefetched by the normal path; on the next restart auto will select it.
+    if keryx_miner::slm::spec_files_ready(picked.pom_spec()) {
+        info!("tier auto: {} model is present on disk — using it.", picked.pom_model_name());
+        return picked;
+    }
+
+    warn!(
+        "tier auto: {} model not downloaded yet — searching for the largest fitting tier already on disk.",
+        picked.pom_model_name()
+    );
+    for tier in Tier::DESCENDING {
+        // Only consider tiers that ALSO fit this card (never downgrade VRAM-fit just to use a
+        // present-but-too-big model — though by construction the present ones are smaller/equal).
+        let fits = vram_mb >= tier.pom_spec().min_vram_mb.saturating_add(AUTO_TIER_HEADROOM_MB)
+            || tier == Tier::Light;
+        if fits && keryx_miner::slm::spec_files_ready(tier.pom_spec()) {
+            warn!(
+                "tier auto: falling back to {} ({:?}, tier {}) — largest fitting tier already on disk. \
+                 ({} will download in the background; restart to use it.)",
+                tier.pom_model_name(),
+                tier,
+                models::pom_tier_index(&tier.pom_spec().model_id).unwrap_or(0),
+                picked.pom_model_name(),
+            );
+            return tier;
+        }
+    }
+
+    // Nothing downloaded at all — keep the VRAM-picked tier; the background prefetch will fetch it
+    // and the OPoI hard-gate keeps PoW suspended until the files are ready.
+    warn!(
+        "tier auto: no tier model present on disk — keeping {} ({:?}); it will download before mining starts.",
+        picked.pom_model_name(),
+        picked,
+    );
+    picked
 }
 
 async fn get_client(
@@ -476,24 +622,12 @@ async fn main() -> Result<(), Error> {
     // blob also fits low-VRAM AMD cards. NVIDIA keeps the flag-selected tier (GPU inference).
     #[cfg(feature = "pom-opencl")]
     let tier = {
-        let _ = (opt.very_high, opt.high, opt.light);
-        info!("AMD/OpenCL: forcing --light tier (Gemma-3-4B) — CPU inference + smallest PoM tier; --high/--very-high ignored on AMD.");
+        let _ = (opt.very_high, opt.high, opt.light, &opt.tier);
+        info!("AMD/OpenCL: forcing --light tier (Gemma-3-4B) — CPU inference + smallest PoM tier; --high/--very-high/--tier ignored on AMD.");
         keryx_miner::models::Tier::Light
     };
     #[cfg(not(feature = "pom-opencl"))]
-    let tier = if opt.very_high {
-        info!("--very-high mode: top tier — mines Llama-3.3-70B under PoM.");
-        keryx_miner::models::Tier::VeryHigh
-    } else if opt.high {
-        info!("--high mode: high tier — mines Qwen3-32B under PoM.");
-        keryx_miner::models::Tier::High
-    } else if opt.light {
-        info!("--light mode: baseline tier — mines Gemma-3-4B under PoM.");
-        keryx_miner::models::Tier::Light
-    } else {
-        info!("default mode: mines Dolphin-8B under PoM.");
-        keryx_miner::models::Tier::Default
-    };
+    let tier = select_tier_nvidia(&opt);
     // OPoI v2 hardfork: the lineup is DAA-gated (mirrors the node's opoi_v2_activation). Stage BOTH
     // lineups for this tier, each VRAM-filtered (capability gate), so the chain crossing H hot-swaps
     // without a restart: legacy (daa<H) served now, uncensored (daa>=H) swapped in at H.

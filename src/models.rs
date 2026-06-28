@@ -228,12 +228,55 @@ pub fn opoi_v2_activation_daa() -> u64 {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
     Light,
     Default,
     High,
     VeryHigh,
+}
+
+impl Tier {
+    /// Tiers from largest to smallest — used by `--tier auto` to pick the biggest that fits.
+    pub const DESCENDING: [Tier; 4] = [Tier::VeryHigh, Tier::High, Tier::Default, Tier::Light];
+
+    /// Human-readable name of the model this tier mines/proves under the OPoI-v2 (PoM) lineup.
+    pub fn pom_model_name(self) -> &'static str {
+        self.pom_spec().name
+    }
+
+    /// The single OPoI-v2 (PoM) model spec this tier proves possession of.
+    pub fn pom_spec(self) -> &'static ModelSpec {
+        match self {
+            Tier::Light => &GEMMA_3_4B,
+            Tier::Default => &DOLPHIN_LLAMA3_8B,
+            Tier::High => &QWEN3_32B,
+            Tier::VeryHigh => &LLAMA_3_3_70B,
+        }
+    }
+}
+
+/// `--tier auto`: pick the LARGEST tier whose footprint fits the GPU's VRAM, with a conservative
+/// safety margin so the chosen tier loads cleanly (weights + PoM possession walk + CUDA workspace
+/// + KV cache for GPU inference). Returns the tier and its budgeted MiB requirement.
+///
+/// The budget is the model's `min_vram_mb` (which already accounts for weights + KV + workspace),
+/// plus a `headroom_mb` margin on top. Empirically an 8 GB 3070 OOMs Gemma-3-4B on the GPU
+/// (needs `--cpu-inference`), so the margin must be conservative: with the default 2 GB headroom,
+/// Light (min_vram_mb=0) is the only tier that fits an 8 GB card, and Default (needs 8000) does
+/// NOT — which is the correct, OOM-safe choice.
+///
+/// `cpu_inference`: when true, GPU inference is off, so the GPU only needs to hold the PoM walk's
+/// resident weights (no inference KV/workspace), but we keep the same conservative margin.
+pub fn auto_select_tier(vram_mb: u64, headroom_mb: u64) -> (Tier, u64) {
+    for tier in Tier::DESCENDING {
+        let need = tier.pom_spec().min_vram_mb.saturating_add(headroom_mb);
+        if vram_mb >= need {
+            return (tier, need);
+        }
+    }
+    // Light has min_vram_mb=0; with any non-trivial card it always fits. Floor to Light.
+    (Tier::Light, headroom_mb)
 }
 
 /// Cumulative model set for a hardware tier within the lineup active at `daa`.
