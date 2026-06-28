@@ -13,7 +13,9 @@ cd "$(dirname "$0")"
 REPO="$(pwd)"
 
 NAME="keryx-miner-supr-amd"
-VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+# Use the same release label as the HiveOS AMD package (CUSTOM_VERSION) so both match — the
+# HiveOS label can carry a 4th component (e.g. 0.6.3.1) that Cargo semver can't.
+VERSION=$(grep -m1 '^CUSTOM_VERSION=' "$REPO/hiveos/pkg-amd/keryx-miner-supr-amd/h-manifest.conf" | cut -d= -f2)
 PKG="${NAME}-mmpos_${VERSION}"
 DIST="$REPO/hiveos/dist-amd"
 BIN="$DIST/keryx-miner-supr"
