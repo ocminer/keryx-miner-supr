@@ -7,6 +7,7 @@ pub mod slm;
 // Device-mapped quantized model forks (OPoI v2 archs) — used by slm inference and the
 // PoM zero-dup gather. Device-agnostic (candle Device = CPU or CUDA), so they build
 // regardless of the cuda feature.
+pub mod quantized_gemma3_split;
 pub mod quantized_llama_split;
 pub mod quantized_qwen3_split;
 
