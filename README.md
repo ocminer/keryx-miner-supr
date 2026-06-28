@@ -43,7 +43,13 @@ sustained runs.
 # Do NOT use CUDA 13.2: driver 580 caps PTX at ISA 9.0, and 13.2 emits 9.2
 # PTX that fails to load at runtime with "unknown error".
 export PATH=/usr/local/cuda-13.0/bin:$PATH
-export CUDA_HOME=/usr/local/cuda-13.0 CUDA_PATH=/usr/local/cuda-13.0 CUDA_COMPUTE_CAP=120
+# CUDA_COMPUTE_CAP sets the arch for candle's OPoI inference PTX. bindgen_cuda
+# emits a single `.target sm_NN` PTX (no fatbin); PTX forward-JITs only to
+# sm >= NN. Use 70 — the lowest candle-kernels compiles for — so one build runs
+# the whole fleet sm_70 (Volta) → sm_120 (5090). A higher value (e.g. 120) makes
+# the inference kernels FAIL to load on every older card (CUDA_ERROR_INVALID_PTX).
+# Pascal sm_61 can't compile candle (reduce.cu half atomicAdd) → run --cpu-inference.
+export CUDA_HOME=/usr/local/cuda-13.0 CUDA_PATH=/usr/local/cuda-13.0 CUDA_COMPUTE_CAP=70
 
 # Workspace build — this also produces libkeryxcuda.so + libkeryxopencl.so.
 # Using `--bin keryx-miner-supr` would skip the plugins and the binary would

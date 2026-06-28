@@ -225,7 +225,10 @@ jobs:
       - name: Build static-cuda + pom-cuda (self-contained PoM exe)
         shell: pwsh
         env:
-          CUDA_COMPUTE_CAP: "80"
+          # 70 = lowest arch candle-kernels compiles for; its sm_70 PTX
+          # forward-JITs across sm_70→sm_120 (Volta→5090). Was 80 (broke
+          # Volta/Turing GPU inference). Pascal sm_61 → --cpu-inference.
+          CUDA_COMPUTE_CAP: "70"
         run: |
           Write-Host "CUDA_PATH=$env:CUDA_PATH"
           & "$env:CUDA_PATH\bin\nvcc.exe" --version
