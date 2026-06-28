@@ -28,9 +28,18 @@ pub struct Opt {
         long = "very-high",
         help = "Model tier: TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B + LLaMA-3.3-70B — RTX 5090 (32GB+)",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["light", "high"]
+        conflicts_with_all = &["light", "high", "tier"]
     )]
     pub very_high: bool,
+
+    #[clap(
+        long = "tier",
+        value_name = "TIER",
+        help = "Model tier: auto | light | default | high | very-high. 'auto' picks the LARGEST tier that fits the GPU's VRAM (per-process: each GPU's own VRAM). Overrides --light/--high/--very-high.",
+        help_heading = "OPoI / Inference",
+        conflicts_with_all = &["light", "high", "very_high"]
+    )]
+    pub tier: Option<String>,
 
     #[clap(
         long = "cpu-inference",
