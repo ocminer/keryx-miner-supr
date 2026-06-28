@@ -49,6 +49,36 @@ else
 fi
 # ---------------------------------------------------------------------------
 
+# --- Vulkan GPU-inference preflight ----------------------------------------
+# OPoI inference runs on the AMD GPU via the bundled ./llama-server (Vulkan). That
+# needs libvulkan.so.1 + a registered AMD Vulkan ICD (RADV/Mesa or AMDVLK) on the
+# rig. If anything is missing the miner AUTO-FALLS BACK to CPU inference (slow but
+# works) — NOT fatal. Report which path this rig will take so it's visible per-rig.
+if [[ -x ./llama-server ]]; then
+  vk_ok=1
+  if ! ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so\.1' \
+     && ! ls /usr/lib/x86_64-linux-gnu/libvulkan.so.1 >/dev/null 2>&1; then
+    preflight "Vulkan preflight: libvulkan.so.1 not found — OPoI inference will run on the CPU (slow)."
+    preflight "                  For GPU inference: 'apt-get install -y libvulkan1 mesa-vulkan-drivers'."
+    vk_ok=0
+  fi
+  if command -v vulkaninfo >/dev/null 2>&1; then
+    amdvk=$(timeout 15 vulkaninfo --summary 2>/dev/null | grep -iE 'deviceName.*(AMD|Radeon|RADV|Instinct)' | head -1 | sed 's/^[[:space:]]*//')
+    if [[ -n "$amdvk" ]]; then
+      preflight "Vulkan preflight: AMD GPU visible to Vulkan ($amdvk)."
+    else
+      preflight "WARNING: no AMD GPU visible to Vulkan — OPoI inference falls back to CPU (slow)."
+      vk_ok=0
+    fi
+  elif [[ "$vk_ok" == 1 ]]; then
+    preflight "note: 'vulkaninfo' not installed — can't confirm AMD Vulkan visibility ('apt-get install vulkan-tools')."
+  fi
+  [[ "$vk_ok" == 1 ]] && preflight "Vulkan GPU inference: AVAILABLE — OPoI inference will run on the AMD GPU (fast)."
+else
+  preflight "note: no bundled llama-server — OPoI inference runs on the CPU (CPU-only build)."
+fi
+# ---------------------------------------------------------------------------
+
 echo "[keryx-miner-supr-amd] launching: ./keryx-miner-supr $CLI_ARGS" | tee -a "$LOG"
 # tee -a (not exec) so the log keeps the preflight lines + miner output for h-stats.sh.
 ./keryx-miner-supr $CLI_ARGS 2>&1 | tee -a "$LOG"
