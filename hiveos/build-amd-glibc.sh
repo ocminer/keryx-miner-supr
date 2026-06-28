@@ -19,6 +19,7 @@ mkdir -p "$OUT"
 
 echo ">> Building AMD flavour in $IMAGE (glibc 2.31) ..."
 docker run --rm \
+  --dns 1.1.1.1 --dns 8.8.8.8 \
   -v "$REPO":/src \
   -w /src \
   -e DEBIAN_FRONTEND=noninteractive \
