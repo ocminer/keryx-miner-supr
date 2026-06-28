@@ -245,6 +245,24 @@ fn ensure_installed_inner() -> bool {
     // Build the possession index once (host, heavy) the first time PoM activates — deferred from
     // boot so the pre-PoM legacy phase starts immediately and keeps host/GPU free.
     if crate::pom::active_index().is_none() {
+        // The background prefetch may still be downloading the mining-tier model (slow IPFS link /
+        // small HiveOS system disk). Building the possession index from a missing or partial GGUF
+        // hard-fails with ENOENT ("index build failed: no such file or directory") and would spam
+        // that on every job. Wait for the `.ok` completion sentinel and retry next job instead.
+        let ready = std::path::Path::new(gguf)
+            .parent()
+            .map(|d| d.join(".ok"))
+            .map_or(false, |p| p.exists());
+        if !ready {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                info!(
+                    "PoM: mining-tier model not downloaded yet — deferring the possession-index build \
+                     until the background prefetch finishes (slow link / small disk can take a while)."
+                );
+            }
+            return false;
+        }
         let tier = match crate::models::pom_tier_index(model_id) {
             Some(t) => t,
             None => return false,
