@@ -669,8 +669,13 @@ SOFTMAX_OP(__half, float, softmax_f16)
 RMSNORM_OP(__half, rmsnorm_f16)
 LAYERNORM_OP(__half, layernorm_f16)
 ROPE_OP(__half, rope_f16, rope_i_f16, rope_thd_f16)
-SUM_OP(__half, sum_f16)
 FAST_OP(__half, fast_min_f16, fast_max_f16, fast_argmin_f16, fast_argmax_f16, fast_sum_f16)
+#endif
+// Pascal (sm_60/61, e.g. GTX 1080 Ti) has no __half global atomicAdd (needs sm_70+).
+// Gate the only f16 op that uses it; 1080 Ti runs inference on CPU (--cpu-inference) so this
+// GPU f16 sum-reduction kernel is never invoked on Pascal anyway.
+#if __CUDA_ARCH__ >= 700
+SUM_OP(__half, sum_f16)
 #endif
 
 SUM_OP(float, sum_f32)
