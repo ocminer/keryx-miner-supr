@@ -520,6 +520,37 @@ async fn main() -> Result<(), Error> {
     // try_init: in the static-cuda build CudaPlugin::new already set a logger;
     // init() would panic on the second call.
     let _ = env_logger::builder().filter_level(opt.log_level()).parse_default_env().try_init();
+
+    // Clean shutdown: respond to SIGINT (Ctrl-C) and SIGTERM — the signals HiveOS / mmpOS / SMOS /
+    // systemd send to STOP a miner. The GPU worker threads sit in long, uninterruptible CUDA calls
+    // and can't be stopped cooperatively, so we exit the process directly and let the OS reclaim the
+    // CUDA context; the orphan possession-tree sweep cleans any leftover pom-tree on the next start.
+    // (Without this the miner ignored SIGINT/SIGTERM and only died on SIGKILL.)
+    tokio::spawn(async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut term) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = term.recv() => {}
+                    }
+                }
+                Err(e) => {
+                    log::error!("SIGTERM handler install failed ({e}) — falling back to Ctrl-C only.");
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        log::warn!("Shutdown signal received — stopping keryx-miner.");
+        std::process::exit(0);
+    });
+
     info!("=================================================================================");
     info!("                 Keryx-Miner GPU {}", env!("CARGO_PKG_VERSION"));
     info!(" Mining for: {}", opt.mining_address.as_deref().unwrap_or("(recovery mode)"));
