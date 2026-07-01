@@ -677,11 +677,11 @@ async fn main() -> Result<(), Error> {
         use keryx_miner::models::Tier;
         check_gpu_power_limit(matches!(tier, Tier::High | Tier::VeryHigh), matches!(tier, Tier::VeryHigh));
     }
-    // OPoI v2 hardfork: the lineup is DAA-gated (mirrors the node's opoi_v2_activation). Stage BOTH
-    // lineups for this tier, each VRAM-filtered (capability gate), so the chain crossing H hot-swaps
-    // without a restart: legacy (daa<H) served now, uncensored (daa>=H) swapped in at H.
-    let specs_v1 = filter_specs_by_vram(keryx_miner::models::specs_for(0, tier));
-    // Stage the FINAL (post-H2) lineup: `specs_for` is DAA-gated, and H2 (VERY_LIGHT_ACTIVATION_DAA)
+    // Stage the FINAL (post-H2) lineup ONLY. The legacy pre-OPoI-v2 lineup (TinyLlama/DeepSeek) is
+    // DEAD — OPoI-v2 is permanently in the past, so `specs_for(0, ..)` would just download an
+    // obsolete model nobody serves (the "why is it downloading tinyllama" bug reports). Upstream
+    // dropped it for the same reason; we mirror that here.
+    // The FINAL (post-H2) lineup: `specs_for` is DAA-gated, and H2 (VERY_LIGHT_ACTIVATION_DAA)
     // is a frozen frontier the network is permanently past. Using OPOI_V2_ACTIVATION_DAA (pre-H2)
     // wrongly staged `--very-light` as Gemma (pre-H2 fallback) instead of Qwen3-1.7B, and
     // `--very-high` as the 48 GB Q4 instead of the 32 GB-servable Q2_K_L. Must match the mining
@@ -696,10 +696,10 @@ async fn main() -> Result<(), Error> {
         .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id, keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA).is_some())
         .max_by_key(|s| s.min_vram_mb);
     keryx_miner::slm::set_v2_lineup(specs_v2);
-    keryx_miner::slm::init_supported(specs_v1);
+    keryx_miner::slm::init_supported(specs_v2);
     info!(
-        "OPoI Phase-3 — {} legacy + {} uncensored model(s) staged, DAA-gated at {}.",
-        specs_v1.len(), specs_v2.len(), keryx_miner::models::OPOI_V2_ACTIVATION_DAA
+        "OPoI Phase-3 — {} uncensored model(s) staged (legacy lineup dropped, post-fork).",
+        specs_v2.len(),
     );
     // Prefetch BOTH lineups in the BACKGROUND (suprnova: backgrounded so a worker/plugin error
     // surfaces immediately instead of after a multi-GB download — the HiveOS "black screen" fix).
@@ -723,9 +723,8 @@ async fn main() -> Result<(), Error> {
         }
         // Then the rest (best-effort) for OPoI inference. A failure here (e.g. small disk) only skips
         // inference tasks — mining already has its model.
-        let _ = tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await;
         match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v2)).await {
-            Ok(Ok(())) => info!("Model files ready (legacy + uncensored) — OPoI inference available."),
+            Ok(Ok(())) => info!("Model files ready (uncensored lineup) — OPoI inference available."),
             Ok(Err(e)) => warn!("Model prefetch failed — AiRequest tasks will be skipped: {}", e),
             Err(e) => warn!("Model prefetch task panicked — AiRequest tasks will be skipped: {}", e),
         }
