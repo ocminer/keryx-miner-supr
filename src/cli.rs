@@ -9,10 +9,18 @@ pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
 
     #[clap(
+        long = "very-light",
+        help = "Model tier: Qwen3-1.7B-abliterated — 4 GB+ GPU, smallest tier (PoM tier 0, post-H2)",
+        help_heading = "OPoI / Inference",
+        conflicts_with_all = &["light", "high", "very_high", "tier"]
+    )]
+    pub very_light: bool,
+
+    #[clap(
         long = "light",
         help = "Model tier: Gemma-3-4B — any GPU (6 GB+ VRAM)",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["high", "very_high"]
+        conflicts_with_all = &["very_light", "high", "very_high"]
     )]
     pub light: bool,
 
@@ -20,24 +28,24 @@ pub struct Opt {
         long = "high",
         help = "Model tier: Qwen3-32B — RTX 3090 / 4090 (24 GB+)",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["light", "very_high"]
+        conflicts_with_all = &["very_light", "light", "very_high"]
     )]
     pub high: bool,
 
     #[clap(
         long = "very-high",
-        help = "Model tier: Llama-3.3-70B — RTX 5090 / 48 GB+",
+        help = "Model tier: Llama-3.3-70B (Q2_K_L post-H2) — RTX 5090 / 32 GB+",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["light", "high", "tier"]
+        conflicts_with_all = &["very_light", "light", "high", "tier"]
     )]
     pub very_high: bool,
 
     #[clap(
         long = "tier",
         value_name = "TIER",
-        help = "Model tier: auto | light | default | high | very-high. DEFAULT (no flag) is 'auto' — picks the LARGEST tier that fits the GPU's VRAM (per-process) AND is downloaded = highest tier reward. Pass a name to pin a tier; overrides --light/--high/--very-high.",
+        help = "Model tier: auto | very-light | light | default | high | very-high. DEFAULT (no flag) is 'auto' — picks the LARGEST tier that fits the GPU's VRAM (per-process) AND is downloaded = highest tier reward. Pass a name to pin a tier; overrides --very-light/--light/--high/--very-high.",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["light", "high", "very_high"]
+        conflicts_with_all = &["very_light", "light", "high", "very_high"]
     )]
     pub tier: Option<String>,
 

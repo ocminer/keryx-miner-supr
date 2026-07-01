@@ -280,6 +280,10 @@ fn select_tier_nvidia(opt: &cli::Opt) -> keryx_miner::models::Tier {
         let t = raw.trim().to_ascii_lowercase();
         match t.as_str() {
             "auto" => return select_tier_auto(),
+            "very-light" | "verylight" | "very_light" => {
+                info!("--tier very-light: smallest tier — mines Qwen3-1.7B under PoM (post-H2).");
+                return Tier::VeryLight;
+            }
             "light" => {
                 info!("--tier light: baseline tier — mines Gemma-3-4B under PoM.");
                 return Tier::Light;
@@ -316,6 +320,9 @@ fn select_tier_nvidia(opt: &cli::Opt) -> keryx_miner::models::Tier {
     } else if opt.light {
         info!("--light mode: baseline tier — mines Gemma-3-4B under PoM.");
         Tier::Light
+    } else if opt.very_light {
+        info!("--very-light mode: smallest tier — mines Qwen3-1.7B under PoM (post-H2).");
+        Tier::VeryLight
     } else {
         // No tier flag given at all → AUTO is the default: pick the largest tier that fits this
         // GPU's VRAM (per-process) and is already on disk. Heavier model = higher PoM tier reward
@@ -346,7 +353,7 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
         vram_mb,
         picked.pom_model_name(),
         picked,
-        models::pom_tier_index(&picked.pom_spec().model_id).unwrap_or(0),
+        models::pom_tier_index(&picked.pom_spec().model_id, models::VERY_LIGHT_ACTIVATION_DAA).unwrap_or(0),
         need,
         AUTO_TIER_HEADROOM_MB,
     );
@@ -374,7 +381,7 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
                  ({} will download in the background; restart to use it.)",
                 tier.pom_model_name(),
                 tier,
-                models::pom_tier_index(&tier.pom_spec().model_id).unwrap_or(0),
+                models::pom_tier_index(&tier.pom_spec().model_id, models::VERY_LIGHT_ACTIVATION_DAA).unwrap_or(0),
                 picked.pom_model_name(),
             );
             return tier;
@@ -681,7 +688,7 @@ async fn main() -> Result<(), Error> {
     let pom_spec = specs_v2
         .iter()
         .copied()
-        .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id).is_some())
+        .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id, keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA).is_some())
         .max_by_key(|s| s.min_vram_mb);
     keryx_miner::slm::set_v2_lineup(specs_v2);
     keryx_miner::slm::init_supported(specs_v1);
@@ -725,7 +732,7 @@ async fn main() -> Result<(), Error> {
     // with zero-dup VRAM sharing.
     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
     if let Some(spec) = pom_spec {
-        let tier_idx = keryx_miner::models::pom_tier_index(&spec.model_id).expect("pom_spec has a tier");
+        let tier_idx = keryx_miner::models::pom_tier_index(&spec.model_id, keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA).expect("pom_spec has a tier");
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         // PoM PASSTHROUGH live test (KERYX_POM_PASSTHROUGH): build the HOST possession index in the
         // background so kHeavyHash shares can carry a PomProof (daemon stores it pre-fork). Heavy

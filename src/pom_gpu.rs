@@ -263,7 +263,9 @@ fn ensure_installed_inner() -> bool {
             }
             return false;
         }
-        let tier = match crate::models::pom_tier_index(model_id) {
+        // H2 is a frozen frontier the network is permanently past → stamp the post-H2 tier index
+        // (Gemma=1, …). MUST match keryxd's POM_TIERS_H2 or the block is rejected (BadWeightPath).
+        let tier = match crate::models::pom_tier_index(model_id, crate::models::VERY_LIGHT_ACTIVATION_DAA) {
             Some(t) => t,
             None => return false,
         };
