@@ -977,22 +977,44 @@ pub fn set_cpu_inference(on: bool) {
     }
 }
 
-/// CUDA ordinal to place OPoI inference on: the GPU with the MOST total VRAM. On a MIXED rig the
-/// big card serves inference (resident model + zero-dup shared walk) while the small cards just
-/// walk — instead of hardcoding device 0, which OOMs when index 0 is an 8 GB card (e.g. rig08's
-/// `[3070, 3070, 5080, 5080]`). Queried once via `nvidia-smi`; the index == the CUDA ordinal
-/// because the miner runs with `CUDA_DEVICE_ORDER=PCI_BUS_ID` (both order by PCI bus). If that
-/// GPU still can't serve inference, `load_engine` flips to CPU (emergency fallback) via the probe.
+/// `--no-shared-inference`: force OPoI inference onto THIS process's own walk GPU instead of the
+/// globally-biggest card. Set from the CLI (see `inference_gpu_ordinal`).
+static NO_SHARED_INFERENCE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_no_shared_inference(v: bool) {
+    NO_SHARED_INFERENCE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// CUDA ordinal to place OPoI inference on.
+///
+/// The tricky case is MANY per-GPU processes (one `--cuda-device N` process per card, each a
+/// separate "system" with its own wallet). Steering every such process's inference to one global
+/// "biggest" card piles N inference models onto that single GPU (and, if the card isn't even
+/// visible to a `CUDA_VISIBLE_DEVICES`-scoped process, `new_cuda` fails) — starving the walk that
+/// also runs there. So the rule is:
+///   • `KERYX_INFERENCE_GPU` env or `--no-shared-inference` → this process's OWN walk GPU.
+///   • exactly ONE walk device (a per-GPU process) → that device (self-contained, no cross-card pile-up).
+///   • MORE THAN ONE walk device (a single process mining all GPUs) → the biggest card (the original
+///     mixed-rig optimization: resident model + zero-dup shared walk on the big card).
+/// `walk_devices()` = the CUDA ordinals this process's PoM walk is installed on (its `--cuda-device`
+/// set). Ordinal == CUDA ordinal because the miner runs with `CUDA_DEVICE_ORDER=PCI_BUS_ID`. If the
+/// chosen GPU still can't serve inference, `load_engine` flips to CPU (emergency fallback).
 pub fn inference_gpu_ordinal() -> usize {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static ORD: AtomicUsize = AtomicUsize::new(usize::MAX);
-    let cached = ORD.load(Ordering::Relaxed);
-    if cached != usize::MAX {
-        return cached;
+    if let Ok(s) = std::env::var("KERYX_INFERENCE_GPU") {
+        if let Ok(n) = s.trim().parse::<usize>() {
+            return n;
+        }
     }
-    let ord = biggest_cuda_gpu().unwrap_or(0);
-    ORD.store(ord, Ordering::Relaxed);
-    ord
+    let walk = crate::pom_gpu::walk_devices();
+    if NO_SHARED_INFERENCE.load(std::sync::atomic::Ordering::Relaxed) {
+        return walk.first().copied().map(|d| d as usize).unwrap_or(0);
+    }
+    match walk.len() {
+        1 => walk[0] as usize,
+        n if n > 1 => biggest_cuda_gpu().unwrap_or(walk[0] as usize),
+        // Walk not installed yet (inference before the first PoM job) — best effort, not cached.
+        _ => biggest_cuda_gpu().unwrap_or(0),
+    }
 }
 
 /// The CUDA ordinal (nvidia-smi index, PCI-bus order) with the largest `memory.total`. `None` if

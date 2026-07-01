@@ -184,6 +184,18 @@ fn miners() -> &'static Mutex<HashMap<u32, Arc<PomGpuMiner>>> {
     MINERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// CUDA ordinals this process's PoM walk is installed on (its `--cuda-device` set), ascending.
+/// Empty until the first PoM-active job installs a miner. Used to place OPoI inference on the
+/// process's OWN card(s) instead of a global "biggest" GPU — see `slm::inference_gpu_ordinal`.
+pub fn walk_devices() -> Vec<u32> {
+    let mut v: Vec<u32> = miners()
+        .lock()
+        .map(|g| g.keys().copied().collect())
+        .unwrap_or_default();
+    v.sort_unstable();
+    v
+}
+
 // Guards the one-time shared host index build. All workers may race into PoM activation, but the
 // heavy GGUF -> WeightIndex build must happen exactly once for the process.
 fn index_build_lock() -> &'static Mutex<()> {
