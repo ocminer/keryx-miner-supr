@@ -909,7 +909,7 @@ mod tests {
         assert_eq!(idx.n_chunks, 77_604_776, "Gemma-3-4B tier N must be 77,604,776");
         assert_eq!(idx.r_t, pinned_rt, "R_T must match the node-pinned Gemma root 846caa40…");
         // Search side: candle-CUDA gather miner (dedicated load — no inference coupling).
-        let gm = crate::pom_gpu::PomGpuMiner::load(&path).expect("load candle-CUDA gather");
+        let gm = crate::pom_gpu::PomGpuMiner::load(&path, 0).expect("load candle-CUDA gather");
         assert_eq!(gm.n_chunks(), idx.n_chunks, "GPU gather N must equal the proof-side index N");
         let pph = blake(b"gpu-real-e2e-cuda");
         let time = 1_700_000_000u64;
@@ -955,7 +955,7 @@ mod tests {
         ];
         assert_eq!(idx.n_chunks, 617_380_448, "Qwen3-32B tier N must be 617,380,448");
         assert_eq!(idx.r_t, pinned_rt, "R_T must match the node-pinned Qwen3-32B root e2aa6659…");
-        let gm = crate::pom_gpu::PomGpuMiner::load(&path).expect("load candle-CUDA gather (Qwen3)");
+        let gm = crate::pom_gpu::PomGpuMiner::load(&path, 0).expect("load candle-CUDA gather (Qwen3)");
         assert_eq!(gm.n_chunks(), idx.n_chunks, "GPU gather N must equal the proof-side index N");
         let pph = blake(b"gpu-real-e2e-qwen3");
         let time = 1_700_000_000u64;
