@@ -418,12 +418,93 @@ pub struct WeightIndex {
     tree_path: PathBuf,
     /// Per level: (byte offset of the level in `tree_file`, node count).
     level_offsets: Vec<(u64, u64)>,
+    /// True for the SHARED, cached possession tree (`pom-tree.bin`, one per model dir, reused across
+    /// every per-GPU process AND across restarts). Such a tree must NOT be deleted on drop — other
+    /// live workers `pread` the same inode and the next restart reuses it. Only a PRIVATE per-process
+    /// fallback tree (or a synthetic test tree) is `persistent = false` and cleaned up on drop.
+    persistent: bool,
 }
 
 impl Drop for WeightIndex {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.tree_path);
+        if !self.persistent {
+            let _ = std::fs::remove_file(&self.tree_path);
+        }
     }
+}
+
+/// On-disk sidecar next to the shared `pom-tree.bin` — the authoritative, builder-written metadata
+/// a reusing process needs to reconstruct a byte-identical `WeightIndex` WITHOUT rebuilding. Its
+/// presence is the build-completion sentinel. Flattened `(u64,u64)` pairs keep the borsh wire simple.
+#[derive(BorshSerialize, BorshDeserialize)]
+struct PomTreeMeta {
+    version: u32,
+    /// GGUF length + mtime — if either differs from the live file, the cache is stale → rebuild.
+    gguf_len: u64,
+    gguf_mtime: i64,
+    n_chunks: u64,
+    r_t: [u8; 32],
+    /// Flattened `ChunkSource::Gguf` table: (first-chunk index, gguf byte offset) pairs.
+    table: Vec<u64>,
+    /// Flattened `level_offsets`: (level byte offset, node count) pairs.
+    level_offsets: Vec<u64>,
+}
+
+const POM_TREE_CACHE_VERSION: u32 = 1;
+
+/// A build lock older than this with no published tree is treated as abandoned (a crashed builder).
+const POM_TREE_LOCK_STALE_SECS: u64 = 90 * 60;
+
+fn pom_tree_mtime_secs(md: &std::fs::Metadata) -> i64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn pom_tree_lock_is_stale(lock_path: &std::path::Path) -> bool {
+    std::fs::metadata(lock_path)
+        .ok()
+        .and_then(|md| md.modified().ok())
+        .and_then(|t| t.elapsed().ok())
+        .map(|e| e > std::time::Duration::from_secs(POM_TREE_LOCK_STALE_SECS))
+        .unwrap_or(false)
+}
+
+/// Write the meta sentinel (atomically, via a temp + rename) AFTER the tree is fully on disk.
+fn write_pom_tree_meta(
+    meta_path: &std::path::Path,
+    gguf_path: &str,
+    idx: &WeightIndex,
+    table: &[(u64, u64)],
+) -> std::io::Result<()> {
+    let gm = std::fs::metadata(gguf_path)?;
+    let mut tflat = Vec::with_capacity(table.len() * 2);
+    for &(a, b) in table {
+        tflat.push(a);
+        tflat.push(b);
+    }
+    let mut lflat = Vec::with_capacity(idx.level_offsets.len() * 2);
+    for &(a, b) in &idx.level_offsets {
+        lflat.push(a);
+        lflat.push(b);
+    }
+    let meta = PomTreeMeta {
+        version: POM_TREE_CACHE_VERSION,
+        gguf_len: gm.len(),
+        gguf_mtime: pom_tree_mtime_secs(&gm),
+        n_chunks: idx.n_chunks,
+        r_t: idx.r_t,
+        table: tflat,
+        level_offsets: lflat,
+    };
+    let bytes = borsh::to_vec(&meta)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let tmp = meta_path.with_extension("meta.tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, meta_path)?; // atomic publish
+    Ok(())
 }
 
 /// Remove `pom-tree-<pid>.bin` files in `dir` left by miner processes that are no longer running.
@@ -457,17 +538,91 @@ impl WeightIndex {
     /// bytes — the same the miner serves in VRAM and the builder pinned in `R_T`. The Merkle tree
     /// is streamed to a temp file next to the GGUF (disk, never tmpfs) so big tiers don't OOM.
     pub fn build_from_gguf(path: &str) -> candle_core::Result<Self> {
+        let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
+        let cache_path = dir.join("pom-tree.bin");
+        let meta_path = dir.join("pom-tree.meta");
+        let lock_path = dir.join("pom-tree.lock");
+        // Sweep pre-0.6.5.3 per-PID orphans (~5 GB each); the shared cache below has no PID in its name.
+        sweep_dead_pom_trees(dir);
+
+        // FAST PATH: a valid shared cache already exists (built by another per-GPU process, or a
+        // previous run). Reuse it read-only — ONE physical copy shared via the OS page cache across
+        // all GPUs, and NO rebuild on restart. (Was: pom-tree-<PID>.bin = one identical copy + a full
+        // rebuild PER process PER restart → N× host RAM, which OOM'd the 4th GPU under WSL's cap.)
+        if let Some(idx) = Self::reuse_cached_tree(&cache_path, &meta_path, path) {
+            log::info!("PoM: reusing cached possession tree {} — shared across GPUs, no rebuild.", cache_path.display());
+            return Ok(idx);
+        }
+
+        // BUILD PATH: exactly ONE process builds; the rest wait. std has no flock, but `create_new`
+        // (O_EXCL) is an atomic cross-process lock on every platform incl. WSL. Losers spin on the
+        // meta sentinel; a crashed builder's lock goes stale and is stolen; a wedged build (or a
+        // read-only dir) falls back to a PRIVATE per-process tree so the miner never hangs.
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(POM_TREE_LOCK_STALE_SECS);
+        loop {
+            if let Some(idx) = Self::reuse_cached_tree(&cache_path, &meta_path, path) {
+                log::info!("PoM: cached possession tree became available — reusing (no rebuild).");
+                return Ok(idx);
+            }
+            match OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+                Ok(mut lock) => {
+                    let _ = writeln!(lock, "{}", std::process::id());
+                    log::info!("PoM: building shared possession tree (first GPU to reach PoM) — this can take a while…");
+                    let tmp = dir.join("pom-tree.bin.building");
+                    let out = match Self::build_tree_to(path, tmp.clone(), true) {
+                        Ok((mut idx, table)) => match std::fs::rename(&tmp, &cache_path) {
+                            Ok(()) => {
+                                idx.tree_path = cache_path.clone();
+                                if let Err(e) = write_pom_tree_meta(&meta_path, path, &idx, &table) {
+                                    log::warn!("PoM: tree built but meta sidecar write failed ({e}); other GPUs will rebuild.");
+                                }
+                                Ok(idx)
+                            }
+                            Err(e) => {
+                                // Couldn't publish (e.g. Windows sharing) — keep it as a private tree.
+                                log::warn!("PoM: could not publish shared tree ({e}); using a private per-process tree.");
+                                idx.persistent = false;
+                                Ok(idx)
+                            }
+                        },
+                        Err(e) => Err(e),
+                    };
+                    let _ = std::fs::remove_file(&lock_path);
+                    return out;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if pom_tree_lock_is_stale(&lock_path) {
+                        log::warn!("PoM: stealing stale possession-tree build lock (previous builder crashed).");
+                        let _ = std::fs::remove_file(&lock_path);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        log::warn!("PoM: shared tree not ready in time — building a private per-process tree.");
+                        let tp = dir.join(format!("pom-tree-{}.bin", std::process::id()));
+                        return Self::build_tree_to(path, tp, false).map(|(idx, _)| idx);
+                    }
+                    std::thread::sleep(Duration::from_millis(750));
+                }
+                Err(e) => {
+                    log::warn!("PoM: cannot create tree lock ({e}) — building a private per-process tree.");
+                    let tp = dir.join(format!("pom-tree-{}.bin", std::process::id()));
+                    return Self::build_tree_to(path, tp, false).map(|(idx, _)| idx);
+                }
+            }
+        }
+    }
+
+    /// Build the possession tree at `tree_path` (the heavy GGUF→leaves→tree pass). Returns the index
+    /// plus a snapshot of the chunk `table` (for the meta sidecar). `persistent` controls Drop.
+    fn build_tree_to(path: &str, tree_path: PathBuf, persistent: bool) -> candle_core::Result<(Self, Vec<(u64, u64)>)> {
         let device = Device::Cpu;
         let mut file = File::open(path).map_err(candle_core::Error::wrap)?;
         let content = gguf_file::Content::read(&mut file)?;
         let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
         names.sort(); // canonical order
 
-        // Tree temp file next to the GGUF (disk-backed; /tmp may be tmpfs = RAM).
-        let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
-        let tree_path = dir.join(format!("pom-tree-{}.bin", std::process::id()));
-        let _ = std::fs::remove_file(&tree_path); // clear a stale file from a crashed run
-        sweep_dead_pom_trees(dir); // delete ~5 GB orphan trees left by previously killed/crashed miners
+        let _ = std::fs::remove_file(&tree_path); // clear a stale/partial file from a crashed run
         let mut writer = BufWriter::new(
             OpenOptions::new().read(true).write(true).create(true).truncate(true)
                 .open(&tree_path).map_err(candle_core::Error::wrap)?,
@@ -496,9 +651,56 @@ impl WeightIndex {
             return Err(candle_core::Error::Msg("PoM: model produced 0 chunks".into()));
         }
 
+        let table_snapshot = table.clone();
         // Independent read-only handle for on-demand chunk preads (the build handle is consumed).
         let gguf = File::open(path).map_err(candle_core::Error::wrap)?;
-        finalize_disk_tree(writer, tree_path, n_chunks, ChunkSource::Gguf { file: gguf, table })
+        let mut idx = finalize_disk_tree(writer, tree_path, n_chunks, ChunkSource::Gguf { file: gguf, table })?;
+        idx.persistent = persistent;
+        Ok((idx, table_snapshot))
+    }
+
+    /// Reconstruct a byte-identical `WeightIndex` from an existing shared cache + meta sidecar, or
+    /// `None` if the cache is absent/stale/corrupt (→ caller rebuilds). Validated FOUR ways: cache
+    /// version, GGUF length+mtime, tree-file size, and the on-disk root hash == the meta's `r_t`.
+    fn reuse_cached_tree(cache_path: &std::path::Path, meta_path: &std::path::Path, gguf_path: &str) -> Option<Self> {
+        let bytes = std::fs::read(meta_path).ok()?;
+        let meta = PomTreeMeta::try_from_slice(&bytes).ok()?;
+        if meta.version != POM_TREE_CACHE_VERSION {
+            return None;
+        }
+        let gm = std::fs::metadata(gguf_path).ok()?;
+        if gm.len() != meta.gguf_len || pom_tree_mtime_secs(&gm) != meta.gguf_mtime {
+            return None; // model changed under the cache → rebuild
+        }
+        if meta.table.len() % 2 != 0 || meta.level_offsets.len() % 2 != 0 || meta.level_offsets.is_empty() {
+            return None;
+        }
+        let level_offsets: Vec<(u64, u64)> = meta.level_offsets.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+        let table: Vec<(u64, u64)> = meta.table.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+        let (root_off, root_cnt) = *level_offsets.last()?;
+        if root_cnt != 1 {
+            return None;
+        }
+        let cm = std::fs::metadata(cache_path).ok()?;
+        if cm.len() < root_off + 32 {
+            return None; // truncated/incomplete tree
+        }
+        let tree_file = File::open(cache_path).ok()?;
+        let mut root = [0u8; 32];
+        read_exact_at(&tree_file, &mut root, root_off).ok()?;
+        if root != meta.r_t {
+            return None; // integrity mismatch — never mine on a corrupt tree
+        }
+        let gguf = File::open(gguf_path).ok()?;
+        Some(WeightIndex {
+            n_chunks: meta.n_chunks,
+            r_t: meta.r_t,
+            chunks: ChunkSource::Gguf { file: gguf, table },
+            tree_file,
+            tree_path: cache_path.to_path_buf(),
+            level_offsets,
+            persistent: true,
+        })
     }
 
     /// 32 B chunk at canonical index `off` (panics if out of range — `off < n_chunks`).
@@ -580,7 +782,9 @@ fn finalize_disk_tree(
     let mut r_t = [0u8; 32];
     read_exact_at(&tree_file, &mut r_t, root_off).map_err(candle_core::Error::wrap)?;
 
-    Ok(WeightIndex { n_chunks, r_t, chunks, tree_file, tree_path, level_offsets })
+    // `persistent = false` by default: a private/test tree, cleaned on drop. `build_from_gguf`
+    // flips it to true for the SHARED cache so that tree survives for other GPUs + restarts.
+    Ok(WeightIndex { n_chunks, r_t, chunks, tree_file, tree_path, level_offsets, persistent: false })
 }
 
 /// PoM possession activation DAA score — MUST match the node's `pom_activation`.

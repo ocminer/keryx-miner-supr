@@ -57,6 +57,13 @@ pub struct Opt {
     pub cpu_inference: bool,
 
     #[clap(
+        long = "no-shared-inference",
+        help = "Bind OPoI inference to THIS process's own --cuda-device GPU instead of the globally-biggest card. Use when running one process per GPU (separate wallets/workers): it stops every process piling inference onto one shared card. Auto-on for a single-GPU process.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub no_shared_inference: bool,
+
+    #[clap(
         long = "ipfs-url",
         help = "IPFS Kubo API URL for uploading inference results",
         help_heading = "OPoI / Inference",

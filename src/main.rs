@@ -811,6 +811,11 @@ async fn main() -> Result<(), Error> {
         // Explicit operator opt-out: force OPoI inference onto the CPU for the whole session.
         keryx_miner::slm::set_cpu_inference(true);
     }
+    if opt.no_shared_inference {
+        // One process per GPU: keep inference on this process's own card (no global-biggest pile-up).
+        info!("--no-shared-inference: OPoI inference will run on this process's own --cuda-device GPU.");
+        keryx_miner::slm::set_no_shared_inference(true);
+    }
     if opt.cpu_inference || keryx_miner::slm::cpu_inference_enabled() {
         info!("CPU inference mode — skipping the GPU/cuBLAS probe (OPoI inference runs on the CPU).");
     } else {
