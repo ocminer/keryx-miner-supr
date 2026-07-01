@@ -1005,7 +1005,15 @@ pub fn inference_gpu_ordinal() -> usize {
             return n;
         }
     }
+    // `pom_gpu` (the CUDA walk driver) only exists on the pom-cuda build. On non-CUDA builds
+    // (default, and AMD/pom-opencl which places inference via llama_vulkan/KERYX_LLAMA_VK_DEVICE)
+    // there are no CUDA walk devices, so fall back to an empty set → ordinal 0 (never used at
+    // runtime there: cpu_inference_enabled()/llama_vulkan take over). Fixes the v0.6.5.3 non-CUDA
+    // build break (slm.rs referenced crate::pom_gpu unconditionally).
+    #[cfg(feature = "pom-cuda")]
     let walk = crate::pom_gpu::walk_devices();
+    #[cfg(not(feature = "pom-cuda"))]
+    let walk: Vec<u32> = Vec::new();
     if NO_SHARED_INFERENCE.load(std::sync::atomic::Ordering::Relaxed) {
         return walk.first().copied().map(|d| d as usize).unwrap_or(0);
     }
