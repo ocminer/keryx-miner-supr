@@ -977,13 +977,57 @@ pub fn set_cpu_inference(on: bool) {
     }
 }
 
-/// Device for OPoI inference: `Device::Cpu` when `cpu_inference_enabled()` (AMD/OpenCL build),
-/// else CUDA device 0 (NVIDIA). Single chokepoint for the 3 inference sites.
+/// CUDA ordinal to place OPoI inference on: the GPU with the MOST total VRAM. On a MIXED rig the
+/// big card serves inference (resident model + zero-dup shared walk) while the small cards just
+/// walk — instead of hardcoding device 0, which OOMs when index 0 is an 8 GB card (e.g. rig08's
+/// `[3070, 3070, 5080, 5080]`). Queried once via `nvidia-smi`; the index == the CUDA ordinal
+/// because the miner runs with `CUDA_DEVICE_ORDER=PCI_BUS_ID` (both order by PCI bus). If that
+/// GPU still can't serve inference, `load_engine` flips to CPU (emergency fallback) via the probe.
+pub fn inference_gpu_ordinal() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static ORD: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let cached = ORD.load(Ordering::Relaxed);
+    if cached != usize::MAX {
+        return cached;
+    }
+    let ord = biggest_cuda_gpu().unwrap_or(0);
+    ORD.store(ord, Ordering::Relaxed);
+    ord
+}
+
+/// The CUDA ordinal (nvidia-smi index, PCI-bus order) with the largest `memory.total`. `None` if
+/// nvidia-smi is unavailable/unparseable → caller defaults to 0. Ties resolve to the lowest index.
+fn biggest_cuda_gpu() -> Option<usize> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut best: Option<(usize, u64)> = None;
+    for (i, line) in text.lines().enumerate() {
+        if let Ok(mib) = line.trim().parse::<u64>() {
+            if best.map_or(true, |(_, m)| mib > m) {
+                best = Some((i, mib));
+            }
+        }
+    }
+    let (ord, _) = best?;
+    if ord != 0 {
+        log::info!("OPoI inference will run on CUDA:{} (largest-VRAM GPU); other GPUs mine PoM only.", ord);
+    }
+    Some(ord)
+}
+
+/// Device for OPoI inference: `Device::Cpu` when `cpu_inference_enabled()` (emergency fallback /
+/// AMD build), else the largest-VRAM CUDA GPU (NVIDIA). Single chokepoint for the inference sites.
 fn inference_device() -> candle_core::Result<Device> {
     if cpu_inference_enabled() {
         Ok(Device::Cpu)
     } else {
-        Device::new_cuda(0)
+        Device::new_cuda(inference_gpu_ordinal())
     }
 }
 
@@ -1192,9 +1236,10 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             // weights so this model fits. Mining rebuilds (reloads its model) when it next runs.
             // (pom-cuda only — the OpenCL/AMD PoM miner has its own buffer, no candle-shared VRAM.)
             #[cfg(feature = "pom-cuda")]
-            crate::pom_gpu::uninstall();
+            crate::pom_gpu::uninstall(inference_gpu_ordinal() as u32);
             *guard = None;
-            log::info!("SlmEngine: inference device active ({})", if cpu_inference_enabled() { "CPU" } else { "CUDA:0" });
+            let dev_str = if cpu_inference_enabled() { "CPU".to_string() } else { format!("CUDA:{}", inference_gpu_ordinal()) };
+            log::info!("SlmEngine: inference device active ({})", dev_str);
             // Loads on CUDA, and auto-falls-back to CPU (warning + set_cpu_inference) if the GPU
             // model load fails (wrong-arch PTX / OOM / old driver) — never crashes the miner.
             match load_engine_with_fallback(spec) {

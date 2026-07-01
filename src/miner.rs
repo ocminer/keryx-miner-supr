@@ -342,20 +342,49 @@ impl MinerManager {
                     // build the proof (host) and submit; the legacy plugin path below is skipped.
                     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
                     if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::activation_daa()) {
-                        let (pph, time, target_le) = {
+                        let (pph, time, target_le, daa) = {
                             let s = state.as_ref().unwrap();
                             let mut pph = [0u8; 32];
                             pph.copy_from_slice(&s.pow_hash_header[0..32]);
-                            (pph, u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap()), s.target.to_le_bytes())
+                            (pph, u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap()), s.target.to_le_bytes(), s.daa_score)
                         };
-                        if !pom_driver::is_installed() {
-                            let _ = pom_driver::ensure_installed();
-                        }
-                        let found = pom_driver::mine(&pph, time, &target_le, pom_nonce, POM_BATCH);
+                        // NVIDIA: per-device PoM. Each GPU thread builds + walks its OWN device's
+                        // blob (upstream's per-device MINERS map) so no-flag multi-GPU works without
+                        // CUDA_VISIBLE_DEVICES. Device id = the worker's `#N (name)` label.
+                        #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+                        let found = {
+                            let wdid = gpu_work.id().strip_prefix('#')
+                                .and_then(|s| s.split_whitespace().next())
+                                .and_then(|s| s.parse::<u32>().ok())
+                                .unwrap_or(0);
+                            if !pom_driver::is_installed(wdid) {
+                                pom_driver::ensure_installed(wdid, daa);
+                            }
+                            pom_driver::mine(wdid, &pph, time, &target_le, pom_nonce, POM_BATCH)
+                        };
+                        // AMD: the thread is already bound to its card (bind_thread_device), so the
+                        // deviceless OpenCL API is per-GPU via thread-local binding.
+                        #[cfg(feature = "pom-opencl")]
+                        let found = {
+                            let _ = daa;
+                            if !pom_driver::is_installed() {
+                                let _ = pom_driver::ensure_installed();
+                            }
+                            pom_driver::mine(&pph, time, &target_le, pom_nonce, POM_BATCH)
+                        };
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         if let Some(nonce) = found {
+                            // NVIDIA: recompute the PoM tier per block (H2-boundary correct).
+                            #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+                            let built = state.as_ref().and_then(|s| {
+                                keryx_miner::pom::active_index().and_then(|(idx, _)| {
+                                    let tier = keryx_miner::pom_gpu::current_tier(s.daa_score)?;
+                                    s.generate_block_if_pom(nonce, idx, tier)
+                                })
+                            });
+                            #[cfg(feature = "pom-opencl")]
                             let built = state.as_ref().and_then(|s| {
                                 keryx_miner::pom::active_index().and_then(|(idx, tier)| s.generate_block_if_pom(nonce, idx, *tier))
                             });
