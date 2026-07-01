@@ -40,6 +40,14 @@ docker run --rm \
            target-hiveos-legacy/release/.fingerprint/candle-kernels-* \
            target-hiveos-legacy/release/deps/*candle_kernels* 2>/dev/null || true
 
+    # Dynamic build first (binary + CUDA/OpenCL plugins) — needed for the generic-Linux package.
+    echo "=== dynamic build (binary + plugins) ==="
+    cargo build --release --features pom-cuda
+    cp target-hiveos-legacy/release/keryx-miner-supr /src/hiveos/dist-legacy/keryx-miner-supr-dynamic
+    cp target-hiveos-legacy/release/libkeryxcuda.so target-hiveos-legacy/release/libkeryxopencl.so /src/hiveos/dist-legacy/
+
+    # Static build (single self-contained binary) — used for HiveOS/SMOS/mmpOS packages.
+    echo "=== static build (single binary) ==="
     cargo build --release --features static-cuda,pom-cuda
 
     cp target-hiveos-legacy/release/keryx-miner-supr /src/hiveos/dist-legacy/
