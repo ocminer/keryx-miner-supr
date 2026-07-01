@@ -27,9 +27,17 @@ args="-a ${CUSTOM_TEMPLATE} -s ${url}"
 # Pass the flight-sheet password to the POOL via --pool-password (NOT -p, which is --port).
 [[ -n "$CUSTOM_PASS" ]] && args="$args --pool-password ${CUSTOM_PASS}"
 
-# Default tier is --light (TinyLlama only) unless the user overrides in extra args.
+# Tier selection: honour whatever tier flag the user put in extra args. Recognise EVERY tier flag
+# (--very-light, --light, --high, --very-high, and the --tier <name> form). Only if NONE is present
+# do we prepend the default. The old check knew only --light/--high/--very-high, so selecting
+# --very-light or --tier <x> in the flight sheet got a spurious "--light" prepended -> clap conflict
+# (--light conflicts_with the others) -> the miner aborted. NB: the AMD/OpenCL build forces --light
+# internally regardless, but the flag must still parse cleanly to avoid the abort.
 extra="$CUSTOM_USER_CONFIG"
-[[ "$extra" == *"--light"* || "$extra" == *"--high"* || "$extra" == *"--very-high"* ]] || extra="--light $extra"
+case " $extra " in
+  *" --very-light "*|*" --light "*|*" --high "*|*" --very-high "*|*" --tier "*|*" --tier="*) : ;;  # tier chosen
+  *) extra="--light $extra" ;;   # default: --light (Gemma-3-4B) — the lightest mining tier
+esac
 
 args="$args ${extra}"
 
