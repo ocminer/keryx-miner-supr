@@ -681,8 +681,13 @@ async fn main() -> Result<(), Error> {
     // lineups for this tier, each VRAM-filtered (capability gate), so the chain crossing H hot-swaps
     // without a restart: legacy (daa<H) served now, uncensored (daa>=H) swapped in at H.
     let specs_v1 = filter_specs_by_vram(keryx_miner::models::specs_for(0, tier));
+    // Stage the FINAL (post-H2) lineup: `specs_for` is DAA-gated, and H2 (VERY_LIGHT_ACTIVATION_DAA)
+    // is a frozen frontier the network is permanently past. Using OPOI_V2_ACTIVATION_DAA (pre-H2)
+    // wrongly staged `--very-light` as Gemma (pre-H2 fallback) instead of Qwen3-1.7B, and
+    // `--very-high` as the 48 GB Q4 instead of the 32 GB-servable Q2_K_L. Must match the mining
+    // model (`Tier::pom_spec`) and the node's `POM_TIERS_H2`.
     let specs_v2 = filter_specs_by_vram(
-        keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
+        keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, tier),
     );
     // PoM: the highest-VRAM v2 model with a pinned R_T is the tier this GPU proves possession of.
     let pom_spec = specs_v2
