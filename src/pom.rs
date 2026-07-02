@@ -507,6 +507,26 @@ fn write_pom_tree_meta(
     Ok(())
 }
 
+/// Best-effort free bytes on the filesystem holding `dir`. UNIX only, via POSIX `df -kP` (available
+/// on HiveOS, SMOS, mmpOS, WSL, plain Linux). `None` → callers SKIP the disk pre-check rather than
+/// block a build. Deliberately no libc/statvfs dependency, and NOT attempted on Windows (no `df`
+/// there — the native Windows build returns `None` and behaves exactly as before).
+#[cfg(unix)]
+fn available_disk_bytes(dir: &std::path::Path) -> Option<u64> {
+    let out = std::process::Command::new("df").arg("-kP").arg(dir).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // POSIX `-P` = exactly one line per filesystem; column 4 = available 1K-blocks.
+    let avail_kb: u64 = text.lines().last()?.split_whitespace().nth(3)?.parse().ok()?;
+    Some(avail_kb.saturating_mul(1024))
+}
+#[cfg(not(unix))]
+fn available_disk_bytes(_dir: &std::path::Path) -> Option<u64> {
+    None // Windows/other: no `df`; skip the pre-check (a real ENOSPC still surfaces at write time).
+}
+
 /// Remove `pom-tree-<pid>.bin` files in `dir` left by miner processes that are no longer running.
 /// A clean exit deletes the tree via `Drop`, but a `kill -9` / crash / ENOSPC skips that, leaving
 /// ~5 GB orphans that accumulate across restarts. This sweeps only DEAD-pid files (own pid + any
@@ -621,6 +641,27 @@ impl WeightIndex {
         let content = gguf_file::Content::read(&mut file)?;
         let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
         names.sort(); // canonical order
+
+        // DISK PRE-CHECK: the possession tree is ~2× the model's size and is written NEXT TO the GGUF.
+        // On a too-small disk (e.g. a HiveOS system SSD, or a 32 GB WSL disk trying `--very-high`) the
+        // build would fill the disk, ENOSPC, and get retried every job — surfacing only as endless
+        // "Workers stalled". Refuse UP FRONT with an actionable message instead. Best-effort: if free
+        // space can't be queried (Windows, odd FS) we skip the check and just build.
+        let gguf_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let tree_dir = tree_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        if let Some(avail) = available_disk_bytes(tree_dir) {
+            // Tree ≈ 2× the chunked GGUF bytes (measured); +1 GB for finalize/rounding headroom.
+            let need = gguf_len.saturating_mul(2).saturating_add(1 << 30);
+            if avail < need {
+                return Err(candle_core::Error::Msg(format!(
+                    "not enough free disk to build the PoM possession tree: it needs ~{} GB free next \
+                     to the model, but only ~{} GB is available on that filesystem. Free up disk or run \
+                     a smaller --tier (e.g. --light or --tier default).",
+                    need / (1 << 30),
+                    avail / (1 << 30),
+                )));
+            }
+        }
 
         let _ = std::fs::remove_file(&tree_path); // clear a stale/partial file from a crashed run
         let mut writer = BufWriter::new(
