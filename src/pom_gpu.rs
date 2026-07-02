@@ -343,7 +343,18 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                     crate::pom::set_index(idx, tier);
                 }
                 Err(e) => {
-                    log::error!("PoM: shared host index build failed on gpu{}: {}", device_id, e);
+                    // The build is retried on every job while the index is missing (e.g. disk too
+                    // small for the tree). Rate-limit the log to ~once/5 min so the actionable reason
+                    // (like the disk pre-check message) is visible without flooding the log.
+                    static LAST_LOG_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if now.saturating_sub(LAST_LOG_SECS.load(Ordering::Relaxed)) >= 300 {
+                        LAST_LOG_SECS.store(now, Ordering::Relaxed);
+                        log::error!("PoM: possession-index build failed on gpu{}: {} (retrying each job; this message is rate-limited to ~5 min).", device_id, e);
+                    }
                     return false;
                 }
             }

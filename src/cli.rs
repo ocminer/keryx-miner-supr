@@ -26,7 +26,7 @@ pub struct Opt {
 
     #[clap(
         long = "high",
-        help = "Model tier: Qwen3-32B — RTX 3090 / 4090 (24 GB+)",
+        help = "Model tier: Qwen3-32B — RTX 3090 / 4090 (24 GB+ VRAM) + ~60 GB free disk (model + possession tree)",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very_light", "light", "very_high"]
     )]
@@ -34,7 +34,7 @@ pub struct Opt {
 
     #[clap(
         long = "very-high",
-        help = "Model tier: Llama-3.3-70B (Q2_K_L post-H2) — RTX 5090 / 32 GB+",
+        help = "Model tier: Llama-3.3-70B (Q2_K_L post-H2) — RTX 5090 / 32 GB+ VRAM + ~85 GB free disk (model + possession tree)",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very_light", "light", "high", "tier"]
     )]
