@@ -877,6 +877,51 @@ async fn main() -> Result<(), Error> {
     const RECONNECT_MAX: Duration = Duration::from_secs(30);
     const HEALTHY_SESSION: Duration = Duration::from_secs(60);
     let mut backoff = RECONNECT_MIN;
+
+    // Independent WEDGE SUPERVISOR. The stratum job-watchdog lives INSIDE listen()'s select loop, so
+    // a listen() that BLOCKS on a hung `handle_message().await` (e.g. a stalled GPU worker
+    // back-pressuring the job-dispatch channel) freezes it too — the reconnect loop below never
+    // re-iterates and no watchdog can fire. This task is FULLY independent of the stratum loop and
+    // the walk threads: it watches the accepted-share counter and, if it stops advancing for
+    // KERYX_STALL_RESTART_SECS while mining is expected, exits (code 75) so the wrapper (HiveOS
+    // agent / systemd Restart=always / external watchdog) relaunches a fresh process — which also
+    // resets any wedged CUDA workers. Keying on the FINAL output (accepted shares) catches every
+    // wedge class. Arms only AFTER the first accepted share, so model download / pre-activation /
+    // brief OPoI inference pauses never trip it.
+    {
+        let stall_secs: u64 = std::env::var("KERYX_STALL_RESTART_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n >= 60)
+            .unwrap_or(600);
+        tokio::spawn(async move {
+            let mut last_acc: u64 = 0;
+            let mut last_change = Instant::now();
+            let mut armed = false;
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                let stats = match crate::client::stratum::share_stats() {
+                    Some(s) => s,
+                    None => continue, // client not connected yet
+                };
+                let acc = stats.accepted.load(std::sync::atomic::Ordering::SeqCst);
+                if acc > last_acc {
+                    last_acc = acc;
+                    last_change = Instant::now();
+                    armed = true;
+                } else if armed && last_change.elapsed() >= Duration::from_secs(stall_secs) {
+                    error!(
+                        "WEDGE SUPERVISOR: no accepted share for {}s while mining — the miner is stuck; \
+                         exiting (code 75) so the wrapper relaunches it and resets stuck workers.",
+                        stall_secs
+                    );
+                    std::process::exit(75);
+                }
+            }
+        });
+    }
+
     loop {
         let started = Instant::now();
         match client_main(&opt, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone()).await {
