@@ -240,12 +240,37 @@ impl Client for StratumHandler {
             .filter(|&n| n > 0)
             .unwrap_or(120);
         let idle_timeout = Duration::from_secs(idle_secs);
+        //   3. JOB watchdog — the idle_timeout above resets on ANY pool message (vardiff,
+        //      keepalives, share ACKs), so a connection that keeps chattering but stops delivering
+        //      block templates wedges the miner (GPUs idle, zero accepted shares) WITHOUT tripping
+        //      it. Observed live: a rig ran ~15 h "alive" at 0 % GPU while the pool sent no jobs and
+        //      the hashrate counter kept ticking. `block_template_ctr` advances on every MiningNotify;
+        //      if it stops advancing for this long, force a reconnect. Env: KERYX_POOL_JOB_TIMEOUT.
+        let job_secs: u64 = std::env::var("KERYX_POOL_JOB_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(300);
+        let job_ctr = self.block_template_ctr.clone();
+        let mut last_ctr = job_ctr.load(Ordering::SeqCst);
+        let mut last_job_at = std::time::Instant::now();
+        let mut job_watch = tokio::time::interval(Duration::from_secs(30));
+        job_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let conn_dead = self.conn_dead.clone();
         loop {
             tokio::select! {
                 biased;
                 _ = conn_dead.notified() => {
                     return Err("pool connection write side died (submit failed) — reconnecting".into());
+                }
+                _ = job_watch.tick() => {
+                    let now_ctr = job_ctr.load(Ordering::SeqCst);
+                    if now_ctr != last_ctr {
+                        last_ctr = now_ctr;
+                        last_job_at = std::time::Instant::now();
+                    } else if last_job_at.elapsed() >= Duration::from_secs(job_secs) {
+                        return Err(format!("no new job for {}s (pool connection delivering no work) — reconnecting", job_secs).into());
+                    }
                 }
                 res = tokio::time::timeout(idle_timeout, self.stream.try_next()) => {
                     match res {
