@@ -113,6 +113,13 @@ pub struct Opt {
     #[clap(short = 's', long = "keryxd-address", default_value = "127.0.0.1", help = "The IP of the keryxd instance")]
     pub keryxd_address: String,
 
+    #[clap(
+        long = "backup-pool",
+        value_name = "URL",
+        help = "Backup/failover pool as a full URL (stratum+tcp://host:port). Repeatable — pass it multiple times to define a PRIORITY LIST tried in the order given. If the primary (-s) fails hard (no job for ~90s or the connection drops), the miner fails over to the next pool; in the background it keeps probing higher-priority pools and switches back as soon as one recovers. Uses the same wallet/password as -s. OFF entirely unless at least one is set."
+    )]
+    pub backup_pool: Vec<String>,
+
     #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22211]")]
     port: Option<u16>,
 
