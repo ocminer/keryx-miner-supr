@@ -92,6 +92,33 @@ pub fn share_stats() -> Option<Arc<ShareStats>> {
     SHARE_STATS.get().cloned()
 }
 
+// ── Multi-pool failover (opt-in; ALL of this is inert unless a --backup-pool is configured) ──
+// The failover monitor / failback prober (in main) set DESIRED_POOL; the reconnect loop stamps
+// ACTIVE_POOL to the index it is about to serve. `listen()` polls a slow ticker and, if failover is
+// enabled AND ACTIVE != DESIRED, returns cleanly so the loop reconnects to the new target. With no
+// backup, FAILOVER_ENABLED stays false and this path is never taken → behaviour is unchanged.
+static FAILOVER_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ACTIVE_POOL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DESIRED_POOL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_failover_enabled(on: bool) {
+    FAILOVER_ENABLED.store(on, Ordering::Relaxed);
+}
+pub fn set_active_pool(i: usize) {
+    ACTIVE_POOL.store(i, Ordering::Relaxed);
+}
+pub fn desired_pool() -> usize {
+    DESIRED_POOL.load(Ordering::Relaxed)
+}
+pub fn set_desired_pool(i: usize) {
+    DESIRED_POOL.store(i, Ordering::Relaxed);
+}
+/// True when the failover controller wants a different pool than the one `listen()` is serving.
+fn pool_switch_requested() -> bool {
+    FAILOVER_ENABLED.load(Ordering::Relaxed)
+        && ACTIVE_POOL.load(Ordering::Relaxed) != DESIRED_POOL.load(Ordering::Relaxed)
+}
+
 impl Display for ShareStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -256,12 +283,21 @@ impl Client for StratumHandler {
         let mut last_job_at = std::time::Instant::now();
         let mut job_watch = tokio::time::interval(Duration::from_secs(30));
         job_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Failover switch check (opt-in): a slow ticker that returns cleanly if the failover
+        // controller has picked a different pool. No-op when no backup is configured (inert flag).
+        let mut switch_watch = tokio::time::interval(Duration::from_secs(3));
+        switch_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let conn_dead = self.conn_dead.clone();
         loop {
             tokio::select! {
                 biased;
                 _ = conn_dead.notified() => {
                     return Err("pool connection write side died (submit failed) — reconnecting".into());
+                }
+                _ = switch_watch.tick() => {
+                    if pool_switch_requested() {
+                        return Err("failover: switching to a different pool".into());
+                    }
                 }
                 _ = job_watch.tick() => {
                     let now_ctr = job_ctr.load(Ordering::SeqCst);

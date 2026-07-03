@@ -437,6 +437,7 @@ async fn get_client(
 
 async fn client_main(
     opt: &Opt,
+    pool_address: String,
     block_template_ctr: Arc<AtomicU16>,
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
@@ -445,7 +446,7 @@ async fn client_main(
     tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url)).await.ok();
 
     let mut client = get_client(
-        opt.keryxd_address.clone(),
+        pool_address,
         opt.mining_address.clone().unwrap_or_default(),
         opt.pool_password.clone(),
         opt.mine_when_not_synced,
@@ -922,9 +923,120 @@ async fn main() -> Result<(), Error> {
         });
     }
 
+    // ── POOL FAILOVER (opt-in) ─────────────────────────────────────────────────────────────────
+    // Priority list: index 0 = primary (-s), then each --backup-pool in the order given. With no
+    // backup the list is length 1 and ALL of the failover machinery below is skipped → the reconnect
+    // loop behaves exactly as before. `desired_pool()` (a global, default 0) is the single source of
+    // truth for which pool to serve; the loop follows it, and two background tasks steer it:
+    //   • failover monitor  — no job (block_template_ctr frozen) for FAILOVER_AFTER on the current
+    //                          pool → step DOWN to the next pool in the list.
+    //   • failback prober   — while off the primary, TCP-probe higher-priority pools and step UP to
+    //                          the highest one that's reachable again (with anti-flap backoff).
+    // A stalled/dead current pool also surfaces as client_main returning Err (drop / job-watchdog);
+    // both the monitor's step-down and the prober's step-up just move `desired_pool`, and the
+    // loop + listen()'s switch-check reconnect to it. Only the primary is failed back TO the top.
+    let pools: Vec<String> = {
+        let mut v = vec![opt.keryxd_address.clone()];
+        v.extend(opt.backup_pool.iter().cloned());
+        v
+    };
+    if pools.len() > 1 {
+        crate::client::stratum::set_failover_enabled(true);
+        let failover_after: u64 = std::env::var("KERYX_FAILOVER_AFTER_SECS")
+            .ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 30).unwrap_or(90);
+        let grace: u64 = std::env::var("KERYX_FAILBACK_GRACE_SECS")
+            .ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 10).unwrap_or(60);
+        let probe_secs: u64 = std::env::var("KERYX_FAILBACK_PROBE_SECS")
+            .ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 10).unwrap_or(30);
+        info!(
+            "Pool failover ENABLED — primary + {} backup(s): {:?}. Failover after {}s no-job; failback grace {}s.",
+            pools.len() - 1, pools, failover_after, grace
+        );
+
+        // FAILOVER MONITOR — steps DOWN the list when the current pool delivers no jobs.
+        {
+            let ctr = block_template_ctr.clone();
+            let n = pools.len();
+            let pools_dbg = pools.clone();
+            tokio::spawn(async move {
+                let mut last_ctr = ctr.load(std::sync::atomic::Ordering::SeqCst);
+                let mut last_job = Instant::now();
+                let mut tick = tokio::time::interval(Duration::from_secs(10));
+                loop {
+                    tick.tick().await;
+                    let c = ctr.load(std::sync::atomic::Ordering::SeqCst);
+                    if c != last_ctr {
+                        last_ctr = c;
+                        last_job = Instant::now();
+                    } else if last_job.elapsed() >= Duration::from_secs(failover_after) {
+                        let cur = crate::client::stratum::desired_pool();
+                        if cur + 1 < n {
+                            let next = cur + 1;
+                            warn!("FAILOVER: pool[{}] ({}) delivered no jobs for {}s → switching to pool[{}] ({}).",
+                                cur, pools_dbg[cur], failover_after, next, pools_dbg[next]);
+                            crate::client::stratum::set_desired_pool(next);
+                        }
+                        last_job = Instant::now(); // give the (new) pool a fresh window
+                    }
+                }
+            });
+        }
+
+        // FAILBACK PROBER — while off the primary, TCP-probe higher-priority pools and step UP to
+        // the highest reachable one. Anti-flap: if a switch-up gets bounced back quickly (pool
+        // reachable but jobless), back off exponentially before re-probing that far up again.
+        {
+            let pools = pools.clone();
+            tokio::spawn(async move {
+                let max_backoff = 900u64; // cap re-probe backoff at 15 min
+                let mut backoff = grace; // first probe after the grace period
+                loop {
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    let cur = crate::client::stratum::desired_pool();
+                    if cur == 0 {
+                        backoff = probe_secs; // already on primary — nothing to fail back to
+                        continue;
+                    }
+                    // probe higher-priority pools (0..cur) in order; switch to the first reachable.
+                    let mut switched_to: Option<usize> = None;
+                    for i in 0..cur {
+                        if tcp_pool_reachable(&pools[i], Duration::from_secs(10)).await {
+                            warn!("FAILBACK: higher-priority pool[{}] ({}) is reachable — switching back up.", i, pools[i]);
+                            crate::client::stratum::set_desired_pool(i);
+                            switched_to = Some(i);
+                            break;
+                        }
+                    }
+                    match switched_to {
+                        Some(i) => {
+                            // Verify it sticks: if the failover monitor bounces us back off pool i
+                            // within ~2 min (reachable but jobless), grow the backoff; else reset.
+                            tokio::time::sleep(Duration::from_secs(120)).await;
+                            if crate::client::stratum::desired_pool() <= i {
+                                backoff = probe_secs; // stuck on i or higher — healthy failback
+                            } else {
+                                backoff = (backoff * 2).min(max_backoff); // bounced → back off
+                                warn!("FAILBACK: pool[{}] was reachable but not delivering jobs — backing off {}s before retrying.", i, backoff);
+                            }
+                        }
+                        None => backoff = (backoff.max(probe_secs) * 2).min(max_backoff),
+                    }
+                }
+            });
+        }
+    }
+
     loop {
         let started = Instant::now();
-        match client_main(&opt, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone()).await {
+        // Serve whichever pool the failover controller currently wants (index 0 = primary when no
+        // failover). Stamp ACTIVE_POOL so listen()'s switch-check matches until a task changes it.
+        let target = crate::client::stratum::desired_pool().min(pools.len() - 1);
+        crate::client::stratum::set_active_pool(target);
+        let pool_address = pools[target].clone();
+        if pools.len() > 1 {
+            info!("Mining pool target: pool[{}] {}", target, pool_address);
+        }
+        match client_main(&opt, pool_address, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone()).await {
             Ok(_) => info!("Client closed gracefully"),
             Err(e) => error!("Client closed with error {:?}", e),
         }
@@ -933,8 +1045,25 @@ async fn main() -> Result<(), Error> {
         if started.elapsed() >= HEALTHY_SESSION {
             backoff = RECONNECT_MIN;
         }
+        // A failover/failback SWITCH (the controller picked a different pool) is NOT a failure of
+        // the new target — reconnect to it immediately instead of waiting out the escalated backoff
+        // that accumulated while the old pool was down. Keeps switches snappy (no long idle gap).
+        if crate::client::stratum::desired_pool().min(pools.len().saturating_sub(1)) != target {
+            backoff = RECONNECT_MIN;
+        }
         info!("Client closed, reconnecting in {}s", backoff.as_secs());
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(RECONNECT_MAX);
     }
+}
+
+/// Best-effort TCP reachability probe of a `stratum+tcp://host:port` (or bare host:port) pool URL —
+/// used by the failback prober to decide whether a higher-priority pool has recovered, WITHOUT
+/// touching the active mining connection or its globals. Just a connect within `timeout`.
+async fn tcp_pool_reachable(url: &str, timeout: Duration) -> bool {
+    let addr = url.split_once("://").map(|(_, a)| a).unwrap_or(url);
+    matches!(
+        tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
 }
