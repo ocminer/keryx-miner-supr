@@ -55,6 +55,10 @@ MMN="${NAME}-${LABEL}"
 MM="$S/mm/${MMN}-mmpos_${VER}"; mkdir -p "$MM"
 cp "$MPKG"/mmp-external.conf "$MPKG"/mmp-launch.sh "$MPKG"/mmp-stats.sh "$MM/"
 sed -i -e "s|^EXTERNAL_NAME=.*|EXTERNAL_NAME=\"${MMN}\"|" -e "s|^EXTERNAL_VERSION=.*|EXTERNAL_VERSION=\"${VER}\"|" "$MM/mmp-external.conf"
+# Keep the stats reporter's NAME in step with EXTERNAL_NAME (the line-suffixed name), so the
+# fallback log-parse path reports the same miner name the package is installed under. The AMD
+# mmpOS package keeps these consistent; this brings the per-line NVIDIA packages in line.
+sed -i -e "s|^NAME=.*|NAME=\"${MMN}\"|" "$MM/mmp-stats.sh"
 cp "$D/keryx-miner-supr" "$MM/"; mklib "$MM"; chmod +x "$MM"/keryx-miner-supr "$MM"/*.sh
 tar -czf "$D/${MMN}-mmpos_${VER}.tar.gz" -C "$S/mm" "${MMN}-mmpos_${VER}"
 
