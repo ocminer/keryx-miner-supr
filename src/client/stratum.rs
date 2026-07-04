@@ -154,6 +154,14 @@ impl Display for ShareStats {
 /// PoM proof). Remembering the last real daa lets `Short` inherit it so PoM still activates.
 static LAST_DAA_SCORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Set when the pool authoritatively tells us the PoM hardfork is active (it rejected a share with
+/// "pom proof required (hardfork active)"). This only happens if the pool feeds us plain `Short`
+/// notifies (no daa_score) so our activation gate never fired and we submitted proofless kHeavyHash
+/// shares. Trust the pool: once set, `Short` jobs floor daa at the current frontier
+/// (VERY_LIGHT_ACTIVATION_DAA) so `daa >= activation_daa()` holds AND the post-H2 tier is stamped —
+/// the next job builds a real PoM proof instead of looping on rejects forever.
+static POOL_FORCED_POM: AtomicBool = AtomicBool::new(false);
+
 #[allow(dead_code)]
 pub struct StratumHandler {
     log_handler: JoinHandle<()>,
@@ -697,8 +705,19 @@ impl StratumHandler {
                                     // Post-relaunch the chain is on SALT v4. Inherit the last
                                     // real daa (from WithTask/ShortV2) so post-fork PoM still
                                     // activates on Short-only pools; floor at SALT-v4 era.
-                                    daa_score: LAST_DAA_SCORE.load(std::sync::atomic::Ordering::Relaxed)
-                                        .max(crate::pow::heavy_hash::POW_SALT_V4_ACTIVATION_DAA),
+                                    daa_score: {
+                                        let base = LAST_DAA_SCORE.load(std::sync::atomic::Ordering::Relaxed)
+                                            .max(crate::pow::heavy_hash::POW_SALT_V4_ACTIVATION_DAA);
+                                        // If the pool told us the fork is active (POOL_FORCED_POM),
+                                        // floor at the current frontier so daa >= activation_daa()
+                                        // AND the post-H2 tier is stamped — otherwise a Short-only
+                                        // pool never lifts us over the activation gate.
+                                        if POOL_FORCED_POM.load(std::sync::atomic::Ordering::Relaxed) {
+                                            base.max(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA)
+                                        } else {
+                                            base
+                                        }
+                                    },
                                     nonce: 0,
                                     target: self.target_pool,
                                     nonce_mask: self.nonce_mask,
@@ -756,8 +775,29 @@ impl StratumHandler {
                         Ok(())
                     }
                     ErrorCode::Unauthorized => {
-                        error!("Got error code {}: {}", code, error);
-                        Err(error.into())
+                        // Distinguish a genuine auth failure (bad wallet/worker) from the pool
+                        // signalling the PoM hardfork: "Unauthorized: pom proof required (hardfork
+                        // active)" means the pool is post-fork and requires a proof on every share,
+                        // but we were submitting proofless kHeavyHash shares — i.e. this connection
+                        // only ever delivered plain `Short` notifies (no daa_score), so our gate
+                        // never fired. Trust the pool as the authority on fork state: force PoM
+                        // activation and STAY connected so the next job attaches a proof, instead of
+                        // returning Err (which tears down the connection into a reconnect loop).
+                        let low = error.to_string().to_lowercase();
+                        if low.contains("pom") || low.contains("hardfork") {
+                            if !POOL_FORCED_POM.swap(true, Ordering::SeqCst) {
+                                warn!(
+                                    "Pool requires a PoM proof (hardfork active): '{}'. This connection sent no daa_score \
+                                     (Short-only notifies) so PoM never activated and we submitted proofless shares. \
+                                     Forcing PoM activation for this session — the next job will build a real proof.",
+                                    error
+                                );
+                            }
+                            Ok(())
+                        } else {
+                            error!("Got error code {}: {}", code, error);
+                            Err(error.into())
+                        }
                     }
                     ErrorCode::NotSubscribed => {
                         error!("Got error code {}: {}", code, error);
