@@ -65,7 +65,17 @@ jobs:
 
       - name: Build binary + OpenCL plugin
         shell: pwsh
-        run: cargo build --release --target $env:TARGET -p keryx-miner-supr -p keryxopencl
+        # --features pom-opencl is REQUIRED on the binary — without it the whole Proof-of-Model
+        # path is #[cfg]'d out of keryx-miner-supr, so the Windows AMD binary can only mine legacy
+        # kHeavyHash and submits PROOFLESS shares post-fork ("pom proof required (hardfork
+        # active)"). The Linux AMD build (hiveos/build-amd-glibc.sh) passes it; Windows must too.
+        # Build the plugin and the binary as SEPARATE commands (mirrors the Linux script): the
+        # keryxopencl plugin has no `pom-opencl` feature, so passing it alongside -p keryxopencl
+        # would fail ("package does not contain this feature"). pom_opencl.rs is portable and
+        # OpenCL.lib is already on LIB via the vcpkg step above.
+        run: |
+          cargo build --release --target $env:TARGET -p keryxopencl
+          cargo build --release --target $env:TARGET --features pom-opencl -p keryx-miner-supr
 
       - name: Stage artifact
         shell: pwsh
