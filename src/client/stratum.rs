@@ -723,7 +723,14 @@ impl StratumHandler {
                 error: Some(StratumError(code, error, _)),
                 ..
             } => {
-                let jobid = { self.shares_stats.shares_pending.try_lock().unwrap().remove(&id) }.unwrap();
+                // An errored StratumResult does NOT always correspond to a pending share: some pools
+                // (observed on suprnova krx after a stale/duplicate worker session) return an error
+                // result for a setup message (subscribe/authorize) whose id was never a submitted
+                // share. The old `.remove(&id).unwrap()` panicked the whole miner in that case —
+                // which, with failover enabled, could also crash on an unexpected reply from a backup
+                // pool. Treat the job id as optional and never panic; the match on `code` below still
+                // returns Err for Unauthorized/NotSubscribed so the reconnect/failover path fires.
+                let jobid = { self.shares_stats.shares_pending.try_lock().unwrap().remove(&id) };
                 match code {
                     ErrorCode::Unknown => {
                         // Match solo-mining behaviour (grpc.rs SubmitBlockResponse): a rejected
