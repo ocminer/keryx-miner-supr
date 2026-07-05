@@ -37,13 +37,15 @@ jobs:
             target/
           key: ${{ runner.os }}-metal-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      # Compiles the whole binary with the Metal PoM backend (candle-core/metal + objc2-metal +
-      # the pom_gpu_metal module). This alone proves the cfg-gated addition builds on Apple Silicon.
+      # Compiles our binary with the Metal PoM backend (candle-core/metal + objc2-metal + the
+      # pom_gpu_metal module). Scoped to `-p keryx-miner-supr`: the workspace also contains the
+      # plugins/cuda member (cudarc → find_cuda_helper), which can't build on a CUDA-less macOS
+      # runner and isn't part of the Metal build anyway.
       - name: Build (release, pom-metal)
-        run: cargo build --release --features pom-metal --bin keryx-miner-supr
+        run: cargo build --release -p keryx-miner-supr --features pom-metal --bin keryx-miner-supr
 
       # Byte-exact gate: the Metal walk winner MUST equal the pom.rs CPU reference over a synthetic
-      # blob. Runs on the runner's Metal GPU. If a runner ever lacks Metal compute this fails loudly
-      # rather than silently skipping — final authority is a `cargo test` on a real Mac.
+      # blob. Runs on the runner's Metal GPU. `-p keryx-miner-supr` keeps the CUDA/OpenCL plugin
+      # members out of the test build. Final authority is a `cargo test` on a real Mac.
       - name: Byte-exact Metal walk test
-        run: cargo test --release --features pom-metal --lib pom_gpu_metal -- --nocapture
+        run: cargo test --release -p keryx-miner-supr --features pom-metal --lib pom_gpu_metal -- --nocapture
