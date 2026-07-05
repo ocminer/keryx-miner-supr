@@ -28,7 +28,7 @@ Numbers below are the **`--light` (Gemma-3-4B)** tier unless noted.
 
 | GPU | Architecture | VRAM | Mem clock | Core clock | Power (mining) | Hashrate | Efficiency | Notes |
 |-----|--------------|------|-----------|------------|----------------|----------|------------|-------|
-| **NVIDIA H200 141GB** | Hopper (2023, datacenter) | 141 GB HBM3e | 3201 MHz | ~1980 MHz | ~410 W (of 700; cap-able) | **~170 MH/s** (bench ceiling; v0.6.8 128-bit loads) | ~0.41 MH/W | **fastest PoM card** — HBM3e ~4.8 TB/s, +35 % over H100. Memory-bound → cap power, no core-clock gain |
+| **NVIDIA H200 141GB** | Hopper (2023, datacenter) | 141 GB HBM3e | 3201 MHz | ~1980 MHz | ~628 W (of 700; cap-able) | **~166 MH/s** live (bench ceiling ~170; v0.6.8 128-bit loads) | ~0.26 MH/W | **fastest PoM card** — HBM3e ~4.8 TB/s, +32 % over H100. Memory-bound (98 % util) → cap power, no core-clock gain |
 | **NVIDIA H100 80GB** | Hopper (2022, datacenter) | 80 GB HBM3 | 2619 MHz (fixed) | ~1650 MHz | **400 W** (cap; see below) | **~123 MH/s** (ceiling 125.6) | 0.31 MH/W | ~2× a 5090. Cap PL to 400 W = 0 loss, −30 % power |
 | NVIDIA RTX 5090 | Blackwell (2025) | 32 GB GDDR7 | 13801 MHz | up to 3090 MHz | ~385 W (of 600 W PL) | ~65–68 MH/s | 0.18 MH/W | memory-bound; core-clock-insensitive, no gain from OC |
 | NVIDIA RTX 5080 | Blackwell (2025) | 16 GB GDDR7 | — | — | ~360 W PL (self-limits) | ~34.6 MH/s | — | |
