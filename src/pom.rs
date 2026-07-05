@@ -1084,6 +1084,27 @@ pub fn is_level_activation_overridden() -> bool {
 }
 static LEVEL_ACTIVATION_DAA: OnceLock<u64> = OnceLock::new();
 
+/// AUTO-SWITCH: is this block at/after the H3 gate? Decided per job from the block's `daa_score`,
+/// so an already-running miner flips to the post-fork PoM convention (H3-salted folds) on the first
+/// job past the gate — no restart, no model reload (the salt changes only the seed/pow folds, not
+/// the weights/tier/R_T). Logs ONCE the moment it first crosses so the switch is visible. This is
+/// what lets miners update now and just leave it running across the fork.
+pub fn h3_active(daa_score: u64) -> bool {
+    let active = daa_score >= level_activation_daa();
+    if active {
+        static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::info!(
+                "H3 hardfork ACTIVE (block DAA {} >= gate {}): auto-switched to the post-fork PoM \
+                 convention (H3-salted folds). No action needed — keep mining.",
+                daa_score,
+                level_activation_daa()
+            );
+        }
+    }
+    active
+}
+
 /// PoM PASSTHROUGH live-test mode (`KERYX_POM_PASSTHROUGH=1`). When set, the miner keeps mining
 /// kHeavyHash (the only valid PoW pre-fork) but ALSO attaches a `PomProof` to each winning share so
 /// the wire envelope — stratum 6th param → pool passthrough → daemon `RpcRawBlock.body.pom_proof` —

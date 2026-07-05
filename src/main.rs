@@ -798,6 +798,17 @@ async fn main() -> Result<(), Error> {
             "PoM: configured for tier {} ({}); possession index + GPU walk load lazily at DAA {}.",
             tier_idx, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA
         );
+        info!(
+            "H3 hardfork: this build is H3-ready. It auto-switches to the post-fork PoM convention \
+             (salted folds) at DAA {} — no restart needed. Update now and leave it running.",
+            keryx_miner::pom::level_activation_daa()
+        );
+        if keryx_miner::pom::is_level_activation_overridden() {
+            warn!(
+                "PoM: H3 LEVEL-ACTIVATION DAA OVERRIDDEN to {} via KERYX_POM_LEVEL_ACTIVATION_DAA — staging/testing ONLY!",
+                keryx_miner::pom::level_activation_daa()
+            );
+        }
         if keryx_miner::pom::is_activation_overridden() {
             warn!(
                 "PoM: ACTIVATION DAA OVERRIDDEN to {} via KERYX_POM_ACTIVATION_DAA — staging/testing ONLY!",

@@ -355,10 +355,11 @@ impl MinerManager {
                             pph.copy_from_slice(&s.pow_hash_header[0..32]);
                             (pph, u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap()), s.target.to_le_bytes(), s.daa_score)
                         };
-                        // H3 gate: at/after POM_LEVEL_ACTIVATION_DAA the pph words feeding both PoM
-                        // folds are salted (POM_H3_PPH_SALT). The kernel is unchanged — the host
-                        // salts the words it uploads, so the same GPU search finds the H3-valid nonce.
-                        let h3 = daa >= keryx_miner::pom::level_activation_daa();
+                        // H3 gate (AUTO-SWITCH): at/after POM_LEVEL_ACTIVATION_DAA the pph words
+                        // feeding both PoM folds are salted (POM_H3_PPH_SALT). Decided per job from
+                        // the block's daa_score, so a running miner flips at the gate with no restart.
+                        // The kernel is unchanged — the host salts the words it uploads.
+                        let h3 = keryx_miner::pom::h3_active(daa);
                         // NVIDIA: per-device PoM. Each GPU thread builds + walks its OWN device's
                         // blob (upstream's per-device MINERS map) so no-flag multi-GPU works without
                         // CUDA_VISIBLE_DEVICES. Device id = the worker's `#N (name)` label.
