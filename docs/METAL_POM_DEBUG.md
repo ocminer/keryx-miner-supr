@@ -2,6 +2,34 @@
 
 **You are Claude Code running on an Apple-Silicon Mac (M2). Your job: make the Metal PoM miner produce VALID shares.** This document is self-contained — it assumes no prior conversation.
 
+## Update 2026-07-05 — on-device investigation result
+
+The bug described below (**"GPU walk disagrees with the host possession index"**) is **not present** on `feat/metal-h3` at commit `d966998`. Verified on an M2 against the real Gemma-3-4B GGUF with five exhaustive diagnostics (see `src/pom_gpu_metal.rs::tests`):
+
+1. Raw byte comparison for every one of the 444 tensors, at first/last/mid/second chunk (`buffer.contents()` vs `WeightIndex::read_chunk`): **0 mismatches**, N (metal cum) = N (host index) = 77 604 776.
+2. CPU-side `walk_final` over the GPU's own `buffer.contents()` for 5 nonces: **byte-identical** to `walk_final` over `WeightIndex::read_chunk`.
+3. Metal-kernel `walk_final` (via a new test-only `debug_walk_states` kernel) for 5 nonces: **byte-identical** to the host walk.
+4. Large-batch sweep — 4096 consecutive nonces in a single kernel dispatch: **0 disagreements**.
+5. `mine()` winner path with a target derived from a known nonce's real `pom_pow_value`: returns the correct lowest nonce.
+
+All five diagnostics also pass under **h3 = true** (the post-fork era) — the pph-salt plumbing is byte-exact.
+
+**Zero shares was a false negative.** In a 3.5-minute live run against `krx.suprnova.cc:4404` at vardiff-initial `d = 1.0`:
+- Hashrate: 838.86 KH/s (matches the ~0.8 MH/s figure in the doc).
+- Target: `0x00000000ffff0000…` → single-share probability ≈ 2⁻³².
+- Expected time-to-share at 840 KH/s = 2³² / 840 000 ≈ **85 minutes**.
+- P(0 shares in 3.5 min) = e^(−3.5/85) ≈ **0.96** — completely normal.
+
+To actually see shares on an M2, request static difficulty via the pool password (Suprnova takes `d=0.1` → ~8.5 min expected) or leave it running for an hour. If shares still don't submit after a long run, the bug is somewhere else (auth, subscribe, `active_index()`, `daa_score` gating), NOT in the Metal walk.
+
+Two permanent CI guards were added:
+- `metal_walk_matches_host_reference_multi_tensor` — 12-tensor synthetic byte-exact test, exercises the multi-buffer bindless path under both h3 eras (runs anywhere, no GGUF needed).
+- `metal_load_bytes_match_host_index_real_model` — the full on-device diagnostic against the real GGUF, gated by `KERYX_TEST_GGUF` and `#[ignore]`d so `cargo test` on a plain checkout still passes. Run with `KERYX_TEST_GGUF=/path/to/model.gguf cargo test --release --features pom-metal metal_load_bytes_match_host_index_real_model -- --ignored --nocapture`.
+
+The original brief follows unmodified for historical reference.
+
+---
+
 ## TL;DR of the bug
 
 Branch **`feat/metal-h3`** of `ocminer/keryx-miner-supr`. On macOS the miner now **loads the real Gemma-3-4B model onto the Metal GPU and runs the PoM walk** at a realistic hashrate (~0.8 MH/s on an M2) — but it finds **zero valid shares**. It is NOT idle; the walk executes. The problem: **the GPU walk computes a result that does not match the host possession index**, so every candidate nonce is rejected by the host self-check before submit. You must find *why the GPU walk reads/produces different data than the host index* and fix it.
