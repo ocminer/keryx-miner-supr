@@ -99,9 +99,38 @@ jobs:
           For NVIDIA GPUs, also drop keryxcuda.dll (from the windows-cuda artifact)
           into this folder.
 
-          Example:
-            keryx-miner-supr.exe -s stratum+tcp://krx.suprnova.cc:4401 -a <keryx-address>.<worker> --light
+          EASIEST START: open start.bat in Notepad, replace REPLACE_ME with your
+          keryx wallet address (and rename rig1 if you like), save, then just
+          double-click start.bat. It keeps the window open if the miner exits.
+
+          Example (manual):
+            keryx-miner-supr.exe -s stratum+tcp://krx.suprnova.cc:4404 -a <keryx-address>.<worker> --light
           "@ | Out-File -FilePath "$out\README-windows.txt" -Encoding utf8
+          @'
+          @echo off
+          setlocal
+          title Keryx Miner
+
+          REM ================================================================
+          REM  EDIT THE NEXT LINE: replace REPLACE_ME with YOUR keryx wallet
+          REM  address, and change rig1 to any worker name you like.
+          REM ================================================================
+          set WALLET=keryx:REPLACE_ME.rig1
+
+          set POOL=stratum+tcp://krx.suprnova.cc:4404
+
+          echo Starting keryx-miner-supr as %WALLET%
+          echo Pool: %POOL%
+          echo.
+          keryx-miner-supr.exe -a %WALLET% -s %POOL% --light
+
+          echo.
+          echo ================================================================
+          echo  The miner STOPPED or CRASHED - read the messages above for the
+          echo  reason. This window stays open on purpose. Press any key to close.
+          echo ================================================================
+          pause
+          '@ | Out-File -FilePath "$out\start.bat" -Encoding ascii
           Compress-Archive -Path "$out\*" -DestinationPath "keryx-miner-supr-windows-amd.zip" -Force
 
       - uses: actions/upload-artifact@v4
@@ -262,9 +291,38 @@ jobs:
           Requires an NVIDIA driver (R535+). Mines kHeavyHash pre-fork and
           auto-switches to PoM at the hardfork.
 
-          Example:
-            keryx-miner-supr.exe -s stratum+tcp://krx.suprnova.cc:4401 -a <keryx-address>.<worker> --light
+          EASIEST START: open start.bat in Notepad, replace REPLACE_ME with your
+          keryx wallet address (and rename rig1 if you like), save, then just
+          double-click start.bat. It keeps the window open if the miner exits.
+
+          Example (manual):
+            keryx-miner-supr.exe -s stratum+tcp://krx.suprnova.cc:4404 -a <keryx-address>.<worker> --light
           "@ | Out-File -FilePath "$out\README-nvidia-pom.txt" -Encoding utf8
+          @'
+          @echo off
+          setlocal
+          title Keryx Miner
+
+          REM ================================================================
+          REM  EDIT THE NEXT LINE: replace REPLACE_ME with YOUR keryx wallet
+          REM  address, and change rig1 to any worker name you like.
+          REM ================================================================
+          set WALLET=keryx:REPLACE_ME.rig1
+
+          set POOL=stratum+tcp://krx.suprnova.cc:4404
+
+          echo Starting keryx-miner-supr as %WALLET%
+          echo Pool: %POOL%
+          echo.
+          keryx-miner-supr.exe -a %WALLET% -s %POOL% --light
+
+          echo.
+          echo ================================================================
+          echo  The miner STOPPED or CRASHED - read the messages above for the
+          echo  reason. This window stays open on purpose. Press any key to close.
+          echo ================================================================
+          pause
+          '@ | Out-File -FilePath "$out\start.bat" -Encoding ascii
           Get-ChildItem $out | Format-Table Name,Length
           Compress-Archive -Path "$out\*" -DestinationPath "keryx-miner-supr-windows-nvidia-pom.zip" -Force
 
