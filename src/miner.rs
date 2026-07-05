@@ -311,10 +311,17 @@ impl MinerManager {
                 let mut state = None;
                 // PoM (post-fork): nonce cursor + per-launch batch. The kernel grinds the whole
                 // batch before returning, so blocks/sec is capped at hashrate / POM_BATCH.
+                //
+                // Batch sizing (H100 microbench, tools/h100/bench_pom.cu — the walk is memory-latency
+                // bound so a batch must supply enough waves to fill the memory pipeline AND amortize
+                // the per-launch host round-trip in the driver's mine()): 2^20=122.6, 2^21=124.4,
+                // 2^22=124.8, 2^24=125.2 MH/s on an H100. 2^22 captures ~all of the throughput while
+                // keeping the per-launch time modest (~33 ms on an H100, ~230 ms on a 3070) so job
+                // switching stays responsive. Bumped 2^20 -> 2^22.
                 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
                 let mut pom_nonce: u64 = thread_rng().next_u64();
                 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
-                const POM_BATCH: u64 = 1 << 20;
+                const POM_BATCH: u64 = 1 << 22;
                 // Driver seam: AMD = OpenCL, NVIDIA = candle-CUDA. Both expose the same interface
                 // (is_installed / ensure_installed / mine / set_mining_tier). OpenCL wins if both on.
                 #[cfg(feature = "pom-opencl")]
