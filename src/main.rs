@@ -794,6 +794,12 @@ async fn main() -> Result<(), Error> {
             keryx_miner::slm::set_pom_force_split(true);
             keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
         }
+        // Apple Silicon (Metal): record the mining tier (global). Phase 1 loads a standalone Metal
+        // walk (no inference VRAM sharing yet), so no `set_pom_force_split` here.
+        #[cfg(all(target_os = "macos", feature = "pom-metal", not(feature = "pom-opencl"), not(feature = "pom-cuda")))]
+        {
+            keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
+        }
         info!(
             "PoM: configured for tier {} ({}); possession index + GPU walk load lazily at DAA {}.",
             tier_idx, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA
