@@ -183,10 +183,11 @@ impl State {
                 let mut pph = [0u8; 32];
                 pph.copy_from_slice(&self.pow_hash_header[0..32]);
                 let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
-                let seed = pom::pom_block_seed(&pph, timestamp, nonce);
+                let h3 = self.daa_score >= pom::level_activation_daa();
+                let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3);
                 let proof = pom::build_proof(
                     *tier, &pph, nonce, seed, index.n_chunks, pom::POM_WALK_STEPS, pom::POM_OPENINGS,
-                    |o| index.read_chunk(o), |o| index.merkle_path(o),
+                    |o| index.read_chunk(o), |o| index.merkle_path(o), h3,
                 );
                 if let Ok(bytes) = borsh::to_vec(&proof) {
                     let n = bytes.len();
@@ -210,9 +211,14 @@ impl State {
         pph.copy_from_slice(&self.pow_hash_header[0..32]);
         let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
 
-        let seed = pom::pom_block_seed(&pph, timestamp, nonce);
+        // H3: at/after the block-level gate the pph words feeding BOTH PoM folds are salted
+        // (POM_H3_PPH_SALT, forced update). The proof carries the winning walk's `final_state`;
+        // for the pool (PartialBlock) path the pool fills the header `pomFinalState` from it on
+        // submitBlock (no solo header field is set here — our RpcBlock header has no such field).
+        let h3 = self.daa_score >= pom::level_activation_daa();
+        let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3);
         let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o));
-        if !pom::le_leq(&pom::pom_pow_value(final_state, &pph), &self.target.to_le_bytes()) {
+        if !pom::le_leq(&pom::pom_pow_value(final_state, &pph, h3), &self.target.to_le_bytes()) {
             return None;
         }
 
@@ -226,6 +232,7 @@ impl State {
             pom::POM_OPENINGS,
             |o| index.read_chunk(o),
             |o| index.merkle_path(o),
+            h3,
         );
         let bytes = borsh::to_vec(&proof).ok()?;
 
