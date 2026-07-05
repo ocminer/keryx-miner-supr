@@ -113,3 +113,33 @@ kernel void pom_mine(
         atomic_fetch_min_explicit(winner, tid, memory_order_relaxed);
     }
 }
+
+// Debug variant: runs the walk for each tid and writes the final `state` (not pow-folded)
+// to `states[tid]` so the host can compare against the CPU walk.
+kernel void pom_walk_states(
+    device   const ulong*        prefix       [[buffer(0)]],
+    device   const ulong*        tensor_addrs [[buffer(1)]],
+    constant const PomUniforms&  u            [[buffer(2)]],
+    device   ulong*              states       [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= u.n_nonces) return;
+    ulong nonce = u.nonce_base + (ulong)tid;
+    ulong state = pom_seed_fold(nonce, u.time_, u.p0, u.p1, u.p2, u.p3);
+    ulong off = state % u.n_total_chunks;
+    for (uint i = 0; i < u.k_steps; i++) {
+        uint idx = upper_bound_prefix(prefix, u.n_tensors, off);
+        ulong local = off - prefix[idx];
+        device const ulong* ptr =
+            reinterpret_cast<device const ulong*>(tensor_addrs[idx]);
+        ulong base = local * 4UL;
+        ulong h = state;
+        h ^= ptr[base + 0];
+        h ^= ptr[base + 1];
+        h ^= ptr[base + 2];
+        h ^= ptr[base + 3];
+        state = mix64(h);
+        off = state % u.n_total_chunks;
+    }
+    states[tid] = state;
+}
