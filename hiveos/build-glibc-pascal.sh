@@ -26,7 +26,7 @@ OUT="$REPO/hiveos/dist-pascal"
 rm -rf "$OUT"; mkdir -p "$OUT/lib"
 
 echo ">> PASCAL build in $IMAGE (CUDA 12.4, sm_60 PTX for GTX 10-series / P100) ..."
-docker run --rm \
+docker run --rm --network host \
   -v "$REPO":/src \
   -w /src \
   -e DEBIAN_FRONTEND=noninteractive \
