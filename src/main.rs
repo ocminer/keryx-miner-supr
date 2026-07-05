@@ -29,6 +29,8 @@ mod client;
 mod escrow;
 mod ipfs;
 mod keryxd_messages;
+#[cfg(all(target_os = "macos", feature = "pom-metal"))]
+mod metal_worker;
 mod miner;
 mod pow;
 mod target;
@@ -485,12 +487,29 @@ async fn main() -> Result<(), Error> {
     }
 
     // Dynamic plugin path (default): scan the binary's dir for libkeryx*.so,
-    // unless --disable-gpu was passed.
-    #[cfg(not(feature = "static-cuda"))]
+    // unless --disable-gpu was passed. Excluded on macOS+pom-metal (no .so plugins there — the
+    // Metal worker is built in below).
+    #[cfg(all(not(feature = "static-cuda"), not(all(target_os = "macos", feature = "pom-metal"))))]
     let plugins = if disable_gpu { Vec::new() } else { filter_plugins(path.to_str().unwrap_or(".")) };
-    #[cfg(not(feature = "static-cuda"))]
+    #[cfg(all(not(feature = "static-cuda"), not(all(target_os = "macos", feature = "pom-metal"))))]
     let (app, mut plugin_manager): (App, PluginManager) =
         keryx_miner::load_plugins(Opt::into_app(), &plugins)?;
+
+    // macOS (Apple Silicon): register the built-in Metal PoM worker. Without this the miner finds
+    // 0 workers and exits ("No workers specified"). --disable-gpu leaves a CPU-only miner.
+    #[cfg(all(target_os = "macos", feature = "pom-metal"))]
+    let plugins: Vec<String> =
+        if disable_gpu { Vec::new() } else { vec!["builtin:metal (Apple Silicon)".to_string()] };
+    #[cfg(all(target_os = "macos", feature = "pom-metal"))]
+    let (app, mut plugin_manager): (App, PluginManager) = {
+        let mut manager = PluginManager::new();
+        let app = if disable_gpu {
+            Opt::into_app()
+        } else {
+            manager.register_builtin(Opt::into_app(), Box::new(crate::metal_worker::MetalPlugin::new()), |a| a)
+        };
+        (app, manager)
+    };
 
     // Static-cuda single-binary build: the CUDA worker is compiled in, so
     // register it directly instead of dlopening a .so. (OpenCL is omitted.)
@@ -836,6 +855,11 @@ async fn main() -> Result<(), Error> {
     }
     if opt.cpu_inference || keryx_miner::slm::cpu_inference_enabled() {
         info!("CPU inference mode — skipping the GPU/cuBLAS probe (OPoI inference runs on the CPU).");
+    } else if cfg!(all(target_os = "macos", feature = "pom-metal")) {
+        // Apple Silicon: inference targets the Metal GPU (candle-metal), not cuBLAS — the cuBLAS
+        // probe is meaningless here. If candle-metal can't run this model, load_engine_with_fallback
+        // degrades to CPU on its own.
+        info!("Apple Silicon: OPoI inference targets the Metal GPU (auto-falls back to CPU if candle-metal can't run this model). Skipping the cuBLAS probe.");
     } else {
     info!("Probing GPU inference (cuBLAS) before mining…");
     match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
