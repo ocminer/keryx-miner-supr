@@ -9,8 +9,9 @@ in a blank. One row per card; keep it sorted roughly by hashrate.
 PoM is a **memory-latency / bandwidth-bound** algorithm — a data-dependent random walk over the model
 weights (a pointer-chase of 32-byte reads). What that means for you:
 
-- **Memory bandwidth is king.** HBM cards (H100, A100, CMP 170HX) punch far above their price for PoM;
-  the walk is limited by random-access memory throughput, not compute.
+- **Memory bandwidth is king.** HBM cards (H100, A100, CMP 170HX, AMD Instinct MI50/MI60) punch far above
+  their price for PoM; the walk is limited by random-access memory throughput, not compute. On AMD the HBM2
+  MI50/MI60 beat the GDDR6 RX 7600 XT ~1.4× for the same reason.
 - **Core clock and power barely matter.** The walk hides all compute behind memory latency, so a high
   core clock is wasted. On most cards the GPU **auto-downclocks** and already sits well under its power
   limit — you generally can't save much by capping it further, and you lose nothing by not overclocking.
@@ -23,7 +24,7 @@ weights (a pointer-chase of 32-byte reads). What that means for you:
 
 Numbers below are the **`--light` (Gemma-3-4B)** tier unless noted.
 
-## Per-card table (keryx PoM, `--light`)
+## Per-card table — NVIDIA (keryx PoM, `--light`)
 
 | GPU | Architecture | VRAM | Mem clock | Core clock | Power (mining) | Hashrate | Efficiency | Notes |
 |-----|--------------|------|-----------|------------|----------------|----------|------------|-------|
@@ -35,6 +36,27 @@ Numbers below are the **`--light` (Gemma-3-4B)** tier unless noted.
 | NVIDIA RTX 3070 | Ampere (2020) | 8 GB GDDR6 | — | — | ~220 W cap | ~18.35 MH/s | — | |
 
 _"—" = not measured yet; PRs welcome. Efficiency = MH/s per watt (higher is better)._
+
+## Per-card table — AMD (keryx PoM, `--light`)
+
+AMD cards mine PoM via the OpenCL worker (`libkeryxopencl.so` / `keryxopencl.dll`). Clocks are as reported by
+`rocm-smi` — note the **mem clock is the actual HBM/GDDR clock, not the effective data rate**, so it is not
+directly comparable to the nvidia-smi numbers above (e.g. this 1000 MHz HBM2 ≈ a very wide, high-bandwidth bus).
+
+| GPU | Architecture | VRAM | Mem clock | Core clock | Power (mining) | Hashrate | Efficiency | Notes |
+|-----|--------------|------|-----------|------------|----------------|----------|------------|-------|
+| **AMD Instinct MI50 / MI60** | Vega 20 (2018–19, datacenter) | 16 GB HBM2 | ~1000 MHz | ~1725 MHz | ~135 W | **~10.9 MH/s** | ~0.08 MH/W | HBM2 (~1 TB/s) → best AMD PoM card; passively cooled (needs chassis airflow), thermally sensitive — a hot card throttles core → hashrate |
+| AMD Radeon RX 7600 XT | RDNA 3, Navi 33 (2024) | 16 GB GDDR6 | ~1124 MHz | ~2771 MHz | ~166 W (at 165 W cap) | ~7.76 MH/s | ~0.047 MH/W | GDDR6 (~288 GB/s); RDNA3's high clocks + Infinity Cache offset some of the bandwidth gap |
+
+_Measured on a 3-GPU box (1× RX 7600 XT + 2× MI50/MI60): **~29.5 MH/s aggregate**, each card mining + submitting
+its own shares independently (per-GPU PoM residency). "—" = not measured yet; PRs welcome._
+
+**AMD notes.** The HBM2 MI50/MI60 beat the GDDR6 RX 7600 XT by **~1.4×** — exactly what the memory-bound
+principle predicts. It's ~1.4× (not the ~3.5× raw-bandwidth ratio) because the walk is **latency-bound on
+data-dependent reads** plus per-step hash compute, and RDNA3's high clocks + Infinity Cache narrow the gap.
+So on AMD the Instinct HBM2 cards are the strongest PoM silicon. OPoI inference on AMD runs on the GPU via a
+bundled **llama.cpp Vulkan** server (RADV/Mesa; ~68 tok/s Gemma-3-4B on the RX 7600 XT), auto-falling back to
+CPU (candle, ~2.7 tok/s) if no Vulkan ICD is present — inference load does not reduce the PoM hashrate.
 
 ## H100 power/hashrate sweep (why 400 W is the sweet spot)
 
@@ -57,4 +79,6 @@ draw at 700 W is inference bursts, which the power cap trims with negligible has
 Measured live on the pool (`krx.suprnova.cc`) with `--light` (Gemma-3-4B, 77.6 M chunks / 2.48 GB
 possession blob), plus an isolated CUDA microbench of the walk kernel (`tools/h100/bench_pom.cu`) for the
 clean per-power-limit numbers. HBM cards were run at stock; consumer cards at stock power limits (they
-self-limit for the memory-bound walk).
+self-limit for the memory-bound walk). **AMD** numbers are the OpenCL worker (`keryxopencl`) measured live
+on the same pool, with per-card hashrate/clocks/power read from `rocm-smi`, on a 3-GPU Ubuntu box (RADV/Mesa
+Vulkan for OPoI inference).
