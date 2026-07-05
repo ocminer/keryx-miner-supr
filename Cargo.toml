@@ -106,11 +106,29 @@ pom-opencl = ["dep:opencl3"]
 # VRAM sharing with the inference engine) + build.rs compiles src/pom_mine.cu -> PTX. Enables
 # candle's CUDA backend (candle 0.9 -> cudarc 0.16). AMD/default stays candle-CPU.
 pom-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# Apple Silicon PoM (Metal): the walk runs as a Metal compute kernel over candle's own resident
+# quantized MTLBuffers (zero-dup, unified memory). Enables candle's Metal backend; the objc2/metal
+# crates come from the macOS-only dependency table below. On macOS, target_os=macos + this feature
+# select the `pom_gpu_metal` module (aliased to `pom_gpu`) in lib.rs. macOS-only — never combine
+# with pom-cuda, and never enable on Linux/Windows (candle's `metal` feature is macОS-only).
+pom-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keccak = "0.1"
 kernel32-sys = "0.2"
 win32console = "0.1"
+
+# Apple Silicon: the keccakf1600 asm is x86_64-only (build.rs), so ARM64 macOS uses the pure-Rust
+# keccak crate instead. Present on any non-x86_64, non-Windows target (i.e. aarch64-darwin).
+[target.'cfg(all(not(target_arch = "x86_64"), not(target_os = "windows")))'.dependencies]
+keccak = "0.1"
+
+# macOS-only Metal plumbing for the PoM walk kernel: candle's Metal-buffer wrappers
+# (candle-metal-kernels re-exports the objc2-metal handles candle itself holds) + the raw
+# objc2-metal protocol traits. Compiled only on macOS; unused unless `pom-metal` is on.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-metal-kernels = "0.9"
+objc2-metal = "0.3"
 
 [profile.release]
 lto = true
@@ -136,3 +154,10 @@ default-members = [".", "plugins/cuda", "plugins/opencl"]
 # sm_80 and broke GPU inference on Volta/Turing. See vendor/candle-kernels/build.rs.
 [patch.crates-io]
 candle-kernels = { path = "vendor/candle-kernels" }
+# Vendored candle-core 0.9.2 = the exact registry source + ONE added accessor,
+# `QTensor::metal_storage()`, gated behind `#[cfg(feature = "metal")]`. On any non-Metal build
+# (Linux/Windows CUDA, default CPU) the feature is off, so this crate compiles byte-for-byte
+# identically to the registry release — the patch is inert off Apple. It only exists so the
+# macOS PoM walk can borrow candle's resident quantized MTLBuffers zero-copy. See the accessor's
+# doc comment in vendor/candle-core/src/quantized/mod.rs.
+candle-core = { path = "vendor/candle-core" }

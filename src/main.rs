@@ -29,6 +29,8 @@ mod client;
 mod escrow;
 mod ipfs;
 mod keryxd_messages;
+#[cfg(all(target_os = "macos", feature = "pom-metal"))]
+mod metal_worker;
 mod miner;
 mod pow;
 mod target;
@@ -442,8 +444,11 @@ async fn client_main(
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
 ) -> Result<(), Error> {
+    // IPFS/kubo setup runs in the BACKGROUND (fire-and-forget) — it's only for optional inference-
+    // reward uploads and must never gate mining. Previously this was `.await`ed, so a slow kubo
+    // download (e.g. first run on macOS) stalled the miner from connecting to the pool for a minute+.
     let ipfs_url = opt.ipfs_url.clone();
-    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url)).await.ok();
+    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url));
 
     let mut client = get_client(
         pool_address,
@@ -485,12 +490,29 @@ async fn main() -> Result<(), Error> {
     }
 
     // Dynamic plugin path (default): scan the binary's dir for libkeryx*.so,
-    // unless --disable-gpu was passed.
-    #[cfg(not(feature = "static-cuda"))]
+    // unless --disable-gpu was passed. Excluded on macOS+pom-metal (no .so plugins there — the
+    // Metal worker is built in below).
+    #[cfg(all(not(feature = "static-cuda"), not(all(target_os = "macos", feature = "pom-metal"))))]
     let plugins = if disable_gpu { Vec::new() } else { filter_plugins(path.to_str().unwrap_or(".")) };
-    #[cfg(not(feature = "static-cuda"))]
+    #[cfg(all(not(feature = "static-cuda"), not(all(target_os = "macos", feature = "pom-metal"))))]
     let (app, mut plugin_manager): (App, PluginManager) =
         keryx_miner::load_plugins(Opt::into_app(), &plugins)?;
+
+    // macOS (Apple Silicon): register the built-in Metal PoM worker. Without this the miner finds
+    // 0 workers and exits ("No workers specified"). --disable-gpu leaves a CPU-only miner.
+    #[cfg(all(target_os = "macos", feature = "pom-metal"))]
+    let plugins: Vec<String> =
+        if disable_gpu { Vec::new() } else { vec!["builtin:metal (Apple Silicon)".to_string()] };
+    #[cfg(all(target_os = "macos", feature = "pom-metal"))]
+    let (app, mut plugin_manager): (App, PluginManager) = {
+        let mut manager = PluginManager::new();
+        let app = if disable_gpu {
+            Opt::into_app()
+        } else {
+            manager.register_builtin(Opt::into_app(), Box::new(crate::metal_worker::MetalPlugin::new()), |a| a)
+        };
+        (app, manager)
+    };
 
     // Static-cuda single-binary build: the CUDA worker is compiled in, so
     // register it directly instead of dlopening a .so. (OpenCL is omitted.)
@@ -735,7 +757,7 @@ async fn main() -> Result<(), Error> {
     // PoM-active job (DAA >= activation). Here we only record cheap config — which tier this GPU
     // mines, picked by VRAM. Driver seam: AMD = OpenCL (gguf,tier); NVIDIA = candle-CUDA (model_id,gguf)
     // with zero-dup VRAM sharing.
-    #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
+    #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
     if let Some(spec) = pom_spec {
         let tier_idx = keryx_miner::models::pom_tier_index(&spec.model_id, keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA).expect("pom_spec has a tier");
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
@@ -794,6 +816,12 @@ async fn main() -> Result<(), Error> {
             keryx_miner::slm::set_pom_force_split(true);
             keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
         }
+        // Apple Silicon (Metal): record the mining tier (global). Phase 1 loads a standalone Metal
+        // walk (no inference VRAM sharing yet), so no `set_pom_force_split` here.
+        #[cfg(all(target_os = "macos", feature = "pom-metal", not(feature = "pom-opencl"), not(feature = "pom-cuda")))]
+        {
+            keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
+        }
         info!(
             "PoM: configured for tier {} ({}); possession index + GPU walk load lazily at DAA {}.",
             tier_idx, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA
@@ -830,6 +858,11 @@ async fn main() -> Result<(), Error> {
     }
     if opt.cpu_inference || keryx_miner::slm::cpu_inference_enabled() {
         info!("CPU inference mode — skipping the GPU/cuBLAS probe (OPoI inference runs on the CPU).");
+    } else if cfg!(all(target_os = "macos", feature = "pom-metal")) {
+        // Apple Silicon: inference targets the Metal GPU (candle-metal), not cuBLAS — the cuBLAS
+        // probe is meaningless here. If candle-metal can't run this model, load_engine_with_fallback
+        // degrades to CPU on its own.
+        info!("Apple Silicon: OPoI inference targets the Metal GPU (auto-falls back to CPU if candle-metal can't run this model). Skipping the cuBLAS probe.");
     } else {
     info!("Probing GPU inference (cuBLAS) before mining…");
     match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {

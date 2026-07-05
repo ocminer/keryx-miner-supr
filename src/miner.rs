@@ -318,15 +318,18 @@ impl MinerManager {
                 // 2^22=124.8, 2^24=125.2 MH/s on an H100. 2^22 captures ~all of the throughput while
                 // keeping the per-launch time modest (~33 ms on an H100, ~230 ms on a 3070) so job
                 // switching stays responsive. Bumped 2^20 -> 2^22.
-                #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
+                #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
                 let mut pom_nonce: u64 = thread_rng().next_u64();
-                #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
+                #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
                 const POM_BATCH: u64 = 1 << 22;
-                // Driver seam: AMD = OpenCL, NVIDIA = candle-CUDA. Both expose the same interface
-                // (is_installed / ensure_installed / mine / set_mining_tier). OpenCL wins if both on.
+                // Driver seam: AMD = OpenCL, NVIDIA = candle-CUDA, Apple Silicon = candle-Metal. All
+                // expose the same interface (is_installed / ensure_installed / mine / set_mining_tier).
+                // OpenCL wins if both on; Metal is macOS-only (never combined with the others).
                 #[cfg(feature = "pom-opencl")]
                 use keryx_miner::pom_opencl as pom_driver;
                 #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+                use keryx_miner::pom_gpu as pom_driver;
+                #[cfg(all(target_os = "macos", feature = "pom-metal", not(feature = "pom-opencl"), not(feature = "pom-cuda")))]
                 use keryx_miner::pom_gpu as pom_driver;
 
                 loop {
@@ -347,7 +350,7 @@ impl MinerManager {
                     // PoM possession mining (post-fork): grind the data-dependent walk on the GPU
                     // over the resident tier weights instead of kHeavyHash. On a winning nonce we
                     // build the proof (host) and submit; the legacy plugin path below is skipped.
-                    #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
+                    #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
                     if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::activation_daa()) {
                         let (pph, time, target_le, daa) = {
                             let s = state.as_ref().unwrap();
@@ -358,12 +361,13 @@ impl MinerManager {
                         // H3 gate (AUTO-SWITCH): at/after POM_LEVEL_ACTIVATION_DAA the pph words
                         // feeding both PoM folds are salted (POM_H3_PPH_SALT). Decided per job from
                         // the block's daa_score, so a running miner flips at the gate with no restart.
-                        // The kernel is unchanged — the host salts the words it uploads.
+                        // The kernel (CUDA/Metal) is unchanged — the host salts the words it uploads.
                         let h3 = keryx_miner::pom::h3_active(daa);
-                        // NVIDIA: per-device PoM. Each GPU thread builds + walks its OWN device's
-                        // blob (upstream's per-device MINERS map) so no-flag multi-GPU works without
-                        // CUDA_VISIBLE_DEVICES. Device id = the worker's `#N (name)` label.
-                        #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+                        // NVIDIA (CUDA) + Apple Silicon (Metal): per-device PoM. Each GPU thread
+                        // builds + walks its OWN device's blob (per-device MINERS map) so no-flag
+                        // multi-GPU works without CUDA_VISIBLE_DEVICES. Device id = the worker's
+                        // `#N (name)` label. Both backends share this identical per-device interface.
+                        #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                         let found = {
                             let wdid = gpu_work.id().strip_prefix('#')
                                 .and_then(|s| s.split_whitespace().next())
@@ -387,8 +391,8 @@ impl MinerManager {
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         if let Some(nonce) = found {
-                            // NVIDIA: recompute the PoM tier per block (H2-boundary correct).
-                            #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+                            // NVIDIA/Apple: recompute the PoM tier per block (H2-boundary correct).
+                            #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                             let built = state.as_ref().and_then(|s| {
                                 keryx_miner::pom::active_index().and_then(|(idx, _)| {
                                     let tier = keryx_miner::pom_gpu::current_tier(s.daa_score)?;
