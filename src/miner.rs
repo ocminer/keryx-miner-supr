@@ -355,6 +355,10 @@ impl MinerManager {
                             pph.copy_from_slice(&s.pow_hash_header[0..32]);
                             (pph, u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap()), s.target.to_le_bytes(), s.daa_score)
                         };
+                        // H3 gate: at/after POM_LEVEL_ACTIVATION_DAA the pph words feeding both PoM
+                        // folds are salted (POM_H3_PPH_SALT). The kernel is unchanged — the host
+                        // salts the words it uploads, so the same GPU search finds the H3-valid nonce.
+                        let h3 = daa >= keryx_miner::pom::level_activation_daa();
                         // NVIDIA: per-device PoM. Each GPU thread builds + walks its OWN device's
                         // blob (upstream's per-device MINERS map) so no-flag multi-GPU works without
                         // CUDA_VISIBLE_DEVICES. Device id = the worker's `#N (name)` label.
@@ -367,17 +371,16 @@ impl MinerManager {
                             if !pom_driver::is_installed(wdid) {
                                 pom_driver::ensure_installed(wdid, daa);
                             }
-                            pom_driver::mine(wdid, &pph, time, &target_le, pom_nonce, POM_BATCH)
+                            pom_driver::mine(wdid, &pph, time, &target_le, pom_nonce, POM_BATCH, h3)
                         };
                         // AMD: the thread is already bound to its card (bind_thread_device), so the
                         // deviceless OpenCL API is per-GPU via thread-local binding.
                         #[cfg(feature = "pom-opencl")]
                         let found = {
-                            let _ = daa;
                             if !pom_driver::is_installed() {
                                 let _ = pom_driver::ensure_installed();
                             }
-                            pom_driver::mine(&pph, time, &target_le, pom_nonce, POM_BATCH)
+                            pom_driver::mine(&pph, time, &target_le, pom_nonce, POM_BATCH, h3)
                         };
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);

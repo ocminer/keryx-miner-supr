@@ -151,10 +151,30 @@ fn pph_words(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
     w
 }
 
-/// Canonical block seed = initial walk state. mix64-fold of (nonce, time, pre_pow_hash).
-/// BYTE-IDENTICAL to `pom_mine.cu::pom_seed_fold` and the node's `pom_block_seed`.
-pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
-    let p = pph_words(pre_pow_hash);
+/// H3 domain salt applied to the pre_pow_hash words feeding BOTH PoM folds (block seed AND pow
+/// value) at/after `POM_LEVEL_ACTIVATION_DAA`. Forced-update mechanism (same spirit as the
+/// kHeavyHash matrix salts): every walk trajectory and pow value changes at the gate, so pre-H3
+/// binaries produce proofs the node rejects. The CUDA/OpenCL kernels are UNCHANGED — the host
+/// salts the pph words before upload (the kernel folds whatever words it receives).
+/// Derivation: sha256("keryx-h3-pom-pph-salt") read as 4 little-endian u64 words.
+/// MUST equal the node's `POM_H3_PPH_SALT` (consensus/core/src/pom.rs @ v1.3.1).
+pub const POM_H3_PPH_SALT: [u64; 4] = [0x7C99D381176D4EC4, 0xC2E28E3E28118C36, 0xD496CE1B129B76CA, 0x47CF0979FA580BCE];
+
+/// pph words for the era selected by `h3` (raw pre-H3, XOR-salted at/after the H3 gate). Single
+/// point the salt is applied — shared by the host proof builder AND every GPU backend.
+#[inline]
+pub fn pph_words_for_era(pre_pow_hash: &[u8; 32], h3: bool) -> [u64; 4] {
+    let mut w = pph_words(pre_pow_hash);
+    if h3 {
+        for (wi, si) in w.iter_mut().zip(POM_H3_PPH_SALT.iter()) {
+            *wi ^= si;
+        }
+    }
+    w
+}
+
+#[inline]
+fn pom_block_seed_from_words(p: &[u64; 4], timestamp: u64, nonce: u64) -> u64 {
     let mut s = mix64(nonce ^ 0x4B65727978531);
     s = mix64(s ^ timestamp);
     s = mix64(s ^ p[0]);
@@ -164,10 +184,16 @@ pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u6
     s
 }
 
+/// Canonical block seed = initial walk state. mix64-fold of (nonce, time, pre_pow_hash).
+/// BYTE-IDENTICAL to `pom_mine.cu::pom_seed_fold` and the node's `pom_block_seed`(`_h3`).
+pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool) -> u64 {
+    pom_block_seed_from_words(&pph_words_for_era(pre_pow_hash, h3), timestamp, nonce)
+}
+
 /// Canonical pow value (256-bit LE) = mix64-fold of (final_state, pre_pow_hash).
-/// BYTE-IDENTICAL to `pom_mine.cu::pom_pow_fold` and the node's `pom_pow_value`.
-pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
-    let p = pph_words(pre_pow_hash);
+/// BYTE-IDENTICAL to `pom_mine.cu::pom_pow_fold` and the node's `pom_pow_value`(`_h3`).
+pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32], h3: bool) -> [u8; 32] {
+    let p = pph_words_for_era(pre_pow_hash, h3);
     let o0 = mix64(final_state ^ p[0] ^ 0x9E3779B97F4A7C15);
     let o1 = mix64(o0 ^ p[1] ^ 0xC2B2AE3D27D4EB4F);
     let o2 = mix64(o1 ^ p[2] ^ 0x165667B19E3779F9);
@@ -274,12 +300,13 @@ pub fn mine_pom(
     t: usize,
     nonce_start: u64,
     max_nonces: u64,
+    h3: bool,
 ) -> Option<(u64, PomProof)> {
     for nonce in nonce_start..nonce_start.saturating_add(max_nonces) {
-        let seed = pom_block_seed(pre_pow_hash, timestamp, nonce);
+        let seed = pom_block_seed(pre_pow_hash, timestamp, nonce, h3);
         let final_state = walk_final(seed, index.n_chunks, k, |o| index.read_chunk(o));
-        if le_leq(&pom_pow_value(final_state, pre_pow_hash), target) {
-            let proof = build_proof(tier, pre_pow_hash, nonce, seed, index.n_chunks, k, t, |o| index.read_chunk(o), |o| index.merkle_path(o));
+        if le_leq(&pom_pow_value(final_state, pre_pow_hash, h3), target) {
+            let proof = build_proof(tier, pre_pow_hash, nonce, seed, index.n_chunks, k, t, |o| index.read_chunk(o), |o| index.merkle_path(o), h3);
             return Some((nonce, proof));
         }
     }
@@ -301,6 +328,7 @@ pub fn build_proof<F, WP>(
     t: usize,
     read_chunk: F,
     weight_path: WP,
+    h3: bool,
 ) -> PomProof
 where
     F: Fn(u64) -> [u64; CHUNK_WORDS],
@@ -318,7 +346,7 @@ where
     let trace_leaves: Vec<[u8; 32]> = trace.iter().map(|&s| trace_leaf(s)).collect();
     let trace_root = merkle_root(&trace_leaves);
     let final_state = trace[k as usize];
-    let pow_value = pom_pow_value(final_state, pre_pow_hash);
+    let pow_value = pom_pow_value(final_state, pre_pow_hash, h3);
 
     let chs = challenges(pre_pow_hash, nonce, &trace_root, &pow_value, t, k);
     let openings = chs
@@ -351,11 +379,11 @@ where
 /// Self-check a built proof before submit (same logic the node runs). Cheap insurance
 /// against emitting a block the node will reject.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_proof(pre_pow_hash: &[u8; 32], nonce: u64, seed: u64, proof: &PomProof, n_chunks: u64, k: u32, t: usize, r_t: &[u8; 32], target: &[u8; 32]) -> bool {
+pub fn verify_proof(pre_pow_hash: &[u8; 32], nonce: u64, seed: u64, proof: &PomProof, n_chunks: u64, k: u32, t: usize, r_t: &[u8; 32], target: &[u8; 32], h3: bool) -> bool {
     if proof.openings.len() != t {
         return false;
     }
-    if pom_pow_value(proof.final_state, pre_pow_hash) != proof.pow_value {
+    if pom_pow_value(proof.final_state, pre_pow_hash, h3) != proof.pow_value {
         return false;
     }
     if !le_leq(&proof.pow_value, target) {
@@ -1031,6 +1059,31 @@ pub fn is_activation_overridden() -> bool {
 }
 static ACTIVATION_DAA: OnceLock<u64> = OnceLock::new();
 
+/// H3 (PoM block-level) hardfork activation DAA. At/after this score the PoM folds are salted
+/// with `POM_H3_PPH_SALT` (forced update) and the block header commits the winning walk's
+/// `final_state` (`pomFinalState`) — for our pool path the pool fills that header field from the
+/// proof's `final_state`, which we already carry. A post-H3 block whose proof was built with the
+/// pre-H3 (unsalted) folds verifies false → rejected. MUST equal the node's
+/// MAINNET_PARAMS.pom_level_activation = new(43_450_000) and the official miner's
+/// POM_LEVEL_ACTIVATION_DAA. Mainnet: 43_450_000 (~2026-07-05 18:00 UTC). Testnet: 2_000.
+pub const POM_LEVEL_ACTIVATION_DAA: u64 = 43_450_000;
+
+/// Effective H3 activation DAA. Overridable via `KERYX_POM_LEVEL_ACTIVATION_DAA` for STAGING /
+/// pre-gate testing only (e.g. set to 0 to force the H3-salted folds on regardless of daa_score),
+/// mirroring `activation_daa()`. Read once. Never set in production.
+pub fn level_activation_daa() -> u64 {
+    *LEVEL_ACTIVATION_DAA.get_or_init(|| {
+        std::env::var("KERYX_POM_LEVEL_ACTIVATION_DAA")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(POM_LEVEL_ACTIVATION_DAA)
+    })
+}
+pub fn is_level_activation_overridden() -> bool {
+    level_activation_daa() != POM_LEVEL_ACTIVATION_DAA
+}
+static LEVEL_ACTIVATION_DAA: OnceLock<u64> = OnceLock::new();
+
 /// PoM PASSTHROUGH live-test mode (`KERYX_POM_PASSTHROUGH=1`). When set, the miner keeps mining
 /// kHeavyHash (the only valid PoW pre-fork) but ALSO attaches a `PomProof` to each winning share so
 /// the wire envelope — stratum 6th param → pool passthrough → daemon `RpcRawBlock.body.pom_proof` —
@@ -1203,11 +1256,51 @@ mod tests {
         let (k, t) = (POM_WALK_STEPS, POM_OPENINGS);
         let pph = [7u8; 32];
         let target = [0xffu8; 32];
-        let (nonce, proof) = mine_pom(&idx, 2, &pph, 123, &target, k, t, 0, 1).expect("max target → win");
-        let seed = pom_block_seed(&pph, 123, nonce);
-        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target));
+        let (nonce, proof) = mine_pom(&idx, 2, &pph, 123, &target, k, t, 0, 1, false).expect("max target → win");
+        let seed = pom_block_seed(&pph, 123, nonce, false);
+        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target, false));
 
         let _ = std::fs::remove_file(&gguf_path);
+    }
+
+    /// H3 hardfork salt: the pph words feeding BOTH PoM folds are XOR-salted with POM_H3_PPH_SALT
+    /// at/after the gate. Proves (a) the salt equals the node's sha256 derivation, (b) it changes
+    /// the walk seed + pow value, and (c) proofs are era-bound — an H3 proof verifies under h3=true
+    /// and is REJECTED under h3=false. That rejection IS the forced-update guarantee: a pre-H3
+    /// binary's proof verifies false post-gate.
+    #[test]
+    fn h3_salt_is_byte_exact_and_era_bound() {
+        // (a) constant == sha256("keryx-h3-pom-pph-salt") as 4 LE u64 words — node-identical.
+        assert_eq!(
+            POM_H3_PPH_SALT,
+            [0x7C99D381176D4EC4, 0xC2E28E3E28118C36, 0xD496CE1B129B76CA, 0x47CF0979FA580BCE]
+        );
+        let pph = [0x5au8; 32];
+        // (b) salted words == raw XOR salt; both folds differ across the gate.
+        let raw = pph_words_for_era(&pph, false);
+        let salted = pph_words_for_era(&pph, true);
+        for i in 0..4 {
+            assert_eq!(salted[i], raw[i] ^ POM_H3_PPH_SALT[i], "word {i} salt");
+        }
+        assert_ne!(pom_block_seed(&pph, 42, 7, true), pom_block_seed(&pph, 42, 7, false), "H3 changes the seed");
+        assert_ne!(pom_pow_value(123, &pph, true), pom_pow_value(123, &pph, false), "H3 changes the pow value");
+
+        // (c) full round-trip on a synthetic tier. Max target → the first nonce wins.
+        let (k, t) = (POM_WALK_STEPS, POM_OPENINGS);
+        let idx = synth_index(4096);
+        let target = [0xffu8; 32];
+        let (nonce, proof) = mine_pom(&idx, 0, &pph, 123, &target, k, t, 0, 1, true).expect("h3 mine");
+        let seed_h3 = pom_block_seed(&pph, 123, nonce, true);
+        assert!(
+            verify_proof(&pph, nonce, seed_h3, &proof, idx.n_chunks, k, t, &idx.r_t, &target, true),
+            "an H3 proof must verify under the H3 folds"
+        );
+        // The SAME proof, checked with the pre-H3 folds → pow_value mismatch → rejected.
+        let seed_pre = pom_block_seed(&pph, 123, nonce, false);
+        assert!(
+            !verify_proof(&pph, nonce, seed_pre, &proof, idx.n_chunks, k, t, &idx.r_t, &target, false),
+            "an H3 proof MUST be rejected under pre-H3 folds (the forced-update lever)"
+        );
     }
 
     /// Real-GGUF byte-identity: build the index from a downloaded model and prove that chunks
@@ -1227,10 +1320,10 @@ mod tests {
         let (k, t) = (POM_WALK_STEPS, POM_OPENINGS);
         let pph = [3u8; 32];
         let target = [0xffu8; 32]; // max → the first nonce wins, so 1 nonce suffices
-        let (nonce, proof) = mine_pom(&idx, 0, &pph, 99, &target, k, t, 0, 1).expect("max target → win");
-        let seed = pom_block_seed(&pph, 99, nonce);
+        let (nonce, proof) = mine_pom(&idx, 0, &pph, 99, &target, k, t, 0, 1, false).expect("max target → win");
+        let seed = pom_block_seed(&pph, 99, nonce, false);
         assert!(
-            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target),
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target, false),
             "GGUF-pread chunks must verify against the model's R_T (byte-identity broken otherwise)"
         );
     }
@@ -1250,14 +1343,14 @@ mod tests {
         let idx = synth_index(4096);
         let pph = blake(b"pph");
         let nonce = 0xabc;
-        let seed = pom_block_seed(&pph, 111, nonce);
+        let seed = pom_block_seed(&pph, 111, nonce, false);
 
-        let proof = build_proof(2, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
-        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0xff; 32]));
+        let proof = build_proof(2, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
+        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0xff; 32], false));
         // borsh wire-format round-trips (same encoding the node decodes).
         let bytes = borsh::to_vec(&proof).unwrap();
         let back: PomProof = borsh::from_slice(&bytes).unwrap();
-        assert!(verify_proof(&pph, nonce, seed, &back, idx.n_chunks, k, t, &idx.r_t, &[0xff; 32]));
+        assert!(verify_proof(&pph, nonce, seed, &back, idx.n_chunks, k, t, &idx.r_t, &[0xff; 32], false));
         assert_eq!(back.tier, 2);
     }
 
@@ -1267,10 +1360,10 @@ mod tests {
         let idx = synth_index(4096);
         let pph = blake(b"pph2");
         let nonce = 7;
-        let seed = pom_block_seed(&pph, 1, nonce);
-        let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
-        assert!(!verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0u8; 32]), "zero target must fail");
-        assert!(!verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &blake(b"wrong"), &[0xff; 32]), "wrong R_T must fail");
+        let seed = pom_block_seed(&pph, 1, nonce, false);
+        let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
+        assert!(!verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0u8; 32], false), "zero target must fail");
+        assert!(!verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &blake(b"wrong"), &[0xff; 32], false), "wrong R_T must fail");
     }
 
     #[test]
@@ -1282,10 +1375,10 @@ mod tests {
         // Target requiring pow_value MSB <= 0x10 (~6.6% of nonces) — found within a few tries.
         let mut target = [0xffu8; 32];
         target[31] = 0x10;
-        let (nonce, proof) = mine_pom(&idx, 1, &pph, ts, &target, k, t, 0, 100_000).expect("mine a nonce");
-        let seed = pom_block_seed(&pph, ts, nonce);
+        let (nonce, proof) = mine_pom(&idx, 1, &pph, ts, &target, k, t, 0, 100_000, false).expect("mine a nonce");
+        let seed = pom_block_seed(&pph, ts, nonce, false);
         // The proof verifies against the same target the node would use.
-        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target));
+        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target, false));
         assert_eq!(proof.tier, 1);
     }
 
@@ -1306,9 +1399,9 @@ mod tests {
         // A real proof over the real model self-verifies against the pinned R_T.
         let pph = blake(b"gemma-pph");
         let nonce = 1234;
-        let seed = pom_block_seed(&pph, 99, nonce);
-        let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, 256, 32, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
-        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, 256, 32, &idx.r_t, &[0xff; 32]));
+        let seed = pom_block_seed(&pph, 99, nonce, false);
+        let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, 256, 32, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
+        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, 256, 32, &idx.r_t, &[0xff; 32], false));
     }
 
     // Emit POM_SAMPLE_submit.json for the CANONICAL VECTOR that the node-built `pom-verify-test`
@@ -1327,8 +1420,8 @@ mod tests {
         ];
         let ts: u64 = 1_700_000_000;
         let nonce: u64 = 1366;
-        let seed = pom_block_seed(&pph, ts, nonce);
-        let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        let seed = pom_block_seed(&pph, ts, nonce, false);
+        let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
         let bytes = borsh::to_vec(&proof).expect("borsh");
         let hexs: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
         println!("proof: {} bytes, pow_value={}", bytes.len(), proof.pow_value.iter().map(|b| format!("{:02x}", b)).collect::<String>());
@@ -1354,17 +1447,17 @@ mod tests {
         let mut base = 0u64;
         let mut found = None;
         for _ in 0..512 {
-            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16) {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false) {
                 found = Some(n);
                 break;
             }
             base = base.wrapping_add(1 << 16);
         }
         let nonce = found.expect("GPU found no winner over the real tier");
-        let seed = pom_block_seed(&pph, time, nonce);
-        let proof = build_proof(*tier, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        let seed = pom_block_seed(&pph, time, nonce, false);
+        let proof = build_proof(*tier, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
         assert!(
-            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target),
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target, false),
             "real-tier GPU proof must verify against the pinned R_T"
         );
         eprintln!(
@@ -1409,10 +1502,10 @@ mod tests {
             base = base.wrapping_add(1 << 16);
         }
         let nonce = found.expect("CUDA GPU found no winner over the real tier");
-        let seed = pom_block_seed(&pph, time, nonce);
-        let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        let seed = pom_block_seed(&pph, time, nonce, false);
+        let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
         assert!(
-            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target),
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target, false),
             "real-tier CUDA GPU proof must verify against the pinned R_T"
         );
         eprintln!(
@@ -1455,10 +1548,10 @@ mod tests {
             base = base.wrapping_add(1 << 16);
         }
         let nonce = found.expect("CUDA GPU found no winner over the Qwen3 tier");
-        let seed = pom_block_seed(&pph, time, nonce);
-        let proof = build_proof(2, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        let seed = pom_block_seed(&pph, time, nonce, false);
+        let proof = build_proof(2, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
         assert!(
-            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target),
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target, false),
             "Qwen3 tier-2 CUDA GPU proof must verify against the pinned R_T"
         );
         eprintln!(
@@ -1488,23 +1581,23 @@ mod tests {
         let mut base = 0u64;
         let mut found = None;
         for _ in 0..1024 {
-            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16) {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false) {
                 found = Some(n);
                 break;
             }
             base = base.wrapping_add(1 << 16);
         }
         let nonce = found.expect("GPU found no winner over the real tier");
-        let seed = pom_block_seed(&pph, time, nonce);
+        let seed = pom_block_seed(&pph, time, nonce, false);
         let final_state = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o));
-        let pow_value = pom_pow_value(final_state, &pph);
+        let pow_value = pom_pow_value(final_state, &pph, false);
         assert!(le_leq(&pow_value, &target), "pow_value must satisfy the share target");
         let proof = build_proof(
             *tier, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS,
-            |o| idx.read_chunk(o), |o| idx.merkle_path(o),
+            |o| idx.read_chunk(o), |o| idx.merkle_path(o), false,
         );
         assert!(
-            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target),
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target, false),
             "sample proof MUST verify locally before handoff"
         );
         let proof_bytes = borsh::to_vec(&proof).expect("borsh");
@@ -1567,23 +1660,23 @@ mod tests {
         let mut base = 0u64;
         let mut found = None;
         for _ in 0..2048 {
-            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16) {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false) {
                 found = Some(n);
                 break;
             }
             base = base.wrapping_add(1 << 16);
         }
         let nonce = found.expect("GPU found no winner");
-        let seed = pom_block_seed(&pph, time, nonce);
+        let seed = pom_block_seed(&pph, time, nonce, false);
         let final_state = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o));
-        let pow_value = pom_pow_value(final_state, &pph);
+        let pow_value = pom_pow_value(final_state, &pph, false);
         assert!(le_leq(&pow_value, &target), "pow_value must satisfy the easy target");
         let proof = build_proof(
             *tier, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS,
-            |o| idx.read_chunk(o), |o| idx.merkle_path(o),
+            |o| idx.read_chunk(o), |o| idx.merkle_path(o), false,
         );
         assert!(
-            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target),
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target, false),
             "Mode B proof MUST verify locally before handoff"
         );
         let proof_hex = hex::encode(borsh::to_vec(&proof).expect("borsh"));

@@ -240,10 +240,12 @@ pub fn ensure_installed() {
 /// Grind one batch of `batch` nonces from `nonce_base` on THIS thread's bound GPU. Returns the
 /// lowest nonce whose pom_pow_value <= target, or None. pph/target are the 32-byte LE forms.
 /// Per-card lock → the other GPUs' threads grind concurrently.
-pub fn mine(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64) -> Option<u64> {
+pub fn mine(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64, h3: bool) -> Option<u64> {
     let id = target_dev()?;
     let miner = miner_for(id)?;
-    let p = words(pph);
+    // H3: salt the pph words host-side (POM_H3_PPH_SALT) — the OpenCL kernel folds whatever words
+    // it receives, so no .cl change at the gate. Byte-identical to the node's pph_words_h3.
+    let p = crate::pom::pph_words_for_era(pph, h3);
     let t = words(target_le);
     let mut g = miner.lock().unwrap();
     g.mine(p, time, t, nonce_base, batch)
