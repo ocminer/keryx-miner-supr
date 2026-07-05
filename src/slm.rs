@@ -1010,9 +1010,9 @@ pub fn inference_gpu_ordinal() -> usize {
     // there are no CUDA walk devices, so fall back to an empty set → ordinal 0 (never used at
     // runtime there: cpu_inference_enabled()/llama_vulkan take over). Fixes the v0.6.5.3 non-CUDA
     // build break (slm.rs referenced crate::pom_gpu unconditionally).
-    #[cfg(feature = "pom-cuda")]
+    #[cfg(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
     let walk = crate::pom_gpu::walk_devices();
-    #[cfg(not(feature = "pom-cuda"))]
+    #[cfg(not(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal"))))]
     let walk: Vec<u32> = Vec::new();
     if NO_SHARED_INFERENCE.load(std::sync::atomic::Ordering::Relaxed) {
         return walk.first().copied().map(|d| d as usize).unwrap_or(0);
@@ -1265,7 +1265,7 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             // Inference has priority over PoW: release the GPU miner's hold on the resident mining
             // weights so this model fits. Mining rebuilds (reloads its model) when it next runs.
             // (pom-cuda only — the OpenCL/AMD PoM miner has its own buffer, no candle-shared VRAM.)
-            #[cfg(feature = "pom-cuda")]
+            #[cfg(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
             crate::pom_gpu::uninstall(inference_gpu_ordinal() as u32);
             *guard = None;
             let dev_str = if cpu_inference_enabled() { "CPU".to_string() } else { format!("CUDA:{}", inference_gpu_ordinal()) };
