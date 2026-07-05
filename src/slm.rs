@@ -586,18 +586,20 @@ fn try_load_engine(spec: &'static ModelSpec, device: Device) -> std::result::Res
 fn load_engine_with_fallback(spec: &'static ModelSpec) -> Result<SlmEngine> {
     let device = inference_device()
         .map_err(|e| anyhow!("inference device unavailable: {}", e))?;
-    let on_cuda = device.is_cuda();
+    // Fall back to CPU on ANY GPU failure — CUDA (NVIDIA) or Metal (Apple Silicon). A Metal device
+    // may init fine but hit an unsupported quantized op mid-load; that surfaces here and degrades.
+    let on_gpu = device.is_cuda() || device.is_metal();
 
     match try_load_engine(spec, device) {
         Ok(engine) => Ok(engine),
-        Err(reason) if on_cuda => {
-            // GPU load failed but we were on CUDA → fall back to CPU instead of crashing.
+        Err(reason) if on_gpu => {
+            // GPU load failed (CUDA or Metal) → fall back to CPU instead of crashing.
             log::warn!(
-                "⚠️ GPU inference FAILED to load on this card ({reason}) — falling back to CPU \
-                 inference (MUCH slower). The PoW walk still runs on GPU. To restore full speed: \
-                 (1) update your NVIDIA driver to R525+; (2) ensure the CUDA 12 runtime libs are \
-                 present (the release bundles them); (3) your GPU may be older than the build's \
-                 compute floor (Pascal/1080Ti must use CPU inference). See the release notes."
+                "⚠️ GPU inference FAILED to load on this device ({reason}) — falling back to CPU \
+                 inference (MUCH slower). The PoW walk still runs on the GPU. NVIDIA: (1) update the \
+                 driver to R525+; (2) ensure the CUDA 12 runtime libs are present (bundled in the \
+                 release); (3) Pascal/1080Ti must use CPU inference. Apple Silicon: candle-metal may \
+                 not yet support this model's quantization — the walk stays on Metal, inference on CPU."
             );
             set_cpu_inference(true);
             let cpu = Device::Cpu;
@@ -1052,11 +1054,21 @@ fn biggest_cuda_gpu() -> Option<usize> {
 }
 
 /// Device for OPoI inference: `Device::Cpu` when `cpu_inference_enabled()` (emergency fallback /
-/// AMD build), else the largest-VRAM CUDA GPU (NVIDIA). Single chokepoint for the inference sites.
+/// AMD build), else the GPU — the Apple Metal device on macOS, otherwise the largest-VRAM CUDA GPU
+/// (NVIDIA). Single chokepoint for the inference sites. If GPU init here fails,
+/// `load_engine_with_fallback` degrades to CPU rather than crashing.
 fn inference_device() -> candle_core::Result<Device> {
     if cpu_inference_enabled() {
-        Ok(Device::Cpu)
-    } else {
+        return Ok(Device::Cpu);
+    }
+    // Apple Silicon: run OPoI inference on the Metal GPU (candle-metal). We fall back to CPU only
+    // if this fails to init or a later op is unsupported — handled by load_engine_with_fallback.
+    #[cfg(all(target_os = "macos", feature = "pom-metal"))]
+    {
+        return Device::new_metal(inference_gpu_ordinal());
+    }
+    #[cfg(not(all(target_os = "macos", feature = "pom-metal")))]
+    {
         Device::new_cuda(inference_gpu_ordinal())
     }
 }
