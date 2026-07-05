@@ -183,7 +183,7 @@ impl State {
                 let mut pph = [0u8; 32];
                 pph.copy_from_slice(&self.pow_hash_header[0..32]);
                 let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
-                let h3 = self.daa_score >= pom::level_activation_daa();
+                let h3 = pom::h3_active(self.daa_score);
                 let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3);
                 let proof = pom::build_proof(
                     *tier, &pph, nonce, seed, index.n_chunks, pom::POM_WALK_STEPS, pom::POM_OPENINGS,
@@ -211,11 +211,12 @@ impl State {
         pph.copy_from_slice(&self.pow_hash_header[0..32]);
         let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
 
-        // H3: at/after the block-level gate the pph words feeding BOTH PoM folds are salted
-        // (POM_H3_PPH_SALT, forced update). The proof carries the winning walk's `final_state`;
-        // for the pool (PartialBlock) path the pool fills the header `pomFinalState` from it on
-        // submitBlock (no solo header field is set here — our RpcBlock header has no such field).
-        let h3 = self.daa_score >= pom::level_activation_daa();
+        // H3 (AUTO-SWITCH): at/after the block-level gate the pph words feeding BOTH PoM folds are
+        // salted (POM_H3_PPH_SALT, forced update). `h3_active` decides per block from daa_score, so
+        // the switch happens automatically at the gate. The proof carries the winning walk's
+        // `final_state`; for the pool (PartialBlock) path the pool fills the header `pomFinalState`
+        // from it on submitBlock (no solo header field is set here — our RpcBlock header has none).
+        let h3 = pom::h3_active(self.daa_score);
         let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3);
         let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o));
         if !pom::le_leq(&pom::pom_pow_value(final_state, &pph, h3), &self.target.to_le_bytes()) {
