@@ -1,0 +1,58 @@
+name: Build Apple (macOS / Metal PoM)
+
+# Apple-Silicon Metal PoM backend (feat/metal-apple-silicon). Proves the miner compiles on
+# aarch64-darwin with the Metal walk, and runs the byte-exact walk test on the runner's Metal GPU.
+# macos-14 / macos-latest runners are Apple Silicon (M-series) → real Metal compute.
+on:
+  push:
+    branches: ["feat/metal-apple-silicon", "main"]
+    paths:
+      - "src/**"
+      - "metal/**"
+      - "vendor/candle-core/**"
+      - "Cargo.toml"
+      - "build.rs"
+      - ".github/workflows/build-apple.yml"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-macos-metal:
+    name: macOS aarch64 — build + byte-exact Metal walk test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf (build-dep)
+        run: brew install protobuf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-metal-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Compiles our binary with the Metal PoM backend (candle-core/metal + objc2-metal + the
+      # pom_gpu_metal module). Scoped to `-p keryx-miner-supr`: the workspace also contains the
+      # plugins/cuda member (cudarc → find_cuda_helper), which can't build on a CUDA-less macOS
+      # runner and isn't part of the Metal build anyway.
+      - name: Build (release, pom-metal)
+        run: cargo build --release -p keryx-miner-supr --features pom-metal --bin keryx-miner-supr
+
+      # Byte-exact gate: the Metal walk winner MUST equal the pom.rs CPU reference over a synthetic
+      # blob. Runs on the runner's Metal GPU. `-p keryx-miner-supr` keeps the CUDA/OpenCL plugin
+      # members out of the test build. The module is aliased to `pom_gpu` via #[path], so the test
+      # is filtered by its function name. The `1 passed` guard fails the job if the filter matches
+      # nothing (a green run with 0 tests executed would otherwise be a false pass).
+      - name: Byte-exact Metal walk test
+        run: |
+          set -o pipefail
+          cargo test --release -p keryx-miner-supr --features pom-metal \
+            metal_walk_matches_host_reference -- --nocapture 2>&1 | tee /tmp/metal_test.log
+          grep -q "1 passed" /tmp/metal_test.log \
+            || { echo "::error::byte-exact Metal walk test did not run (0 tests matched)"; exit 1; }
