@@ -46,6 +46,13 @@ jobs:
 
       # Byte-exact gate: the Metal walk winner MUST equal the pom.rs CPU reference over a synthetic
       # blob. Runs on the runner's Metal GPU. `-p keryx-miner-supr` keeps the CUDA/OpenCL plugin
-      # members out of the test build. Final authority is a `cargo test` on a real Mac.
+      # members out of the test build. The module is aliased to `pom_gpu` via #[path], so the test
+      # is filtered by its function name. The `1 passed` guard fails the job if the filter matches
+      # nothing (a green run with 0 tests executed would otherwise be a false pass).
       - name: Byte-exact Metal walk test
-        run: cargo test --release -p keryx-miner-supr --features pom-metal --lib pom_gpu_metal -- --nocapture
+        run: |
+          set -o pipefail
+          cargo test --release -p keryx-miner-supr --features pom-metal \
+            metal_walk_matches_host_reference -- --nocapture 2>&1 | tee /tmp/metal_test.log
+          grep -q "1 passed" /tmp/metal_test.log \
+            || { echo "::error::byte-exact Metal walk test did not run (0 tests matched)"; exit 1; }
