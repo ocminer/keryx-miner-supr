@@ -17,7 +17,7 @@ OUT="$REPO/hiveos/dist-legacy"
 rm -rf "$OUT"; mkdir -p "$OUT/lib"
 
 echo ">> LEGACY build in $IMAGE (CUDA 12.4, glibc 2.31) ..."
-docker run --rm --dns 8.8.8.8 --dns 1.1.1.1 \
+docker run --rm --network host \
   -v "$REPO":/src \
   -w /src \
   -e DEBIAN_FRONTEND=noninteractive \
