@@ -1,0 +1,49 @@
+name: Build Apple (macOS / Metal PoM)
+
+# Apple-Silicon Metal PoM backend (feat/metal-apple-silicon). Proves the miner compiles on
+# aarch64-darwin with the Metal walk, and runs the byte-exact walk test on the runner's Metal GPU.
+# macos-14 / macos-latest runners are Apple Silicon (M-series) → real Metal compute.
+on:
+  push:
+    branches: ["feat/metal-apple-silicon", "main"]
+    paths:
+      - "src/**"
+      - "metal/**"
+      - "vendor/candle-core/**"
+      - "Cargo.toml"
+      - "build.rs"
+      - ".github/workflows/build-apple.yml"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-macos-metal:
+    name: macOS aarch64 — build + byte-exact Metal walk test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf (build-dep)
+        run: brew install protobuf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-metal-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Compiles the whole binary with the Metal PoM backend (candle-core/metal + objc2-metal +
+      # the pom_gpu_metal module). This alone proves the cfg-gated addition builds on Apple Silicon.
+      - name: Build (release, pom-metal)
+        run: cargo build --release --features pom-metal --bin keryx-miner-supr
+
+      # Byte-exact gate: the Metal walk winner MUST equal the pom.rs CPU reference over a synthetic
+      # blob. Runs on the runner's Metal GPU. If a runner ever lacks Metal compute this fails loudly
+      # rather than silently skipping — final authority is a `cargo test` on a real Mac.
+      - name: Byte-exact Metal walk test
+        run: cargo test --release --features pom-metal --lib pom_gpu_metal -- --nocapture

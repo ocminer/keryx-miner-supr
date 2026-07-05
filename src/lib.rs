@@ -21,7 +21,13 @@ pub mod pom;
 pub mod pom_opencl;
 #[cfg(feature = "pom-opencl")]
 pub mod llama_vulkan;
-#[cfg(feature = "pom-cuda")]
+// PoM GPU driver aliased to `pom_gpu` per platform so main.rs/miner.rs/slm.rs stay backend-agnostic:
+// NVIDIA CUDA on Linux/Windows, Apple-Silicon Metal on macOS. Mutually exclusive by construction
+// (the macOS Metal build never enables pom-cuda), and the `not(...)` guard makes that explicit.
+#[cfg(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))))]
+pub mod pom_gpu;
+#[cfg(all(target_os = "macos", feature = "pom-metal"))]
+#[path = "pom_gpu_metal.rs"]
 pub mod pom_gpu;
 pub use keryx_plugin_api::{declare_plugin, xoshiro256starstar, Error, Plugin, Worker, WorkerSpec};
 
