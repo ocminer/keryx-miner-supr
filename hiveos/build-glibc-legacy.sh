@@ -30,7 +30,12 @@ docker run --rm \
     . "$HOME/.cargo/env"
 
     export CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda
-    export CUDA_COMPUTE_CAP=70                  # sm_70 PTX JITs across the fleet (Volta..Blackwell)
+    export CUDA_COMPUTE_CAP=70                  # sm_70 PTX (candle inference) JITs across the fleet (Volta..Blackwell)
+    # PoM walk PTX at compute_70 too (build.rs default is compute_75, which CANNOT JIT down to sm_70).
+    # The walk is pure u64 + gather (no dp4a/fp16/tensor), so it compiles at sm_70 and forward-JITs to
+    # sm_75..sm_120 with identical (memory-bound) perf. This is what makes Volta sm_70 cards run the
+    # walk: Tesla V100 AND the CMP 100-210 (GV100 mining card). Without it the walk kernel won't load.
+    export POM_CUDA_ARCH=compute_70
     export PATH=/usr/local/cuda/bin:$PATH
     export RUSTFLAGS="-L /usr/local/cuda/lib64/stubs"
     export CARGO_TARGET_DIR=/src/target-hiveos-legacy
