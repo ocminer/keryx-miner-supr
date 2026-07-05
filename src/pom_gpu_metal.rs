@@ -457,8 +457,9 @@ mod tests {
     }
 
     /// Byte-exact CPU oracle: reproduce the walk over the same blob using pom.rs primitives.
+    /// Pre-H3 era (h3=false) to match the `mine(…, false)` call below.
     fn cpu_pow_value(bytes: &[u8], n_chunks: u64, pph: &[u8; 32], ts: u64, nonce: u64) -> [u8; 32] {
-        let seed = pom::pom_block_seed(pph, ts, nonce);
+        let seed = pom::pom_block_seed(pph, ts, nonce, false);
         let read = |off: u64| -> [u64; pom::CHUNK_WORDS] {
             let o = (off as usize) * CHUNK_BYTES;
             let mut c = [0u8; 32];
@@ -466,7 +467,7 @@ mod tests {
             pom::chunk_to_words(&c)
         };
         let final_state = pom::walk_final(seed, n_chunks, pom::POM_WALK_STEPS, read);
-        pom::pom_pow_value(final_state, pph)
+        pom::pom_pow_value(final_state, pph, false)
     }
 
     // Requires a real Metal device — runs on Apple Silicon (CI macos runner / dev Mac), skipped
