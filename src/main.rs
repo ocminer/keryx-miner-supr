@@ -444,8 +444,11 @@ async fn client_main(
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
 ) -> Result<(), Error> {
+    // IPFS/kubo setup runs in the BACKGROUND (fire-and-forget) — it's only for optional inference-
+    // reward uploads and must never gate mining. Previously this was `.await`ed, so a slow kubo
+    // download (e.g. first run on macOS) stalled the miner from connecting to the pool for a minute+.
     let ipfs_url = opt.ipfs_url.clone();
-    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url)).await.ok();
+    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url));
 
     let mut client = get_client(
         pool_address,
@@ -754,7 +757,7 @@ async fn main() -> Result<(), Error> {
     // PoM-active job (DAA >= activation). Here we only record cheap config — which tier this GPU
     // mines, picked by VRAM. Driver seam: AMD = OpenCL (gguf,tier); NVIDIA = candle-CUDA (model_id,gguf)
     // with zero-dup VRAM sharing.
-    #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
+    #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
     if let Some(spec) = pom_spec {
         let tier_idx = keryx_miner::models::pom_tier_index(&spec.model_id, keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA).expect("pom_spec has a tier");
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
