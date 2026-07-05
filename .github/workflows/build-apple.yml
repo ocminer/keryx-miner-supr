@@ -59,7 +59,7 @@ jobs:
 
       # Package the Apple-Silicon binary into a downloadable tarball (run script + notes), so it can
       # be attached to the GitHub release for Mac miners to test.
-      - name: Package macOS (arm64) tarball
+      - name: Package macOS (arm64) tarball (ad-hoc signed)
         run: |
           set -e
           VER=$(grep -m1 '^CUSTOM_VERSION=' hiveos/pkg/keryx-miner-supr/h-manifest.conf | cut -d= -f2)
@@ -67,18 +67,46 @@ jobs:
           rm -rf "$DIR"; mkdir -p "$DIR"
           strip target/release/keryx-miner-supr
           cp target/release/keryx-miner-supr "$DIR/"
+          # Ad-hoc code sign AFTER strip: strip invalidates the linker's default ad-hoc signature,
+          # which on Apple Silicon makes the kernel refuse to exec it ("killed: 9"). Re-signing with
+          # `-s -` (no certificate) restores a valid signature. This does NOT remove the Gatekeeper
+          # quarantine prompt (that needs notarization) — the run.sh clears quarantine on first launch.
+          codesign --force --sign - --timestamp=none "$DIR/keryx-miner-supr"
+          codesign -dv "$DIR/keryx-miner-supr" 2>&1 | head -3 || true
           cat > "$DIR/run.sh" <<'SH'
           #!/usr/bin/env bash
+          # Self-whitelisting launcher: on first run, clear the Gatekeeper quarantine flag that macOS
+          # puts on anything downloaded, then exec the (ad-hoc-signed) miner. No sudo needed.
           cd "$(dirname "$(realpath "$0")")"
+          xattr -dr com.apple.quarantine . 2>/dev/null || true
+          chmod +x ./keryx-miner-supr 2>/dev/null || true
           exec ./keryx-miner-supr "$@"
           SH
-          chmod +x "$DIR/run.sh" "$DIR/keryx-miner-supr"
+          # Double-clickable Finder helper that clears quarantine (for users who don't use Terminal).
+          cat > "$DIR/whitelist-macos.command" <<'SH'
+          #!/bin/bash
+          cd "$(dirname "$0")"
+          xattr -dr com.apple.quarantine . 2>/dev/null
+          chmod +x keryx-miner-supr run.sh whitelist-macos.command 2>/dev/null
+          echo "✅ Whitelisted. Now run in Terminal:"
+          echo "   ./run.sh -a keryx:<yourwallet>.<worker> -s stratum+tcp://krx.suprnova.cc:4401 --light"
+          echo "(press any key to close)"; read -n 1
+          SH
+          chmod +x "$DIR/run.sh" "$DIR/keryx-miner-supr" "$DIR/whitelist-macos.command"
           cat > "$DIR/RUN.txt" <<TXT
           keryx-miner-supr ${VER} — macOS Apple Silicon (arm64), Metal PoM. EXPERIMENTAL.
           The PoM walk runs on the Apple GPU via Metal; OPoI inference falls back to CPU for now
           (use --light). H3-ready: auto-switches at the fork.
-          Run:  ./run.sh -a keryx:<addr>.<worker> -s stratum+tcp://krx.suprnova.cc:4401 --light
-          (Gatekeeper: first run may need  xattr -dr com.apple.quarantine keryx-miner-supr )
+
+          FIRST RUN (macOS Gatekeeper blocks unsigned downloads):
+            Easiest — in Terminal, from this folder:
+              ./run.sh -a keryx:<yourwallet>.<worker> -s stratum+tcp://krx.suprnova.cc:4401 --light
+              (run.sh clears the quarantine flag itself on first launch)
+            Or double-click  whitelist-macos.command  in Finder, then run ./run.sh
+            Or manually:  xattr -dr com.apple.quarantine .
+            If a dialog still blocks it: System Settings > Privacy & Security > "Open Anyway".
+
+          The binary is ad-hoc code-signed (valid signature, not Apple-notarized).
           TXT
           tar -czf "keryx-miner-supr-macos-arm64-${VER}.tar.gz" "$DIR"
           shasum -a 256 "keryx-miner-supr-macos-arm64-${VER}.tar.gz" > "SHA256SUMS-macos-arm64.txt"
