@@ -645,6 +645,33 @@ mod tests {
         assert_eq!(&base[base.len() - 8..], &[0u8; 8], "pom_final_state=0 → trailing 8 zero bytes");
         assert_ne!(base, with, "post-gate block hash depends on pom_final_state");
 
+        // (3b) BYTE-EXACT cross-check vs keryx-node v1.3.1: the SAME header hashed by the node's
+        //      consensus/core/src/hashing/header.rs (post-gate `hash`) must equal the miner's
+        //      block hash. The node value below is emitted by the node test `xcheck_solo_h3_block_hash`.
+        let xheader = RpcBlockHeader {
+            version: 1,
+            parents: vec![RpcBlockLevelParents { parent_hashes: vec!["aa".repeat(32)] }],
+            hash_merkle_root: "11".repeat(32),
+            accepted_id_merkle_root: "22".repeat(32),
+            utxo_commitment: "33".repeat(32),
+            timestamp: 1_700_000_000_000,
+            bits: 684408190,
+            nonce: 42,
+            daa_score: 43_450_000,
+            blue_work: "010203".into(),
+            pruning_point: "44".repeat(32),
+            blue_score: 12345,
+            pom_final_state: 0x0102_0304_0506_0708,
+        };
+        let mut hasher = HeaderHasher::new();
+        serialize_header(&mut hasher, &xheader, false);
+        let full_hash = hasher.finalize();
+        let full_hex: String = full_hash.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            full_hex, "038b79024aa0ba50ca8b36785863505d3a0af90439c85fed5801739f26e086e9",
+            "miner block hash must byte-match keryx-node v1.3.1 hash() for the same post-gate header"
+        );
+
         // (4) Structurally, the post-gate stream is exactly the pre-gate stream length + 8 bytes
         //     (the only per-block difference at the gate boundary is the appended field).
         assert_eq!(
