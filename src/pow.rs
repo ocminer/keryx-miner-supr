@@ -214,8 +214,9 @@ impl State {
         // H3 (AUTO-SWITCH): at/after the block-level gate the pph words feeding BOTH PoM folds are
         // salted (POM_H3_PPH_SALT, forced update). `h3_active` decides per block from daa_score, so
         // the switch happens automatically at the gate. The proof carries the winning walk's
-        // `final_state`; for the pool (PartialBlock) path the pool fills the header `pomFinalState`
-        // from it on submitBlock (no solo header field is set here — our RpcBlock header has none).
+        // `final_state`; the pool (PartialBlock) path forwards the proof and the pool fills the
+        // header `pomFinalState` on submitBlock, while the solo (FullBlock) path fills the header
+        // field itself below (H3: the node requires proof.final_state == header.pom_final_state).
         let h3 = pom::h3_active(self.daa_score);
         let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3);
         let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o));
@@ -242,6 +243,11 @@ impl State {
             BlockSeed::FullBlock(ref mut block) => {
                 let header = block.header.as_mut().expect("We checked that a header exists on creation");
                 header.nonce = nonce;
+                // H3 solo path: commit the winning walk's final_state into the header — the node
+                // checks `proof.final_state == header.pom_final_state` (body validation) and its
+                // block hash commits it post-gate. Pre-H3 pom_level_active is false so the node
+                // neither hashes nor checks it; setting it unconditionally is a harmless no-op then.
+                header.pom_final_state = proof.final_state;
                 block.pom_proof = bytes; // plain bytes field (empty = none on the wire)
             }
             BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut pom_proof, .. } => {
@@ -310,6 +316,17 @@ pub fn serialize_header<H: Hasher>(hasher: &mut H, header: &RpcBlockHeader, for_
 
     decode_to_slice(&header.pruning_point, &mut hash).unwrap();
     hasher.update(hash);
+
+    // H3 (keryx-node v1.3.1): at/after pom_level_activation the *block* hash commits the winning
+    // walk's pom_final_state (appended LE, last field) — mirrors the node's
+    // consensus/core/src/hashing/header.rs `hash_internal` (Some(..) only for the full hash).
+    // NEVER for the pre-PoW form (`for_pre_pow`): the PoM walk seed derives from the pre-PoW hash
+    // and the walk PRODUCES final_state, so including it there would be circular AND would change
+    // the seed the node/pool computed — keeping this pre-PoW-exclusive is what leaves the stratum
+    // (PartialBlock) path and every pre-H3 hash byte-identical.
+    if !for_pre_pow && header.daa_score >= pom::level_activation_daa() {
+        hasher.update(header.pom_final_state.to_le_bytes());
+    }
 }
 
 #[allow(dead_code)] // False Positive: https://github.com/rust-lang/rust/issues/88900
@@ -353,6 +370,7 @@ mod tests {
     use crate::pow::serialize_header;
     use crate::proto::{RpcBlockHeader, RpcBlockLevelParents};
     use crate::Hash;
+    use keryx_miner::pom;
 
     struct Buf(Vec<u8>);
     impl Hasher for Buf {
@@ -464,6 +482,7 @@ mod tests {
             blue_work: "ce5639b8ed46571e20eeaa7a62a078f8c55aef6edd6a35ed37a3d6cf98736abd".into(),
             pruning_point: "fc44c4f57cf8f7a2ba410a70d0ad49060355b9deb97012345603d9d0d1dcb0de".into(),
             blue_score: 29372123613087746,
+            pom_final_state: 0,
         };
         let expected_res = [
             245, 95, 9, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 98, 165, 238, 232, 42, 189, 244, 74, 45, 11, 117,
@@ -561,5 +580,77 @@ mod tests {
         let mut hasher = HeaderHasher::new();
         hasher.write(buf.0);
         assert_eq!(hasher.finalize(), expected_hash);
+    }
+
+    fn minimal_header(daa_score: u64, pom_final_state: u64) -> RpcBlockHeader {
+        RpcBlockHeader {
+            version: 1,
+            parents: vec![RpcBlockLevelParents {
+                parent_hashes: vec!["62a5eee82abdf44a2d0b75fb180daf48a79ee0b10d394651850fd4a178892ee2".into()],
+            }],
+            hash_merkle_root: "a98347ec1e71514eb26822162dc7c3992fd41f0b2ccc26e55e7bd8f3fa37215f".into(),
+            accepted_id_merkle_root: "774b5216b5b872b6c2388dd950160e3ffa3bf0623c438655bb5c8c768ab33ae2".into(),
+            utxo_commitment: "ee39218674008665e20a3acdf84abef35cabcc489158c0853fd5bfa954226139".into(),
+            timestamp: 1_700_000_000_000,
+            bits: 684408190,
+            nonce: 42,
+            daa_score,
+            blue_work: "ce5639b8ed46571e20eeaa7a62a078f8c55aef6edd6a35ed37a3d6cf98736abd".into(),
+            pruning_point: "fc44c4f57cf8f7a2ba410a70d0ad49060355b9deb97012345603d9d0d1dcb0de".into(),
+            blue_score: 12345,
+            pom_final_state,
+        }
+    }
+
+    fn ser(header: &RpcBlockHeader, for_pre_pow: bool) -> Vec<u8> {
+        let mut buf = Buf(Vec::new());
+        serialize_header(&mut buf, header, for_pre_pow);
+        buf.0
+    }
+
+    /// The H3 solo `pom_final_state` header commitment must be surgical: it appears ONLY in the
+    /// post-gate block-hash form, exactly mirroring the node's hashing/header.rs `hash_internal`.
+    /// The pre-PoW form (walk seed) and every pre-gate hash MUST be byte-identical to before —
+    /// that is what keeps the stratum (PartialBlock) path and all legacy hashes untouched.
+    #[test]
+    fn solo_h3_pom_final_state_commit_is_surgical() {
+        let gate = pom::level_activation_daa();
+        let fs: u64 = 0x0102_0304_0506_0708;
+
+        // (1) Pre-PoW form NEVER depends on pom_final_state — pre OR post gate. This is the PoM
+        //     walk seed; it must stay byte-identical (node hashes it as `None`).
+        for daa in [gate - 1, gate, gate + 1000] {
+            assert_eq!(
+                ser(&minimal_header(daa, 0), true),
+                ser(&minimal_header(daa, fs), true),
+                "pre-pow (walk seed) must not depend on pom_final_state (daa={daa})"
+            );
+        }
+
+        // (2) Pre-gate block-hash form ignores pom_final_state (legacy blocks + pool path unchanged).
+        assert_eq!(
+            ser(&minimal_header(gate - 1, 0), false),
+            ser(&minimal_header(gate - 1, fs), false),
+            "pre-gate block hash must not depend on pom_final_state"
+        );
+
+        // (3) Post-gate block-hash form commits pom_final_state as the trailing 8 LE bytes. Compare
+        //     two SAME-daa (gate) headers differing only in pom_final_state: identical prefix, the
+        //     trailing 8 bytes carry the value LE — byte-for-byte what the node appends last.
+        let base = ser(&minimal_header(gate, 0), false); // trailing 8 == zero
+        let with = ser(&minimal_header(gate, fs), false); // trailing 8 == fs LE
+        assert_eq!(base.len(), with.len(), "the field is a fixed 8 bytes either way");
+        assert_eq!(&with[..with.len() - 8], &base[..base.len() - 8], "prefix identical (only the field differs)");
+        assert_eq!(&with[with.len() - 8..], &fs.to_le_bytes(), "trailing 8 bytes == pom_final_state LE");
+        assert_eq!(&base[base.len() - 8..], &[0u8; 8], "pom_final_state=0 → trailing 8 zero bytes");
+        assert_ne!(base, with, "post-gate block hash depends on pom_final_state");
+
+        // (4) Structurally, the post-gate stream is exactly the pre-gate stream length + 8 bytes
+        //     (the only per-block difference at the gate boundary is the appended field).
+        assert_eq!(
+            ser(&minimal_header(gate, fs), false).len(),
+            ser(&minimal_header(gate - 1, fs), false).len() + 8,
+            "post-gate appends exactly 8 bytes"
+        );
     }
 }

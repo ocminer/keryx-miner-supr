@@ -41,6 +41,10 @@ message RpcBlockHeader {
   string blueWork = 10;
   string pruningPoint = 14;
   uint64 blueScore = 13;
+  // H3 (keryx-node v1.3.1): the winning PoM walk's final_state, committed into the block hash
+  // at/after pom_level_activation (DAA 43,450,000). The solo miner fills this from the proof;
+  // field number 16 MUST match the node's rpc/grpc/core/proto/rpc.proto RpcBlockHeader.
+  uint64 pomFinalState = 16;
 }
 
 message RpcBlockLevelParents {
