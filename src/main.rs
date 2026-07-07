@@ -472,8 +472,40 @@ async fn client_main(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
+/// Tokio async worker count. The miner's async workload is tiny (one gRPC/stratum connection + a
+/// few tasks and timers — the heavy work runs on `spawn_blocking` / dedicated std::threads), so we
+/// cap workers instead of spawning one per logical CPU: dozens of idle executor threads on a
+/// many-core rig are pure scheduler overhead. Override with `KERYX_ASYNC_WORKERS`.
+/// (upstream Keryx-Labs/keryx-miner@9bb0d55)
+fn tokio_worker_threads() -> usize {
+    std::env::var("KERYX_ASYNC_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 8)
+}
+
+/// Optional cap for the `spawn_blocking` pool (SLM inference, IPFS upload, model prefetch). Only
+/// applied when `KERYX_BLOCKING_THREADS` is set: the blocking pool spawns lazily and idles out, so
+/// tokio's default costs nothing at rest and capping it low would bottleneck parallel multi-model
+/// prefetch on multi-GPU rigs.
+fn tokio_blocking_threads() -> Option<usize> {
+    std::env::var("KERYX_BLOCKING_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(2, 64))
+}
+
+fn main() -> Result<(), Error> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(tokio_worker_threads()).enable_all();
+    if let Some(n) = tokio_blocking_threads() {
+        builder.max_blocking_threads(n);
+    }
+    builder.build()?.block_on(run())
+}
+
+async fn run() -> Result<(), Error> {
     #[cfg(target_os = "windows")]
     adjust_console().unwrap_or_else(|e| {
         eprintln!("WARNING: Failed to protect console ({}). Any selection in console will freeze the miner.", e)
