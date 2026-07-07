@@ -367,12 +367,15 @@ impl MinerManager {
                         // builds + walks its OWN device's blob (per-device MINERS map) so no-flag
                         // multi-GPU works without CUDA_VISIBLE_DEVICES. Device id = the worker's
                         // `#N (name)` label. Both backends share this identical per-device interface.
+                        // Device id from the worker's "#N (name)" label — used for BOTH the walk and
+                        // the per-device model/index/tier lookup (mixed-rig per-card models).
+                        #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
+                        let wdid = gpu_work.id().strip_prefix('#')
+                            .and_then(|s| s.split_whitespace().next())
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .unwrap_or(0);
                         #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                         let found = {
-                            let wdid = gpu_work.id().strip_prefix('#')
-                                .and_then(|s| s.split_whitespace().next())
-                                .and_then(|s| s.parse::<u32>().ok())
-                                .unwrap_or(0);
                             if !pom_driver::is_installed(wdid) {
                                 pom_driver::ensure_installed(wdid, daa);
                             }
@@ -394,8 +397,8 @@ impl MinerManager {
                             // NVIDIA/Apple: recompute the PoM tier per block (H2-boundary correct).
                             #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                             let built = state.as_ref().and_then(|s| {
-                                keryx_miner::pom::active_index().and_then(|(idx, _)| {
-                                    let tier = keryx_miner::pom_gpu::current_tier(s.daa_score)?;
+                                keryx_miner::pom::active_index_for(wdid).and_then(|(idx, _)| {
+                                    let tier = keryx_miner::pom_gpu::current_tier(wdid, s.daa_score)?;
                                     s.generate_block_if_pom(nonce, idx, tier)
                                 })
                             });
