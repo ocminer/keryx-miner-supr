@@ -62,20 +62,62 @@ The binary lands at `target/release/keryx-miner-supr` (~26 MB). Copy alongside `
 ## Run
 
 ```bash
+# No tier flag = AUTO: every GPU loads the heaviest model its VRAM can hold.
 LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64 \
   ./keryx-miner-supr \
     -a keryx:<your_mining_address>.<worker_name> \
-    -s stratum+tcp://krx.suprnova.cc:4401 \
-    --light --cuda-device 0
+    -s stratum+tcp://krx.suprnova.cc:4401
 ```
+
+Add `--cuda-device N` to run a single GPU, a tier flag (`--very-high`, …) to pin all cards to one tier, or `--force-model` to set a model per card (see [Model tiers](#model-tiers) below).
 
 `-s` must be a full URL with the `stratum+tcp://` scheme — without it the miner silently picks gRPC. Port MUST be embedded in the URL; the standalone `-p` flag is ignored when a scheme is present.
 
-Tier flags:
-- `--light` — TinyLlama only (any GPU ≥ 6 GB).
-- (default) TinyLlama + DeepSeek-R1-8B (RTX 3060 12 GB / 3070 / 3080).
-- `--high` — + DeepSeek-R1-32B (RTX 3090 / 4090, 24 GB+).
-- `--very-high` — + LLaMA-3.3-70B (RTX 5090, 32 GB+).
+### Model tiers
+
+Heavier tiers earn more (higher tier-reward + higher OPoI inference-reward floor), so each card should
+run the heaviest model its VRAM can hold. The tiers (lightest → heaviest):
+
+| Tier flag      | Model            | GPU VRAM |
+|----------------|------------------|----------|
+| `--very-light` | Qwen3-1.7B       | ≥ 4 GB   |
+| `--light`      | Gemma-3-4B       | ≥ 6 GB   |
+| *(default)*    | Dolphin-Llama3-8B| ≥ 8 GB   |
+| `--high`       | Qwen3-32B        | ≥ 24 GB  |
+| `--very-high`  | Llama-3.3-70B-Q2 | ≥ 32 GB  |
+
+You can also pin one with `--tier <auto|very-light|light|default|high|very-high>`.
+
+### Automatic per-card selection (default — recommended)
+
+With **no tier flag**, the miner runs in **AUTO** mode: it queries each GPU's VRAM independently and loads the
+**heaviest tier that fits that card**. In a mixed rig every card gets its own best-fit model — e.g. on a box
+with a 5090 + two 3070s, the 5090 loads Llama-70B while each 3070 loads Gemma, all in one process. A single
+tier flag (`--very-high`, `--tier high`, …) instead pins **every** card to that one tier.
+
+### Forcing a model per card — `--force-model`
+
+To override AUTO and assign specific models to specific cards, pass a **comma-separated list mapped to CUDA
+device order**:
+
+```bash
+# GPU0 → very-high, GPU1 → light, GPU2 → default, GPU3 → high
+--force-model very-high,light,default,high
+
+# force every card to Gemma
+--force-model light,light,light,light
+
+# pin only GPU0; every other card falls back to AUTO best-fit
+--force-model very-high
+```
+
+Names are the tier names without the `--` (`very-light`, `light`, `default`, `high`, `very-high`).
+`--force-model`:
+- is **positional** — entry *N* applies to CUDA device *N*;
+- **auto-fills** any cards beyond the list with normal per-card AUTO best-fit;
+- **overrides** `--tier` / `--light` / `--very-high` / AUTO; and
+- **bypasses the VRAM-fit and download-availability checks** — it's a power-user knob, so forcing a model
+  larger than a card's VRAM will OOM that card.
 
 The miner blocks on model prefetch until every file in the chosen tier is local. Per-share OPoI `tag_fixed` MLP is baked into the binary; the LLM tier only affects optional AI-request task eligibility.
 

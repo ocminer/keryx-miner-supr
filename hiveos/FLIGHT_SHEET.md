@@ -41,22 +41,30 @@ uses the template below), set **Miner = Custom**, then open **Setup Miner Config
 | **Wallet and worker template** | `keryx:YOUR_KERYX_ADDRESS.%WORKER_NAME%` |
 | **Pool URL** | `stratum+tcp://krx.suprnova.cc:4401` |
 | **Pass** | *(optional — sent to the pool; on suprnova use `d=16` for static difficulty 16, otherwise leave blank)* |
-| **Extra config arguments** | `--light --cpu-inference --cuda-device 0` |
+| **Extra config arguments** | *optional* — blank = per-card AUTO. e.g. `--cpu-inference` (all GPUs), or `--very-high` to pin a tier |
 
 Keep the `stratum+tcp://` scheme on the Pool URL — without it the miner falls
 back to gRPC. Apply the Flight Sheet to your rig(s).
 
 ## 4. Extra config arguments — reference
-- `--light` — TinyLlama only (smallest weights; recommended for mining rigs).
-  Omit for bigger tiers: `--high` (DeepSeek-R1-32B, 24 GB+),
-  `--very-high` (LLaMA-3.3-70B, 32 GB+) — those download much larger weights.
+
+**Model tier** (heavier = more reward; each needs more VRAM + a bigger first-run download):
+- `--very-light` — Qwen3-1.7B (≥ 4 GB) · `--light` — Gemma-3-4B (≥ 6 GB) ·
+  *(default)* Dolphin-Llama3-8B (≥ 8 GB) · `--high` — Qwen3-32B (≥ 24 GB) ·
+  `--very-high` — Llama-3.3-70B-Q2 (≥ 32 GB).
+- **`--tier auto`** — **per-card AUTO** (this is also the default with blank extra args): each GPU
+  loads the heaviest model its own VRAM can hold, so a mixed rig gets a different model per card = max reward.
+- **`--force-model <csv>`** — force a model per card, in CUDA device order, e.g.
+  `--force-model very-high,light,default` → GPU0=70B, GPU1=Gemma, GPU2=Dolphin. Unlisted cards fall
+  back to AUTO. Bypasses the VRAM-fit check (a card too small will OOM). Names: `very-light,light,default,high,very-high`.
+- ℹ️ **Blank extra args = `--tier auto`** (per-card best-fit — the launcher adds it for you). Pass a single
+  tier flag (`--light`, `--very-high`, …) to instead pin **every** card to that one tier.
 - `--cpu-inference` — run the OPoI inference on the **CPU** so the GPU stays 100%
   on hashing (recommended for dedicated rigs). Drop it to run inference on the
   GPU (needs spare VRAM; PoW pauses briefly during an inference challenge).
 - `--cuda-device 0` — which GPU(s). Comma-separated for several: `--cuda-device 0,1`.
   **Omit entirely to use all GPUs.** (For PCI-bus order, the miner respects
   `CUDA_DEVICE_ORDER=PCI_BUS_ID`.)
-- If you pass no tier flag, the launcher adds `--light` automatically.
 
 ## 5. Verify
 The HiveOS dashboard shows hashrate and accepted/rejected per GPU (reported by

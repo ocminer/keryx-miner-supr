@@ -61,9 +61,10 @@ keryx-miner-supr/
    - **Wallet and worker template**: `keryx:<addr>.%WORKER_NAME%`
    - **Pool URL**: `stratum+tcp://krx.suprnova.cc:4401` (the scheme is required)
    - **Pass**: as needed (keryx pools usually ignore)
-   - **Extra config arguments**: e.g. `--light --cuda-device 0`
-     (`--light` = TinyLlama only; omit for higher model tiers, which need the
-     weights pre-fetched and more VRAM)
+   - **Extra config arguments**: optional. **Blank = per-card AUTO** (each GPU loads the
+     heaviest model its VRAM can hold = max reward). Pass a tier flag like `--very-high`
+     to pin all cards to one tier, or `--force-model <csv>` to set a model per GPU. See
+     [FLIGHT_SHEET.md](FLIGHT_SHEET.md#4-extra-config-arguments--reference) for all model/tier options.
 
 Stats (hashrate, accepted/rejected, per-GPU) report back to the HiveOS dashboard
 via `h-stats.sh`.
