@@ -415,12 +415,65 @@ pub fn mine(
     miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3).ok().flatten()
 }
 
-/// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup. Global (not
-/// per-device) to match the CUDA backend's surface.
+/// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup — the PROCESS-WIDE
+/// DEFAULT model (single-model rigs, --light/--very-high/etc.). Per-device overrides (mixed rigs /
+/// --force-model) go through `set_device_model`; `device_model()` prefers a per-device entry and
+/// falls back to this default, so the single-model path stays byte-identical to before.
 static MINING_TIER: OnceLock<([u8; 32], String)> = OnceLock::new();
 
 pub fn set_mining_tier(model_id: [u8; 32], gguf_path: String) {
     let _ = MINING_TIER.set((model_id, gguf_path));
+}
+
+/// Per-Metal-device mining model (model_id, gguf_path) — populated only for --force-model. Apple
+/// Silicon has ONE integrated GPU (ordinal 0), so in practice this map either has an entry for 0
+/// (when the operator pins a model to it) or is empty (default: use `MINING_TIER`). Present for
+/// API parity with the CUDA backend so `main.rs` stays backend-agnostic.
+fn device_models() -> &'static Mutex<HashMap<u32, ([u8; 32], String)>> {
+    static DEVICE_MODELS: OnceLock<Mutex<HashMap<u32, ([u8; 32], String)>>> = OnceLock::new();
+    DEVICE_MODELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Assign a specific model to one Metal device (per-card / `--force-model`). Byte-identical
+/// signature to `pom_gpu::set_device_model` — `main.rs` calls this on macOS through the
+/// module alias.
+pub fn set_device_model(device_id: u32, model_id: [u8; 32], gguf_path: String) {
+    if let Ok(mut m) = device_models().lock() {
+        m.insert(device_id, (model_id, gguf_path));
+    }
+}
+
+/// The model this device mines: its per-device override if set, else the process-wide default.
+fn device_model(device_id: u32) -> Option<([u8; 32], String)> {
+    if let Ok(m) = device_models().lock() {
+        if let Some(v) = m.get(&device_id) {
+            return Some(v.clone());
+        }
+    }
+    MINING_TIER.get().cloned()
+}
+
+/// Total GPU-usable memory (MiB) per Metal device — Apple Silicon reports ONE integrated GPU
+/// (ordinal 0). We use `MTLDevice.recommendedMaxWorkingSetSize` (the driver's own recommendation
+/// for the working set the GPU can allocate under memory pressure), not `hw.memsize`: on a 24 GB
+/// M2 the working set is ~18 GB, and OPoI's VRAM gate should honour that, not the whole system
+/// RAM. Byte-identical return shape to the CUDA path (`Vec<(device_id, MiB)>`) so `main.rs` and
+/// the OPoI capability gate stay backend-agnostic. Never panics.
+pub fn query_all_gpus_vram() -> Vec<(u32, u64)> {
+    use objc2_metal::MTLDevice as _;
+    std::panic::catch_unwind(|| {
+        let cdev = match candle_core::Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let mdev = match &cdev {
+            candle_core::Device::Metal(m) => m.metal_device().clone(),
+            _ => return Vec::new(),
+        };
+        let bytes = mdev.as_ref().recommendedMaxWorkingSetSize();
+        vec![(0u32, bytes / (1024 * 1024))]
+    })
+    .unwrap_or_default()
 }
 
 pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
@@ -433,16 +486,22 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
     ok
 }
 
-pub fn current_tier(daa: u64) -> Option<u8> {
-    let (model_id, _) = MINING_TIER.get()?;
-    crate::models::pom_tier_index(model_id, daa)
+/// PoM tier index of THIS device's mining model at a given block DAA — reads the per-device
+/// override (`set_device_model`) first, falls back to the process-wide default (`MINING_TIER`),
+/// so a per-card model in a mixed rig is tagged with its own tier. Signature byte-identical to
+/// the CUDA `pom_gpu::current_tier` for backend-agnostic call sites.
+pub fn current_tier(device_id: u32, daa: u64) -> Option<u8> {
+    let (model_id, _) = device_model(device_id)?;
+    crate::models::pom_tier_index(&model_id, daa)
 }
 
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
-    let (model_id, gguf) = match MINING_TIER.get() {
-        Some(x) => x,
+    let (model_id, gguf) = match device_model(device_id) {
+        Some(x) => (x.0, x.1),
         None => return false,
     };
+    let model_id = &model_id;
+    let gguf = &gguf;
     // Build the possession index once (host, heavy) the first time PoM activates.
     if crate::pom::active_index().is_none() {
         let _guard = match index_build_lock().lock() {
