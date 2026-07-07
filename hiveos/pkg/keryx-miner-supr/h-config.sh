@@ -25,15 +25,16 @@ args="-a ${CUSTOM_TEMPLATE} -s ${url}"
 # Pass the flight-sheet password to the POOL via --pool-password (NOT -p, which is --port).
 [[ -n "$CUSTOM_PASS" ]] && args="$args --pool-password ${CUSTOM_PASS}"
 
-# Tier selection: honour whatever tier flag the user put in extra args. Recognise EVERY tier flag
-# (--very-light, --light, --high, --very-high, and the --tier <name> form). Only if NONE is present
-# do we prepend the default. The old check knew only --light/--high/--very-high, so selecting
-# --very-light or --tier <x> in the flight sheet got a spurious "--light" prepended -> clap conflict
-# (--light conflicts_with the others) -> the miner aborted = "can't select model with HiveOS".
+# Model selection: honour whatever the user put in extra args — a tier flag
+# (--very-light/--light/--high/--very-high), the --tier <name> form, OR --force-model <csv>.
+# If NONE is present, default to per-card AUTO: each GPU loads the heaviest model its own VRAM
+# can hold (a mixed rig gets a different model per card) = max reward. Passing a tier flag still
+# pins every card to that one tier; --tier auto is the explicit form of the default.
+# (Recognising --force-model here avoids a spurious "--light" that would clash with it.)
 extra="$CUSTOM_USER_CONFIG"
 case " $extra " in
-  *" --very-light "*|*" --light "*|*" --high "*|*" --very-high "*|*" --tier "*|*" --tier="*) : ;;  # tier chosen
-  *) extra="--light $extra" ;;   # default: --light (Gemma-3-4B) — the lightest mining tier
+  *" --very-light "*|*" --light "*|*" --high "*|*" --very-high "*|*" --tier "*|*" --tier="*|*" --force-model "*|*" --force-model="*) : ;;  # model chosen
+  *) extra="--tier auto $extra" ;;   # default: per-card AUTO best-fit
 esac
 
 args="$args ${extra}"

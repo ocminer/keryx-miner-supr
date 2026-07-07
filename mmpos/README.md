@@ -6,7 +6,7 @@ Two ways to report keryx-miner-supr stats to mmpOS. Either works; pick one.
 Run the miner with the stats API enabled:
 ```
 keryx-miner-supr -a keryx:<addr>.<worker> -s stratum+tcp://krx.suprnova.cc:4401 \
-    --light --api-bind 127.0.0.1:4067
+    --tier auto --api-bind 127.0.0.1:4067
 ```
 Then point the mmpos agent at the endpoint (mmpos agent v4.0.18+ supports a
 direct HTTP json endpoint):
