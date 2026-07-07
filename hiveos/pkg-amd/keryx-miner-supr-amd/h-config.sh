@@ -27,16 +27,17 @@ args="-a ${CUSTOM_TEMPLATE} -s ${url}"
 # Pass the flight-sheet password to the POOL via --pool-password (NOT -p, which is --port).
 [[ -n "$CUSTOM_PASS" ]] && args="$args --pool-password ${CUSTOM_PASS}"
 
-# Tier selection: honour whatever tier flag the user put in extra args. Recognise EVERY tier flag
-# (--very-light, --light, --high, --very-high, and the --tier <name> form). Only if NONE is present
-# do we prepend the default. The old check knew only --light/--high/--very-high, so selecting
-# --very-light or --tier <x> in the flight sheet got a spurious "--light" prepended -> clap conflict
-# (--light conflicts_with the others) -> the miner aborted. NB: the AMD/OpenCL build forces --light
-# internally regardless, but the flag must still parse cleanly to avoid the abort.
+# Model selection: honour whatever the user put in extra args — a tier flag (--very-light/--light/
+# --high/--very-high), the --tier <name> form, OR --force-model <csv>. Only if NONE is present do we
+# prepend the default. Unlike the NVIDIA launcher (which defaults to per-card --tier auto), AMD
+# defaults to --light: the AMD/OpenCL build forces the Gemma-3-4B tier internally on EVERY card
+# (there is no per-card model selection on AMD), so --light is the accurate, always-valid default —
+# --tier auto would just be forced to --light anyway. Recognising --force-model here (even though the
+# AMD binary ignores it) avoids a spurious "--light" that could clash with it.
 extra="$CUSTOM_USER_CONFIG"
 case " $extra " in
-  *" --very-light "*|*" --light "*|*" --high "*|*" --very-high "*|*" --tier "*|*" --tier="*) : ;;  # tier chosen
-  *) extra="--light $extra" ;;   # default: --light (Gemma-3-4B) — the lightest mining tier
+  *" --very-light "*|*" --light "*|*" --high "*|*" --very-high "*|*" --tier "*|*" --tier="*|*" --force-model "*|*" --force-model="*) : ;;  # model chosen
+  *) extra="--light $extra" ;;   # default: --light (Gemma-3-4B) — AMD mines Gemma on every card
 esac
 
 args="$args ${extra}"
