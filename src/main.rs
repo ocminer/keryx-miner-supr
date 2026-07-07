@@ -225,6 +225,25 @@ fn query_vram_mb() -> Option<u64> {
     None
 }
 
+/// GPU VRAM per device `(device_id, MiB)` via the CUDA/Metal `pom_gpu` driver when it is linked in,
+/// else an empty list. `pom_gpu` exists ONLY under pom-cuda (non-Metal) OR macos+pom-metal — NOT in
+/// the default (no-feature) build or the AMD build — so gating the query on plain `not(pom-opencl)`
+/// referenced a configured-out `pom_gpu` and broke the default build. Callers already handle an empty
+/// result (fall back to nvidia-smi / `select_tier_nvidia`), so returning empty here is safe.
+#[cfg(not(feature = "pom-opencl"))]
+fn all_gpus_vram() -> Vec<(u32, u64)> {
+    #[cfg(any(
+        all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))),
+        all(target_os = "macos", feature = "pom-metal")
+    ))]
+    { keryx_miner::pom_gpu::query_all_gpus_vram() }
+    #[cfg(not(any(
+        all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))),
+        all(target_os = "macos", feature = "pom-metal")
+    )))]
+    { Vec::new() }
+}
+
 /// OPoI capability gate (layer A): drop models GPU 0 cannot serve, so `ai:cap` never promises a
 /// model the miner would fail to load. VRAM comes from nvidia-smi (NVIDIA) or OpenCL (AMD); the
 /// gate is skipped only on CPU-only hosts where neither is available.
@@ -234,7 +253,7 @@ fn filter_specs_by_vram(
     // Gate against the BIGGEST card in the rig, not GPU 0: in a mixed rig the inference/primary
     // model runs on the largest-VRAM card, so a small GPU 0 must not filter it out.
     #[cfg(not(feature = "pom-opencl"))]
-    let max_mb = keryx_miner::pom_gpu::query_all_gpus_vram().into_iter().map(|(_, m)| m).max();
+    let max_mb = all_gpus_vram().into_iter().map(|(_, m)| m).max();
     #[cfg(feature = "pom-opencl")]
     let max_mb: Option<u64> = None;
     let Some(gpu0_mb) = max_mb.or_else(query_vram_mb) else {
@@ -442,7 +461,7 @@ fn pinned_tier(opt: &cli::Opt) -> Option<keryx_miner::models::Tier> {
 #[cfg(not(feature = "pom-opencl"))]
 fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier)> {
     use keryx_miner::models;
-    let mut vrams = keryx_miner::pom_gpu::query_all_gpus_vram(); // (device_id, MiB), CUDA order
+    let mut vrams = all_gpus_vram(); // (device_id, MiB), CUDA order
     if vrams.is_empty() {
         return vec![(0, select_tier_nvidia(opt))];
     }
