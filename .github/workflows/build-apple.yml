@@ -3,9 +3,12 @@ name: Build Apple (macOS / Metal PoM)
 # Apple-Silicon Metal PoM backend (feat/metal-apple-silicon). Proves the miner compiles on
 # aarch64-darwin with the Metal walk, and runs the byte-exact walk test on the runner's Metal GPU.
 # macos-14 / macos-latest runners are Apple Silicon (M-series) → real Metal compute.
+# On a vX.Y.Z tag push, the packaged tarball is ALSO attached to the GitHub release (same
+# pattern as .github/workflows/windows.yml).
 on:
   push:
     branches: ["feat/metal-apple-silicon", "feat/metal-h3", "main"]
+    tags: ['v*']            # release builds — asset attaches to the GitHub release
     paths:
       - "src/**"
       - "metal/**"
@@ -15,6 +18,9 @@ on:
       - ".github/workflows/build-apple.yml"
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write          # needed to attach assets to the release on tag builds
 
 jobs:
   build-macos-metal:
@@ -123,5 +129,17 @@ jobs:
         with:
           name: keryx-miner-supr-macos-arm64
           path: |
+            keryx-miner-supr-macos-arm64-*.tar.gz
+            SHA256SUMS-macos-arm64.txt
+
+      # On a vX.Y.Z tag push, attach the tarball + SHA sidecar to the GitHub release.
+      # Mirrors the softprops upload the Windows / AMD / CUDA workflows use. No-op on
+      # branch pushes / PRs — the artifact upload above still runs unconditionally so
+      # every CI run leaves a downloadable build for testing.
+      - name: Attach to GitHub release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
             keryx-miner-supr-macos-arm64-*.tar.gz
             SHA256SUMS-macos-arm64.txt
