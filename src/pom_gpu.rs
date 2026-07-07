@@ -266,8 +266,65 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
 static MINING_TIER: OnceLock<([u8; 32], String)> = OnceLock::new();
 
 /// Record the mining tier so the miner can be rebuilt after an inference swapped the model away.
+/// This is the PROCESS-WIDE DEFAULT model (single-model rigs, --light/--very-high/etc.). Per-device
+/// overrides (mixed rigs / --force-model) go through `set_device_model`; `device_model()` prefers a
+/// per-device entry and falls back to this default, so the single-model path is byte-identical.
 pub fn set_mining_tier(model_id: [u8; 32], gguf_path: String) {
     let _ = MINING_TIER.set((model_id, gguf_path));
+}
+
+/// Per-CUDA-device mining model (model_id, gguf_path) — populated only for mixed-rig per-card
+/// best-fit / `--force-model`. Empty on single-model rigs (they use `MINING_TIER`).
+fn device_models() -> &'static Mutex<HashMap<u32, ([u8; 32], String)>> {
+    static DEVICE_MODELS: OnceLock<Mutex<HashMap<u32, ([u8; 32], String)>>> = OnceLock::new();
+    DEVICE_MODELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Assign a specific model to one CUDA device (per-card best-fit or `--force-model`).
+pub fn set_device_model(device_id: u32, model_id: [u8; 32], gguf_path: String) {
+    if let Ok(mut m) = device_models().lock() {
+        m.insert(device_id, (model_id, gguf_path));
+    }
+}
+
+/// The model this device mines: its per-device override if set, else the process-wide default.
+pub fn device_model(device_id: u32) -> Option<([u8; 32], String)> {
+    if let Ok(m) = device_models().lock() {
+        if let Some(v) = m.get(&device_id) {
+            return Some(v.clone());
+        }
+    }
+    MINING_TIER.get().cloned()
+}
+
+/// True if this device has its OWN model (mixed rig / --force-model) vs using the shared default.
+/// Decides whether it builds/uses a per-device possession index or the process-wide shared one.
+fn has_device_override(device_id: u32) -> bool {
+    device_models().lock().map(|m| m.contains_key(&device_id)).unwrap_or(false)
+}
+
+/// Total VRAM (MiB) of every CUDA device in **CUDA device order** (the order `Device::new_cuda(id)`
+/// and the miner's worker ids use) — sourced from the CUDA driver, NOT nvidia-smi line order (which
+/// can map to the wrong card). Empty vec if no CUDA driver (CPU-only / AMD). Never panics.
+/// (upstream Keryx-Labs/keryx-miner@cb7f81c)
+pub fn query_all_gpus_vram() -> Vec<(u32, u64)> {
+    use candle_core::cuda_backend::cudarc::driver::result;
+    std::panic::catch_unwind(|| {
+        if result::init().is_err() {
+            return Vec::new();
+        }
+        let count = result::device::get_count().unwrap_or(0);
+        let mut out = Vec::with_capacity(count.max(0) as usize);
+        for ordinal in 0..count {
+            let Ok(dev) = result::device::get(ordinal) else { continue };
+            // SAFETY: `dev` is a valid handle just returned by `device::get(ordinal)`.
+            if let Ok(bytes) = unsafe { result::device::total_mem(dev) } {
+                out.push((ordinal as u32, (bytes / (1024 * 1024)) as u64));
+            }
+        }
+        out
+    })
+    .unwrap_or_default()
 }
 
 /// Ensure the GPU miner is installed; if an inference evicted the mining model, reload it
@@ -288,9 +345,9 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
 /// PoM tier index of the mining model at a given block DAA. Recomputed per block (not frozen at
 /// index-build time) so the tier reindexing at the very-light hardfork (H2) is applied at the
 /// exact boundary — e.g. Gemma 0→1 — rather than from a stale build-time value.
-pub fn current_tier(daa: u64) -> Option<u8> {
-    let (model_id, _) = MINING_TIER.get()?;
-    crate::models::pom_tier_index(model_id, daa)
+pub fn current_tier(device_id: u32, daa: u64) -> Option<u8> {
+    let (model_id, _) = device_model(device_id)?;
+    crate::models::pom_tier_index(&model_id, daa)
 }
 
 /// CUDA ordinal of a candle device (None if not CUDA) — used to check whether the inference
@@ -304,23 +361,28 @@ fn cuda_gpu_id(d: &Device) -> Option<usize> {
 }
 
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
-    let (model_id, gguf) = match MINING_TIER.get() {
+    // This device's model: its own (mixed rig / --force-model) or the process-wide default.
+    let (model_id, gguf) = match device_model(device_id) {
         Some(x) => x,
         None => return false,
     };
-    // Build the possession index once (host, heavy) the first time PoM activates — deferred from
-    // boot so the pre-PoM legacy phase starts immediately and keeps host/GPU free.
-    if crate::pom::active_index().is_none() {
+    let per_device = has_device_override(device_id);
+    // Single-model rigs share ONE host index (built once); per-card rigs build one index PER device.
+    let index_ready = if per_device { crate::pom::has_device_index(device_id) } else { crate::pom::active_index().is_some() };
+    // Build the possession index (host, heavy) the first time PoM activates — deferred from boot so
+    // the pre-PoM legacy phase starts immediately and keeps host/GPU free.
+    if !index_ready {
         let _guard = match index_build_lock().lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if crate::pom::active_index().is_none() {
-            // The background prefetch may still be downloading the mining-tier model (slow IPFS
+        let still_missing = if per_device { !crate::pom::has_device_index(device_id) } else { crate::pom::active_index().is_none() };
+        if still_missing {
+            // The background prefetch may still be downloading this device's model (slow IPFS
             // link / small HiveOS system disk). Building the index from a missing/partial GGUF
             // hard-fails with ENOENT ("index build failed: no such file or directory") and would
             // spam that on every job. Wait for the `.ok` completion sentinel and retry next job.
-            let ready = std::path::Path::new(gguf)
+            let ready = std::path::Path::new(&gguf)
                 .parent()
                 .map(|d| d.join(".ok"))
                 .map_or(false, |p| p.exists());
@@ -328,21 +390,21 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, Ordering::Relaxed) {
                     info!(
-                        "PoM: mining-tier model not downloaded yet — deferring the possession-index \
-                         build until the background prefetch finishes (slow link / small disk)."
+                        "PoM: mining-tier model (gpu{}) not downloaded yet — deferring the possession-index \
+                         build until the background prefetch finishes (slow link / small disk).", device_id
                     );
                 }
                 return false;
             }
-            let tier = match crate::models::pom_tier_index(model_id, daa) {
+            let tier = match crate::models::pom_tier_index(&model_id, daa) {
                 Some(t) => t,
                 None => return false,
             };
-            info!("PoM: building shared host weight index (gpu{}) — this can take a while…", device_id);
-            match crate::pom::WeightIndex::build_from_gguf(gguf) {
+            info!("PoM: building host weight index (gpu{}) — this can take a while…", device_id);
+            match crate::pom::WeightIndex::build_from_gguf(&gguf) {
                 Ok(idx) => {
-                    info!("PoM: shared host index ready — N={} chunks", idx.n_chunks);
-                    crate::pom::set_index(idx, tier);
+                    info!("PoM[gpu{}]: host index ready — N={} chunks", device_id, idx.n_chunks);
+                    if per_device { crate::pom::set_index_for(device_id, idx, tier); } else { crate::pom::set_index(idx, tier); }
                 }
                 Err(e) => {
                     // The build is retried on every job while the index is missing (e.g. disk too
@@ -371,25 +433,25 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // worth of VRAM on the serving GPU. Mining-only GPUs (no resident inference model to share)
     // fall back to a standalone copy. The N-guard below validates the gather against the host
     // index on every path, so a mismatch refuses to mine rather than producing bad proofs.
-    let m = match crate::slm::pom_shared(model_id) {
+    let m = match crate::slm::pom_shared(&model_id) {
         Some((inf_dev, shared)) if cuda_gpu_id(&inf_dev) == Some(device_id as usize) => {
             info!("PoM[gpu{}]: zero-dup — sharing the inference engine's resident weights (no 2nd VRAM copy)", device_id);
-            PomGpuMiner::load_shared(gguf, &inf_dev, &shared)
+            PomGpuMiner::load_shared(&gguf, &inf_dev, &shared)
         }
-        _ => PomGpuMiner::load(gguf, device_id as usize),
+        _ => PomGpuMiner::load(&gguf, device_id as usize),
     };
     match m {
         Ok(gm) => {
             let n = gm.n_chunks();
-            // N-guard: the gather must match the host index, else blocks would be rejected.
-            if let Some((idx, _)) = crate::pom::active_index() {
+            // N-guard: the gather must match THIS device's host index, else blocks would be rejected.
+            if let Some((idx, _)) = crate::pom::active_index_for(device_id) {
                 if n != idx.n_chunks {
-                    log::error!("PoM[gpu{}]: gather N={} != shared index N={} — refusing to mine", device_id, n, idx.n_chunks);
+                    log::error!("PoM[gpu{}]: gather N={} != host index N={} — refusing to mine", device_id, n, idx.n_chunks);
                     return false;
                 }
             }
             install(device_id, gm);
-            info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches shared index)", device_id, n);
+            info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches host index)", device_id, n);
             true
         }
         Err(e) => {

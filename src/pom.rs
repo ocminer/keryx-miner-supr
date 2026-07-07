@@ -1129,9 +1129,43 @@ pub fn set_index(index: WeightIndex, tier: u8) {
     let _ = POM_INDEX.set((index, tier));
 }
 
-/// The active possession index + tier, if installed.
+/// The active possession index + tier, if installed. This is the PROCESS-WIDE SHARED index used by
+/// single-model rigs (every device mines the same model). Mixed-rig per-card models use the
+/// per-device variants below; those fall back here when a device has no override.
 pub fn active_index() -> Option<&'static (WeightIndex, u8)> {
     POM_INDEX.get()
+}
+
+/// Per-CUDA-device possession index (mixed-rig per-card models). Entries are `Box::leak`'d →
+/// `&'static`, matching the OnceLock "lives forever" semantics. Empty on single-model rigs.
+fn pom_indices() -> &'static std::sync::Mutex<std::collections::HashMap<u32, &'static (WeightIndex, u8)>> {
+    static POM_INDICES: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, &'static (WeightIndex, u8)>>> =
+        OnceLock::new();
+    POM_INDICES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Install a possession index for one device (per-card model). Leaked to `&'static` (models live
+/// for the whole process, same as the global `POM_INDEX`).
+pub fn set_index_for(device_id: u32, index: WeightIndex, tier: u8) {
+    let leaked: &'static (WeightIndex, u8) = Box::leak(Box::new((index, tier)));
+    if let Ok(mut m) = pom_indices().lock() {
+        m.insert(device_id, leaked);
+    }
+}
+
+/// This device's possession index + tier: its per-device entry if set, else the shared global one.
+pub fn active_index_for(device_id: u32) -> Option<&'static (WeightIndex, u8)> {
+    if let Ok(m) = pom_indices().lock() {
+        if let Some(v) = m.get(&device_id) {
+            return Some(*v);
+        }
+    }
+    active_index()
+}
+
+/// Whether this device has its own per-device index installed (vs falling back to the global one).
+pub fn has_device_index(device_id: u32) -> bool {
+    pom_indices().lock().map(|m| m.contains_key(&device_id)).unwrap_or(false)
 }
 
 #[cfg(test)]

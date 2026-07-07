@@ -231,7 +231,13 @@ fn query_vram_mb() -> Option<u64> {
 fn filter_specs_by_vram(
     specs: &'static [&'static keryx_miner::models::ModelSpec],
 ) -> &'static [&'static keryx_miner::models::ModelSpec] {
-    let Some(gpu0_mb) = query_vram_mb() else {
+    // Gate against the BIGGEST card in the rig, not GPU 0: in a mixed rig the inference/primary
+    // model runs on the largest-VRAM card, so a small GPU 0 must not filter it out.
+    #[cfg(not(feature = "pom-opencl"))]
+    let max_mb = keryx_miner::pom_gpu::query_all_gpus_vram().into_iter().map(|(_, m)| m).max();
+    #[cfg(feature = "pom-opencl")]
+    let max_mb: Option<u64> = None;
+    let Some(gpu0_mb) = max_mb.or_else(query_vram_mb) else {
         log::warn!("Cannot query GPU VRAM (no nvidia-smi / OpenCL GPU) — skipping the model capability gate.");
         return specs;
     };
@@ -398,6 +404,81 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
         picked,
     );
     picked
+}
+
+/// Parse a tier name (for `--force-model` / `--tier`). None on an unrecognised token.
+#[cfg(not(feature = "pom-opencl"))]
+fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
+    use keryx_miner::models::Tier;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "very-light" | "verylight" | "very_light" => Some(Tier::VeryLight),
+        "light" => Some(Tier::Light),
+        "default" => Some(Tier::Default),
+        "high" => Some(Tier::High),
+        "very-high" | "veryhigh" | "very_high" => Some(Tier::VeryHigh),
+        _ => None,
+    }
+}
+
+/// The tier the user PINNED for every card (legacy flag or `--tier <name>`), or None = AUTO.
+#[cfg(not(feature = "pom-opencl"))]
+fn pinned_tier(opt: &cli::Opt) -> Option<keryx_miner::models::Tier> {
+    use keryx_miner::models::Tier;
+    if let Some(raw) = opt.tier.as_deref() {
+        let t = raw.trim().to_ascii_lowercase();
+        return if t == "auto" { None } else { parse_tier_name(&t) };
+    }
+    if opt.very_high { Some(Tier::VeryHigh) }
+    else if opt.high { Some(Tier::High) }
+    else if opt.light { Some(Tier::Light) }
+    else if opt.very_light { Some(Tier::VeryLight) }
+    else { None }
+}
+
+/// Resolve the mining tier for EACH CUDA device (CUDA-driver order): `--force-model <csv>` wins
+/// per-card (forced, VRAM bypassed), else a pinned flag (all cards), else per-card AUTO best-fit
+/// (heaviest tier that fits that card's VRAM). Fewer force-model entries than cards → the rest AUTO.
+/// Falls back to a single (device 0, legacy-resolver) entry when the CUDA driver can't enumerate.
+#[cfg(not(feature = "pom-opencl"))]
+fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier)> {
+    use keryx_miner::models;
+    let mut vrams = keryx_miner::pom_gpu::query_all_gpus_vram(); // (device_id, MiB), CUDA order
+    if vrams.is_empty() {
+        return vec![(0, select_tier_nvidia(opt))];
+    }
+    vrams.sort_by_key(|(id, _)| *id);
+    let forced: Vec<Option<models::Tier>> = opt
+        .force_model
+        .as_deref()
+        .map(|s| s.split(',').map(|x| parse_tier_name(x)).collect())
+        .unwrap_or_default();
+    if let Some(raw) = opt.force_model.as_deref() {
+        info!("--force-model: {} — per-card override (VRAM check bypassed; unlisted/extra cards use auto).", raw.trim());
+    }
+    let pinned = pinned_tier(opt);
+    let mut out = Vec::with_capacity(vrams.len());
+    for (dev, vram) in &vrams {
+        let tier = match forced.get(*dev as usize).copied().flatten() {
+            Some(t) => {
+                info!("GPU {}: --force-model → {} (forced; card has {} MiB).", dev, t.pom_model_name(), vram);
+                t
+            }
+            None => {
+                if forced.get(*dev as usize).is_some() {
+                    warn!("GPU {}: --force-model entry unrecognised — using auto (names: very-light|light|default|high|very-high).", dev);
+                }
+                if let Some(t) = pinned {
+                    t
+                } else {
+                    let (picked, need) = models::auto_select_tier(*vram, AUTO_TIER_HEADROOM_MB);
+                    info!("GPU {}: auto → {} (fits {} MiB VRAM, budget {} MiB).", dev, picked.pom_model_name(), vram, need);
+                    picked
+                }
+            }
+        };
+        out.push((*dev, tier));
+    }
+    out
 }
 
 async fn get_client(
@@ -722,8 +803,18 @@ async fn run() -> Result<(), Error> {
         info!("AMD/OpenCL: forcing --light tier (Gemma-3-4B) — CPU inference + smallest PoM tier; --high/--very-high/--tier ignored on AMD.");
         keryx_miner::models::Tier::Light
     };
+    // Resolve the mining tier PER CUDA DEVICE (mixed-rig best-fit / --force-model). `tier` below is
+    // the PRIMARY = biggest tier across cards: it drives the inference lineup (OPoI runs on the
+    // largest card), the prefetch, and the power-limit check. Per-card overrides for smaller cards
+    // are registered after the primary model is set up (search: set_device_model).
     #[cfg(not(feature = "pom-opencl"))]
-    let tier = select_tier_nvidia(&opt);
+    let device_tiers = resolve_device_tiers(&opt);
+    #[cfg(not(feature = "pom-opencl"))]
+    let tier = device_tiers
+        .iter()
+        .map(|(_, t)| *t)
+        .max_by_key(|t| t.pom_spec().min_vram_mb)
+        .unwrap_or(keryx_miner::models::Tier::Light);
 
     // Warn if GPU power limit is below safe threshold for the RESOLVED model tier (post-auto).
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads. Driven by the
@@ -846,7 +937,36 @@ async fn run() -> Result<(), Error> {
             // Force the single-device split loader so the mining tier exposes its quant tensors
             // for zero-dup VRAM sharing with inference (avoids a 2nd full copy on the big tiers).
             keryx_miner::slm::set_pom_force_split(true);
+            // Global DEFAULT model = the primary (biggest) tier — the inference card and any card
+            // without a per-device override use it. On a UNIFORM rig no overrides are set below, so
+            // this is byte-identical to the previous single-model path.
             keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
+            // Per-card overrides: cards whose best-fit (or --force-model) differs from the primary
+            // get their OWN model, and those distinct smaller models are prefetched too.
+            let mut extra: Vec<&'static keryx_miner::models::ModelSpec> = Vec::new();
+            for (dev, t) in &device_tiers {
+                let ds = t.pom_spec();
+                if ds.model_id != spec.model_id {
+                    let gp = keryx_miner::slm::gguf_path_for(ds).to_string_lossy().into_owned();
+                    keryx_miner::pom_gpu::set_device_model(*dev, ds.model_id, gp);
+                    if !extra.iter().any(|e| e.model_id == ds.model_id) {
+                        extra.push(ds);
+                    }
+                }
+            }
+            if !extra.is_empty() {
+                info!(
+                    "Per-card model selection ACTIVE: {} distinct smaller model(s) for lighter cards \
+                     (primary = {} on the biggest card) — prefetching.",
+                    extra.len(),
+                    spec.dir_name,
+                );
+                let leaked: &'static [&'static keryx_miner::models::ModelSpec] =
+                    Box::leak(extra.into_boxed_slice());
+                tokio::spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(leaked)).await;
+                });
+            }
         }
         // Apple Silicon (Metal): record the mining tier (global). Phase 1 loads a standalone Metal
         // walk (no inference VRAM sharing yet), so no `set_pom_force_split` here.

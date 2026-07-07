@@ -50,6 +50,19 @@ pub struct Opt {
     pub tier: Option<String>,
 
     #[clap(
+        long = "force-model",
+        value_name = "MODELS",
+        help = "PER-DEVICE model override, comma-separated, mapped to CUDA device order: \
+                --force-model light,very-light,high → GPU0=light, GPU1=very-light, GPU2=high. \
+                FORCES the model regardless of VRAM fit (a card too small OOMs — power-user knob) and \
+                bypasses the download-availability check. Fewer entries than GPUs → the remaining cards \
+                use normal per-card AUTO best-fit. Overrides --tier / --light / etc. Names: \
+                very-light | light | default | high | very-high.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub force_model: Option<String>,
+
+    #[clap(
         long = "cpu-inference",
         help = "Run OPoI inference on the CPU instead of the GPU — frees the GPU for hashing and avoids weak-fp16 GPUs (e.g. GTX 1060). Pairs well with --light.",
         help_heading = "OPoI / Inference"
