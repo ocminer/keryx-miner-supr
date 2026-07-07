@@ -347,22 +347,30 @@ fn stop_config(tokenizer: &Tokenizer, name: &str) -> (Vec<u32>, Vec<&'static str
                 &[1]),
             vec!["<end_of_turn>", "<start_of_turn>"],
         ),
-        // Llama-3.3-70B-Instruct (abliterated) — LLaMA-3 header template. Stop on
-        // the official `eos_token_id` set for 3.3 Instruct:
-        //   128009 = <|eot_id|> (end of turn), 128001 = <|end_of_text|> (base EOS),
-        //   128008 = <|eom_id|> (end of message, tool turns).
-        // Both the abliterated (v2) and the genuine official (v1) Llama-3.3-70B share
-        // the LLaMA-3 header template and terminators.
-        "llama-3.3-70b" | "llama-3.3-70b-official" => (
+        // Llama-3.3-70B (abliterated / uncensored — our `--very-high`) — re-templated to ChatML.
+        // The vocab is still stock LLaMA-3, so <|im_end|>/<|im_start|> are NOT atomic tokens: the
+        // model writes "<|im_end|>" as plain multi-token text and never emits <|eot_id|> (128009).
+        // Neither the id set nor an <|eot_id|> stop-string ever fires — only a stop-STRING on the
+        // ChatML markers cuts the turn. Without it the model completes its turn, prints the marker,
+        // opens `assistant`, and loops the same answer to max_tokens (a failed OPoI inference).
+        // (upstream Keryx-Labs/keryx-miner@faee090)
+        "llama-3.3-70b" => (
+            collect_stop_ids(tokenizer, &["<|eot_id|>", "<|end_of_text|>"], &[128009, 128001]),
+            vec!["<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|end_of_text|>"],
+        ),
+        // Genuine official Llama-3.3-70B-Instruct — LLaMA-3 header template. Stop on the official
+        // `eos_token_id` set: 128009 <|eot_id|>, 128001 <|end_of_text|>, 128008 <|eom_id|>.
+        "llama-3.3-70b-official" => (
             collect_stop_ids(tokenizer,
                 &["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"],
                 &[128009, 128001, 128008]),
-            // Cut if the model tries to open a fresh turn instead of stopping.
             vec!["<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"],
         ),
-        // Qwen3-32B — ChatML template:
+        // Qwen3 (32B and 1.7B share the same ChatML template + 151k vocab):
         //   151645 = <|im_end|> (end of turn), 151643 = <|endoftext|> (base EOS).
-        "qwen3-32b" => (
+        // The 1.7B must NOT fall through to the generic </s> stops — Qwen3 never emits </s>, so it
+        // would run past <|im_end|> and loop into a fresh turn. (upstream Keryx-Labs/keryx-miner@a033620)
+        "qwen3-32b" | "qwen3-1.7b" => (
             collect_stop_ids(tokenizer,
                 &["<|im_end|>", "<|endoftext|>"],
                 &[151645, 151643]),
@@ -663,9 +671,9 @@ fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
             "<|system|>\n{}</s>\n<|user|>\n{}</s>\n<|assistant|>\n",
             SYSTEM_PROMPT_TINYLLAMA, prompt
         ),
-        // Qwen3-32B — ChatML template. `/no_think` disables the thinking block
-        // so the assistant answers directly (no <think>…</think> to strip).
-        "qwen3-32b" => format!(
+        // Qwen3 (32B + 1.7B) — ChatML template. `/no_think` disables the thinking block
+        // so the assistant answers directly (only an empty <think></think> to strip).
+        "qwen3-32b" | "qwen3-1.7b" => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{} /no_think<|im_end|>\n\
              <|im_start|>assistant\n",
@@ -913,7 +921,7 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
     // Qwen3 (ChatML + /no_think) emits an empty <think></think> pair, and the legacy
     // DeepSeek-R1 models prime an open <think> block — both must be stripped so only
     // the final answer is published. Other models answer directly.
-    Ok(if matches!(engine.name, "qwen3-32b" | "deepseek-r1-8b" | "deepseek-r1-32b") {
+    Ok(if matches!(engine.name, "qwen3-32b" | "qwen3-1.7b" | "deepseek-r1-8b" | "deepseek-r1-32b") {
         strip_think_tags(answer)
     } else {
         answer.to_string()
