@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # HiveOS stats reporter for keryx-miner-supr.
 # Reads the agent's $GPU_STATS_JSON for per-GPU busids/brand/temp/fan, brand-filters
-# to the miner's GPUs, and emits aligned hs[]/temp[]/fan[]/bus_numbers[] arrays.
-# Hashrate is parsed from the miner log.
+# to the miner's GPUs, and emits aligned hs[]/temp[]/fan[]/bus_numbers[] arrays plus
+# ar[]=[accepted,rejected] shares. Hashrate + shares are parsed from the miner log.
 #
-# Ported from upstream keryx-miner integration pkg 0.3.31 (commits c6f7948/599fb99/9b568a0):
+# Ported from upstream keryx-miner integration pkg 0.3.31 (commits c6f7948/599fb99/9b568a0),
+# then hardened for the HiveOS UI (issue #4 "UI stats in hive (AMD)"):
 #   * env_logger ISO timestamp parser (the miner logs "[2026-06-26T06:31:08Z INFO ...]")
-#   * khs scaling fixed (rate*1000 base; Ghash *1e3, NOT *1e6 — the old code was 1000x too high)
-#   * octal guard (sub-1.0 rates yield a leading zero -> bash rejects as octal)
-#   * iGPU off-by-one (separate miner_dev counter that advances only for mining-brand cards)
-# Our log lines carry the GPU name: "... [INFO ] Device #0 (NVIDIA GeForce RTX 5090): 3.28 Ghash/s"
-# so the per-device grep matches "Device #N " (space) rather than "Device #N:".
+#   * robust float->khs conversion via awk (rate*multiplier), decimal-count independent
+#     (Thash *1e9, Ghash *1e6, Mhash *1e3, khash *1) — replaces fragile string slicing
+#   * per-GPU line matches BOTH NVIDIA ("Device #N (name): R unit") and AMD/Vulkan
+#     ("Device Vulkan #N: R unit") — the old NVIDIA-only grep left AMD hs[] at 0
+#   * ar[] shares: cumulative "Shares: Accepted: N ..." + a count of "Share rejected by pool"
+#   * uptime emitted as a JSON number (HiveOS expects numeric), algo=keryxhash, ver from manifest
+#   * iGPU off-by-one guard (separate miner_dev counter that advances only for mining-brand cards)
 
 . /hive/miners/custom/keryx-miner-supr/h-manifest.conf
 
@@ -30,21 +33,23 @@ ts_field=`echo "$stats_raw" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[
 time_rep=`date -d "$ts_field" +%s 2>/dev/null || echo 0`
 diffTime=`echo $((time_now-time_rep)) | tr -d '-'`
 
+# Convert a miner log line ("... R <unit>hash/s") to kilohashes/s. Robust to any decimal count:
+# takes the value field (NF-1) and multiplies by the unit's khs factor. khash=1, Mhash=1e3,
+# Ghash=1e6, Thash=1e9; default Mhash if no unit token is present.
+to_khs() {
+        awk '{
+                rate = $(NF-1); m = 1000;
+                if      ($0 ~ /Thash/) m = 1000000000;
+                else if ($0 ~ /Ghash/) m = 1000000;
+                else if ($0 ~ /Mhash/) m = 1000;
+                else if ($0 ~ /khash/) m = 1;
+                printf "%.0f\n", rate * m;
+        }'
+}
+
 if [ "$diffTime" -lt "$maxDelay" ]; then
-        # Value is second-to-last field (before unit), unit is last field. The miner logs the rate
-        # with 2 decimals; dropping the dot then appending one 0 yields rate*1000 (3.48 -> "3480").
-        # Use `tr -d '.'` (not `cut --output-delimiter=''`, which emits a NUL byte).
-        total_hashrate=`echo $stats_raw | awk 'NF>=2{print $(NF-1)}' | tr -d '.' | sed 's/$/0/'`
-        # Force base 10: a sub-1.0 rate yields a leading zero (0.48 -> "0480") that bash parses as octal.
-        total_hashrate=$((10#${total_hashrate:-0}))
-        # HiveOS expects khs. base = rate*1000, so: Mhash needs nothing, Ghash *1e3, Thash *1e6.
-        if [[ $stats_raw == *"Thash"* ]]; then
-                total_hashrate=$(($total_hashrate*1000000))
-        elif [[ $stats_raw == *"Ghash"* ]]; then
-                total_hashrate=$(($total_hashrate*1000))
-        elif [[ $stats_raw == *"Mhash"* ]]; then
-                : # Mhash/s = rate*1e3 khs = rate*1000 already, no multiplier needed
-        fi
+        total_hashrate=`echo "$stats_raw" | to_khs`
+        [[ -z $total_hashrate ]] && total_hashrate=0
 
         # GPU status — from the HiveOS agent's gpu-stats (temps/fans/busids/brand).
         readarray -t gpu_stats < <( jq --slurp -r -c '.[] | .busids, .brand, .temp, .fan | join(" ")' $GPU_STATS_JSON 2>/dev/null)
@@ -76,19 +81,12 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
                 busid_arr+=($((16#${BASH_REMATCH[1]})))
                 temp_arr+=(${temps[i]})
                 fan_arr+=(${fans[i]})
-                # Per-device line: "... [INFO ] Device #N (<name>): 5.23 Ghash/s" — match "#N "
-                # (space) so "#1 " never matches "#10 ".
-                gpu_raw=`grep "Device #$miner_dev " <<< "$log" | tail -n 1`
+                # Per-device line, NVIDIA: "... Device #N (<name>): 5.23 Ghash/s"
+                #                  AMD:    "... Device Vulkan #N: 5.23 Ghash/s"
+                # Match "Device [Vulkan ]#N" followed by space or colon so "#1" never hits "#10".
+                gpu_raw=`grep -E "Device (Vulkan )?#$miner_dev[ :]" <<< "$log" | tail -n 1`
                 if [[ -n "$gpu_raw" ]]; then
-                        hashrate=`echo $gpu_raw | awk 'NF>=2{print $(NF-1)}' | tr -d '.' | sed 's/$/0/'`
-                        hashrate=$((10#${hashrate:-0}))
-                        if [[ $gpu_raw == *"Thash"* ]]; then
-                                hashrate=$(($hashrate*1000000))
-                        elif [[ $gpu_raw == *"Ghash"* ]]; then
-                                hashrate=$(($hashrate*1000))
-                        elif [[ $gpu_raw == *"Mhash"* ]]; then
-                                : # Mhash/s = rate*1000 already
-                        fi
+                        hashrate=`echo "$gpu_raw" | to_khs`
                 else
                         hashrate=0
                 fi
@@ -96,6 +94,16 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
                 hash_arr+=($hashrate)
                 miner_dev=$((miner_dev+1))
         done
+
+        # Shares. The miner logs a cumulative summary line
+        #   "Shares: Accepted: N [Stale: S ][Low difficulty: L ][Duplicate: D ]Pending: P"
+        # (each sub-count is emitted only when >0), plus per-event "Share rejected by pool ..." WARN
+        # lines (there is no cumulative reject counter). ar=[accepted,rejected] feeds the HiveOS
+        # shares column: accepted from the last summary line, rejected = count of reject events seen.
+        ac=`grep "Shares:" <<< "$log" | tail -n 1 | grep -oE 'Accepted: [0-9]+' | grep -oE '[0-9]+'`
+        rj=`grep -c "Share rejected" <<< "$log"`
+        [[ -z $ac ]] && ac=0
+        [[ -z $rj ]] && rj=0
 
         hash_json=`printf '%s\n' "${hash_arr[@]}" | jq -cs '.'`
         bus_numbers=`printf '%s\n' "${busid_arr[@]}" | jq -cs '.'`
@@ -112,7 +120,8 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
                 --argjson fan "$fan_json" \
                 --argjson temp "$temp_json" \
                 --arg uptime "$uptime" \
-                '{ hs: $hs, hs_units: "khs", algo: "keryxhash", ver: $ver, $uptime, $bus_numbers, $temp, $fan }')
+                --argjson ar "[${ac:-0}, ${rj:-0}]" \
+                '{ hs: $hs, hs_units: "khs", algo: "keryxhash", ver: $ver, uptime: ($uptime|tonumber), bus_numbers: $bus_numbers, temp: $temp, fan: $fan, ar: $ar }')
         khs=$total_hashrate
 else
         khs=0
