@@ -30,6 +30,41 @@ The original brief follows unmodified for historical reference.
 
 ---
 
+## Update 2026-07-07 — release pipeline + Metal API port
+
+Two follow-ups since the 07-05 investigation, both shipped:
+
+**Release automation (PR #3 → `dacea4d`).** `.github/workflows/build-apple.yml` now attaches the macOS arm64 tarball + SHA sidecar to the GitHub release on `vX.Y.Z` tag pushes. Added `tags: ['v*']` trigger, `contents: write` permission, and a `softprops/action-gh-release@v2` step gated by `if: startsWith(github.ref, 'refs/tags/v')`. Mirrors the same pattern `windows.yml` uses for the AMD / keryxcuda / NVIDIA-PoM zips. Branch pushes / PRs are unaffected (the softprops step is a no-op without a tag).
+
+**Trap to know:** the workflow file that runs on a tag ref is the one committed *at that tag*. So the softprops step did NOT apply to tags cut before the PR merged (v0.6.7.0 through v0.6.8.2 — manual upload for those). It also cannot help when the tag's tree fails to compile in the first place, which is exactly what happened next.
+
+**v0.6.9.0 / v0.6.9.1 Metal build broke (PR #5 → `56e2237`).** The v0.6.9.0 per-card model refactor added `set_device_model`, `query_all_gpus_vram`, and bumped `current_tier` from `(daa)` to `(device_id, daa)` on `src/pom_gpu.rs`, wired `main.rs` and `miner.rs` to call them through the `pom_gpu` module alias, but did NOT update `src/pom_gpu_metal.rs`. Result: `cargo build --features pom-metal` failed on the v0.6.9.0 and v0.6.9.1 tag runs with `E0425 cannot find function query_all_gpus_vram` and `E0061` (arity mismatch on `current_tier`) — softprops never got the chance to upload.
+
+Ported the missing surface to `pom_gpu_metal.rs`, byte-identical signatures so `main.rs` / `miner.rs` stay backend-agnostic:
+
+- `set_device_model(device_id, model_id, gguf_path)` — per-device override map. Apple Silicon has one integrated GPU (ordinal 0) so the map is either empty (single-model rig → `MINING_TIER` default) or has an entry for 0 (`--force-model`).
+- `device_model(device_id)` — override-first, `MINING_TIER` fallback.
+- `query_all_gpus_vram()` → `[(0, MiB)]` on Apple Silicon, MiB from `MTLDevice.recommendedMaxWorkingSetSize` (the driver's own recommendation under memory pressure — NOT `hw.memsize`, so the OPoI VRAM gate honours the ~18 GB working set on a 24 GB M2). Wrapped in `catch_unwind`, returns empty on init failure to match the CUDA path's contract.
+- `current_tier(device_id, daa)` — signature bumped, reads through `device_model`.
+- `ensure_installed_inner` — was reading `MINING_TIER.get()` directly; now goes through `device_model(device_id)` so `--force-model` on device 0 loads the override GGUF. Single-model rigs are byte-identical (fall-through to `MINING_TIER`).
+
+Both byte-exact synthetic tests still pass; smoke-tested end-to-end against `krx.suprnova.cc:4404` (H3 active DAA 45 033 210, GPU miner ready, ~419 KH/s). v0.6.9.1 macOS asset uploaded manually (build from `main` post-merge because the tag tree still can't compile). **The first release where CI produces the macOS asset unaided will be the first tag pushed after `56e2237`.**
+
+## H3 hardfork went live
+
+DAA 43 450 000, roughly 2026-07-05 18:00 UTC, salts the pph words feeding both PoM folds. As of 2026-07-07 the network is well past the gate. The `metal_walk_matches_host_reference_multi_tensor` test covers both eras and the on-device diagnostic exercises the full h3 sweep + winner path — the pph-salt plumbing is byte-exact on Metal.
+
+## If someone opens a fresh session claiming "Metal PoM finds zero shares"
+
+1. Run the byte-exact tests: `cargo test --release --features pom-metal metal_walk_matches`. If they pass, the walk is fine.
+2. Run the on-device diagnostic against the real model: `KERYX_TEST_GGUF=/path/to/Gemma-3-4B/model.gguf cargo test --release --features pom-metal metal_load_bytes_match_host_index_real_model -- --ignored --nocapture`. If this also passes, empirically confirm the walk is byte-exact.
+3. Do the target-math check: at hashrate `H` and difficulty `d`, expected seconds-per-share is `d · 2^32 / H`. On M2 at ~840 KH/s + `d=1.0`, that's ~85 minutes. Zero shares in a few minutes is normal.
+4. Ask the pool for a lower static diff via `--pool-password 'd=0.1'` if faster empirical validation is needed.
+
+Do NOT rewrite the walk data path based on the original TL;DR below. That hypothesis was falsified.
+
+---
+
 ## TL;DR of the bug
 
 Branch **`feat/metal-h3`** of `ocminer/keryx-miner-supr`. On macOS the miner now **loads the real Gemma-3-4B model onto the Metal GPU and runs the PoM walk** at a realistic hashrate (~0.8 MH/s on an M2) — but it finds **zero valid shares**. It is NOT idle; the walk executes. The problem: **the GPU walk computes a result that does not match the host possession index**, so every candidate nonce is rejected by the host self-check before submit. You must find *why the GPU walk reads/produces different data than the host index* and fix it.
