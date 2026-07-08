@@ -57,7 +57,9 @@ pub struct Opt {
                 FORCES the model regardless of VRAM fit (a card too small OOMs — power-user knob) and \
                 bypasses the download-availability check. Fewer entries than GPUs → the remaining cards \
                 use normal per-card AUTO best-fit. Overrides --tier / --light / etc. Names: \
-                very-light | light | default | high | very-high.",
+                very-light | light | default | high | very-high. \
+                AMD/OpenCL: PROCESS-WIDE (one resident model per process) — the FIRST entry applies to \
+                ALL cards.",
         help_heading = "OPoI / Inference"
     )]
     pub force_model: Option<String>,
