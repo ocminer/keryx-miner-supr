@@ -32,8 +32,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let out = env::var("OUT_DIR").unwrap();
         let ptx = format!("{}/pom_mine.ptx", out);
         println!("cargo:rerun-if-changed=src/pom_mine.cu");
+        println!("cargo:rerun-if-env-changed=POM_CUDA_ARCH");
         let nvcc = env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
         let arch = env::var("POM_CUDA_ARCH").unwrap_or_else(|_| "compute_75".to_string());
+        // Baked into the binary so the runtime can say WHICH arch the walk PTX targets when the
+        // module load fails on an older GPU (PTX only JITs forward → CUDA_ERROR_INVALID_PTX).
+        println!("cargo:rustc-env=POM_PTX_ARCH={}", arch.replace("compute_", "sm_"));
         let status = std::process::Command::new(&nvcc)
             .args(["-ptx", &format!("-arch={}", arch), "-o", &ptx, "src/pom_mine.cu"])
             .status()

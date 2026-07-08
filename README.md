@@ -36,19 +36,24 @@ Full per-card data (H100/H200, AMD, power sweeps) and tuning guidance:
 ## Build
 
 ```bash
-# Build with CUDA 13.0. The PoW runtime is `cust 0.3`, which binds to the
-# driver (not the toolkit), so the toolkit version is purely a build-time
-# choice — there is no cudarc pin to worry about for the miner.
-# Do NOT use CUDA 13.2: driver 580 caps PTX at ISA 9.0, and 13.2 emits 9.2
-# PTX that fails to load at runtime with "unknown error".
-export PATH=/usr/local/cuda-13.0/bin:$PATH
-# CUDA_COMPUTE_CAP sets the arch for candle's OPoI inference PTX. bindgen_cuda
-# emits a single `.target sm_NN` PTX (no fatbin); PTX forward-JITs only to
-# sm >= NN. Use 70 — the lowest candle-kernels compiles for — so one build runs
-# the whole fleet sm_70 (Volta) → sm_120 (5090). A higher value (e.g. 120) makes
-# the inference kernels FAIL to load on every older card (CUDA_ERROR_INVALID_PTX).
-# Pascal sm_61 can't compile candle (reduce.cu half atomicAdd) → run --cpu-inference.
-export CUDA_HOME=/usr/local/cuda-13.0 CUDA_PATH=/usr/local/cuda-13.0 CUDA_COMPUTE_CAP=70
+# ⚠️ TOOLKIT CHOICE = which GPUs your build can run on. All PoM/inference PTX
+# is compiled at build time and JIT'd by the driver at runtime; PTX only JITs
+# FORWARD — a sm_75 PTX never loads on a sm_70 card (CUDA_ERROR_INVALID_PTX).
+#   - CUDA 13.x CANNOT compile for Volta or Pascal (compute_50–72 removed).
+#     A CUDA 13 build is Turing (sm_75)+ only. For a Tesla V100 / CMP 100-210
+#     (sm_70) build you MUST use a CUDA 12.x toolkit (12.4–12.9) — or just run
+#     the prebuilt `legacy` release tarball (all its PTX targets sm_70).
+#   - Do NOT use CUDA 13.2: driver 580 caps PTX at ISA 9.0, and 13.2 emits 9.2
+#     PTX that fails to load at runtime with "unknown error".
+export PATH=/usr/local/cuda-13.0/bin:$PATH   # Turing+ build; cuda-12.x for Volta
+# CUDA_COMPUTE_CAP sets the arch for candle's OPoI inference PTX (bindgen_cuda
+# emits a single `.target sm_NN`, no fatbin). POM_CUDA_ARCH sets the PoM walk
+# kernel's arch (default compute_75). Set BOTH to your OLDEST card:
+#   Turing+ fleet (CUDA 13.0): CUDA_COMPUTE_CAP=75              (walk default 75)
+#   incl. Volta   (CUDA 12.x): CUDA_COMPUTE_CAP=70 POM_CUDA_ARCH=compute_70
+#   Pascal        (CUDA 12.4): CUDA_COMPUTE_CAP=60 POM_CUDA_ARCH=compute_60
+#     (Pascal can't run candle GPU inference — pair with --cpu-inference.)
+export CUDA_HOME=/usr/local/cuda-13.0 CUDA_PATH=/usr/local/cuda-13.0 CUDA_COMPUTE_CAP=75
 
 # Workspace build — this also produces libkeryxcuda.so + libkeryxopencl.so.
 # Using `--bin keryx-miner-supr` would skip the plugins and the binary would
@@ -57,6 +62,10 @@ cargo build --release
 ```
 
 The binary lands at `target/release/keryx-miner-supr` (~26 MB). Copy alongside `target/release/libkeryxcuda.so` + `target/release/libkeryxopencl.so` into a single run directory.
+
+Or skip building entirely — the release page ships three prebuilt lines: **modern** (sm_75+, native
+sm_120 for RTX 50xx; driver 575+), **legacy** (sm_70+ — Tesla V100/Volta, CMP 100-210, Turing and
+newer; driver 550+), **pascal** (sm_60/61 — GTX 10-series; driver 550+, runs `--cpu-inference`).
 
 ## Run
 
