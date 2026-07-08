@@ -302,7 +302,13 @@ inline uint64_t xoshiro256_next(global ulong4 *s) {
 global int lock = false;
 #endif
 
-#if defined(NVIDIA_CUDA) && (__COMPUTE_MAJOR__ > 6 || (__COMPUTE_MAJOR__ == 6 && __COMPUTE_MINOR__ >= 1))
+// NO_INLINE_ASM (set by the worker on Windows): the AMD Adrenalin OpenCL compiler rejects the GNU
+// `__asm__`/`asm` extension ("implicit declaration of function 'asm' is invalid in C99" ->
+// CL_BUILD_PROGRAM_FAILURE), unlike ROCm on Linux. When it is defined we skip BOTH inline-asm dot
+// paths (NVIDIA dp4a + AMD v_dot4/v_dot8) and fall through to the scalar `#else` below — a bit-
+// identical (nibble-/byte-unpack) reimplementation with the SAME packed layout + host matrix, so
+// the hash is unchanged; only the JIT path differs.
+#if defined(NVIDIA_CUDA) && !defined(NO_INLINE_ASM) && (__COMPUTE_MAJOR__ > 6 || (__COMPUTE_MAJOR__ == 6 && __COMPUTE_MINOR__ >= 1))
 #define amul4bit(X,Y,Z) _amul4bit((constant uint32_t*)(X), (private uint32_t*)(Y), (uint32_t *)(Z))
 void STATIC inline _amul4bit(__constant uint32_t packed_vec1[32], uint32_t packed_vec2[32], uint32_t *ret) {
     // We assume each 32 bits have four values: A0 B0 C0 D0
@@ -318,7 +324,7 @@ void STATIC inline _amul4bit(__constant uint32_t packed_vec1[32], uint32_t packe
 // feature — and ROCm's online OpenCL compiler emits them fine. They were previously
 // gated behind -DOFFLINE (only the AOT path), which dropped the MI50 onto the slow
 // scalar fallback. Enable them unconditionally like the RDNA parts.
-#elif defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx1011__) || defined(__gfx1012__) || defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1034__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
+#elif !defined(NO_INLINE_ASM) && (defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx1011__) || defined(__gfx1012__) || defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1034__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__))
 #define amul4bit(X,Y,Z) _amul4bit((constant uint32_t*)(X), (private uint32_t*)(Y), (uint32_t *)(Z))
 void STATIC inline _amul4bit(__constant uint32_t packed_vec1[32], uint32_t packed_vec2[32], uint32_t *ret) {
     // We assume each 32 bits have four values: A0 B0 C0 D0
