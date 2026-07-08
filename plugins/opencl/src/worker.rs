@@ -245,11 +245,22 @@ impl OpenCLGPUWorker {
             || matches!(arch.as_str(), "gfx1011" | "gfx1012" | "gfx1030" | "gfx1031" | "gfx1032" | "gfx1034");
         let experimental_amd_use = vdot8_default || (experimental_amd && vdot8_capable);
 
-        let options = match experimental_amd_use {
-            // true => "-D __FORCE_AMD_V_DOT4_U32_U8__=1 ",
-            true => "-D __FORCE_AMD_V_DOT8_U32_U4__=1 ",
-            false => "",
+        // Windows: the AMD Adrenalin OpenCL compiler rejects the GNU `__asm__`/`asm` inline asm the
+        // dot-product paths use (ROCm on Linux accepts it) — the JIT fails with CL_BUILD_PROGRAM_FAILURE
+        // ("implicit declaration of function 'asm' is invalid in C99"). Pass -D NO_INLINE_ASM so the
+        // kernel routes to its bit-identical scalar (nibble-unpack) dot path — SAME packed layout + host
+        // matrix, so the hash is unchanged. Keep -D __FORCE_AMD_V_DOT8_U32_U4__=1 (it still drives the
+        // v_dot8 host matrix packing AND the scalar path's v_dot8-equivalent selection). No-op on ROCm.
+        #[cfg(target_os = "windows")]
+        const NO_ASM: &str = "-D NO_INLINE_ASM ";
+        #[cfg(not(target_os = "windows"))]
+        const NO_ASM: &str = "";
+        let options_str = match experimental_amd_use {
+            // true => format!("-D __FORCE_AMD_V_DOT4_U32_U8__=1 {NO_ASM}"),
+            true => format!("-D __FORCE_AMD_V_DOT8_U32_U4__=1 {NO_ASM}"),
+            false => NO_ASM.to_string(),
         };
+        let options: &str = &options_str;
 
         let program = match use_binary {
             true => {
