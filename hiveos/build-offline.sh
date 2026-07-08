@@ -6,10 +6,14 @@
 # Usage: build-offline.sh <IMAGE> <OUTDIR-name> <SUFFIX> [HOST_CUDA_DIR]
 #   e.g. build-offline.sh keryx-build:offline dist-modern modern
 #   HOST_CUDA_DIR: optional host path to a CUDA toolkit to mount at /opt/cuda and
-#   build against (e.g. an extracted 12.2 toolkit) instead of the image's CUDA.
+#   build against (e.g. an extracted 12.4 toolkit) instead of the image's CUDA.
+# Per-line arch overrides (env): BOFF_POM_CUDA_ARCH (walk PTX; default compute_75 via
+# build.rs; legacy=compute_70, pascal=compute_60) and BOFF_CUDA_COMPUTE_CAP (candle
+# inference PTX; default 70; pascal=60).
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="$1"; OUTDIR="$2"; SUF="$3"; CUDADIR="${4:-}"
+POMARCH="${BOFF_POM_CUDA_ARCH:-}"; CCAP="${BOFF_CUDA_COMPUTE_CAP:-70}"
 OUT="$REPO/hiveos/$OUTDIR"
 SCRATCH=/tmp/koffcargo-$SUF
 TGT="target-offline-$SUF"
@@ -26,15 +30,17 @@ docker run --rm --network none \
   -v "$REPO":/src -w /src \
   -v "$SCRATCH":/root/.cargo "${CUDAMOUNT[@]}" \
   -e CARGO_HOME=/root/.cargo -e CARGO_NET_OFFLINE=true -e RUSTUP_HOME=/usr/local/rustup \
-  -e KCUDA="$KCUDA" \
+  -e KCUDA="$KCUDA" -e POMARCH="$POMARCH" -e CCAP="$CCAP" \
   "$IMAGE" bash -euo pipefail -c '
-    export CUDA_HOME=$KCUDA CUDA_PATH=$KCUDA CUDA_COMPUTE_CAP=70
+    export CUDA_HOME=$KCUDA CUDA_PATH=$KCUDA CUDA_COMPUTE_CAP=$CCAP
+    if [ -n "$POMARCH" ]; then export POM_CUDA_ARCH="$POMARCH"; fi
     export PATH=$KCUDA/bin:/usr/local/cargo/bin:/root/.cargo/bin:$PATH
     export RUSTFLAGS="-L $KCUDA/lib64/stubs"
     export CARGO_TARGET_DIR=/src/'"$TGT"'
     O=/src/hiveos/'"$OUTDIR"'
-    echo "building against CUDA: $(nvcc --version | grep -oE "release [0-9.]+")"
+    echo "building against CUDA: $(nvcc --version | grep -oE "release [0-9.]+") walk-arch=${POMARCH:-default} candle-cap=$CCAP"
     rm -rf '"$TGT"'/release/build/candle-kernels-* '"$TGT"'/release/.fingerprint/candle-kernels-* '"$TGT"'/release/deps/*candle_kernels* 2>/dev/null || true
+    touch /src/src/pom_mine.cu 2>/dev/null || true
     echo "=== dynamic build (binary + plugins) ==="
     cargo build --offline --release --features pom-cuda
     cp '"$TGT"'/release/keryx-miner-supr "$O/keryx-miner-supr-dynamic"
