@@ -29,15 +29,16 @@ args="-a ${CUSTOM_TEMPLATE} -s ${url}"
 
 # Model selection: honour whatever the user put in extra args — a tier flag (--very-light/--light/
 # --high/--very-high), the --tier <name> form, OR --force-model <csv>. Only if NONE is present do we
-# prepend the default. Unlike the NVIDIA launcher (which defaults to per-card --tier auto), AMD
-# defaults to --light: the AMD/OpenCL build forces the Gemma-3-4B tier internally on EVERY card
-# (there is no per-card model selection on AMD), so --light is the accurate, always-valid default —
-# --tier auto would just be forced to --light anyway. Recognising --force-model here (even though the
-# AMD binary ignores it) avoids a spurious "--light" that could clash with it.
+# prepend the default. As of v0.6.9.3 the AMD/OpenCL build HONORS these overrides (was hardcoded Light
+# — issue #7): a user override is applied PROCESS-WIDE (one resident tier for all cards; there is no
+# per-card model map on AMD, unlike CUDA), and --force-model bypasses the VRAM gate. The default stays
+# --light (Gemma-3-4B) — the OOM-safe choice, since AMD loads the whole tier blob into VRAM and a bigger
+# tier would OOM a small card. So we differ from the NVIDIA launcher (per-card --tier auto): AMD pins
+# --light and lets the operator opt into a heavier tier explicitly (--tier high / --force-model qwen3-32b).
 extra="$CUSTOM_USER_CONFIG"
 case " $extra " in
   *" --very-light "*|*" --light "*|*" --high "*|*" --very-high "*|*" --tier "*|*" --tier="*|*" --force-model "*|*" --force-model="*) : ;;  # model chosen
-  *) extra="--light $extra" ;;   # default: --light (Gemma-3-4B) — AMD mines Gemma on every card
+  *) extra="--light $extra" ;;   # default: --light (Gemma-3-4B) — OOM-safe; override with --tier/--force-model
 esac
 
 args="$args ${extra}"
