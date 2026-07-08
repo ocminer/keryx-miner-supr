@@ -20,7 +20,27 @@ use candle_core::quantized::{gguf_file, QTensor};
 use candle_core::{CudaDevice, Device};
 
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine.ptx"));
+/// The arch the walk PTX was compiled for (build.rs bakes POM_CUDA_ARCH in) — modern=sm_75,
+/// legacy=sm_70, pascal=sm_60. Used to explain arch-mismatch load failures.
+const PTX_ARCH: &str = env!("POM_PTX_ARCH");
 const CHUNK_BYTES: usize = 32;
+
+/// Load the walk kernel, turning a bare driver error (typically CUDA_ERROR_INVALID_PTX when the
+/// GPU is OLDER than the PTX target — PTX only JITs forward) into an actionable message naming
+/// this build's PTX arch and the right build line for older cards.
+fn load_walk_func(cuda: &CudaDevice) -> candle_core::Result<candle_core::cuda_backend::CudaFunc> {
+    cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX).map_err(|e| {
+        candle_core::Error::Msg(format!(
+            "PoM walk kernel failed to load ({e}). This build's walk PTX targets {PTX_ARCH}, and PTX \
+             only JIT-compiles onto {PTX_ARCH}-or-newer GPUs — on an older card the driver returns \
+             CUDA_ERROR_INVALID_PTX. Use the build line that matches your GPU: LEGACY = sm_70+ \
+             (Volta/V100, CMP 100-210, Turing and newer), PASCAL = sm_60/61 (GTX 10-series), \
+             MODERN = sm_75+ with driver 575+. If you built from source: CUDA 13.x cannot compile \
+             for Volta or Pascal — use a CUDA 12.x toolkit and set POM_CUDA_ARCH=compute_70 (Volta) \
+             or compute_60 (Pascal), plus CUDA_COMPUTE_CAP to match."
+        ))
+    })
+}
 
 fn words4(b: &[u8; 32]) -> [u64; 4] {
     let mut w = [0u64; 4];
@@ -79,7 +99,7 @@ impl PomGpuMiner {
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
         // Warm the module cache so mine() never compiles on the hot path.
-        let _ = cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?;
+        let _ = load_walk_func(&cuda)?;
 
         Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: tensors, _shared: Vec::new() })
     }
@@ -144,7 +164,7 @@ impl PomGpuMiner {
 
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
-        let _ = cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?;
+        let _ = load_walk_func(&cuda)?;
 
         Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: raw, _shared: kept_shared })
     }
@@ -165,7 +185,7 @@ impl PomGpuMiner {
         let grid = ((batch + 255) / 256) as u32;
         let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
 
-        let func = self.cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?; // cached
+        let func = load_walk_func(&self.cuda)?; // cached
         let mut b = func.builder();
         b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&self.n_total_chunks).arg(&k)
             .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3]).arg(&timestamp)
