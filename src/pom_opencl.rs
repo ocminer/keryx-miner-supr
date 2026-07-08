@@ -30,43 +30,83 @@ pub struct PomMiner {
 // serializes all access (one mining thread), so sending the miner across threads is sound.
 unsafe impl Send for PomMiner {}
 
+/// Staging window for the VRAM upload: 2^23 chunks × 32 B = 256 MiB. The blob is streamed
+/// GGUF → window → cl_mem, so no full host copy of the tier ever exists (the old design cached
+/// the whole blob in system RAM — ~2.5 GB for Gemma, ~28 GB for the 70B tier).
+const UPLOAD_WINDOW_CHUNKS: u64 = 1 << 23;
+
+/// Max nonces per kernel launch. mine() grinds its batch in sub-dispatches of this size: one
+/// huge NDRange (2^22 nonces × 256 dependent reads) can run multi-second on slow cards, which
+/// trips the Windows TDR watchdog (~2 s) → device lost. 2^18 keeps a dispatch to ~0.5 s even
+/// at 0.5 MH/s while amortizing launch overhead (<0.5% at MI60/7600 XT rates). Sub-batches run
+/// in ascending nonce order, so the first one with a winner holds the batch's lowest nonce —
+/// early-returning there is result-identical and submits the share sooner.
+const SUB_DISPATCH_NONCES: u64 = 1 << 18;
+
 impl PomMiner {
-    /// `blob` = the tier in canonical chunk order, N*4 little-endian u64.
-    pub fn new(device: Device, blob: &[u64], n_chunks: u64) -> Result<Self, String> {
+    /// Build the resident tier on `device` by streaming the canonical chunks straight from the
+    /// shared WeightIndex (GGUF pread) into the cl_mem buffer through a bounded staging window.
+    pub fn new(device: Device, index: &crate::pom::WeightIndex, n_chunks: u64) -> Result<Self, String> {
         let context = Arc::new(Context::from_device(&device).map_err(|e| e.to_string())?);
         let queue = CommandQueue::create(&context, device.id(), 0).map_err(|e| e.to_string())?;
         let program = Program::create_and_build_from_source(&context, POM_SRC, "")?;
         let kernel = Kernel::create(&program, "pom_mine").map_err(|e| e.to_string())?;
         // worker.rs pattern: a context ref that outlives the borrow checker (Arc kept in struct).
         let cref = unsafe { Arc::as_ptr(&context).as_ref().unwrap() };
-        let mut weights = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_ONLY, blob.len(), ptr::null_mut())
+        let mut weights = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_ONLY, (n_chunks * 4) as usize, ptr::null_mut())
             .map_err(|e| e.to_string())?;
-        queue.enqueue_write_buffer(&mut weights, CL_BLOCKING, 0, blob, &[]).map_err(|e| e.to_string())?;
+        let mut staging = vec![0u64; (UPLOAD_WINDOW_CHUNKS.min(n_chunks) * 4) as usize];
+        let mut done: u64 = 0;
+        while done < n_chunks {
+            let n = (n_chunks - done).min(UPLOAD_WINDOW_CHUNKS);
+            let words = &mut staging[..(n * 4) as usize];
+            // Fill the window with the raw chunk bytes, then normalize to the LE word values the
+            // kernel folds (u64::from_le is a no-op on our little-endian targets) — identical to
+            // chunk_to_words / u64::from_le_bytes on every chunk.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8) };
+            index.read_chunks_into(done, bytes);
+            for w in words.iter_mut() {
+                *w = u64::from_le(*w);
+            }
+            queue
+                .enqueue_write_buffer(&mut weights, CL_BLOCKING, (done * 32) as usize, words, &[])
+                .map_err(|e| e.to_string())?;
+            done += n;
+        }
         let winner = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_WRITE, 1, ptr::null_mut())
             .map_err(|e| e.to_string())?;
         Ok(Self { _context: context, queue, kernel, weights, winner, n_chunks })
     }
 
-    /// Launch one batch of `batch` nonces from `nonce_base`. Returns the lowest nonce whose
-    /// pom_pow_value <= target, or None.
+    /// Grind one batch of `batch` nonces from `nonce_base` in TDR-safe sub-dispatches. Returns
+    /// the lowest nonce whose pom_pow_value <= target, or None.
     pub fn mine(&mut self, pph: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64) -> Option<u64> {
-        self.queue.enqueue_write_buffer(&mut self.winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
-        ExecuteKernel::new(&self.kernel)
-            .set_arg(&self.weights)
-            .set_arg(&self.n_chunks)
-            .set_arg(&POM_WALK_STEPS)
-            .set_arg(&pph[0]).set_arg(&pph[1]).set_arg(&pph[2]).set_arg(&pph[3])
-            .set_arg(&time)
-            .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
-            .set_arg(&nonce_base).set_arg(&batch)
-            .set_arg(&self.winner)
-            .set_global_work_size(batch as usize)
-            .enqueue_nd_range(&self.queue)
-            .ok()?;
-        self.queue.finish().ok()?;
-        let mut w = [u64::MAX];
-        self.queue.enqueue_read_buffer(&self.winner, CL_BLOCKING, 0, &mut w, &[]).ok()?;
-        if w[0] == u64::MAX { None } else { Some(w[0]) }
+        let mut done: u64 = 0;
+        while done < batch {
+            let sub = (batch - done).min(SUB_DISPATCH_NONCES);
+            let base = nonce_base.wrapping_add(done);
+            self.queue.enqueue_write_buffer(&mut self.winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
+            ExecuteKernel::new(&self.kernel)
+                .set_arg(&self.weights)
+                .set_arg(&self.n_chunks)
+                .set_arg(&POM_WALK_STEPS)
+                .set_arg(&pph[0]).set_arg(&pph[1]).set_arg(&pph[2]).set_arg(&pph[3])
+                .set_arg(&time)
+                .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
+                .set_arg(&base).set_arg(&sub)
+                .set_arg(&self.winner)
+                .set_global_work_size(sub as usize)
+                .enqueue_nd_range(&self.queue)
+                .ok()?;
+            self.queue.finish().ok()?;
+            let mut w = [u64::MAX];
+            self.queue.enqueue_read_buffer(&self.winner, CL_BLOCKING, 0, &mut w, &[]).ok()?;
+            if w[0] != u64::MAX {
+                return Some(w[0]);
+            }
+            done += sub;
+        }
+        None
     }
 }
 
@@ -88,11 +128,9 @@ use std::sync::Mutex;
 
 /// Per-GPU resident miners, keyed by cl_device_id (as usize). Each behind its own Mutex so the
 /// owning thread mines without blocking the other cards. Vec (tiny N) keeps a const initializer.
+/// Each card streams its blob straight from the GGUF (no host-RAM blob cache — the OS page cache
+/// makes the 2nd+ card's upload cheap).
 static POM_BY_DEV: Mutex<Vec<(usize, Arc<Mutex<PomMiner>>)>> = Mutex::new(Vec::new());
-
-/// The contiguous GPU blob (canonical chunk order), built once from the shared WeightIndex and
-/// reused to make each card resident. Kept cached so adding a card doesn't re-pread the GGUF.
-static BLOB: Mutex<Option<Arc<Vec<u64>>>> = Mutex::new(None);
 
 thread_local! {
     /// The cl_device_id this mining thread owns (set once via bind_thread_device). All PoM
@@ -131,16 +169,16 @@ fn words(b: &[u8; 32]) -> [u64; 4] {
     w
 }
 
-/// Make the resident tier (the cached `BLOB`) GPU-resident on `device_id` — its own OpenCL
-/// context + buffer. Idempotent per card. `BLOB` + the shared WeightIndex must already be built.
+/// Make the resident tier GPU-resident on `device_id` — its own OpenCL context + buffer, filled
+/// by streaming from the shared WeightIndex's GGUF. Idempotent per card. The index must exist.
 fn install_resident(device_id: usize) -> Result<(), String> {
     if miner_for(device_id).is_some() {
         return Ok(());
     }
-    let blob = BLOB.lock().unwrap().clone().ok_or("PoM: weight blob not built")?;
-    let n = crate::pom::active_index().map(|(i, _)| i.n_chunks).ok_or("PoM: no index")?;
+    let (index, _) = crate::pom::active_index().ok_or("PoM: no index")?;
+    let n = index.n_chunks;
     let dev = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id);
-    let miner = PomMiner::new(dev, &blob, n)?;
+    let miner = PomMiner::new(dev, index, n)?;
     POM_BY_DEV.lock().unwrap().push((device_id, Arc::new(Mutex::new(miner))));
     log::info!("PoM: tier resident on GPU {device_id:#x} ({} MiB).", (n * 32) / (1024 * 1024));
     Ok(())
@@ -180,32 +218,27 @@ pub fn set_mining_tier(gguf_path: String, tier: u8) {
 /// Single-GPU AMD boxes never trip this; multi-GPU rigs do. Mirrors pom_gpu's BUILD_LOCK.
 static BUILD_LOCK: Mutex<()> = Mutex::new(());
 
-/// Build the shared proof-side WeightIndex + the cached GPU blob from a GGUF, once. Idempotent —
-/// returns immediately if both already exist. Caller must hold BUILD_LOCK. This is the heavy,
-/// card-independent work (CPU/disk); the per-card upload is install_resident().
-fn build_index_and_blob(gguf_path: &str, tier: u8) -> Result<(), String> {
-    if crate::pom::active_index().is_some() && BLOB.lock().unwrap().is_some() {
+/// Build the shared proof-side WeightIndex from a GGUF, once. Idempotent — returns immediately
+/// if it already exists. Caller must hold BUILD_LOCK. This is the heavy, card-independent work
+/// (CPU/disk); the per-card VRAM upload streams from this index in install_resident().
+fn ensure_index(gguf_path: &str, tier: u8) -> Result<(), String> {
+    if crate::pom::active_index().is_some() {
         return Ok(());
     }
     log::info!("PoM: building WeightIndex from {gguf_path} (tier {tier})…");
     let index = crate::pom::WeightIndex::build_from_gguf(gguf_path).map_err(|e| e.to_string())?;
-    let n = index.n_chunks;
     log::info!(
-        "PoM: tier {tier} loaded — {n} chunks, computed R_T = {} (must match the node's pinned root)",
+        "PoM: tier {tier} loaded — {} chunks, computed R_T = {} (must match the node's pinned root)",
+        index.n_chunks,
         hex32(&index.r_t)
     );
-    // Contiguous GPU blob in canonical chunk order; read_chunk guarantees the SAME indexing the
-    // proof side uses. TODO(perf): bulk-read for the big tiers (this is O(N) preads).
-    let mut blob: Vec<u64> = Vec::with_capacity((n * 4) as usize);
-    for off in 0..n { blob.extend_from_slice(&index.read_chunk(off)); }
     crate::pom::set_index(index, tier);
-    *BLOB.lock().unwrap() = Some(Arc::new(blob));
     Ok(())
 }
 
 /// Lazily build the shared tier and make it resident on THIS thread's bound GPU, on the first
 /// PoM-active iteration. Safe to call concurrently from every GPU mining thread: the shared index
-/// + blob are built once (first thread under BUILD_LOCK), then each thread uploads to its OWN card,
+/// is built once (first thread under BUILD_LOCK), then each thread streams the GGUF to its OWN card,
 /// so all cards end up resident and mine independently.
 /// (Unlike NVIDIA, the AMD OpenCL buffer is never evicted, so each card does this work once.)
 pub fn ensure_installed() {
@@ -224,7 +257,7 @@ pub fn ensure_installed() {
             return;
         }
     };
-    if let Err(e) = build_index_and_blob(&path, t) {
+    if let Err(e) = ensure_index(&path, t) {
         log::warn!("PoM: tier build failed ({path}): {e} — is the model GGUF downloaded?");
         return;
     }
@@ -251,11 +284,11 @@ pub fn mine(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, ba
     g.mine(p, time, t, nonce_base, batch)
 }
 
-/// Build the resident tier from a GGUF (shared proof WeightIndex + cached GPU blob) and make it
+/// Build the resident tier from a GGUF (shared proof WeightIndex, streamed to VRAM) and make it
 /// resident on the FIRST OpenCL GPU. The multi-GPU production path uses ensure_installed (one
 /// resident copy per card); this single-device form backs the tests + any non-bound caller.
 pub fn load_tier(gguf_path: &str, tier: u8) -> Result<(), String> {
-    build_index_and_blob(gguf_path, tier)?;
+    ensure_index(gguf_path, tier)?;
     let id = opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU)
         .map_err(|e| e.to_string())?
         .first()

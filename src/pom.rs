@@ -840,6 +840,42 @@ impl WeightIndex {
         arr
     }
 
+    /// Bulk chunk reader: fill `out` (length a multiple of 32) with the raw bytes of canonical
+    /// chunks `[first_chunk, first_chunk + out.len()/32)`. Byte-identical to concatenating
+    /// `read_chunk_bytes` over the range, but issues one pread per overlapped TENSOR instead of
+    /// one per 32 B chunk — the GPU drivers stream the tier blob to VRAM through a bounded
+    /// window with this (a full per-chunk loop is ~78M preads for Gemma).
+    pub fn read_chunks_into(&self, first_chunk: u64, out: &mut [u8]) {
+        assert!(out.len() % 32 == 0, "read_chunks_into: length must be whole chunks");
+        let count = (out.len() / 32) as u64;
+        assert!(first_chunk + count <= self.n_chunks, "read_chunks_into: range past n_chunks");
+        match &self.chunks {
+            #[cfg(test)]
+            ChunkSource::Ram(data) => {
+                let base = (first_chunk as usize) * 32;
+                out.copy_from_slice(&data[base..base + out.len()]);
+            }
+            ChunkSource::Gguf { file, table } => {
+                let mut off = first_chunk;
+                let mut filled = 0usize;
+                // Tensor whose canonical range contains `off` (same lookup as read_chunk_bytes);
+                // subsequent tensors are consecutive table entries.
+                let mut j = table.partition_point(|&(start, _)| start <= off) - 1;
+                while filled < out.len() {
+                    let (start, file_off) = table[j];
+                    let tensor_end = table.get(j + 1).map_or(self.n_chunks, |&(s, _)| s);
+                    let n = (tensor_end - off).min(((out.len() - filled) / 32) as u64);
+                    let bytes = (n * 32) as usize;
+                    read_exact_at(file, &mut out[filled..filled + bytes], file_off + (off - start) * 32)
+                        .expect("PoM gguf chunk read");
+                    filled += bytes;
+                    off += n;
+                    j += 1;
+                }
+            }
+        }
+    }
+
     /// Find the stored checkpoint at `level` (panics if not found).
     fn find_checkpoint(&self, level: u32) -> &StoredLevel {
         self.checkpoints.iter().find(|cp| cp.level == level).expect("PoM: checkpoint not found")
