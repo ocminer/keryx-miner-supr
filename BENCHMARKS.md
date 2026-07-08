@@ -22,19 +22,23 @@ weights (a pointer-chase of 32-byte reads). What that means for you:
   24 GB; `--very-high` (Llama-70B) needs 32 GB+. Heavier tiers pay a higher block-reward bracket at
   ~the same walk hashrate — see the miner's `--help`.
 
-Numbers below are the **`--light` (Gemma-3-4B)** tier unless noted.
+Numbers below are at each card's **AUTO tier** (noted per row; heavier tiers pay more at ~the same
+walk rate — the walk is near-flat, ~5 %, across tiers). Datacenter rows were measured at `--light`.
 
-## Per-card table — NVIDIA (keryx PoM, `--light`)
+## Per-card table — NVIDIA (keryx PoM)
+
+Consumer/fleet rows **re-verified 2026-07-08 on v0.6.9.3** (≥5 min live per card, AUTO tier,
+stock clocks/power, 0 rejects).
 
 | GPU | Architecture | VRAM | Mem clock | Core clock | Power (mining) | Hashrate | Efficiency | Notes |
 |-----|--------------|------|-----------|------------|----------------|----------|------------|-------|
-| **NVIDIA H200 141GB** | Hopper (2023, datacenter) | 141 GB HBM3e | 3201 MHz | ~1980 MHz | ~628 W (of 700; cap-able) | **~166 MH/s** live (bench ceiling ~170; v0.6.8 128-bit loads) | ~0.26 MH/W | **fastest PoM card** — HBM3e ~4.8 TB/s, +32 % over H100. Memory-bound (98 % util) → cap power, no core-clock gain |
-| **NVIDIA H100 80GB** | Hopper (2022, datacenter) | 80 GB HBM3 | 2619 MHz (fixed) | ~1650 MHz | **400 W** (cap; see below) | **~123 MH/s** (ceiling 125.6) | 0.31 MH/W | ~2× a 5090. Cap PL to 400 W = 0 loss, −30 % power |
-| NVIDIA RTX 5090 | Blackwell (2025) | 32 GB GDDR7 | 13801 MHz | up to 3090 MHz | ~385 W (of 600 W PL) | ~65–68 MH/s | 0.18 MH/W | memory-bound; core-clock-insensitive, no gain from OC |
-| NVIDIA RTX 5080 | Blackwell (2025) | 16 GB GDDR7 | — | — | ~360 W PL (self-limits) | ~34.6 MH/s | — | |
-| NVIDIA RTX 5070 Ti | Blackwell (2025) | 16 GB GDDR7 | — | — | ~285 W PL (self-limits) | ~33.7 MH/s | — | |
-| NVIDIA CMP 170HX | Ampere GA100 (2021, mining) | 8 GB HBM2 | 1458 MHz | ~465 MHz (auto) | ~109 W | ~19.5 MH/s | ~0.18 MH/W | HBM2 → strong for PoM; auto-parks low, already efficient |
-| NVIDIA RTX 3070 | Ampere (2020) | 8 GB GDDR6 | — | — | ~220 W cap | ~18.35 MH/s | — | |
+| **NVIDIA H200 141GB** | Hopper (2023, datacenter) | 141 GB HBM3e | 3201 MHz | ~1980 MHz | ~628 W (of 700; cap-able) | **~166 MH/s** live (bench ceiling ~170; v0.6.8 128-bit loads) | ~0.26 MH/W | **fastest PoM card** — HBM3e ~4.8 TB/s, +32 % over H100. Memory-bound (98 % util) → cap power, no core-clock gain. `--light` |
+| **NVIDIA H100 80GB** | Hopper (2022, datacenter) | 80 GB HBM3 | 2619 MHz (fixed) | ~1650 MHz | **400 W** (cap; see below) | **~123 MH/s** (ceiling 125.6) | 0.31 MH/W | ~2× a 5090. Cap PL to 400 W = 0 loss, −30 % power. `--light` |
+| NVIDIA RTX 5090 | Blackwell (2025) | 32 GB GDDR7 | 13801 MHz | ~2850 MHz | ~382 W (of 600 W PL) | **~68 MH/s** | 0.18 MH/W | AUTO → very-high (Llama-70B-Q2); memory-bound, core-clock-insensitive, no gain from OC |
+| NVIDIA RTX 5080 | Blackwell (2025) | 16 GB GDDR7 | 14801 MHz | ~2835–2900 MHz | ~190–202 W (of 360 W PL) | **~34.8 MH/s** | ~0.18 MH/W | AUTO → default (Dolphin-8B); self-limits well under PL |
+| NVIDIA RTX 5070 Ti | Blackwell (2025) | 16 GB GDDR7 | 13801 MHz | ~2812 MHz | ~179 W (of 285 W PL) | **~34 MH/s** | ~0.19 MH/W | AUTO → default (Dolphin-8B); self-limits well under PL |
+| NVIDIA CMP 170HX | Ampere GA100 (2021, mining) | 8 GB HBM2 | 1458 MHz | ~510–570 MHz (auto) | ~115 W | **~20 MH/s** | ~0.17 MH/W | AUTO → light (Gemma); HBM2 → strong for PoM; auto-parks low, already efficient |
+| NVIDIA RTX 3070 | Ampere (2020) | 8 GB GDDR6 | 6801 MHz | ~1900 MHz | ~173 W (at 220 W cap) | **~18.5 MH/s** | ~0.11 MH/W | AUTO → light (Gemma) |
 
 _"—" = not measured yet; PRs welcome. Efficiency = MH/s per watt (higher is better)._
 
@@ -77,9 +81,11 @@ draw at 700 W is inference bursts, which the power cap trims with negligible has
 
 ## Method
 
-Measured live on the pool (`krx.suprnova.cc`) with `--light` (Gemma-3-4B, 77.6 M chunks / 2.48 GB
-possession blob), plus an isolated CUDA microbench of the walk kernel (`tools/h100/bench_pom.cu`) for the
-clean per-power-limit numbers. HBM cards were run at stock; consumer cards at stock power limits (they
+Measured live on the pool (`krx.suprnova.cc`), verified by share acceptance (0 rejects), plus an isolated
+CUDA microbench of the walk kernel (`tools/h100/bench_pom.cu`) for the clean per-power-limit numbers.
+Consumer/fleet rows re-measured 2026-07-08 on **v0.6.9.3** at AUTO tier (5090 → Llama-70B-Q2,
+5080/5070 Ti → Dolphin-8B, 170HX/3070 → Gemma-3-4B), ≥5 min live per card, stock clocks and power limits;
+datacenter rows are `--light` (Gemma-3-4B, 77.6 M chunks / 2.48 GB possession blob). HBM cards were run at stock; consumer cards at stock power limits (they
 self-limit for the memory-bound walk). **AMD** numbers are the OpenCL worker (`keryxopencl`) measured live
 on the same pool, with per-card hashrate/clocks/power read from `rocm-smi`, on a 3-GPU Ubuntu box (RADV/Mesa
 Vulkan for OPoI inference).
