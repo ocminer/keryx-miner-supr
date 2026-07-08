@@ -74,7 +74,18 @@ jobs:
       - name: Package macOS (arm64) tarball (ad-hoc signed)
         run: |
           set -e
-          VER=$(grep -m1 '^CUSTOM_VERSION=' hiveos/pkg/keryx-miner-supr/h-manifest.conf | cut -d= -f2)
+          # Version source: on a vX.Y.Z tag build take VER from the tag ref (strips leading v); on
+          # branch / PR builds fall back to the base HiveOS manifest. The manifest is unreliable for
+          # tarball naming — the v0.6.9.4 and v0.6.9.5 releases both shipped `-0.6.9.3.tar.gz`
+          # because those tag commits only bumped hiveos/pkg-amd/ or hiveos/pkg-nvidia/, leaving the
+          # base hiveos/pkg/keryx-miner-supr/h-manifest.conf stuck at 0.6.9.3. The tag ref is
+          # authoritative and always matches the release version.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+          else
+            VER=$(grep -m1 '^CUSTOM_VERSION=' hiveos/pkg/keryx-miner-supr/h-manifest.conf | cut -d= -f2)
+          fi
+          echo "Packaging macOS arm64 tarball for VER=${VER} (source: ${GITHUB_REF})"
           DIR="keryx-miner-supr-macos-arm64"
           rm -rf "$DIR"; mkdir -p "$DIR"
           strip target/release/keryx-miner-supr
