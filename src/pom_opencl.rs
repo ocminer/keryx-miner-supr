@@ -30,10 +30,12 @@ pub struct PomMiner {
 // serializes all access (one mining thread), so sending the miner across threads is sound.
 unsafe impl Send for PomMiner {}
 
-/// Staging window for the VRAM upload: 2^23 chunks × 32 B = 256 MiB. The blob is streamed
+/// Staging window for the VRAM upload: 2^22 chunks × 32 B = 128 MiB. The blob is streamed
 /// GGUF → window → cl_mem, so no full host copy of the tier ever exists (the old design cached
-/// the whole blob in system RAM — ~2.5 GB for Gemma, ~28 GB for the 70B tier).
-const UPLOAD_WINDOW_CHUNKS: u64 = 1 << 23;
+/// the whole blob in system RAM — ~2.5 GB for Gemma, ~28 GB for the 70B tier). Cards stream
+/// CONCURRENTLY (one window each), so the window is kept moderate: N cards hold N windows of
+/// transient host RAM, and each pread is still multi-MB (readahead-friendly, seek cost amortized).
+const UPLOAD_WINDOW_CHUNKS: u64 = 1 << 22;
 
 /// Max nonces per kernel launch. mine() grinds its batch in sub-dispatches of this size: one
 /// huge NDRange (2^22 nonces × 256 dependent reads) can run multi-second on slow cards, which
@@ -169,19 +171,38 @@ fn words(b: &[u8; 32]) -> [u64; 4] {
     w
 }
 
+/// Cards whose streaming upload is currently in flight. Uploads for DIFFERENT cards run
+/// concurrently (each thread streams its own card); a second caller for the SAME card waits
+/// here instead of double-building (only the unbound/test fallback path can race like that —
+/// production mining threads each bind a distinct device).
+static INSTALLING: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
 /// Make the resident tier GPU-resident on `device_id` — its own OpenCL context + buffer, filled
 /// by streaming from the shared WeightIndex's GGUF. Idempotent per card. The index must exist.
 fn install_resident(device_id: usize) -> Result<(), String> {
-    if miner_for(device_id).is_some() {
-        return Ok(());
+    loop {
+        let mut ins = INSTALLING.lock().unwrap();
+        if miner_for(device_id).is_some() {
+            return Ok(());
+        }
+        if !ins.contains(&device_id) {
+            ins.push(device_id); // claimed — we stream this card
+            break;
+        }
+        drop(ins); // another thread is streaming this card; wait for it to finish
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    let (index, _) = crate::pom::active_index().ok_or("PoM: no index")?;
-    let n = index.n_chunks;
-    let dev = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id);
-    let miner = PomMiner::new(dev, index, n)?;
-    POM_BY_DEV.lock().unwrap().push((device_id, Arc::new(Mutex::new(miner))));
-    log::info!("PoM: tier resident on GPU {device_id:#x} ({} MiB).", (n * 32) / (1024 * 1024));
-    Ok(())
+    let result = (|| {
+        let (index, _) = crate::pom::active_index().ok_or("PoM: no index")?;
+        let n = index.n_chunks;
+        let dev = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id);
+        let miner = PomMiner::new(dev, index, n)?;
+        POM_BY_DEV.lock().unwrap().push((device_id, Arc::new(Mutex::new(miner))));
+        log::info!("PoM: tier resident on GPU {device_id:#x} ({} MiB).", (n * 32) / (1024 * 1024));
+        Ok(())
+    })();
+    INSTALLING.lock().unwrap().retain(|d| *d != device_id);
+    result
 }
 
 /// True if THIS thread's bound card has the tier resident (or, with no binding, any card does).
@@ -245,10 +266,6 @@ pub fn ensure_installed() {
     if is_installed() {
         return; // this thread's card is already resident
     }
-    let _build = BUILD_LOCK.lock().unwrap(); // serialize the one-time index build + per-card uploads
-    if is_installed() {
-        return; // our card was made resident while we waited
-    }
     let tier = TIER.lock().unwrap().clone();
     let (path, t) = match tier {
         Some(pt) => pt,
@@ -257,9 +274,18 @@ pub fn ensure_installed() {
             return;
         }
     };
-    if let Err(e) = ensure_index(&path, t) {
-        log::warn!("PoM: tier build failed ({path}): {e} — is the model GGUF downloaded?");
-        return;
+    {
+        // BUILD_LOCK covers ONLY the one-time shared index build. The per-card VRAM streams run
+        // OUTSIDE it, concurrently across cards: holding the lock through the upload serialized
+        // the streams, so a multi-card rig's hashrate ramped up one card at a time (minutes on
+        // big rigs) and the pool's vardiff chasing that ramp caused low-diff reject bursts at
+        // startup (issue #9). Concurrent streams cost ~one disk pass total — the page cache
+        // serves the followers.
+        let _build = BUILD_LOCK.lock().unwrap();
+        if let Err(e) = ensure_index(&path, t) {
+            log::warn!("PoM: tier build failed ({path}): {e} — is the model GGUF downloaded?");
+            return;
+        }
     }
     match target_dev() {
         Some(id) => match install_resident(id) {
