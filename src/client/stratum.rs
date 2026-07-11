@@ -709,11 +709,17 @@ impl StratumHandler {
                                         let base = LAST_DAA_SCORE.load(std::sync::atomic::Ordering::Relaxed)
                                             .max(crate::pow::heavy_hash::POW_SALT_V4_ACTIVATION_DAA);
                                         // If the pool told us the fork is active (POOL_FORCED_POM),
-                                        // floor at the current frontier so daa >= activation_daa()
-                                        // AND the post-H2 tier is stamped — otherwise a Short-only
-                                        // pool never lifts us over the activation gate.
+                                        // floor at the CURRENT frontier — activation + H2 tier AND
+                                        // the H3 gate (level_activation_daa, salted folds). The old
+                                        // floor stopped at H2: on a Short-only pool/proxy (no
+                                        // daa_score on the wire) the miner then mined UNSALTED
+                                        // pre-H3 folds forever, and every post-H3 verifier rejected
+                                        // ~every share as "low difficulty". H3 (like H2) is a frozen
+                                        // frontier the network is permanently past, so any pool
+                                        // forcing PoM today is necessarily post-H3.
                                         if POOL_FORCED_POM.load(std::sync::atomic::Ordering::Relaxed) {
                                             base.max(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA)
+                                                .max(keryx_miner::pom::level_activation_daa())
                                         } else {
                                             base
                                         }

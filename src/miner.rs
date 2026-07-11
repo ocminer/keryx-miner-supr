@@ -33,15 +33,25 @@ const FREEZE_GRACE: Duration = Duration::from_secs(30);
 const FREEZE_POLL: Duration = Duration::from_millis(50);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-extern "C" fn signal_panic(_signal: nix::libc::c_int) {
+extern "C-unwind" fn signal_panic(_signal: nix::libc::c_int) {
+    // MUST be `extern "C-unwind"` (upstream 13d9515): a plain `extern "C"` handler turns
+    // this panic into a process-wide abort ("panic in a function that cannot unwind") — so
+    // force-killing ONE genuinely frozen worker nuked the whole miner, and on HiveOS the
+    // agent relaunch turned that into a shutdown crash-loop (worst during an OPoI inference
+    // reload). Unwinding lets the stuck worker's join() return an Err instead.
     panic!("Forced shutdown");
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn register_freeze_handler() {
-    let handler = nix::sys::signal::SigHandler::Handler(signal_panic);
+    // nix's typed SigHandler only accepts `extern "C" fn`, which would reintroduce the
+    // abort. Register through libc with a transmute: the C and C-unwind ABIs share the
+    // same calling convention (ABI-sound), and unwind behavior follows the handler's own
+    // `extern "C-unwind"` definition.
     unsafe {
-        nix::sys::signal::signal(nix::sys::signal::Signal::SIGUSR1, handler).unwrap();
+        let handler: nix::libc::sighandler_t =
+            std::mem::transmute(signal_panic as extern "C-unwind" fn(nix::libc::c_int));
+        let _ = nix::libc::signal(nix::libc::SIGUSR1, handler);
     }
 }
 
@@ -377,6 +387,19 @@ impl MinerManager {
                         #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                         let found = {
                             if !pom_driver::is_installed(wdid) {
+                                // A resident-model reload (inference evicted the walk) is a
+                                // multi-second blocking GPU op with no cooperative Close check
+                                // inside it. If a shutdown or newer job is already pending, act
+                                // on it NOW instead of starting a reload that would outlive the
+                                // shutdown grace window (upstream 13d9515).
+                                if let Some(new_cmd) = block_channel.get_changed()? {
+                                    state = match new_cmd {
+                                        Some(WorkerCommand::Job(s)) => Some(s),
+                                        Some(WorkerCommand::Close) => return Ok(()),
+                                        None => None,
+                                    };
+                                    continue;
+                                }
                                 pom_driver::ensure_installed(wdid, daa);
                             }
                             pom_driver::mine(wdid, &pph, time, &target_le, pom_nonce, POM_BATCH, h3)
@@ -386,6 +409,15 @@ impl MinerManager {
                         #[cfg(feature = "pom-opencl")]
                         let found = {
                             if !pom_driver::is_installed() {
+                                // Same cooperative pre-reload check as the CUDA/Metal branch above.
+                                if let Some(new_cmd) = block_channel.get_changed()? {
+                                    state = match new_cmd {
+                                        Some(WorkerCommand::Job(s)) => Some(s),
+                                        Some(WorkerCommand::Close) => return Ok(()),
+                                        None => None,
+                                    };
+                                    continue;
+                                }
                                 let _ = pom_driver::ensure_installed();
                             }
                             pom_driver::mine(&pph, time, &target_le, pom_nonce, POM_BATCH, h3)
