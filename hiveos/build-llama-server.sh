@@ -40,7 +40,7 @@ docker run --rm --network host \
     B=/tmp/llama-build
     /tmp/cmk/bin/cmake -S /llama -B $B -DGGML_CUDA=ON \
       -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DBUILD_SHARED_LIBS=OFF \
-      -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release \
+      -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DGGML_CUDA_NCCL=OFF -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_COMPILER=$KCUDA/bin/nvcc
     /tmp/cmk/bin/cmake --build $B --target llama-server -j "$JOBS"
     cp $B/bin/llama-server /out/llama-server
