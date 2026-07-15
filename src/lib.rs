@@ -23,6 +23,10 @@ pub mod pom_opencl;
 // candle-independence — the module self-disables when no server binary is bundled/env-pointed.
 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
 pub mod llama_vulkan;
+// In-process llama.cpp engine (dlopen'd libkeryx-llama.so): Phase 2 candle-independence — when
+// present it hosts the model (the walk gathers over its VRAM, zero-dup) AND serves OPoI text.
+#[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+pub mod llama_engine;
 // PoM GPU driver aliased to `pom_gpu` per platform so main.rs/miner.rs/slm.rs stay backend-agnostic:
 // NVIDIA CUDA on Linux/Windows, Apple-Silicon Metal on macOS. Mutually exclusive by construction
 // (the macOS Metal build never enables pom-cuda), and the `not(...)` guard makes that explicit.

@@ -822,7 +822,7 @@ impl WeightIndex {
     }
 
     /// Raw 32 B chunk bytes — used for leaf recompute in `merkle_path`.
-    fn read_chunk_bytes(&self, off: u64) -> [u8; 32] {
+    pub(crate) fn read_chunk_bytes(&self, off: u64) -> [u8; 32] {
         let mut arr = [0u8; 32];
         match &self.chunks {
             #[cfg(test)]

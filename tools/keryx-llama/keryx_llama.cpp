@@ -1,0 +1,119 @@
+// libkeryx-llama.so — the miner's llama.cpp engine (Phase 2 candle-independence).
+//
+// One in-process llama.cpp (CUDA) instance per loaded model: it OWNS the resident GGUF copy on
+// the inference GPU and exposes (a) per-tensor device pointers so the PoM walk gathers straight
+// over the SAME VRAM (zero-dup — proven byte-identical to the on-disk GGUF by
+// tools/llama_zerodup_spike), and (b) text generation for OPoI.
+//
+// The miner dlopens this next to its own binary; absent = the candle fallback stays active.
+// Built by hiveos/build-keryx-llama.sh against a PINNED llama.cpp (see the script).
+#include "llama.h"
+#include "llama-model.h"
+#include "ggml.h"
+#include <cuda_runtime.h>
+#include <algorithm>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <vector>
+
+struct KeryxLlama {
+    llama_model*   model = nullptr;
+    llama_context* ctx   = nullptr;
+    llama_sampler* smpl  = nullptr;
+    std::vector<std::string> names; // canonical (byte-lexicographic) order — matches pom.rs
+    std::mutex gen_lock;
+};
+
+extern "C" {
+
+// ABI version — the miner refuses to use a mismatched .so.
+int keryx_llama_abi() { return 2; }
+
+KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
+    llama_backend_init();
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 999;
+    mp.split_mode   = LLAMA_SPLIT_MODE_NONE; // ONE GPU — never layer-split across mining cards
+    mp.main_gpu     = gpu;
+    mp.use_mmap     = true;
+    llama_model* model = llama_model_load_from_file(gguf_path, mp);
+    if (!model) return nullptr;
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
+    llama_context* ctx = llama_init_from_model(model, cp);
+    if (!ctx) { llama_model_free(model); return nullptr; }
+
+    // Same user-facing sampling the candle path uses (temperature 0.7 / top_p 0.9) — the OPoI
+    // text is not consensus-relevant, but keep the flavor consistent.
+    llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
+
+    auto* h = new KeryxLlama();
+    h->model = model; h->ctx = ctx; h->smpl = smpl;
+    for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
+    std::sort(h->names.begin(), h->names.end());
+    return h;
+}
+
+size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
+
+// Tensor i in CANONICAL order. *is_device = the data pointer is CUDA device memory (walkable
+// in-place); 0 = host memory (the caller uploads its own device copy for the walk).
+bool keryx_llama_tensor_info(KeryxLlama* h, size_t i, const char** name, void** data,
+                             size_t* nbytes, int* is_device) {
+    if (!h || i >= h->names.size()) return false;
+    const ggml_tensor* t = h->model->get_tensor(h->names[i].c_str());
+    if (!t || !t->data) return false;
+    *name = h->names[i].c_str();
+    *data = t->data;
+    *nbytes = ggml_nbytes(t);
+    cudaPointerAttributes attr{};
+    cudaPointerGetAttributes(&attr, t->data);
+    *is_device = attr.type == cudaMemoryTypeDevice ? 1 : 0;
+    return true;
+}
+
+// Generate up to max_tokens; writes UTF-8 into out (cap bytes, NUL-terminated). Returns written
+// length, or -1 on error. Serialized — one generation at a time (OPoI challenges are rare).
+int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
+    if (!h || !prompt || !out || cap < 2) return -1;
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    const llama_vocab* vocab = llama_model_get_vocab(h->model);
+
+    std::vector<llama_token> toks(strlen(prompt) + 16);
+    int n = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt), toks.data(), (int32_t)toks.size(), true, true);
+    if (n < 0) return -1;
+    toks.resize(n);
+
+    llama_memory_clear(llama_get_memory(h->ctx), true);
+    llama_batch batch = llama_batch_get_one(toks.data(), (int32_t)toks.size());
+    int written = 0;
+    for (int i = 0; i < max_tokens; i++) {
+        if (llama_decode(h->ctx, batch) != 0) break;
+        llama_token tok = llama_sampler_sample(h->smpl, h->ctx, -1);
+        if (llama_vocab_is_eog(vocab, tok)) break;
+        char piece[256];
+        int pn = llama_token_to_piece(vocab, tok, piece, sizeof(piece), 0, true);
+        if (pn < 0) break;
+        if (written + pn >= cap - 1) break;
+        memcpy(out + written, piece, pn);
+        written += pn;
+        batch = llama_batch_get_one(&tok, 1);
+    }
+    out[written] = 0;
+    return written;
+}
+
+void keryx_llama_free(KeryxLlama* h) {
+    if (!h) return;
+    if (h->smpl) llama_sampler_free(h->smpl);
+    if (h->ctx) llama_free(h->ctx);
+    if (h->model) llama_model_free(h->model);
+    delete h;
+}
+
+} // extern "C"
