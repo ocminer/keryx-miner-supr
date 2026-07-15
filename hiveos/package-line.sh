@@ -24,9 +24,15 @@ VER=$(grep -m1 '^CUSTOM_VERSION=' "$HPKG/h-manifest.conf" | cut -d= -f2)
 LIBS=(libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libcurand.so.10)
 
 mklib(){ mkdir -p "$1/lib"; for l in "${LIBS[@]}"; do cp -L "$D/lib/$l" "$1/lib/"; done; }
-# Bundle the CUDA llama-server (OPoI inference engine, Phase 1 candle-independence) when the
-# line's dist dir has one (hiveos/build-llama-server.sh). Absent = feature stays dormant.
-bundle_llama(){ if [ -f "$D/llama-server" ]; then cp "$D/llama-server" "$1/"; chmod +x "$1/llama-server"; fi; }
+# Bundle the llama.cpp engine when the line's dist dir has it. libkeryx-llama.so = the
+# in-process Phase-2 engine (walk zero-dup + inference; hiveos/build-keryx-llama.sh) — the
+# shipped default. llama-server (Phase-1 subprocess; build-llama-server.sh) is NOT normally
+# placed in dist for NVIDIA (env-pointable fallback), but is bundled too when present.
+# Absent files = the corresponding engine stays dormant (candle fallback).
+bundle_llama(){
+  if [ -f "$D/libkeryx-llama.so" ]; then cp "$D/libkeryx-llama.so" "$1/"; chmod +x "$1/libkeryx-llama.so"; fi
+  if [ -f "$D/llama-server" ]; then cp "$D/llama-server" "$1/"; chmod +x "$1/llama-server"; fi
+}
 # Rewrite the HiveOS miner-dir name in the hardcoded h-* paths + CUSTOM_NAME (the
 # binary stays ./keryx-miner-supr; only the /hive + /var/log dir component changes).
 hrename(){ # $1=dir of h-* files  $2=new miner name
