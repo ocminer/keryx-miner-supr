@@ -986,6 +986,36 @@ async fn run() -> Result<(), Error> {
                 keryx_miner::llama_vulkan::try_start(&gpath_llama, port);
             });
         }
+        // NVIDIA llama.cpp-CUDA inference (Phase 1 of candle-independence): if a CUDA llama-server
+        // is bundled next to the miner (or KERYX_LLAMA_SERVER points at one), bring it up once the
+        // GGUF is on disk — slm then prefers it over candle. No binary = try_start logs once and
+        // returns; candle-GPU inference is untouched. The server is pinned to ONE GPU (the same
+        // biggest-VRAM ordinal candle uses; KERYX_LLAMA_CUDA_DEVICE overrides).
+        #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+        {
+            let gpath_llama = gpath.clone();
+            std::thread::spawn(move || {
+                let port: u16 = std::env::var("KERYX_LLAMA_PORT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(18099);
+                let ok_marker = std::path::Path::new(&gpath_llama).parent().map(|d| d.join(".ok"));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+                loop {
+                    let ready = std::path::Path::new(&gpath_llama).exists()
+                        && ok_marker.as_ref().map_or(true, |m| m.exists());
+                    if ready {
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        warn!("PoM(CUDA): model GGUF not ready in 30 min — llama-server not started; candle inference stays active.");
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+                keryx_miner::llama_vulkan::try_start(&gpath_llama, port);
+            });
+        }
         #[cfg(feature = "pom-opencl")]
         keryx_miner::pom_opencl::set_mining_tier(gpath, tier_idx);
         #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
