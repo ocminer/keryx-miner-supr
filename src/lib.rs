@@ -19,7 +19,9 @@ pub mod quantized_qwen3_split;
 pub mod pom;
 #[cfg(feature = "pom-opencl")]
 pub mod pom_opencl;
-#[cfg(feature = "pom-opencl")]
+// llama.cpp llama-server inference: AMD (Vulkan) always; NVIDIA (CUDA server) since Phase 1 of
+// candle-independence — the module self-disables when no server binary is bundled/env-pointed.
+#[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
 pub mod llama_vulkan;
 // PoM GPU driver aliased to `pom_gpu` per platform so main.rs/miner.rs/slm.rs stay backend-agnostic:
 // NVIDIA CUDA on Linux/Windows, Apple-Silicon Metal on macOS. Mutually exclusive by construction
