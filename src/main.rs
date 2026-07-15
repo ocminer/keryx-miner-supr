@@ -1008,12 +1008,18 @@ async fn run() -> Result<(), Error> {
                         break;
                     }
                     if std::time::Instant::now() > deadline {
-                        warn!("PoM(CUDA): model GGUF not ready in 30 min — llama-server not started; candle inference stays active.");
+                        warn!("PoM(CUDA): model GGUF not ready in 30 min — llama engine not started; candle inference stays active.");
                         return;
                     }
                     std::thread::sleep(std::time::Duration::from_secs(5));
                 }
-                keryx_miner::llama_vulkan::try_start(&gpath_llama, port);
+                // Prefer the IN-PROCESS engine (Phase 2: hosts the walk's model too — zero-dup).
+                // No libkeryx-llama.so → fall back to the Phase-1 llama-server subprocess; no
+                // llama-server either → candle stays active (dormant-fallback chain).
+                let inf_gpu = keryx_miner::slm::inference_gpu_ordinal();
+                if !keryx_miner::llama_engine::ensure_loaded(&gpath_llama, inf_gpu) {
+                    keryx_miner::llama_vulkan::try_start(&gpath_llama, port);
+                }
             });
         }
         #[cfg(feature = "pom-opencl")]

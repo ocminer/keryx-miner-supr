@@ -1259,6 +1259,16 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     // user-facing only (consensus checks the fixed-point `model_fixed` commitment separately), so
     // a non-candle engine is fine. Falls through to the candle engine below when the server isn't
     // available — on NVIDIA that is the exact pre-Phase-1 behavior (candle-GPU → candle-CPU).
+    // Highest priority: the IN-PROCESS llama.cpp engine (Phase 2) — it already hosts the model
+    // for the walk, so its inference is free of extra VRAM.
+    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    if crate::llama_engine::available() {
+        if let Some(text) = crate::llama_engine::generate(prompt, max_tokens) {
+            return Some(text);
+        }
+        log::warn!("SlmEngine: in-process llama generate failed — trying the next engine.");
+    }
+
     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
     if crate::llama_vulkan::available() {
         if let Some(text) = crate::llama_vulkan::generate(prompt, max_tokens) {
