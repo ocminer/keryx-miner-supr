@@ -17,14 +17,15 @@
 //! unavailable, or the server doesn't come up healthy, `AVAILABLE` stays false and the caller
 //! (`slm::load_and_run_inference`) transparently falls back to candle-CPU.
 
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::Mutex;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-static SERVER: Mutex<Option<Child>> = Mutex::new(None);
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
 static PORT: AtomicU16 = AtomicU16::new(0);
+/// PID of the running llama-server (0 = none). The Child handle itself is owned by the monitor
+/// thread that spawned it (see try_start) — it reaps the child and clears this on exit.
+static SERVER_PID: AtomicU32 = AtomicU32::new(0);
 
 /// Whether the Vulkan llama-server is up and ready to serve inference.
 pub fn available() -> bool {
@@ -112,29 +113,60 @@ pub fn try_start(gguf_path: &str, port: u16) -> bool {
         log::info!("llama server: pinning CUDA llama-server to GPU {dev} (CUDA_VISIBLE_DEVICES).");
     }
 
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
+    // Spawn from a DEDICATED MONITOR THREAD that outlives the caller. Two reasons:
+    // (1) orphan fix — on Linux the child gets PR_SET_PDEATHSIG(SIGKILL), so the kernel kills
+    //     llama-server whenever the miner dies, on EVERY exit path incl. `kill -9` and panics
+    //     (previously it survived the miner and squatted on VRAM). PDEATHSIG fires when the
+    //     SPAWNING THREAD dies — not the process — hence the spawner must stay alive, parked in
+    //     wait(), for the child's whole life.
+    // (2) the wait() reaps the child (no zombie) and flips AVAILABLE off if the server crashes
+    //     mid-session, so inference self-heals back to candle instead of timing out per request.
+    let (tx, rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+    std::thread::spawn(move || {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                nix::libc::prctl(nix::libc::PR_SET_PDEATHSIG, nix::libc::SIGKILL as nix::libc::c_ulong);
+                Ok(())
+            });
+        }
+        match cmd.spawn() {
+            Ok(mut ch) => {
+                let _ = tx.send(Ok(ch.id()));
+                let status = ch.wait(); // parks here for the child's lifetime (keeps PDEATHSIG armed)
+                let was_up = AVAILABLE.swap(false, Ordering::Relaxed);
+                SERVER_PID.store(0, Ordering::Relaxed);
+                if was_up {
+                    log::warn!("llama server: llama-server exited ({status:?}) — inference falls back to candle.");
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e.to_string()));
+            }
+        }
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(pid)) => SERVER_PID.store(pid, Ordering::Relaxed),
+        Ok(Err(e)) => {
             log::warn!("llama server: failed to spawn llama-server ({e}) — falling back to candle inference.");
             return false;
         }
-    };
-    *SERVER.lock().unwrap() = Some(child);
+        Err(_) => {
+            log::warn!("llama server: spawn did not report within 10s — falling back to candle inference.");
+            return false;
+        }
+    }
 
     // Poll /health until ready (model load on the GPU can take ~30-60s).
     let health = format!("http://127.0.0.1:{port}/health");
     let deadline = Instant::now() + Duration::from_secs(180);
     log::info!("llama_vulkan: starting Vulkan llama-server on port {port} (loading {gguf_path} into VRAM)…");
     while Instant::now() < deadline {
-        // exit early if the child already died
-        if let Ok(mut g) = SERVER.lock() {
-            if let Some(ch) = g.as_mut() {
-                if matches!(ch.try_wait(), Ok(Some(_))) {
-                    log::warn!("llama_vulkan: llama-server exited during startup — using CPU inference (no Vulkan/AMD GPU?).");
-                    *g = None;
-                    return false;
-                }
-            }
+        // exit early if the child already died (the monitor thread clears SERVER_PID on exit)
+        if SERVER_PID.load(Ordering::Relaxed) == 0 {
+            log::warn!("llama server: llama-server exited during startup — falling back to candle inference (wrong GPU/driver, OOM?).");
+            return false;
         }
         if ureq::get(&health).timeout(Duration::from_secs(2)).call().is_ok() {
             AVAILABLE.store(true, Ordering::Relaxed);
@@ -192,13 +224,16 @@ pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
     }
 }
 
-/// Kill the llama-server (best-effort). Called on shutdown / failed startup.
+/// Kill the llama-server (best-effort). Called on failed startup; the monitor thread reaps the
+/// child and clears SERVER_PID. (On Linux, normal miner death needs no call at all — PDEATHSIG
+/// kills the child from the kernel side.)
 pub fn stop() {
     AVAILABLE.store(false, Ordering::Relaxed);
-    if let Ok(mut g) = SERVER.lock() {
-        if let Some(mut ch) = g.take() {
-            let _ = ch.kill();
-            let _ = ch.wait();
-        }
+    let pid = SERVER_PID.swap(0, Ordering::Relaxed);
+    #[cfg(unix)]
+    if pid != 0 {
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL);
     }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
