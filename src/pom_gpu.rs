@@ -59,6 +59,7 @@ pub struct PomGpuMiner {
     n_total_chunks: u64,
     _tensors: Vec<QTensor>, // raw-loaded tensors kept alive so the gather pointers stay valid
     _shared: Vec<Arc<QTensor>>, // shared-with-inference tensors kept alive (zero-dup, Option C)
+    _uploads: Vec<CudaSlice<u8>>, // our own device copies of llama-engine host-resident tensors
 }
 
 impl PomGpuMiner {
@@ -101,7 +102,7 @@ impl PomGpuMiner {
         // Warm the module cache so mine() never compiles on the hot path.
         let _ = load_walk_func(&cuda)?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: tensors, _shared: Vec::new() })
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: tensors, _shared: Vec::new(), _uploads: Vec::new() })
     }
 
     /// Zero-dup load (Option C): build the gather over the SAME canonical name-sorted layout as
@@ -166,7 +167,88 @@ impl PomGpuMiner {
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
         let _ = load_walk_func(&cuda)?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: raw, _shared: kept_shared })
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: raw, _shared: kept_shared, _uploads: Vec::new() })
+    }
+
+    /// Phase-2 zero-dup over the IN-PROCESS llama.cpp engine (candle hosts nothing): bases/prefix
+    /// straight over the engine's resident device tensors in canonical name-sorted order (the
+    /// wrapper pre-sorts; byte-identity to the on-disk GGUF proven by tools/llama_zerodup_spike).
+    /// The few host-resident tensors (e.g. token_embd stays on the CPU buffer) get a small device
+    /// upload of our own. candle's CudaDevice here is pure CUDA plumbing (context/stream/kernel).
+    pub fn load_llama(device_id: usize) -> candle_core::Result<Self> {
+        let device = Device::new_cuda(device_id)?;
+        let cuda = match &device {
+            Device::Cuda(c) => c.clone(),
+            _ => return Err(candle_core::Error::Msg("PoM GPU: not a CUDA device".into())),
+        };
+        let stream = cuda.cuda_stream();
+        let ts = crate::llama_engine::tensors()
+            .ok_or_else(|| candle_core::Error::Msg("PoM GPU: llama engine tensors unavailable".into()))?;
+        let mut bases: Vec<u64> = Vec::new();
+        let mut prefix: Vec<u64> = vec![0];
+        let mut uploads: Vec<CudaSlice<u8>> = Vec::new();
+        let mut n_uploaded = 0usize;
+        for (_name, ptr, nbytes, is_dev) in &ts {
+            let chunks = (nbytes / CHUNK_BYTES) as u64;
+            if chunks == 0 {
+                continue;
+            }
+            let base = if *is_dev {
+                *ptr
+            } else {
+                // Host-resident in ggml (CPU buffer): the walk needs device memory — upload our
+                // own copy of the raw bytes (identical to the GGUF bytes, same as the pointer).
+                let host: &[u8] = unsafe { std::slice::from_raw_parts(*ptr as *const u8, *nbytes) };
+                let dev = stream.clone_htod(host).map_err(candle_core::Error::wrap)?;
+                use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+                let p = dev.device_ptr(&stream).0 as u64;
+                uploads.push(dev);
+                n_uploaded += 1;
+                p
+            };
+            bases.push(base);
+            prefix.push(prefix.last().unwrap() + chunks);
+        }
+        let n_total_chunks = *prefix.last().unwrap();
+        if n_total_chunks == 0 {
+            return Err(candle_core::Error::Msg("PoM GPU: llama engine produced 0 chunks".into()));
+        }
+        info!(
+            "PoM llama zero-dup gather: {} tensors ({} host-resident uploaded), N={} chunks",
+            bases.len(), n_uploaded, n_total_chunks
+        );
+        // BYTE GATE (consensus safety): the pool does not deep-verify every share, so a wrong
+        // gather would mine garbage silently. Read back evenly-spaced chunks from the llama-owned
+        // device memory and compare them byte-for-byte against the host index (GGUF pread) —
+        // any mismatch refuses to mine. (Full-model byte-identity for this llama build was proven
+        // once by tools/llama_zerodup_spike; this guards every startup against regressions.)
+        let idx_ref = crate::pom::active_index_for(device_id as u32)
+            .map(|t| &t.0)
+            .or_else(|| crate::pom::active_index().map(|(i, _)| i));
+        if let Some(idx) = idx_ref {
+            if idx.n_chunks == n_total_chunks {
+                use candle_core::cuda_backend::cudarc::driver::result as cures;
+                let samples = 128u64;
+                for k in 0..=samples {
+                    let off = if k == samples { n_total_chunks - 1 } else { k * (n_total_chunks / (samples + 1)) };
+                    let j = prefix.partition_point(|&p| p <= off) - 1;
+                    let dev_addr = bases[j] + (off - prefix[j]) * CHUNK_BYTES as u64;
+                    let mut got = [0u8; CHUNK_BYTES];
+                    unsafe { cures::memcpy_dtoh_sync(&mut got, dev_addr).map_err(candle_core::Error::wrap)? };
+                    let want = idx.read_chunk_bytes(off);
+                    if got != want {
+                        return Err(candle_core::Error::Msg(format!(
+                            "PoM llama byte gate FAILED at chunk {off} — llama-resident bytes differ from the GGUF; refusing to mine"
+                        )));
+                    }
+                }
+                info!("PoM llama byte gate: {} sampled chunks match the host index byte-for-byte.", samples + 1);
+            }
+        }
+        let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
+        let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
+        let _ = load_walk_func(&cuda)?;
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
     }
 
     pub fn n_chunks(&self) -> u64 {
@@ -453,12 +535,23 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // worth of VRAM on the serving GPU. Mining-only GPUs (no resident inference model to share)
     // fall back to a standalone copy. The N-guard below validates the gather against the host
     // index on every path, so a mismatch refuses to mine rather than producing bad proofs.
-    let m = match crate::slm::pom_shared(&model_id) {
-        Some((inf_dev, shared)) if cuda_gpu_id(&inf_dev) == Some(device_id as usize) => {
-            info!("PoM[gpu{}]: zero-dup — sharing the inference engine's resident weights (no 2nd VRAM copy)", device_id);
-            PomGpuMiner::load_shared(&gguf, &inf_dev, &shared)
+    // Phase 2 (candle-independence): if the in-process llama.cpp engine holds THIS model on THIS
+    // device (or can be brought up — .so bundled/env-pointed), the walk gathers over ITS resident
+    // tensors and candle hosts nothing. ensure_loaded is idempotent/cheap when already active and
+    // self-disables (returns false) when no .so is present — then the candle paths below apply.
+    let inference_gpu = crate::slm::inference_gpu_ordinal();
+    let use_llama = device_id as usize == inference_gpu && crate::llama_engine::ensure_loaded(&gguf, inference_gpu);
+    let m = if use_llama {
+        info!("PoM[gpu{}]: zero-dup — walking the llama.cpp engine's resident weights (candle dormant)", device_id);
+        PomGpuMiner::load_llama(device_id as usize)
+    } else {
+        match crate::slm::pom_shared(&model_id) {
+            Some((inf_dev, shared)) if cuda_gpu_id(&inf_dev) == Some(device_id as usize) => {
+                info!("PoM[gpu{}]: zero-dup — sharing the inference engine's resident weights (no 2nd VRAM copy)", device_id);
+                PomGpuMiner::load_shared(&gguf, &inf_dev, &shared)
+            }
+            _ => PomGpuMiner::load(&gguf, device_id as usize),
         }
-        _ => PomGpuMiner::load(&gguf, device_id as usize),
     };
     match m {
         Ok(gm) => {
