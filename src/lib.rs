@@ -25,8 +25,19 @@ pub mod pom_opencl;
 pub mod llama_vulkan;
 // In-process llama.cpp engine (dlopen'd libkeryx-llama.so): Phase 2 candle-independence — when
 // present it hosts the model (the walk gathers over its VRAM, zero-dup) AND serves OPoI text.
-#[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+#[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl"), unix))]
 pub mod llama_engine;
+// Windows: no dlopen — the in-process engine is unavailable there (candle stays the default;
+// the llama-server subprocess path still works via KERYX_LLAMA_SERVER). Stub keeps call sites
+// identical across platforms.
+#[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl"), not(unix)))]
+pub mod llama_engine {
+    pub fn ensure_loaded(_gguf: &str, _gpu: usize) -> bool { false }
+    pub fn active_for(_gguf: &str, _gpu: usize) -> bool { false }
+    pub fn available() -> bool { false }
+    pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> { None }
+    pub fn generate(_prompt: &str, _max_tokens: usize) -> Option<String> { None }
+}
 // PoM GPU driver aliased to `pom_gpu` per platform so main.rs/miner.rs/slm.rs stay backend-agnostic:
 // NVIDIA CUDA on Linux/Windows, Apple-Silicon Metal on macOS. Mutually exclusive by construction
 // (the macOS Metal build never enables pom-cuda), and the `not(...)` guard makes that explicit.
