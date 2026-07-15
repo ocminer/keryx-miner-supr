@@ -24,6 +24,9 @@ VER=$(grep -m1 '^CUSTOM_VERSION=' "$HPKG/h-manifest.conf" | cut -d= -f2)
 LIBS=(libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libcurand.so.10)
 
 mklib(){ mkdir -p "$1/lib"; for l in "${LIBS[@]}"; do cp -L "$D/lib/$l" "$1/lib/"; done; }
+# Bundle the CUDA llama-server (OPoI inference engine, Phase 1 candle-independence) when the
+# line's dist dir has one (hiveos/build-llama-server.sh). Absent = feature stays dormant.
+bundle_llama(){ if [ -f "$D/llama-server" ]; then cp "$D/llama-server" "$1/"; chmod +x "$1/llama-server"; fi; }
 # Rewrite the HiveOS miner-dir name in the hardcoded h-* paths + CUSTOM_NAME (the
 # binary stays ./keryx-miner-supr; only the /hive + /var/log dir component changes).
 hrename(){ # $1=dir of h-* files  $2=new miner name
@@ -39,7 +42,7 @@ HVN="${NAME}-${LABEL}"
 H="$S/hv/$HVN"; mkdir -p "$H"
 cp "$HPKG"/h-manifest.conf "$HPKG"/h-config.sh "$HPKG"/h-run.sh "$HPKG"/h-stats.sh "$H/"
 hrename "$H" "$HVN"
-cp "$D/keryx-miner-supr" "$H/"; mklib "$H"; chmod +x "$H"/h-*.sh "$H"/keryx-miner-supr
+cp "$D/keryx-miner-supr" "$H/"; bundle_llama "$H"; mklib "$H"; chmod +x "$H"/h-*.sh "$H"/keryx-miner-supr
 tar -czf "$D/${HVN}-${VER}.tar.gz" -C "$S/hv" "$HVN"
 
 # 2) SMOS — HiveOS layout, miner name = keryx-miner-supr-smos-<line>
@@ -47,7 +50,7 @@ SMN="${NAME}-smos-${LABEL}"
 SM="$S/sm/$SMN"; mkdir -p "$SM"
 cp "$HPKG"/h-manifest.conf "$HPKG"/h-config.sh "$HPKG"/h-run.sh "$HPKG"/h-stats.sh "$SM/"
 hrename "$SM" "$SMN"
-cp "$D/keryx-miner-supr" "$SM/"; mklib "$SM"; chmod +x "$SM"/h-*.sh "$SM"/keryx-miner-supr
+cp "$D/keryx-miner-supr" "$SM/"; bundle_llama "$SM"; mklib "$SM"; chmod +x "$SM"/h-*.sh "$SM"/keryx-miner-supr
 tar -czf "$D/${SMN}-${VER}.tar.gz" -C "$S/sm" "$SMN"
 
 # 3) mmpOS — folder = <name>-<line>-mmpos_<ver>, EXTERNAL_NAME set to the line
@@ -59,14 +62,14 @@ sed -i -e "s|^EXTERNAL_NAME=.*|EXTERNAL_NAME=\"${MMN}\"|" -e "s|^EXTERNAL_VERSIO
 # fallback log-parse path reports the same miner name the package is installed under. The AMD
 # mmpOS package keeps these consistent; this brings the per-line NVIDIA packages in line.
 sed -i -e "s|^NAME=.*|NAME=\"${MMN}\"|" "$MM/mmp-stats.sh"
-cp "$D/keryx-miner-supr" "$MM/"; mklib "$MM"; chmod +x "$MM"/keryx-miner-supr "$MM"/*.sh
+cp "$D/keryx-miner-supr" "$MM/"; bundle_llama "$MM"; mklib "$MM"; chmod +x "$MM"/keryx-miner-supr "$MM"/*.sh
 tar -czf "$D/${MMN}-mmpos_${VER}.tar.gz" -C "$S/mm" "${MMN}-mmpos_${VER}"
 
 # 4) Generic Linux (dynamic binary + plugins + lib + run.sh)
 LXN="${NAME}-${LABEL}"
 LX="$S/lx/$LXN"; mkdir -p "$LX"
 cp "$D/keryx-miner-supr-dynamic" "$LX/keryx-miner-supr"
-cp "$D/libkeryxcuda.so" "$D/libkeryxopencl.so" "$LX/"; mklib "$LX"; chmod +x "$LX/keryx-miner-supr"
+cp "$D/libkeryxcuda.so" "$D/libkeryxopencl.so" "$LX/"; bundle_llama "$LX"; mklib "$LX"; chmod +x "$LX/keryx-miner-supr"
 cat > "$LX/run.sh" <<'SH'
 #!/usr/bin/env bash
 cd "$(dirname "$(realpath "$0")")"
