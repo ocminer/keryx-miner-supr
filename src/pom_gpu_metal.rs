@@ -7,19 +7,26 @@
 //!
 //! The walk runs the `metal/pom_mine.metal` compute kernel — whose seed/pow folds are byte-identical
 //! to `pom::pom_block_seed`/`pom::pom_pow_value` and the CUDA `pom_mine.cu`, so a nonce found here
-//! builds a `PomProof` the node accepts. Under the hood it is a **zero-dup** walk over candle's own
-//! resident quantized `MTLBuffer`s (Apple unified memory): no packed weight blob, no host copy. Two
-//! small side tables are built once at load:
-//!   * `prefix` — cumulative 32-byte-chunk count per tensor in canonical (name-sorted) GGUF order,
-//!     length `n_tensors + 1`. Same layout the node's `R_T` root is built over, so a global chunk
-//!     index addresses the same bytes here and there.
-//!   * `addrs`  — `MTLBuffer.gpuAddress()` per tensor. On Apple Silicon (always Metal-3 Tier-2
-//!     argument buffers) these are plain 64-bit pointers the kernel reinterprets to
-//!     `device const ulong*`. `use_resource` keeps each buffer GPU-resident across the dispatch.
+//! builds a `PomProof` the node accepts.
 //!
-//! The candle-owned `MTLBuffer` is reached through the vendored `QTensor::metal_storage()` accessor
-//! (see vendor/candle-core/src/quantized/mod.rs). Cloning a `Buffer` only bumps the objc2 retain
-//! count — no bytes copied.
+//! ### Storage layout: single packed MTLBuffer (Phase 3 candle-independence for the walk)
+//! Since v0.6.10.x the walk no longer borrows candle-owned per-tensor MTLBuffers via
+//! `QTensor::metal_storage()`. Instead this module owns **one** contiguous MTLBuffer holding the
+//! GGUF quantized bytes packed in canonical (name-sorted, skip-<32 B) order, each tensor truncated
+//! to a whole-32-byte-chunk multiple (the same integer-division truncation `pom.rs::WeightIndex`
+//! applies host-side, so chunk-index → same 32 bytes on both sides by construction).
+//!
+//! Trade-off: one ~2.4 GB copy in Apple unified memory at load time, in exchange for:
+//!   * No dependency on candle's Metal Device or `QTensor::metal_storage()` (the vendored patch).
+//!   * A guarantee that the walk sees the exact bytes the host possession index reads —
+//!     regardless of any future changes to how candle-Metal repacks/aligns quantized blocks.
+//!   * The prefix/addrs tables collapse to `prefix=[0, N]` / `addrs=[buf.gpuAddress()]`, so the
+//!     kernel's `upper_bound_prefix` binary search resolves to tensor 0 in one iteration — the
+//!     exact single-buffer path the `metal_walk_matches_host_reference` test has been exercising
+//!     since day one.
+//!
+//! Consensus stays byte-identical: the walk math, `POM_H3_PPH_SALT`, chunk format and canonical
+//! ordering are unchanged; only the data path is de-candled.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,14 +35,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use log::info;
 
 use candle_core::quantized::gguf_file;
-use candle_core::Device;
 use candle_metal_kernels::metal::{
     create_command_buffer, Buffer, CommandQueue, CommandSemaphore, ComputePipeline,
     Device as MtlDevice, MTLResourceOptions,
 };
 use objc2_metal::{
-    MTLBuffer as _, MTLDevice as _, MTLResourceOptions as ObjcMTLResourceOptions, MTLResourceUsage,
-    MTLSize,
+    MTLBuffer as _, MTLResourceOptions as ObjcMTLResourceOptions, MTLResourceUsage, MTLSize,
 };
 
 const METAL_SRC: &str = include_str!("../metal/pom_mine.metal");
@@ -150,51 +155,106 @@ impl PomGpuMiner {
         })
     }
 
-    /// Load the mining model's GGUF onto a candle Metal device and build the bindless walk tables.
-    /// Heavy — call once per (device, model).
+    /// Load the mining model's GGUF into a single packed MTLBuffer and build the walk tables.
+    /// Heavy — call once per (device, model). Reads raw quantized bytes straight from the GGUF
+    /// (via `std::os::unix::fs::FileExt::read_exact_at`) into a Metal shared-storage buffer, no
+    /// intermediate candle CPU/Metal tensor allocation. `gguf_file::Content` is still used to
+    /// parse the header (metadata + `tensor_infos`) — that's a pure-CPU parser, no Metal touch.
+    ///
+    /// `device_id` is retained in the signature for backend-parity with `pom_gpu::load` (CUDA
+    /// ordinal) but Apple Silicon exposes ONE integrated GPU (ordinal 0), so it's only
+    /// pass-through for logging.
     pub fn load(gguf_path: &str, device_id: usize) -> candle_core::Result<Self> {
-        let cdev = Device::new_metal(device_id)?;
-        let mdev = match &cdev {
-            Device::Metal(m) => m.metal_device().clone(),
-            _ => return Err(candle_core::Error::Msg("PoM Metal: not a Metal device".into())),
-        };
+        use std::os::unix::fs::FileExt;
+
+        // Metal device WITHOUT candle_core — pure candle_metal_kernels wrapper over objc2-metal.
+        // Ordinal is a no-op on Apple Silicon (single integrated GPU).
+        let _ = device_id;
+        let mdev = MtlDevice::system_default().ok_or_else(|| {
+            candle_core::Error::Msg("PoM Metal: MTLCreateSystemDefaultDevice returned nil".into())
+        })?;
 
         let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::wrap)?;
         let content = gguf_file::Content::read(&mut file)?;
         let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
         names.sort(); // canonical name-sorted order — matches pom-rt-builder / the node R_T
 
-        let mut resources: Vec<Buffer> = Vec::with_capacity(names.len());
-        let mut addrs: Vec<u64> = Vec::with_capacity(names.len());
-        let mut prefix: Vec<u64> = Vec::with_capacity(names.len() + 1);
-        prefix.push(0);
-        let mut cum: u64 = 0;
-
+        // Pass 1: compute per-tensor file offset + packed byte count (each tensor truncated to a
+        // whole 32-byte-chunk multiple, the same integer-division `pom.rs::WeightIndex` applies).
+        // Tensors with byte count < 32 are skipped (biases, norms) — matches the CUDA gather.
+        struct Pack {
+            file_offset: u64,
+            packed_bytes: usize,
+        }
+        let mut packs: Vec<Pack> = Vec::with_capacity(names.len());
+        let mut total_bytes: usize = 0;
         for name in &names {
-            let qt = content.tensor(&mut file, name, &cdev)?;
-            let n_bytes = qt.storage_size_in_bytes();
-            if n_bytes < CHUNK_BYTES {
-                // Skip tiny tensors (biases, norms) — same behaviour as the CUDA gather (chunks==0).
+            let info = &content.tensor_infos[name];
+            let n_elems: usize = info.shape.elem_count();
+            let block_size = info.ggml_dtype.block_size();
+            if !n_elems.is_multiple_of(block_size) {
+                return Err(candle_core::Error::Msg(format!(
+                    "PoM Metal: tensor {name}: elements {n_elems} not divisible by block_size {block_size}"
+                )));
+            }
+            let n_bytes = n_elems / block_size * info.ggml_dtype.type_size();
+            let n_chunks = n_bytes / CHUNK_BYTES;
+            if n_chunks == 0 {
                 continue;
             }
-            let qmet = qt
-                .metal_storage()
-                .ok_or_else(|| candle_core::Error::Msg("PoM Metal: QTensor has no Metal storage".into()))?;
-            let buf: Buffer = qmet.buffer().clone();
-            let addr = buf.as_ref().gpuAddress();
-            let n_chunks = (n_bytes / CHUNK_BYTES) as u64;
-            cum += n_chunks;
-            prefix.push(cum);
-            addrs.push(addr);
-            resources.push(buf);
+            let packed_bytes = n_chunks * CHUNK_BYTES; // drops the tail < 32 B (host does the same)
+            packs.push(Pack {
+                file_offset: content.tensor_data_offset + info.offset,
+                packed_bytes,
+            });
+            total_bytes = total_bytes
+                .checked_add(packed_bytes)
+                .ok_or_else(|| candle_core::Error::Msg("PoM Metal: total tensor byte count overflowed usize".into()))?;
         }
-        let n_total_chunks = cum;
+        if total_bytes == 0 {
+            return Err(candle_core::Error::Msg("PoM Metal: model produced 0 chunks".into()));
+        }
+        let n_total_chunks = (total_bytes / CHUNK_BYTES) as u64;
+
+        // Allocate ONE shared-storage MTLBuffer for the packed weights. Apple Silicon unified
+        // memory: CPU writes here are visible to the GPU with no blit.
+        let weights_buf = mdev
+            .new_buffer(total_bytes, SHARED_STORAGE)
+            .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: alloc {total_bytes} B: {e}")))?;
+        let base_ptr = weights_buf.contents();
+        if base_ptr.is_null() {
+            return Err(candle_core::Error::Msg("PoM Metal: buffer.contents() is null for shared-storage buffer".into()));
+        }
+
+        // Pass 2: pread raw GGUF bytes for each tensor's packed region into the Metal buffer at
+        // its cumulative offset. `read_exact_at` bypasses the `File` cursor, so this is safe to
+        // interleave with `gguf_file::Content::read` on the same handle.
+        let mut cum: usize = 0;
+        for p in &packs {
+            // SAFETY: `base_ptr` is a valid, mapped writable pointer of `total_bytes` bytes (shared
+            // storage on Apple Silicon exposes the same page to CPU + GPU). `cum + packed_bytes`
+            // never exceeds `total_bytes` because that sum IS `total_bytes` after the loop.
+            let dst = unsafe { std::slice::from_raw_parts_mut(base_ptr.add(cum), p.packed_bytes) };
+            file.read_exact_at(dst, p.file_offset).map_err(candle_core::Error::wrap)?;
+            cum += p.packed_bytes;
+        }
+        debug_assert_eq!(cum, total_bytes);
+
+        // Single-tensor walk: prefix collapses to [0, N], addrs to [buf.gpuAddress()].
+        // The kernel's `upper_bound_prefix` resolves every off < N to tensor 0, `local = off`,
+        // reading `addrs[0][off*4]` — i.e. the packed buffer — exactly the path the byte-exact
+        // `metal_walk_matches_host_reference` test exercises.
+        let base_addr = weights_buf.as_ref().gpuAddress();
+        let prefix = [0u64, n_total_chunks];
+        let addrs = [base_addr];
+        let resources = vec![weights_buf];
         let miner = Self::build(mdev, &prefix, &addrs, resources, n_total_chunks)?;
         info!(
-            "PoM Metal: {} tensors, {} chunks (~{} MiB) resident on device {} (zero-dup)",
-            miner.n_tensors,
+            "PoM Metal: packed {} tensors ({} chunks, ~{} MiB) into 1 MTLBuffer on device {} \
+             (candle-Metal independent)",
+            packs.len(),
             n_total_chunks,
-            (n_total_chunks as usize * CHUNK_BYTES) / (1024 * 1024),
+            (total_bytes) / (1024 * 1024),
             device_id
         );
         Ok(miner)
@@ -462,13 +522,9 @@ fn device_model(device_id: u32) -> Option<([u8; 32], String)> {
 pub fn query_all_gpus_vram() -> Vec<(u32, u64)> {
     use objc2_metal::MTLDevice as _;
     std::panic::catch_unwind(|| {
-        let cdev = match candle_core::Device::new_metal(0) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
-        };
-        let mdev = match &cdev {
-            candle_core::Device::Metal(m) => m.metal_device().clone(),
-            _ => return Vec::new(),
+        let mdev = match MtlDevice::system_default() {
+            Some(d) => d,
+            None => return Vec::new(),
         };
         let bytes = mdev.as_ref().recommendedMaxWorkingSetSize();
         vec![(0u32, bytes / (1024 * 1024))]
@@ -582,11 +638,7 @@ mod tests {
     /// bindless plumbing the real GGUF path uses (`upper_bound_prefix` non-trivial, `use_resource`
     /// on N > 1 buffers, `local = off - prefix[idx]` mapping) without needing a real model.
     fn miner_from_tensor_blobs(tensor_bytes: &[&[u8]]) -> PomGpuMiner {
-        let cdev = Device::new_metal(0).expect("Metal device 0");
-        let mdev = match &cdev {
-            Device::Metal(m) => m.metal_device().clone(),
-            _ => panic!("not a Metal device"),
-        };
+        let mdev = MtlDevice::system_default().expect("Metal device 0");
         let mut prefix: Vec<u64> = vec![0];
         let mut addrs: Vec<u64> = Vec::new();
         let mut resources: Vec<Buffer> = Vec::new();
@@ -612,11 +664,7 @@ mod tests {
     fn miner_from_blob(bytes: &[u8]) -> PomGpuMiner {
         assert!(bytes.len() % CHUNK_BYTES == 0 && !bytes.is_empty());
         let n_chunks = (bytes.len() / CHUNK_BYTES) as u64;
-        let cdev = Device::new_metal(0).expect("Metal device 0");
-        let mdev = match &cdev {
-            Device::Metal(m) => m.metal_device().clone(),
-            _ => panic!("not a Metal device"),
-        };
+        let mdev = MtlDevice::system_default().expect("Metal device 0");
         let buf = mdev
             .new_buffer_with_data(bytes.as_ptr() as *const _, bytes.len(), SHARED_STORAGE)
             .expect("blob buffer");
@@ -640,16 +688,21 @@ mod tests {
         pom::pom_pow_value(final_state, pph, false)
     }
 
-    /// On-device diagnostic: compares the GPU-side bytes at the first chunk of the first N
-    /// tensors (via `MTLBuffer::contents()` — Apple unified memory) against the host
-    /// `WeightIndex::read_chunk(off)` at the equivalent canonical chunk index. If bytes diverge
-    /// even for chunk 0 of tensor 0, the "borrow candle-metal's per-tensor buffers" strategy is
-    /// wrong for this consensus use case (candle re-packed / offset / padded them), and the fix
-    /// is to pack the raw GGUF quantized bytes ourselves.
+    /// On-device diagnostic (real Gemma-3-4B GGUF): loads the production `PomGpuMiner::load`,
+    /// which now packs raw GGUF quantized bytes into ONE Metal buffer, and asserts:
     ///
-    /// Requires the real Gemma-3-4B GGUF: pass its path in `KERYX_TEST_GGUF`. The host index
-    /// build reuses `pom-tree.bin` in the same directory if present. Ignored (skipped) if
-    /// the env var is unset so `cargo test` on a plain checkout still passes.
+    /// 1. The packed buffer's chunks match the host `WeightIndex::read_chunk` byte-for-byte at a
+    ///    broad set of sampled offsets (start, end, mid, and a stratified sweep).
+    /// 2. `debug_walk_states` (real Metal kernel) → same `final_state` as the host walk over the
+    ///    same `WeightIndex`, for 5 spot nonces + a 4096-nonce single-dispatch sweep.
+    /// 3. The `mine()` winner path returns the correct lowest nonce for a target derived from a
+    ///    real nonce's `pom_pow_value`.
+    /// 4. All of the above also under `h3=true` (post-fork era) — proves the pph-salt plumbing
+    ///    stays byte-exact after the switch to the packed single buffer.
+    ///
+    /// Gated by `KERYX_TEST_GGUF` + `#[ignore]` so `cargo test` on a plain checkout still passes;
+    /// run with `KERYX_TEST_GGUF=/path/to/model.gguf cargo test --release --features pom-metal \
+    /// metal_load_bytes_match_host_index_real_model -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn metal_load_bytes_match_host_index_real_model() {
@@ -666,283 +719,132 @@ mod tests {
         let idx = pom::WeightIndex::build_from_gguf(&gguf).expect("host index");
         eprintln!("host index: N = {} chunks", idx.n_chunks);
 
-        // Reproduce PomGpuMiner::load()'s tensor scan so we can inspect per-tensor buffers.
-        let cdev = Device::new_metal(0).expect("Metal 0");
-        let _mdev = match &cdev {
-            Device::Metal(m) => m.metal_device().clone(),
-            _ => panic!("not Metal"),
-        };
-        let mut file = std::fs::File::open(&gguf).expect("open gguf");
-        let content = gguf_file::Content::read(&mut file).expect("gguf hdr");
-        let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
-        names.sort();
+        // Production loader — packs raw GGUF bytes into ONE MTLBuffer, no candle Metal touch.
+        let miner = PomGpuMiner::load(&gguf, 0).expect("PomGpuMiner::load");
+        eprintln!(
+            "miner: N = {} chunks (packed single buffer, {} MiB)",
+            miner.n_chunks(),
+            (miner.n_chunks() as usize * CHUNK_BYTES) / (1024 * 1024)
+        );
+        assert_eq!(miner.n_chunks(), idx.n_chunks, "N mismatch between packed buffer and host index");
 
-        // Per-tensor (name, first-global-chunk-index, gpu_first_32_bytes, host_first_32_bytes,
-        // buffer_length, gguf_file_offset, storage_size_in_bytes).
-        let mut cum: u64 = 0;
+        // ── (1) Packed buffer vs host WeightIndex: sample chunks across the whole 2.4 GB range.
+        eprintln!("\n── packed buffer vs host WeightIndex (byte-exact per-chunk) ──");
+        let n = miner.n_chunks();
+        // Sample offsets: 0, 1, N-1, N/2, plus a stratified sweep across the buffer at 1/16 steps.
+        let mut sample_offs: Vec<u64> = vec![0, 1, n - 1, n / 2];
+        for i in 1..16 {
+            sample_offs.push((n * i) / 16);
+        }
+        sample_offs.sort_unstable();
+        sample_offs.dedup();
+        let base_ptr = miner.resources[0].contents() as *const u8;
+        assert!(!base_ptr.is_null(), "packed buffer contents() is null");
         let mut mismatches = 0usize;
-        let mut inspected = 0usize;
-        let n_to_dump: usize = std::env::var("KERYX_TEST_DUMP_TENSORS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6);
-        for name in &names {
-            let info = &content.tensor_infos[name];
-            let file_off = content.tensor_data_offset + info.offset;
-            let qt = content.tensor(&mut file, name, &cdev).expect("qt");
-            let n_bytes = qt.storage_size_in_bytes();
-            if n_bytes < CHUNK_BYTES {
-                continue;
-            }
-            let qmet = qt.metal_storage().expect("Metal QStorage");
-            let buf: Buffer = qmet.buffer().clone();
-            let buf_len = buf.length();
-            let n_chunks = (n_bytes / CHUNK_BYTES) as u64;
-            let global_off = cum;
-
-            // Sample GPU vs host at first, last, and a few interior chunks of the tensor.
-            let gpu_ptr = buf.contents();
-            assert!(!gpu_ptr.is_null(), "buffer.contents() null for {name}");
-            let sample_offs: Vec<u64> = {
-                let mut s = vec![0u64];
-                if n_chunks > 1 {
-                    s.push(n_chunks - 1);
-                }
-                if n_chunks > 4 {
-                    s.push(n_chunks / 2);
-                    s.push(1);
-                }
-                s
-            };
-            let mut gpu_first = [0u8; 32];
-            let mut host_first = [0u8; 32];
-            let mut tensor_ok = true;
-            for &lo in &sample_offs {
-                let mut gpu = [0u8; 32];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        (gpu_ptr as *const u8).add((lo as usize) * 32),
-                        gpu.as_mut_ptr(),
-                        32,
-                    );
-                }
-                let host_words = idx.read_chunk(global_off + lo);
-                let host = pom::words_to_bytes(&host_words);
-                if lo == 0 {
-                    gpu_first = gpu;
-                    host_first = host;
-                }
-                if gpu != host {
-                    tensor_ok = false;
-                    if inspected < n_to_dump || mismatches < 4 {
-                        eprintln!(
-                            "  MISMATCH tensor={name} local_off={lo} global_off={} \
-                             gpu={} host={}",
-                            global_off + lo,
-                            hex32(&gpu),
-                            hex32(&host)
-                        );
-                    }
-                }
-            }
-            let match_ = tensor_ok;
-            if inspected < n_to_dump {
-                eprintln!(
-                    "[{:>3}] {:<40} n_bytes={} buf_len={} file_off={} chunks={} global_off={}  {}",
-                    inspected,
-                    name,
-                    n_bytes,
-                    buf_len,
-                    file_off,
-                    n_chunks,
-                    global_off,
-                    if match_ { "OK" } else { "MISMATCH" }
-                );
-                eprintln!("      GPU  first32: {}", hex32(&gpu_first));
-                eprintln!("      HOST first32: {}", hex32(&host_first));
-            }
-            if !match_ {
+        for &off in &sample_offs {
+            let mut buf = [0u8; 32];
+            // SAFETY: `off < N`, `off * 32 + 32 <= N * 32 = buffer length`.
+            unsafe { std::ptr::copy_nonoverlapping(base_ptr.add((off as usize) * 32), buf.as_mut_ptr(), 32) };
+            let host_words = idx.read_chunk(off);
+            let host = pom::words_to_bytes(&host_words);
+            let ok = buf == host;
+            eprintln!(
+                "  off={off:>10}  packed={}  host={}  {}",
+                hex32(&buf),
+                hex32(&host),
+                if ok { "OK" } else { "MISMATCH" }
+            );
+            if !ok {
                 mismatches += 1;
             }
-            cum += n_chunks;
-            inspected += 1;
         }
-        eprintln!(
-            "total tensors: {inspected}, mismatches: {mismatches}, N (metal cum)={cum} vs host N={}",
-            idx.n_chunks
-        );
-        assert_eq!(cum, idx.n_chunks, "tensor total chunk count divergence");
-        assert_eq!(mismatches, 0, "GPU chunk[0] differs from host chunk[global_off] for {mismatches} tensors");
+        assert_eq!(mismatches, 0, "packed buffer differs from host WeightIndex");
 
-        // ── Second diagnostic: run the CPU walk over the GPU's OWN buffers (via .contents())
-        // for a specific nonce, and compare `final_state` to the host WeightIndex walk. This
-        // isolates a "kernel indexing bug" (walks diverge) from a "data mapping bug" (walks agree
-        // over the same underlying bytes → the Metal kernel is the culprit).
-        eprintln!("\n── walk-final CPU-over-GPU-buffers vs CPU-over-WeightIndex ──");
-
-        // Rebuild prefix + per-tensor Buffer clones (drop them at end of test).
-        let mut file2 = std::fs::File::open(&gguf).expect("open gguf");
-        let content2 = gguf_file::Content::read(&mut file2).expect("gguf hdr");
-        let mut prefix2: Vec<u64> = vec![0];
-        let mut bufs: Vec<Buffer> = Vec::new();
-        let mut cum2: u64 = 0;
-        for name in &names {
-            let qt = content2.tensor(&mut file2, name, &cdev).expect("qt");
-            let n_bytes = qt.storage_size_in_bytes();
-            if n_bytes < CHUNK_BYTES {
-                continue;
-            }
-            let qmet = qt.metal_storage().expect("Metal QStorage");
-            let buf: Buffer = qmet.buffer().clone();
-            let n_chunks = (n_bytes / CHUNK_BYTES) as u64;
-            cum2 += n_chunks;
-            prefix2.push(cum2);
-            bufs.push(buf);
-        }
-        let n_total = cum2;
-
-        // Reads chunk[off] via the GPU buffers, mirroring the kernel's upper_bound + local.
-        let gpu_backed_read = |off: u64| -> [u64; pom::CHUNK_WORDS] {
-            let i = prefix2.partition_point(|&p| p <= off) - 1;
-            let local = off - prefix2[i];
-            let ptr = bufs[i].contents() as *const u8;
-            let mut c = [0u8; 32];
-            unsafe {
-                std::ptr::copy_nonoverlapping(ptr.add((local as usize) * 32), c.as_mut_ptr(), 32);
-            }
-            pom::chunk_to_words(&c)
-        };
-
-        // Pick a nonzero deterministic (pph, ts, nonce). Doesn't need to satisfy any target — we
-        // only compare final_state.
+        // ── (2) Metal-kernel `debug_walk_states` vs host walk_final for 5 spot nonces.
+        eprintln!("\n── Metal-kernel walk_final vs host walk_final (5 nonces) ──");
         let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(31).wrapping_add(7));
         let ts: u64 = 0x1122_3344_5566_7788;
         let test_nonces: &[u64] = &[0, 1, 42, 100_000, 12345678];
-        let mut host_states = Vec::new();
         for &nonce in test_nonces {
             let seed = pom::pom_block_seed(&pph, ts, nonce, false);
-            let host_state = pom::walk_final(seed, n_total, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
-            let gpu_state = pom::walk_final(seed, n_total, pom::POM_WALK_STEPS, gpu_backed_read);
-            eprintln!(
-                "nonce={nonce:<10}  host_final=0x{host_state:016x}  gpubuf_final=0x{gpu_state:016x}  {}",
-                if host_state == gpu_state { "OK" } else { "MISMATCH" }
-            );
-            assert_eq!(host_state, gpu_state, "walk over GPU buffers diverges from walk over WeightIndex for nonce {nonce}");
-            host_states.push(host_state);
-        }
-
-        // ── Third diagnostic: run the ACTUAL Metal kernel via `debug_walk_states` and compare
-        // GPU-reported final_state to the host walk. If this diverges the bug is IN the kernel.
-        eprintln!("\n── walk-final Metal kernel vs CPU-over-WeightIndex ──");
-
-        // Rebuild a PomGpuMiner using the same setup as `load()` so `debug_walk_states` runs the
-        // full production path (prefix / addrs tables uploaded to Metal buffers, use_resource on
-        // all 444 tensors during dispatch).
-        let miner = PomGpuMiner::load(&gguf, 0).expect("PomGpuMiner::load");
-        // Ensure the two paths see the same N so the walk trajectories can be compared at all.
-        assert_eq!(miner.n_chunks(), idx.n_chunks, "N mismatch between metal miner and host index");
-
-        // One dispatch, `batch = 8` consecutive nonces starting at each test nonce, take state[0].
-        for (i, &nonce) in test_nonces.iter().enumerate() {
-            let gpu_states = miner
-                .debug_walk_states(&pph, ts, nonce, 8, false)
-                .expect("debug_walk_states");
+            let host_state = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+            let gpu_states = miner.debug_walk_states(&pph, ts, nonce, 8, false).expect("debug_walk_states");
             let gpu_state = gpu_states[0];
-            let host_state = host_states[i];
             eprintln!(
-                "nonce={nonce:<10}  host_final=0x{host_state:016x}  metal_kernel_final=0x{gpu_state:016x}  {}",
+                "  nonce={nonce:<10}  host=0x{host_state:016x}  metal=0x{gpu_state:016x}  {}",
                 if host_state == gpu_state { "OK" } else { "MISMATCH" }
             );
+            assert_eq!(host_state, gpu_state, "walk diverges for nonce {nonce}");
         }
 
-        // ── Fourth diagnostic: large-batch walk-state sweep — verifies the kernel is byte-exact
-        // across the full batch dispatch (256+ threadgroups), catching a race or threadgroup-scope
-        // bug the tiny 8-thread dispatch above cannot.
-        eprintln!("\n── large-batch Metal-kernel walk states vs host walk states ──");
+        // ── (3) Large-batch sweep: 4096 consecutive nonces in one dispatch, all must agree.
+        eprintln!("\n── large-batch (4096 nonces) Metal-kernel walk vs host walk ──");
         let sweep_batch: u64 = 4096;
         let sweep_start: u64 = 100_000;
-        let sweep_gpu = miner
-            .debug_walk_states(&pph, ts, sweep_start, sweep_batch, false)
-            .expect("debug_walk_states sweep");
+        let sweep_gpu = miner.debug_walk_states(&pph, ts, sweep_start, sweep_batch, false).expect("sweep");
         let mut disagreements = 0usize;
         for i in 0..sweep_batch {
             let nonce = sweep_start + i;
             let seed = pom::pom_block_seed(&pph, ts, nonce, false);
-            let host = pom::walk_final(seed, n_total, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
-            let gpu = sweep_gpu[i as usize];
-            if host != gpu {
+            let host = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+            if host != sweep_gpu[i as usize] {
                 if disagreements < 5 {
-                    eprintln!(
-                        "  DIVERGE nonce={nonce} host=0x{host:016x} gpu=0x{gpu:016x}"
-                    );
+                    eprintln!("  DIVERGE nonce={nonce} host=0x{host:016x} gpu=0x{:016x}", sweep_gpu[i as usize]);
                 }
                 disagreements += 1;
             }
         }
         eprintln!("large batch: {disagreements}/{sweep_batch} disagreements");
-        assert_eq!(disagreements, 0, "Metal kernel walk diverges from host walk in the large-batch dispatch");
+        assert_eq!(disagreements, 0, "large-batch Metal kernel walk diverges");
 
-        // ── Fifth diagnostic: exercise `mine()` end-to-end with a target derived from a known
-        // nonce's CPU pow_value — the LOWEST such nonce must be the winner returned.
-        eprintln!("\n── mine() winner path over the real model ──");
+        // ── (4) mine() winner path: target derived from a real nonce's pow_value → the LOWEST
+        //       satisfying nonce in the batch must be the winner returned.
+        eprintln!("\n── mine() winner path ──");
         let winner_start: u64 = 500_000;
         let winner_batch: u64 = 8192;
         let n_star = winner_start + winner_batch / 3;
         let seed_star = pom::pom_block_seed(&pph, ts, n_star, false);
-        let final_star = pom::walk_final(seed_star, n_total, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+        let final_star = pom::walk_final(seed_star, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
         let target = pom::pom_pow_value(final_star, &pph, false);
-        eprintln!("target = pow_value(nonce={n_star}) = {}", hex32(&target));
-
-        let expected = (winner_start..winner_start + winner_batch).find(|&n| {
-            let s = pom::pom_block_seed(&pph, ts, n, false);
-            let fs = pom::walk_final(s, n_total, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+        let expected = (winner_start..winner_start + winner_batch).find(|&nn| {
+            let s = pom::pom_block_seed(&pph, ts, nn, false);
+            let fs = pom::walk_final(s, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
             pom::le_leq(&pom::pom_pow_value(fs, &pph, false), &target)
         });
-        let got = miner
-            .mine(&pph, ts, &target, winner_start, winner_batch, false)
-            .expect("mine");
-        eprintln!("mine() returned {got:?} — expected {expected:?}");
+        let got = miner.mine(&pph, ts, &target, winner_start, winner_batch, false).expect("mine");
+        eprintln!("  mine() returned {got:?} — expected {expected:?}");
         assert_eq!(got, expected, "mine() winner disagrees with host reference");
 
-        // ── Sixth diagnostic: H3 era (post-fork). The network activated H3 at DAA 43_450_000
-        // (~2026-07-05). If the walk is byte-exact for h3=false but diverges for h3=true, the
-        // pph-salt plumbing is wrong.
-        eprintln!("\n── H3 era (h3=true) walk-state parity ──");
-        let h3_sweep_batch: u64 = 1024;
-        let h3_sweep_gpu = miner
-            .debug_walk_states(&pph, ts, sweep_start, h3_sweep_batch, true)
-            .expect("debug_walk_states h3");
-        let mut h3_diverge = 0usize;
-        for i in 0..h3_sweep_batch {
+        // ── (5) H3 era: pph-salt plumbing byte-exact under h3=true. 1024-nonce sweep + winner.
+        eprintln!("\n── H3 era (h3=true) walk parity ──");
+        let h3_sweep: u64 = 1024;
+        let h3_gpu = miner.debug_walk_states(&pph, ts, sweep_start, h3_sweep, true).expect("h3 sweep");
+        let mut h3_disagreements = 0usize;
+        for i in 0..h3_sweep {
             let nonce = sweep_start + i;
             let seed = pom::pom_block_seed(&pph, ts, nonce, true);
-            let host = pom::walk_final(seed, n_total, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
-            let gpu = h3_sweep_gpu[i as usize];
-            if host != gpu {
-                if h3_diverge < 5 {
-                    eprintln!("  H3 DIVERGE nonce={nonce} host=0x{host:016x} gpu=0x{gpu:016x}");
+            let host = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+            if host != h3_gpu[i as usize] {
+                if h3_disagreements < 5 {
+                    eprintln!("  H3 DIVERGE nonce={nonce} host=0x{host:016x} gpu=0x{:016x}", h3_gpu[i as usize]);
                 }
-                h3_diverge += 1;
+                h3_disagreements += 1;
             }
         }
-        eprintln!("H3 batch: {h3_diverge}/{h3_sweep_batch} disagreements");
+        eprintln!("H3 batch: {h3_disagreements}/{h3_sweep} disagreements");
+        assert_eq!(h3_disagreements, 0, "H3 kernel walk diverges");
 
-        // Also exercise mine() winner path under h3=true.
-        let h3_n_star = winner_start + winner_batch / 3;
-        let h3_seed_star = pom::pom_block_seed(&pph, ts, h3_n_star, true);
-        let h3_final_star = pom::walk_final(h3_seed_star, n_total, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
-        let h3_target = pom::pom_pow_value(h3_final_star, &pph, true);
-        let h3_expected = (winner_start..winner_start + winner_batch).find(|&n| {
-            let s = pom::pom_block_seed(&pph, ts, n, true);
-            let fs = pom::walk_final(s, n_total, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+        let h3_seed = pom::pom_block_seed(&pph, ts, n_star, true);
+        let h3_final = pom::walk_final(h3_seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+        let h3_target = pom::pom_pow_value(h3_final, &pph, true);
+        let h3_expected = (winner_start..winner_start + winner_batch).find(|&nn| {
+            let s = pom::pom_block_seed(&pph, ts, nn, true);
+            let fs = pom::walk_final(s, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
             pom::le_leq(&pom::pom_pow_value(fs, &pph, true), &h3_target)
         });
-        let h3_got = miner
-            .mine(&pph, ts, &h3_target, winner_start, winner_batch, true)
-            .expect("mine h3");
-        eprintln!("H3 mine() returned {h3_got:?} — expected {h3_expected:?}");
-        assert_eq!(h3_diverge, 0, "H3 kernel walk diverges from host walk");
-        assert_eq!(h3_got, h3_expected, "H3 mine() winner disagrees with host");
+        let h3_got = miner.mine(&pph, ts, &h3_target, winner_start, winner_batch, true).expect("mine h3");
+        eprintln!("  H3 mine() returned {h3_got:?} — expected {h3_expected:?}");
+        assert_eq!(h3_got, h3_expected, "H3 mine() winner disagrees");
     }
 
     fn hex32(b: &[u8; 32]) -> String {
