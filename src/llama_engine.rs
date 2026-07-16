@@ -20,6 +20,7 @@ type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
 type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
 type InfoFn = unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
+type FreeFn = unsafe extern "C" fn(*mut c_void);
 
 const ABI: c_int = 2;
 
@@ -28,6 +29,7 @@ struct Engine {
     count: CountFn,
     info: InfoFn,
     generate: GenFn,
+    free: FreeFn,
     gpu: usize,
     gguf: String,
 }
@@ -100,12 +102,13 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
             log::warn!("llama engine: dlopen({}) failed: {} — candle fallback stays active.", so.display(), msg);
             return false;
         }
-        let (Some(abi), Some(load), Some(count), Some(info), Some(gen)) = (
+        let (Some(abi), Some(load), Some(count), Some(info), Some(gen), Some(free)) = (
             sym::<AbiFn>(lib, "keryx_llama_abi"),
             sym::<LoadFn>(lib, "keryx_llama_load"),
             sym::<CountFn>(lib, "keryx_llama_tensor_count"),
             sym::<InfoFn>(lib, "keryx_llama_tensor_info"),
             sym::<GenFn>(lib, "keryx_llama_generate"),
+            sym::<FreeFn>(lib, "keryx_llama_free"),
         ) else {
             log::warn!("llama engine: {} is missing symbols — candle fallback stays active.", so.display());
             return false;
@@ -126,7 +129,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
             log::warn!("llama engine: model load failed (VRAM? arch?) — candle fallback stays active.");
             return false;
         }
-        *g = Some(Engine { model, count, info, generate: gen, gpu, gguf: gguf.to_string() });
+        *g = Some(Engine { model, count, info, generate: gen, free, gpu, gguf: gguf.to_string() });
         log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves OPoI inference (candle dormant).");
         true
     }
@@ -144,6 +147,18 @@ pub fn available() -> bool {
     match engine().lock() {
         Ok(g) => g.is_some(),
         Err(_) => false,
+    }
+}
+
+/// Free the resident model and disable the engine (available() -> false). Used when llama's
+/// resident layout for this model is NOT byte-compatible with the canonical possession index
+/// (e.g. llama repacks Gemma's tied embeddings) — the walk must gather the canonical GGUF bytes,
+/// so we free llama's VRAM and let the caller fall back to candle for BOTH walk and inference.
+pub fn unload() {
+    if let Ok(mut g) = engine().lock() {
+        if let Some(e) = g.take() {
+            unsafe { (e.free)(e.model) };
+        }
     }
 }
 
