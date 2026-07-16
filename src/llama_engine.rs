@@ -39,7 +39,8 @@ fn engine() -> &'static Mutex<Option<Engine>> {
     E.get_or_init(|| Mutex::new(None))
 }
 
-/// `KERYX_LLAMA_SO=<path>` wins; else `libkeryx-llama.so` next to our own executable.
+/// `KERYX_LLAMA_SO=<path>` wins; else the platform-native shared library next to our own
+/// executable (`libkeryx-llama.dylib` on macOS, `libkeryx-llama.so` elsewhere).
 fn so_path() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("KERYX_LLAMA_SO") {
         let pb = std::path::PathBuf::from(p);
@@ -49,8 +50,21 @@ fn so_path() -> Option<std::path::PathBuf> {
         log::warn!("llama engine: KERYX_LLAMA_SO points at a missing file — ignoring.");
     }
     let exe = std::env::current_exe().ok()?;
-    let bin = exe.parent()?.join("libkeryx-llama.so");
-    if bin.exists() { Some(bin) } else { None }
+    let dir = exe.parent()?;
+    // macOS ships a .dylib (Mach-O). Every other unix (Linux/BSD) ships a .so (ELF). Probe the
+    // native name first, and on macOS also fall back to .so — some HiveOS-adjacent tooling may
+    // repackage the Linux .so alongside the macOS binary during cross-arch testing.
+    #[cfg(target_os = "macos")]
+    let candidates: [&str; 2] = ["libkeryx-llama.dylib", "libkeryx-llama.so"];
+    #[cfg(not(target_os = "macos"))]
+    let candidates: [&str; 1] = ["libkeryx-llama.so"];
+    for name in candidates {
+        let p = dir.join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 unsafe fn sym<T: Copy>(lib: *mut c_void, name: &str) -> Option<T> {
