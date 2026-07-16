@@ -106,12 +106,16 @@ pom-opencl = ["dep:opencl3"]
 # VRAM sharing with the inference engine) + build.rs compiles src/pom_mine.cu -> PTX. Enables
 # candle's CUDA backend (candle 0.9 -> cudarc 0.16). AMD/default stays candle-CPU.
 pom-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-# Apple Silicon PoM (Metal): the walk runs as a Metal compute kernel over candle's own resident
-# quantized MTLBuffers (zero-dup, unified memory). Enables candle's Metal backend; the objc2/metal
-# crates come from the macOS-only dependency table below. On macOS, target_os=macos + this feature
-# select the `pom_gpu_metal` module (aliased to `pom_gpu`) in lib.rs. macOS-only — never combine
-# with pom-cuda, and never enable on Linux/Windows (candle's `metal` feature is macОS-only).
-pom-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# Apple Silicon PoM (Metal): the walk runs as a Metal compute kernel over a self-packed MTLBuffer
+# (Phase 3a) and OPoI inference runs via the in-process llama.cpp Metal engine (Phase 3b —
+# `libkeryx-llama.dylib` next to the binary). Phase 3d dropped `candle-core/metal` etc.: candle is
+# no longer used on the Metal build for either the walk or inference. `candle-metal-kernels` and
+# `objc2-metal` stay (see the macOS-only dependency table below) — those are the MTL wrappers
+# `pom_gpu_metal` uses directly, independent of `candle-core`. macOS-only — never combine with
+# pom-cuda, and never enable on Linux/Windows. Ultimate fallback: if `libkeryx-llama.dylib` isn't
+# next to the binary, `slm::inference_device()` returns `Device::Cpu` so candle-CPU inference is
+# still available (slow, but never crashes for lack of a GPU inference path).
+pom-metal = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keccak = "0.1"
@@ -154,10 +158,7 @@ default-members = [".", "plugins/cuda", "plugins/opencl"]
 # sm_80 and broke GPU inference on Volta/Turing. See vendor/candle-kernels/build.rs.
 [patch.crates-io]
 candle-kernels = { path = "vendor/candle-kernels" }
-# Vendored candle-core 0.9.2 = the exact registry source + ONE added accessor,
-# `QTensor::metal_storage()`, gated behind `#[cfg(feature = "metal")]`. On any non-Metal build
-# (Linux/Windows CUDA, default CPU) the feature is off, so this crate compiles byte-for-byte
-# identically to the registry release — the patch is inert off Apple. It only exists so the
-# macOS PoM walk can borrow candle's resident quantized MTLBuffers zero-copy. See the accessor's
-# doc comment in vendor/candle-core/src/quantized/mod.rs.
-candle-core = { path = "vendor/candle-core" }
+# vendor/candle-core removed in Phase 3d: it existed only to add `QTensor::metal_storage()` for
+# the macOS PoM walk's zero-dup borrow of candle's resident MTLBuffers. Phase 3a switched the walk
+# to a self-packed MTLBuffer, and Phase 3d dropped candle-core/metal from `pom-metal` entirely, so
+# the vendored patch was dead code. Everyone now uses stock candle-core 0.9.2 from crates.io.
