@@ -27,9 +27,12 @@ type PciFn = unsafe extern "C" fn(*mut c_void, *mut u32, *mut u32, *mut u32, *mu
 const ABI: c_int = 2;
 const VK_ABI: c_int = 2;
 
-/// Max nonces per engine dispatch — same TDR-safety reasoning as `pom_opencl::SUB_DISPATCH_NONCES`
-/// (ascending sub-batches, early exit on the first winner = identical lowest-nonce semantics).
-const SUB_DISPATCH_NONCES: u64 = 1 << 18;
+/// Max nonces per engine dispatch (ascending sub-batches, early exit on the first winner =
+/// identical lowest-nonce semantics). Larger than the OpenCL driver's 2^18: this engine is
+/// Linux-only (no Windows TDR watchdog), so the only bound is the kernel's ~10 s compute ring
+/// timeout — 2^20 is ~120 ms on an MI60-class card while quartering the per-dispatch
+/// submit+fence overhead.
+const SUB_DISPATCH_NONCES: u64 = 1 << 20;
 
 struct Engine {
     model: *mut c_void,

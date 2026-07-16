@@ -1569,6 +1569,70 @@ mod tests {
         );
     }
 
+    /// Wall-clock throughput bench for the OPENCL blob walk on a chosen card — the apples-to-
+    /// apples baseline for bench_llama_vk_walk (the miner's own hashrate accounting is not a
+    /// wall-clock measure). KERYX_BENCH_CL_DEV picks the OpenCL device index (default 0).
+    #[test]
+    #[ignore]
+    #[cfg(feature = "pom-opencl")]
+    fn bench_opencl_walk() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        let devs = opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU).expect("cl devices");
+        let di: usize = std::env::var("KERYX_BENCH_CL_DEV").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let id = devs[di] as usize;
+        let name = opencl3::device::Device::new(devs[di]).name().unwrap_or_default();
+        eprintln!("opencl walk bench on device {di} ({name})");
+        crate::pom_opencl::bind_thread_device(id);
+        crate::pom_opencl::set_mining_tier(path, 1);
+        crate::pom_opencl::ensure_installed();
+        let pph = blake(b"bench-llama-vk");
+        let target = [0u8; 32]; // impossible target -> full grind
+        let batch: u64 = 1 << 21;
+        let _ = crate::pom_opencl::mine(&pph, 1_700_000_000, &target, 0, batch, false); // warmup
+        let start = std::time::Instant::now();
+        let rounds: u64 = 8;
+        for i in 0..rounds {
+            let _ = crate::pom_opencl::mine(&pph, 1_700_000_000, &target, i * batch, batch, false);
+        }
+        let secs = start.elapsed().as_secs_f64();
+        eprintln!(
+            "opencl walk: {:.2} MH/s ({} nonces in {:.2}s)",
+            (rounds * batch) as f64 / secs / 1e6,
+            rounds * batch,
+            secs
+        );
+    }
+
+    /// Throughput bench for the zero-dup engine walk (no consensus assertion — correctness is
+    /// covered by gpu_real_tier_end_to_end_llama_vk). Prints MH/s; compare against the SAME
+    /// card's OpenCL blob rate. Needs the .so + KERYX_GEMMA_GGUF + a GPU.
+    #[test]
+    #[ignore]
+    #[cfg(all(feature = "pom-opencl", unix))]
+    fn bench_llama_vk_walk() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        assert!(crate::llama_engine_vk::ensure_loaded(&path, gpu), "engine load failed");
+        assert!(crate::llama_engine_vk::pom_ready(), "walk not ready");
+        let p = pph_words_for_era(&blake(b"bench-llama-vk"), false);
+        let t = [0u64; 4]; // impossible target -> full grind, no early exit
+        let batch: u64 = 1 << 21;
+        // warmup
+        let _ = crate::llama_engine_vk::pom_mine(p, 1_700_000_000, t, 0, batch);
+        let start = std::time::Instant::now();
+        let rounds: u64 = 8;
+        for i in 0..rounds {
+            let _ = crate::llama_engine_vk::pom_mine(p, 1_700_000_000, t, i * batch, batch);
+        }
+        let secs = start.elapsed().as_secs_f64();
+        eprintln!(
+            "llama-vk walk: {:.2} MH/s ({} nonces in {:.2}s)",
+            (rounds * batch) as f64 / secs / 1e6,
+            rounds * batch,
+            secs
+        );
+    }
+
     /// Full AMD path on the REAL tier: load_tier (WeightIndex + GPU blob + PomMiner) -> GPU mine
     /// over the resident Gemma weights -> build proof from the resident index -> verify vs pinned R_T.
     /// Proves the GPU blob and the proof-side WeightIndex are the same canonical chunks.
