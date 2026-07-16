@@ -37,8 +37,15 @@ mkdir -p "$DEST"
 
 cp "$BIN" "$DEST/keryx-miner-supr"
 cp "$PLUGIN" "$DEST/libkeryxopencl.so"
-# Vulkan GPU inference (optional): bundle llama-server + its ggml/llama .so (miner spawns it for
-# OPoI inference on the AMD GPU; absent / no Vulkan ICD → CPU fallback).
+# Zero-dup in-process engine (optional): libkeryx-llama-vk.so — llama.cpp hosts the model in VRAM,
+# serves OPoI inference in-process, and (on RDNA cards) hosts the PoM walk over the same resident
+# weights (no OpenCL blob for that card). Absent = the llama-server subprocess fallback below.
+if [[ -f "$DIST/libkeryx-llama-vk.so" ]]; then
+  cp -P "$DIST/libkeryx-llama-vk.so" "$DEST/"
+  echo ">> bundled zero-dup in-process engine (libkeryx-llama-vk.so)"
+fi
+# Vulkan GPU inference (fallback): bundle llama-server + its ggml/llama .so (miner spawns it for
+# OPoI inference only when the in-process engine is unavailable; absent / no Vulkan ICD → CPU).
 if [[ -f "$DIST/llama-server" ]]; then
   cp -P "$DIST/llama-server" "$DEST/"
   cp -P "$DIST"/lib{ggml,llama,mtmd}*.so* "$DEST/" 2>/dev/null || true

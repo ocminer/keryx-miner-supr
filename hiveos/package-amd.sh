@@ -28,8 +28,17 @@ mkdir -p "$DEST"
 cp "$PKG"/h-manifest.conf "$PKG"/h-config.sh "$PKG"/h-run.sh "$PKG"/h-stats.sh "$DEST/"
 cp "$DIST/$BIN" "$DEST/"
 cp "$DIST/libkeryxopencl.so" "$DEST/"
-# Vulkan GPU inference (optional): bundle llama-server + its ggml/llama .so. The miner spawns it
-# for OPoI inference on the AMD GPU; if absent (or no Vulkan ICD on the rig), it falls back to CPU.
+# Zero-dup in-process engine (optional): the miner dlopens libkeryx-llama-vk.so — llama.cpp hosts
+# the model in VRAM, serves OPoI inference in-process, AND (on RDNA cards) hosts the PoM walk over
+# the same resident weights so that card needs no OpenCL blob. Absent = the llama-server subprocess
+# + candle-CPU fallbacks below stay active. Built by hiveos/build-keryx-llama-vk.sh.
+if [[ -f "$DIST/libkeryx-llama-vk.so" ]]; then
+  cp -P "$DIST/libkeryx-llama-vk.so" "$DEST/"
+  echo ">> bundled zero-dup in-process engine (libkeryx-llama-vk.so)"
+fi
+# Vulkan GPU inference (fallback): bundle llama-server + its ggml/llama .so. The miner spawns it
+# for OPoI inference only when the in-process engine above is unavailable; if that is also absent
+# (or no Vulkan ICD on the rig), it falls back to CPU.
 if [[ -f "$DIST/llama-server" ]]; then
   cp -P "$DIST/llama-server" "$DEST/"
   cp -P "$DIST"/lib{ggml,llama,mtmd}*.so* "$DEST/" 2>/dev/null || true
