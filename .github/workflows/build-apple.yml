@@ -43,6 +43,23 @@ jobs:
             target/
           key: ${{ runner.os }}-metal-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      # llama.cpp (Metal) — cache the checkout and the static-lib build across CI runs. Rebuilds
+      # only when hiveos/build-keryx-llama-macos.sh, tools/keryx-llama/*, or the pinned llama.cpp
+      # TAG in the script changes. The keryx wrapper linker step is fast (~1 s), the llama.cpp
+      # static libs are what costs time (~5 min on macos-latest).
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/llama-src-b10015
+            /tmp/llama-metal-build
+          key: ${{ runner.os }}-metal-llama-${{ hashFiles('hiveos/build-keryx-llama-macos.sh', 'tools/keryx-llama/keryx_llama.cpp') }}
+
+      # In-process llama.cpp (Metal) engine — libkeryx-llama.dylib. Bundled next to the miner
+      # binary, dlopen'd at startup by src/llama_engine.rs to serve OPoI inference. Absent = the
+      # candle-Metal fallback stays active, byte-identical to the pre-Phase-3b Metal build.
+      - name: Build libkeryx-llama.dylib (Metal)
+        run: ./hiveos/build-keryx-llama-macos.sh
+
       # Compiles our binary with the Metal PoM backend (candle-core/metal + objc2-metal + the
       # pom_gpu_metal module). Scoped to `-p keryx-miner-supr`: the workspace also contains the
       # plugins/cuda member (cudarc → find_cuda_helper), which can't build on a CUDA-less macOS
@@ -90,6 +107,10 @@ jobs:
           rm -rf "$DIR"; mkdir -p "$DIR"
           strip target/release/keryx-miner-supr
           cp target/release/keryx-miner-supr "$DIR/"
+          # In-process llama.cpp (Metal) engine: src/llama_engine.rs dlopens this next to the
+          # binary at startup. Absent = the miner still runs, candle-Metal inference stays active
+          # as fallback. build-keryx-llama-macos.sh already ad-hoc-signed it in-place.
+          cp hiveos/dist-macos-arm64/libkeryx-llama.dylib "$DIR/"
           # Ad-hoc code sign AFTER strip: strip invalidates the linker's default ad-hoc signature,
           # which on Apple Silicon makes the kernel refuse to exec it ("killed: 9"). Re-signing with
           # `-s -` (no certificate) restores a valid signature. This does NOT remove the Gatekeeper
@@ -118,8 +139,10 @@ jobs:
           chmod +x "$DIR/run.sh" "$DIR/keryx-miner-supr" "$DIR/whitelist-macos.command"
           cat > "$DIR/RUN.txt" <<TXT
           keryx-miner-supr ${VER} — macOS Apple Silicon (arm64), Metal PoM. EXPERIMENTAL.
-          The PoM walk runs on the Apple GPU via Metal; OPoI inference falls back to CPU for now
-          (use --light). H3-ready: auto-switches at the fork.
+          The PoM walk runs on the Apple GPU via Metal (candle-independent, packed single MTLBuffer).
+          OPoI inference runs on Metal via bundled libkeryx-llama.dylib (llama.cpp Metal backend)
+          when the .dylib sits next to the miner — falls back to candle-CPU otherwise. H3-ready:
+          auto-switches at the fork.
 
           FIRST RUN (macOS Gatekeeper blocks unsigned downloads):
             Easiest — in Terminal, from this folder:
@@ -129,7 +152,8 @@ jobs:
             Or manually:  xattr -dr com.apple.quarantine .
             If a dialog still blocks it: System Settings > Privacy & Security > "Open Anyway".
 
-          The binary is ad-hoc code-signed (valid signature, not Apple-notarized).
+          Both the miner binary and libkeryx-llama.dylib are ad-hoc code-signed (valid signature,
+          not Apple-notarized). The launcher's xattr clear covers both.
           TXT
           tar -czf "keryx-miner-supr-macos-arm64-${VER}.tar.gz" "$DIR"
           shasum -a 256 "keryx-miner-supr-macos-arm64-${VER}.tar.gz" > "SHA256SUMS-macos-arm64.txt"

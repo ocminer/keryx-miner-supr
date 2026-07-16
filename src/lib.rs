@@ -23,14 +23,16 @@ pub mod pom_opencl;
 // candle-independence — the module self-disables when no server binary is bundled/env-pointed.
 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
 pub mod llama_vulkan;
-// In-process llama.cpp engine (dlopen'd libkeryx-llama.so): Phase 2 candle-independence — when
-// present it hosts the model (the walk gathers over its VRAM, zero-dup) AND serves OPoI text.
-#[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl"), unix))]
+// In-process llama.cpp engine (dlopen'd libkeryx-llama.{so,dylib}): candle-independence — when
+// present it hosts the model (the walk gathers over its VRAM on CUDA / zero-dup; on Metal the
+// walk today keeps its own packed buffer) AND serves OPoI text. Compiled on every unix target
+// (Linux CUDA + macOS Metal), stubbed on Windows since dlopen semantics differ.
+#[cfg(all(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")), unix))]
 pub mod llama_engine;
 // Windows: no dlopen — the in-process engine is unavailable there (candle stays the default;
 // the llama-server subprocess path still works via KERYX_LLAMA_SERVER). Stub keeps call sites
 // identical across platforms.
-#[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl"), not(unix)))]
+#[cfg(all(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")), not(unix)))]
 pub mod llama_engine {
     pub fn ensure_loaded(_gguf: &str, _gpu: usize) -> bool { false }
     pub fn active_for(_gguf: &str, _gpu: usize) -> bool { false }
