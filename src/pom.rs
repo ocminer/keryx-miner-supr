@@ -1495,6 +1495,27 @@ mod tests {
         assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, 256, 32, &idx.r_t, &[0xff; 32], false));
     }
 
+    // End-to-end H3 test on the REAL Gemma tier — this is exactly what generate_block_if_pom does
+    // at runtime post-fork: pph from a "block header", nonce, h3=true, build_proof, then locally
+    // verify_proof. If our local verify_proof PASSES, the miner is submitting proofs that satisfy
+    // the same math the node uses; any pool `PowValueMismatch` rejection is on the pool/node side.
+    #[test]
+    #[ignore = "needs Gemma-3-4B GGUF on disk"]
+    fn h3_end_to_end_real_model() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        assert_eq!(idx.n_chunks, 77_604_776);
+        let pph = blake(b"h3-real-gemma-end-to-end");
+        let ts = 1_700_000_000u64;
+        for &nonce in &[1u64, 42, 12345, 999_999_999] {
+            let seed = pom_block_seed(&pph, ts, nonce, true);
+            let proof = build_proof(1, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true);
+            let ok = verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &[0xff; 32], true);
+            eprintln!("nonce={nonce:<12}  h3=true  pow_value[0..8]={:02x?}  verify_proof={}", &proof.pow_value[0..8], if ok { "OK" } else { "REJECTED" });
+            assert!(ok, "H3 proof over real Gemma tier must self-verify");
+        }
+    }
+
     // Emit POM_SAMPLE_submit.json for the CANONICAL VECTOR that the node-built `pom-verify-test`
     // expects (pph=4d27ef7d…, ts=1_700_000_000, nonce=1366), so we can run the chain-exact
     // `verify_pom_proof` on a proof OUR build_proof produces over the real Gemma tier.

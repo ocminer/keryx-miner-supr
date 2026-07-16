@@ -330,8 +330,23 @@ impl MinerManager {
                 // switching stays responsive. Bumped 2^20 -> 2^22.
                 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
                 let mut pom_nonce: u64 = thread_rng().next_u64();
-                #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
+                #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
                 const POM_BATCH: u64 = 1 << 22;
+                // Apple Silicon: at M-class PoM rates (~0.8 MH/s on an M2) the 2^22 batch above is a
+                // ~5 s blocking launch — new jobs are only picked up at batch boundaries (see the
+                // get_changed() poll after the winner branch), so every winner was submitted ~5-10 s
+                // after its job's creation, past the pool's job-retention window. Observed live on
+                // stratum-us:4405 (2026-07-16): suprnova's stratum handler substituted its CURRENT
+                // job on the lookup miss (getJob(id) || getCurrentJob(), stratum-handler.js:701 —
+                // confirmed + fixed pool-side) and rejected with a false PowValueMismatch; shares
+                // were accepted only when job rotation happened to be slow. 2^19 keeps the launch
+                // ~0.6 s at 840 KH/s — the responsiveness class the 2^22 sizing intended — while
+                // costing ~1-2% throughput vs 2^22 (2^18 measured ~8% loss on an M2; 2^19 recovers
+                // most of it). The pool side also widened its job-retention window to 25 s, so a
+                // one-rotation-late submit now resolves as a share (or an honest stale), never a
+                // false PowValueMismatch.
+                #[cfg(all(target_os = "macos", feature = "pom-metal", not(feature = "pom-opencl"), not(feature = "pom-cuda")))]
+                const POM_BATCH: u64 = 1 << 19;
                 // Driver seam: AMD = OpenCL, NVIDIA = candle-CUDA, Apple Silicon = candle-Metal. All
                 // expose the same interface (is_installed / ensure_installed / mine / set_mining_tier).
                 // OpenCL wins if both on; Metal is macOS-only (never combined with the others).
