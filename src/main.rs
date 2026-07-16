@@ -986,6 +986,35 @@ async fn run() -> Result<(), Error> {
                 keryx_miner::llama_vulkan::try_start(&gpath_llama, port);
             });
         }
+        // Apple Silicon (Metal) — llama.cpp Metal inference via the in-process engine (Phase 3b of
+        // candle-independence): if `libkeryx-llama.dylib` sits next to the miner (or
+        // `KERYX_LLAMA_SO` points at one), bring it up once the GGUF is on disk — slm then prefers
+        // it over candle-Metal. No .dylib = candle-Metal inference stays active (dormant-fallback).
+        // No llama-server subprocess fallback here: Metal doesn't ship one and llama_vulkan is
+        // gated to pom-cuda/pom-opencl only.
+        #[cfg(all(target_os = "macos", feature = "pom-metal"))]
+        {
+            let gpath_llama = gpath.clone();
+            std::thread::spawn(move || {
+                let ok_marker = std::path::Path::new(&gpath_llama).parent().map(|d| d.join(".ok"));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+                loop {
+                    let ready = std::path::Path::new(&gpath_llama).exists()
+                        && ok_marker.as_ref().map_or(true, |m| m.exists());
+                    if ready {
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        warn!("PoM(Metal): model GGUF not ready in 30 min — llama engine not started; candle inference stays active.");
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+                // Metal has one integrated GPU — ordinal 0 unconditionally. No slm::inference_gpu_ordinal
+                // dispatch here (that's CUDA-oriented).
+                let _ = keryx_miner::llama_engine::ensure_loaded(&gpath_llama, 0);
+            });
+        }
         // NVIDIA llama.cpp-CUDA inference (Phase 1 of candle-independence): if a CUDA llama-server
         // is bundled next to the miner (or KERYX_LLAMA_SERVER points at one), bring it up once the
         // GGUF is on disk — slm then prefers it over candle. No binary = try_start logs once and
