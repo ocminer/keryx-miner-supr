@@ -53,6 +53,7 @@ pub mod llama_engine {
     pub fn ensure_loaded(_gguf: &str, _gpu: usize) -> bool { false }
     pub fn active_for(_gguf: &str, _gpu: usize) -> bool { false }
     pub fn available() -> bool { false }
+    pub fn unload() {}
     pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> { None }
     pub fn generate(_prompt: &str, _max_tokens: usize) -> Option<String> { None }
 }
