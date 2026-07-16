@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use log::info;
 
-use candle_core::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use candle_core::cuda_backend::cudarc::driver::{
+    CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchArgs, LaunchConfig, PushKernelArg,
+};
 use candle_core::quantized::{gguf_file, QTensor};
 use candle_core::{CudaDevice, Device};
 
@@ -25,21 +27,56 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine.ptx"));
 const PTX_ARCH: &str = env!("POM_PTX_ARCH");
 const CHUNK_BYTES: usize = 32;
 
+/// The walk kernel bound to its device's stream. Mirrors the `CudaFunc` wrapper the vendored
+/// candle-core used to export: stock candle 0.9 keeps that type in a private module
+/// (`cuda_backend::device` is not `pub`), so since Phase 3d dropped the vendor we carry
+/// (function, stream) ourselves and load the PTX through the re-exported `cudarc` driver API.
+struct WalkFunc {
+    func: CudaFunction,
+    stream: Arc<CudaStream>,
+}
+
+impl WalkFunc {
+    fn builder(&self) -> LaunchArgs<'_> {
+        self.stream.launch_builder(&self.func)
+    }
+}
+
+/// JIT'd walk module per CUDA context (device ordinal) — mine() must never compile on the hot
+/// path. Replaces the `custom_modules` cache the vendored candle-core kept device-side.
+static WALK_MODULES: OnceLock<Mutex<HashMap<usize, Arc<CudaModule>>>> = OnceLock::new();
+
+fn walk_load_err(e: impl std::fmt::Display) -> candle_core::Error {
+    candle_core::Error::Msg(format!(
+        "PoM walk kernel failed to load ({e}). This build's walk PTX targets {PTX_ARCH}, and PTX \
+         only JIT-compiles onto {PTX_ARCH}-or-newer GPUs — on an older card the driver returns \
+         CUDA_ERROR_INVALID_PTX. Use the build line that matches your GPU: LEGACY = sm_70+ \
+         (Volta/V100, CMP 100-210, Turing and newer), PASCAL = sm_60/61 (GTX 10-series), \
+         MODERN = sm_75+ with driver 575+. If you built from source: CUDA 13.x cannot compile \
+         for Volta or Pascal — use a CUDA 12.x toolkit and set POM_CUDA_ARCH=compute_70 (Volta) \
+         or compute_60 (Pascal), plus CUDA_COMPUTE_CAP to match."
+    ))
+}
+
 /// Load the walk kernel, turning a bare driver error (typically CUDA_ERROR_INVALID_PTX when the
 /// GPU is OLDER than the PTX target — PTX only JITs forward) into an actionable message naming
 /// this build's PTX arch and the right build line for older cards.
-fn load_walk_func(cuda: &CudaDevice) -> candle_core::Result<candle_core::cuda_backend::CudaFunc> {
-    cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX).map_err(|e| {
-        candle_core::Error::Msg(format!(
-            "PoM walk kernel failed to load ({e}). This build's walk PTX targets {PTX_ARCH}, and PTX \
-             only JIT-compiles onto {PTX_ARCH}-or-newer GPUs — on an older card the driver returns \
-             CUDA_ERROR_INVALID_PTX. Use the build line that matches your GPU: LEGACY = sm_70+ \
-             (Volta/V100, CMP 100-210, Turing and newer), PASCAL = sm_60/61 (GTX 10-series), \
-             MODERN = sm_75+ with driver 575+. If you built from source: CUDA 13.x cannot compile \
-             for Volta or Pascal — use a CUDA 12.x toolkit and set POM_CUDA_ARCH=compute_70 (Volta) \
-             or compute_60 (Pascal), plus CUDA_COMPUTE_CAP to match."
-        ))
-    })
+fn load_walk_func(cuda: &CudaDevice) -> candle_core::Result<WalkFunc> {
+    let stream = cuda.cuda_stream();
+    let ctx = stream.context().clone();
+    let module = {
+        let mut cache = WALK_MODULES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        match cache.get(&ctx.ordinal()) {
+            Some(m) => m.clone(),
+            None => {
+                let m = ctx.load_module(PTX.into()).map_err(walk_load_err)?;
+                cache.insert(ctx.ordinal(), m.clone());
+                m
+            }
+        }
+    };
+    let func = module.load_function("pom_mine").map_err(walk_load_err)?;
+    Ok(WalkFunc { func, stream })
 }
 
 fn words4(b: &[u8; 32]) -> [u64; 4] {
