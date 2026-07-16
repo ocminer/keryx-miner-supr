@@ -577,7 +577,30 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // tensors and candle hosts nothing. ensure_loaded is idempotent/cheap when already active and
     // self-disables (returns false) when no .so is present — then the candle paths below apply.
     let inference_gpu = crate::slm::inference_gpu_ordinal();
-    let use_llama = device_id as usize == inference_gpu && crate::llama_engine::ensure_loaded(&gguf, inference_gpu);
+    let mut use_llama = device_id as usize == inference_gpu && crate::llama_engine::ensure_loaded(&gguf, inference_gpu);
+    // BYTE-COMPAT GATE: llama.cpp repacks some architectures on load (e.g. Gemma-3 materialises a
+    // separate output.weight from its tied embeddings), so its resident chunk count differs from
+    // the canonical GGUF the walk MUST gather and R_T pins. When that happens the zero-dup walk is
+    // impossible — free llama's VRAM and fall back to candle for BOTH the walk and inference for
+    // this model (llama byte-clean archs like Dolphin/Llama-70B keep the zero-dup path). Cheaper
+    // than letting load_llama build a doomed gather that the N-guard then rejects into a mine-
+    // refusing loop (the bug that made Gemma-tier/6-8GB cards, incl. Pascal P106, sit idle).
+    if use_llama {
+        let host_n = crate::pom::active_index_for(device_id as u32).map(|t| t.0.n_chunks)
+            .or_else(|| crate::pom::active_index().map(|(i, _)| i.n_chunks));
+        let llama_n = crate::llama_engine::tensors().map(|ts| {
+            ts.iter().map(|(_, _, nbytes, _)| (*nbytes / CHUNK_BYTES) as u64).sum::<u64>()
+        });
+        if let (Some(hn), Some(ln)) = (host_n, llama_n) {
+            if ln != hn {
+                info!(
+                    "PoM[gpu{}]: llama-resident layout N={} != canonical N={} (llama repacks this model arch)                      — using candle for the walk + inference on this card.", device_id, ln, hn
+                );
+                crate::llama_engine::unload();
+                use_llama = false;
+            }
+        }
+    }
     let m = if use_llama {
         info!("PoM[gpu{}]: zero-dup — walking the llama.cpp engine's resident weights (candle dormant)", device_id);
         PomGpuMiner::load_llama(device_id as usize)
