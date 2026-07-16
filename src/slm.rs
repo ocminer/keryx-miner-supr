@@ -1069,11 +1069,15 @@ fn inference_device() -> candle_core::Result<Device> {
     if cpu_inference_enabled() {
         return Ok(Device::Cpu);
     }
-    // Apple Silicon: run OPoI inference on the Metal GPU (candle-metal). We fall back to CPU only
-    // if this fails to init or a later op is unsupported — handled by load_engine_with_fallback.
+    // Apple Silicon (Phase 3d — candle-Metal is out of the build entirely): the primary GPU
+    // inference path is the in-process llama.cpp Metal engine (`libkeryx-llama.dylib`, wired
+    // through `crate::llama_engine` in `load_and_run_inference`). This `candle` device is only
+    // reached as the ULTIMATE fallback when the .dylib isn't present, and in that case we want
+    // CPU inference — `Device::new_metal` no longer exists (candle-core is built without the
+    // `metal` feature on this platform).
     #[cfg(all(target_os = "macos", feature = "pom-metal"))]
     {
-        return Device::new_metal(inference_gpu_ordinal());
+        return Ok(Device::Cpu);
     }
     #[cfg(not(all(target_os = "macos", feature = "pom-metal")))]
     {
