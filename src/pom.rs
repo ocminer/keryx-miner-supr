@@ -1521,6 +1521,54 @@ mod tests {
         println!("WROTE /home/marcel/POM_SAMPLE_submit.json");
     }
 
+    /// ZERO-DUP AMD path on the REAL tier: the in-process llama engine hosts the model
+    /// (libkeryx-llama-vk.so via KERYX_LLAMA_VK_SO or next to the test binary), the walk gathers
+    /// over its resident VRAM tensors -> must find the SAME lowest winner the OpenCL blob walk
+    /// finds (same fixed pph/target search) -> proof verifies vs the pinned R_T. Needs an AMD
+    /// GPU + the .so + KERYX_GEMMA_GGUF.
+    #[test]
+    #[ignore]
+    #[cfg(all(feature = "pom-opencl", unix))]
+    fn gpu_real_tier_end_to_end_llama_vk() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        assert_eq!(idx.n_chunks, 77_604_776, "Gemma-3-4B tier N must be 77,604,776");
+        let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        assert!(crate::llama_engine_vk::ensure_loaded(&path, gpu), "engine load failed (.so present? VRAM?)");
+        assert!(crate::llama_engine_vk::pom_ready(), "engine walk not ready (bufferDeviceAddress?)");
+        assert!(crate::llama_engine_vk::pom_byte_gate(&idx), "byte gate must pass before mining");
+        let pph = blake(b"gpu-real-e2e");
+        let time = 1_700_000_000u64;
+        let mut target = [0xffu8; 32]; // same fixed search as gpu_real_tier_end_to_end
+        target[24..32].copy_from_slice(&0x0010_0000_0000_0000u64.to_le_bytes());
+        let p = pph_words_for_era(&pph, false);
+        let mut t = [0u64; 4];
+        for (i, w) in t.iter_mut().enumerate() {
+            *w = u64::from_le_bytes(target[i * 8..i * 8 + 8].try_into().unwrap());
+        }
+        let mut base = 0u64;
+        let mut found = None;
+        for _ in 0..512 {
+            if let Some(n) = crate::llama_engine_vk::pom_mine(p, time, t, base, 1 << 16) {
+                found = Some(n);
+                break;
+            }
+            base = base.wrapping_add(1 << 16);
+        }
+        let nonce = found.expect("engine walk found no winner over the real tier");
+        assert_eq!(nonce, 9559, "engine walk must find the SAME lowest winner as the OpenCL blob walk");
+        let seed = pom_block_seed(&pph, time, nonce, false);
+        let proof = build_proof(1, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
+        assert!(
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target, false),
+            "zero-dup engine proof must verify against the pinned R_T"
+        );
+        eprintln!(
+            "ZERO-DUP engine walk mined nonce {nonce} over the REAL Gemma tier ({} chunks); proof verifies vs pinned R_T ✅",
+            idx.n_chunks
+        );
+    }
+
     /// Full AMD path on the REAL tier: load_tier (WeightIndex + GPU blob + PomMiner) -> GPU mine
     /// over the resident Gemma weights -> build proof from the resident index -> verify vs pinned R_T.
     /// Proves the GPU blob and the proof-side WeightIndex are the same canonical chunks.

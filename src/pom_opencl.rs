@@ -171,6 +171,60 @@ fn words(b: &[u8; 32]) -> [u64; 4] {
     w
 }
 
+/// The cl_device_id whose card hosts the in-process llama engine (zero-dup): that card gets NO
+/// OpenCL blob — its mine() routes over the engine's resident weights instead. Claimed once by
+/// the card whose PCI location matches the engine's, after the startup byte gate passes.
+static SHARED_DEV: Mutex<Option<usize>> = Mutex::new(None);
+
+fn is_shared_dev(device_id: usize) -> bool {
+    SHARED_DEV.lock().unwrap().map_or(false, |d| d == device_id)
+}
+
+/// This card's PCI (bus, device, function) via CL_DEVICE_TOPOLOGY_AMD — matched against the
+/// engine's VK_EXT_pci_bus_info to identify the SAME physical card across the two APIs.
+#[cfg(unix)]
+fn device_pci(device_id: usize) -> Option<(u32, u32, u32)> {
+    const CL_DEVICE_TOPOLOGY_AMD: opencl3::types::cl_device_info = 0x4037;
+    const CL_DEVICE_TOPOLOGY_TYPE_PCIE_AMD: u32 = 1;
+    let v = opencl3::device::get_device_data(device_id as opencl3::types::cl_device_id, CL_DEVICE_TOPOLOGY_AMD).ok()?;
+    if v.len() < 24 || u32::from_le_bytes(v[0..4].try_into().ok()?) != CL_DEVICE_TOPOLOGY_TYPE_PCIE_AMD {
+        return None;
+    }
+    Some((v[21] as u32, v[22] as u32, v[23] as u32))
+}
+
+/// Zero-dup claim: if the in-process llama engine hosts the model on THIS card (PCI match) and
+/// its gather passes the byte gate against the possession index, this card walks the engine's
+/// resident weights — no OpenCL blob is uploaded for it. Returns whether the claim succeeded.
+#[cfg(unix)]
+fn try_claim_shared(device_id: usize) -> bool {
+    if is_shared_dev(device_id) {
+        return true;
+    }
+    if SHARED_DEV.lock().unwrap().is_some() || !crate::llama_engine_vk::pom_ready() {
+        return false;
+    }
+    let (Some((_, eb, ed, ef)), Some((b, d, f))) = (crate::llama_engine_vk::pom_pci(), device_pci(device_id)) else {
+        return false;
+    };
+    if (eb, ed, ef) != (b, d, f) {
+        return false;
+    }
+    let Some((idx, _)) = crate::pom::active_index() else { return false };
+    if !crate::llama_engine_vk::pom_byte_gate(idx) {
+        return false;
+    }
+    *SHARED_DEV.lock().unwrap() = Some(device_id);
+    log::info!(
+        "PoM: card {device_id:#x} walks the llama-engine-resident weights (zero-dup — no OpenCL blob for this card)."
+    );
+    true
+}
+#[cfg(not(unix))]
+fn try_claim_shared(_device_id: usize) -> bool {
+    false
+}
+
 /// Cards whose streaming upload is currently in flight. Uploads for DIFFERENT cards run
 /// concurrently (each thread streams its own card); a second caller for the SAME card waits
 /// here instead of double-building (only the unbound/test fallback path can race like that —
@@ -205,11 +259,12 @@ fn install_resident(device_id: usize) -> Result<(), String> {
     result
 }
 
-/// True if THIS thread's bound card has the tier resident (or, with no binding, any card does).
+/// True if THIS thread's bound card has the tier resident — either its own OpenCL blob or the
+/// zero-dup engine walk (or, with no binding, any card does).
 pub fn is_installed() -> bool {
     match bound_dev() {
-        Some(id) => miner_for(id).is_some(),
-        None => !POM_BY_DEV.lock().unwrap().is_empty(),
+        Some(id) => miner_for(id).is_some() || is_shared_dev(id),
+        None => !POM_BY_DEV.lock().unwrap().is_empty() || SHARED_DEV.lock().unwrap().is_some(),
     }
 }
 
@@ -288,10 +343,17 @@ pub fn ensure_installed() {
         }
     }
     match target_dev() {
-        Some(id) => match install_resident(id) {
-            Ok(()) => log::info!("PoM: tier {t} installed (GPU-resident) on card {id:#x}."),
-            Err(e) => log::warn!("PoM: install on card {id:#x} failed: {e}"),
-        },
+        Some(id) => {
+            // Zero-dup first: when the in-process llama engine hosts the model on this very
+            // card (PCI match + byte gate), walk its resident weights — skip the blob upload.
+            if try_claim_shared(id) {
+                return;
+            }
+            match install_resident(id) {
+                Ok(()) => log::info!("PoM: tier {t} installed (GPU-resident) on card {id:#x}."),
+                Err(e) => log::warn!("PoM: install on card {id:#x} failed: {e}"),
+            }
+        }
         None => log::warn!("PoM: no OpenCL GPU device for this thread."),
     }
 }
@@ -301,11 +363,15 @@ pub fn ensure_installed() {
 /// Per-card lock → the other GPUs' threads grind concurrently.
 pub fn mine(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64, h3: bool) -> Option<u64> {
     let id = target_dev()?;
-    let miner = miner_for(id)?;
-    // H3: salt the pph words host-side (POM_H3_PPH_SALT) — the OpenCL kernel folds whatever words
-    // it receives, so no .cl change at the gate. Byte-identical to the node's pph_words_h3.
+    // H3: salt the pph words host-side (POM_H3_PPH_SALT) — both walk backends fold whatever
+    // words they receive, so no kernel/shader change at the gate.
     let p = crate::pom::pph_words_for_era(pph, h3);
     let t = words(target_le);
+    // Zero-dup card: grind over the llama-engine-resident weights (byte-gate-verified).
+    if is_shared_dev(id) {
+        return crate::llama_engine_vk::pom_mine(p, time, t, nonce_base, batch);
+    }
+    let miner = miner_for(id)?;
     let mut g = miner.lock().unwrap();
     g.mine(p, time, t, nonce_base, batch)
 }
