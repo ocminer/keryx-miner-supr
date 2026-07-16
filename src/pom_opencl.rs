@@ -193,9 +193,33 @@ fn device_pci(device_id: usize) -> Option<(u32, u32, u32)> {
     Some((v[21] as u32, v[22] as u32, v[23] as u32))
 }
 
-/// Zero-dup claim: if the in-process llama engine hosts the model on THIS card (PCI match) and
-/// its gather passes the byte gate against the possession index, this card walks the engine's
-/// resident weights — no OpenCL blob is uploaded for it. Returns whether the claim succeeded.
+/// True if `device_id` is an RDNA (gfx10/11/12) card — the Vulkan zero-dup walk matches or beats
+/// the OpenCL blob walk there (measured +1.7% on gfx1102). On GCN (gfx9 and older) the Vulkan
+/// walk is ~15-24% slower at equal clocks (a RADV-vs-ROCm memory-path gap the shader can't close),
+/// so those cards keep their full-speed OpenCL blob by default. gfx name via CL_DEVICE_NAME.
+#[cfg(unix)]
+fn device_is_rdna(device_id: usize) -> bool {
+    let name = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id)
+        .name()
+        .unwrap_or_default();
+    name.contains("gfx10") || name.contains("gfx11") || name.contains("gfx12")
+}
+
+/// Zero-dup default policy: claim only when it never costs hashrate. `KERYX_ZERO_DUP` = `force`
+/// (claim any PCI-matched card, VRAM over hashrate) / `off` (never) / unset = RDNA-only (default).
+#[cfg(unix)]
+fn zero_dup_allowed(device_id: usize) -> bool {
+    match std::env::var("KERYX_ZERO_DUP").ok().as_deref() {
+        Some("force") => true,
+        Some("off") => false,
+        _ => device_is_rdna(device_id),
+    }
+}
+
+/// Zero-dup claim: if the in-process llama engine hosts the model on THIS card (PCI match), the
+/// policy allows it, and its gather passes the byte gate against the possession index, this card
+/// walks the engine's resident weights — no OpenCL blob is uploaded for it. Returns whether the
+/// claim succeeded (false = the card keeps its own OpenCL blob).
 #[cfg(unix)]
 fn try_claim_shared(device_id: usize) -> bool {
     if is_shared_dev(device_id) {
@@ -208,6 +232,13 @@ fn try_claim_shared(device_id: usize) -> bool {
         return false;
     };
     if (eb, ed, ef) != (b, d, f) {
+        return false; // the engine hosts the model on a different card
+    }
+    if !zero_dup_allowed(device_id) {
+        log::info!(
+            "PoM: card {device_id:#x} hosts the llama engine but is not RDNA — keeping its OpenCL blob \
+             (full hashrate; set KERYX_ZERO_DUP=force to trade ~2.4 GB VRAM for it)."
+        );
         return false;
     }
     let Some((idx, _)) = crate::pom::active_index() else { return false };
