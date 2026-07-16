@@ -1,0 +1,118 @@
+#version 460
+// Keryx Proof-of-Model walk — Vulkan compute, ZERO-DUP variant: gathers the K data-dependent
+// 32-byte chunk reads DIRECTLY over the inference engine's resident weight tensors (reached by
+// buffer device address through a per-tensor prefix table) instead of a miner-owned blob copy.
+//
+// BYTE-IDENTICAL math to plugins/opencl/resources/pom_mine.cl and src/pom.rs (mix64 folds,
+// pom_block_seed, pom_pow_value, le_leq — the consensus verifier re-executes exactly this).
+// The host proves the gather path byte-exact against the possession index before mining is
+// allowed (startup byte gate through pom_fetch_vk.comp).
+//
+// One invocation = one nonce. Winner = lowest in-dispatch offset via atomicMin (host resets to
+// 0xFFFFFFFF per sub-dispatch; ascending sub-dispatches preserve lowest-nonce semantics).
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 64) in;
+
+// A resident weight tensor's bytes as LE u64 words, reached by device address. Canonical chunk
+// c inside tensor j = words [ (c - prefix[j])*4 .. +4 ] at addr[j] (raw GGUF quant bytes,
+// uploaded verbatim by the engine — u64 LE view is exactly pom.rs chunk_to_words).
+layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Tensor {
+    uint64_t words[];
+};
+
+layout(std430, binding = 0) buffer Winner { uint offset; } OUT;
+
+// Per-tensor gather table, canonical (name-sorted) order, zero-chunk tensors skipped:
+// prefix[j] = first canonical chunk of tensor j (prefix[n_tensors] = n_chunks sentinel),
+// addr[j] = tensor j's buffer device address.
+layout(std430, binding = 1) readonly buffer Table {
+    uint64_t prefix[];  // n_tensors + 1
+} PREFIX;
+layout(std430, binding = 2) readonly buffer Addrs {
+    uint64_t addr[];    // n_tensors
+} ADDRS;
+
+layout(push_constant) uniform Push {
+    uint64_t p0, p1, p2, p3;   // pre_pow_hash as 4 LE u64 (caller pre-salts for the H3 era)
+    uint64_t t0, t1, t2, t3;   // target (256-bit LE) as 4 u64
+    uint64_t timestamp;
+    uint64_t n_chunks;
+    uint64_t start_nonce;
+    uint     k;                // POM_WALK_STEPS (256)
+    uint     batch;            // nonces in this dispatch
+    uint     n_tensors;
+    uint     _pad;
+} pc;
+
+// SplitMix64 finalizer — exactly pom.rs mix64 (u64 * wraps).
+uint64_t mix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9UL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebUL;
+    x ^= x >> 31;
+    return x;
+}
+
+// Read + fold canonical chunk `off`: binary-search the prefix table for the owning tensor
+// (table is tiny -> cache-resident; the walk is memory-latency-bound on the chunk read itself).
+uint64_t step_state(uint64_t state, uint64_t off) {
+    uint lo = 0u, hi = pc.n_tensors; // invariant: prefix[lo] <= off < prefix[hi]
+    while (hi - lo > 1u) {
+        uint mid = (lo + hi) / 2u;
+        if (PREFIX.prefix[mid] <= off) { lo = mid; } else { hi = mid; }
+    }
+    // Advance the buffer_reference POINTER by the 64-bit byte offset and index with small
+    // constants — GLSL array subscripts are 32-bit, so the wide arithmetic must live in the
+    // pointer, never the index.
+    Tensor chunk = Tensor(ADDRS.addr[lo] + (off - PREFIX.prefix[lo]) * 32UL);
+    uint64_t h = state;
+    h ^= chunk.words[0];
+    h ^= chunk.words[1];
+    h ^= chunk.words[2];
+    h ^= chunk.words[3];
+    return mix64(h);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.batch) {
+        return;
+    }
+    uint64_t nonce = pc.start_nonce + uint64_t(idx);
+
+    // pom_block_seed (pom.rs): mix64 fold of (nonce, timestamp, pph words).
+    uint64_t state = mix64(nonce ^ 0x4B65727978531UL);
+    state = mix64(state ^ pc.timestamp);
+    state = mix64(state ^ pc.p0);
+    state = mix64(state ^ pc.p1);
+    state = mix64(state ^ pc.p2);
+    state = mix64(state ^ pc.p3);
+
+    // walk_final: K data-dependent reads, off = state % n_chunks.
+    uint64_t off = state % pc.n_chunks;
+    for (uint i = 0u; i < pc.k; ++i) {
+        state = step_state(state, off);
+        off = state % pc.n_chunks;
+    }
+
+    // pom_pow_value: 4 keyed mix64 folds -> 256-bit LE words o0..o3.
+    uint64_t o0 = mix64(state ^ pc.p0 ^ 0x9E3779B97F4A7C15UL);
+    uint64_t o1 = mix64(o0 ^ pc.p1 ^ 0xC2B2AE3D27D4EB4FUL);
+    uint64_t o2 = mix64(o1 ^ pc.p2 ^ 0x165667B19E3779F9UL);
+    uint64_t o3 = mix64(o2 ^ pc.p3 ^ 0xD6E8FEB86659FD93UL);
+
+    // le_leq: unsigned 256-bit LE compare, most-significant word first.
+    bool le;
+    if (o3 != pc.t3) { le = o3 < pc.t3; }
+    else if (o2 != pc.t2) { le = o2 < pc.t2; }
+    else if (o1 != pc.t1) { le = o1 < pc.t1; }
+    else if (o0 != pc.t0) { le = o0 < pc.t0; }
+    else { le = true; }
+
+    if (le) {
+        atomicMin(OUT.offset, idx);
+    }
+}
