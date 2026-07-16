@@ -1,16 +1,26 @@
-// libkeryx-llama.so — the miner's llama.cpp engine (Phase 2 candle-independence).
+// libkeryx-llama.{so,dylib} — the miner's in-process llama.cpp engine (candle-independence Phase 2
+// on CUDA, Phase 3b on Apple Silicon Metal).
 //
-// One in-process llama.cpp (CUDA) instance per loaded model: it OWNS the resident GGUF copy on
-// the inference GPU and exposes (a) per-tensor device pointers so the PoM walk gathers straight
-// over the SAME VRAM (zero-dup — proven byte-identical to the on-disk GGUF by
-// tools/llama_zerodup_spike), and (b) text generation for OPoI.
+// One llama.cpp instance per loaded model: it OWNS the resident GGUF copy on the inference GPU
+// and exposes (a) per-tensor device pointers so the PoM walk gathers straight over the SAME VRAM
+// (zero-dup — proven byte-identical to the on-disk GGUF by tools/llama_zerodup_spike on CUDA), and
+// (b) text generation for OPoI. On Apple Silicon (Metal) the walk uses its own packed buffer
+// (`pom_gpu_metal` Phase 3a) so the tensor-pointer contract there only feeds the future zero-dup
+// Metal walk; today it just satisfies the loader-side count/name enumeration.
 //
 // The miner dlopens this next to its own binary; absent = the candle fallback stays active.
-// Built by hiveos/build-keryx-llama.sh against a PINNED llama.cpp (see the script).
+// Built by hiveos/build-keryx-llama.sh (CUDA) or hiveos/build-keryx-llama-macos.sh (Metal).
 #include "llama.h"
 #include "llama-model.h"
 #include "ggml.h"
+#ifdef __APPLE__
+// Metal: llama.cpp's ggml-metal backend stores quantized tensors in unified-memory MTLBuffers.
+// `t->data` is a CPU-readable pointer into that unified memory (also GPU-visible on Apple Silicon
+// via the shared address space), so we don't need cudaPointerGetAttributes — `is_device` is
+// always 1 for tensors llama.cpp reports.
+#else
 #include <cuda_runtime.h>
+#endif
 #include <algorithm>
 #include <cstring>
 #include <mutex>
@@ -71,9 +81,17 @@ bool keryx_llama_tensor_info(KeryxLlama* h, size_t i, const char** name, void** 
     *name = h->names[i].c_str();
     *data = t->data;
     *nbytes = ggml_nbytes(t);
+#ifdef __APPLE__
+    // Metal / Apple Silicon unified memory: tensor bytes are in an MTLBuffer that's both CPU- and
+    // GPU-visible via the same address. The Metal PoM walk (Phase 3a) doesn't consume `data` for
+    // its own gather (it pre-packs from GGUF), so the semantic here is "there's a live pointer
+    // to the tensor bytes for anyone who wants to check byte-exactness against GGUF".
+    *is_device = 1;
+#else
     cudaPointerAttributes attr{};
     cudaPointerGetAttributes(&attr, t->data);
     *is_device = attr.type == cudaMemoryTypeDevice ? 1 : 0;
+#endif
     return true;
 }
 
