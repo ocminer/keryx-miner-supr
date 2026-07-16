@@ -1277,6 +1277,16 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
         log::warn!("SlmEngine: in-process llama generate failed — trying the next engine.");
     }
 
+    // AMD (pom-opencl) in-process engine: the zero-dup host of the walk's model — its inference
+    // costs no extra VRAM. Ranks above the llama-server subprocess.
+    #[cfg(feature = "pom-opencl")]
+    if crate::llama_engine_vk::available() {
+        if let Some(text) = crate::llama_engine_vk::generate(prompt, max_tokens) {
+            return Some(text);
+        }
+        log::warn!("SlmEngine: in-process llama-vk generate failed — trying the next engine.");
+    }
+
     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
     if crate::llama_vulkan::available() {
         if let Some(text) = crate::llama_vulkan::generate(prompt, max_tokens) {

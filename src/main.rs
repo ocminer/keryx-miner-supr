@@ -983,7 +983,16 @@ async fn run() -> Result<(), Error> {
                     }
                     std::thread::sleep(std::time::Duration::from_secs(5));
                 }
-                keryx_miner::llama_vulkan::try_start(&gpath_llama, port);
+                // Prefer the IN-PROCESS Vulkan engine (zero-dup: it also hosts the model the PoM
+                // walk gathers over, so the inference card holds ONE resident copy). No
+                // libkeryx-llama-vk.so → the llama-server subprocess; none → candle-CPU.
+                let inf_gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                if !keryx_miner::llama_engine_vk::ensure_loaded(&gpath_llama, inf_gpu) {
+                    keryx_miner::llama_vulkan::try_start(&gpath_llama, port);
+                }
             });
         }
         // Apple Silicon (Metal) — llama.cpp Metal inference via the in-process engine (Phase 3b of

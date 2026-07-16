@@ -428,7 +428,26 @@ extern "C" {
 
 // Core ABI (load/generate/free) matches the CUDA flavor; the _vk_abi covers the walk exports.
 int keryx_llama_abi() { return 2; }
-int keryx_llama_vk_abi() { return 1; }
+int keryx_llama_vk_abi() { return 2; }
+
+// PCI location of the GPU hosting the model (VK_EXT_pci_bus_info) — lets the OpenCL driver map
+// this engine to its cl_device_id (CL_DEVICE_TOPOLOGY_AMD) so THAT card skips its own blob and
+// routes its walk here. Returns false if the walk isn't ready or the extension is unavailable.
+bool keryx_llama_pom_pci(KeryxLlama* h, uint32_t* domain, uint32_t* bus, uint32_t* device, uint32_t* function) {
+    if (!h || !h->walk_ready || !h->phys) return false;
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pci{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    props.pNext = &pci;
+    vkGetPhysicalDeviceProperties2(h->phys, &props);
+    if (pci.pciBus == 0 && pci.pciDevice == 0 && pci.pciDomain == 0 && pci.pciFunction == 0) {
+        return false; // extension not filled in (all-zero is implausible for a dGPU)
+    }
+    *domain = pci.pciDomain;
+    *bus = pci.pciBus;
+    *device = pci.pciDevice;
+    *function = pci.pciFunction;
+    return true;
+}
 
 KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     llama_backend_init();

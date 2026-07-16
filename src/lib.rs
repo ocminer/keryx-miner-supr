@@ -23,6 +23,22 @@ pub mod pom_opencl;
 // candle-independence — the module self-disables when no server binary is bundled/env-pointed.
 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
 pub mod llama_vulkan;
+// AMD in-process llama.cpp engine (dlopen'd libkeryx-llama-vk.so): zero-dup — llama hosts the
+// model on the inference card, the PoM walk gathers over its VRAM, OPoI text runs in-process.
+// Absent .so = the llama-server subprocess + candle-CPU fallbacks and per-card OpenCL blobs.
+#[cfg(all(feature = "pom-opencl", unix))]
+pub mod llama_engine_vk;
+// Windows AMD: no dlopen — stub keeps call sites identical (OpenCL blob + llama-server paths).
+#[cfg(all(feature = "pom-opencl", not(unix)))]
+pub mod llama_engine_vk {
+    pub fn ensure_loaded(_gguf: &str, _gpu: usize) -> bool { false }
+    pub fn available() -> bool { false }
+    pub fn generate(_prompt: &str, _max_tokens: usize) -> Option<String> { None }
+    pub fn pom_ready() -> bool { false }
+    pub fn pom_pci() -> Option<(u32, u32, u32, u32)> { None }
+    pub fn pom_byte_gate(_index: &crate::pom::WeightIndex) -> bool { false }
+    pub fn pom_mine(_p: [u64; 4], _time: u64, _t: [u64; 4], _nonce_base: u64, _batch: u64) -> Option<u64> { None }
+}
 // In-process llama.cpp engine (dlopen'd libkeryx-llama.{so,dylib}): candle-independence — when
 // present it hosts the model (the walk gathers over its VRAM on CUDA / zero-dup; on Metal the
 // walk today keeps its own packed buffer) AND serves OPoI text. Compiled on every unix target
