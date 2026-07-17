@@ -986,11 +986,10 @@ async fn run() -> Result<(), Error> {
                 // Prefer the IN-PROCESS Vulkan engine (zero-dup: it also hosts the model the PoM
                 // walk gathers over, so the inference card holds ONE resident copy). No
                 // libkeryx-llama-vk.so → the llama-server subprocess; none → candle-CPU.
-                let inf_gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                if !keryx_miner::llama_engine_vk::ensure_loaded(&gpath_llama, inf_gpu) {
+                // Device selection lives INSIDE ensure_loaded/try_start (issue #18: pin to a
+                // discrete GPU, KERYX_LLAMA_VK_DEVICE overrides) — the `0` here is only the
+                // last-resort ggml index when no discrete Vulkan device is found at all.
+                if !keryx_miner::llama_engine_vk::ensure_loaded(&gpath_llama, 0) {
                     keryx_miner::llama_vulkan::try_start(&gpath_llama, port);
                 }
             });
