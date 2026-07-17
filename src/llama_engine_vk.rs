@@ -23,9 +23,10 @@ type U64Fn = unsafe extern "C" fn(*mut c_void) -> u64;
 type FetchFn = unsafe extern "C" fn(*mut c_void, u64, *mut u8) -> bool;
 type MineFn = unsafe extern "C" fn(*mut c_void, *const u64, *const u64, u64, u64, u32, u32) -> i64;
 type PciFn = unsafe extern "C" fn(*mut c_void, *mut u32, *mut u32, *mut u32, *mut u32) -> bool;
+type PickFn = unsafe extern "C" fn() -> c_int;
 
 const ABI: c_int = 2;
-const VK_ABI: c_int = 2;
+const VK_ABI: c_int = 3;
 
 /// Max nonces per engine dispatch (ascending sub-batches, early exit on the first winner =
 /// identical lowest-nonce semantics). Larger than the OpenCL driver's 2^18: this engine is
@@ -82,113 +83,40 @@ unsafe fn sym<T: Copy>(lib: *mut c_void, name: &str) -> Option<T> {
     Some(std::mem::transmute_copy::<*mut c_void, T>(&p))
 }
 
-// ── Vulkan device auto-pick (issue #18) ─────────────────────────────────────────────────────
-// ggml-vulkan numbers devices in raw `vkEnumeratePhysicalDevices` order and its DEFAULT visible
-// set includes integrated GPUs, so on a rig with an iGPU "device 0" is the Intel/AMD APU: the
-// model loads into UMA system RAM and the engine (or the whole miner) falls over. We enumerate
-// the same raw order through libvulkan directly (no Vulkan crate dep — the runtime always has
-// the loader when any Vulkan mining works at all) and pick a DISCRETE GPU to pin ggml to.
+// ── Discrete-GPU selection (issue #18) ──────────────────────────────────────────────────────
+// The model must NOT land on an integrated GPU (UMA system RAM → the miner exits/restart-loops).
+// A device index is only meaningful WITHIN the Vulkan instance that produced it: ggml enumerates
+// + filters devices in its own instance, and any index from a SEPARATE enumeration (a private
+// libvulkan instance, or a GGML_VK_VISIBLE_DEVICES value derived from one) can map to a different
+// device on an iGPU rig — silently loading onto the iGPU or tripping a GGML_ASSERT. So the
+// discrete GPU is chosen INSIDE the engine .so, against ggml's OWN device list (see
+// keryx_vk_pick_discrete_device); Rust only asks the .so for the answer.
 
-const VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: u32 = 1;
-const VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: u32 = 2;
-const VK_VENDOR_ID_AMD: u32 = 0x1002;
-
-#[repr(C)]
-struct VkInstanceCreateInfo {
-    s_type: u32, // VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
-    p_next: *const c_void,
-    flags: u32,
-    p_application_info: *const c_void,
-    enabled_layer_count: u32,
-    pp_enabled_layer_names: *const *const c_char,
-    enabled_extension_count: u32,
-    pp_enabled_extension_names: *const *const c_char,
-}
-
-type VkCreateInstanceFn = unsafe extern "C" fn(*const VkInstanceCreateInfo, *const c_void, *mut *mut c_void) -> i32;
-type VkEnumeratePhysicalDevicesFn = unsafe extern "C" fn(*mut c_void, *mut u32, *mut *mut c_void) -> i32;
-type VkGetPhysicalDevicePropertiesFn = unsafe extern "C" fn(*mut c_void, *mut u8);
-type VkDestroyInstanceFn = unsafe extern "C" fn(*mut c_void, *const c_void);
-
-/// Raw-enumeration index of the Vulkan device the llama engine should live on, as a
-/// `GGML_VK_VISIBLE_DEVICES` value: the first DISCRETE AMD GPU, else the first discrete GPU of
-/// any vendor. `None` = no discrete GPU (or no usable libvulkan) — leave ggml's own selection
-/// alone. Logs the full device table once so support tickets show the index→card mapping.
-pub fn pick_discrete_vk_device() -> Option<String> {
+/// The discrete-GPU `main_gpu` index in GGML's own device list, via the bundled engine .so.
+/// Valid for any ggml in this process tree — the in-process engine AND the bundled llama-server
+/// subprocess share the same ggml build. `None` = no .so / no discrete GPU (leave ggml's default).
+pub fn pick_discrete_ggml_device() -> Option<i32> {
+    let so = so_path()?;
+    let cso = CString::new(so.to_string_lossy().as_bytes()).ok()?;
     unsafe {
-        let mut lib = libc::dlopen(b"libvulkan.so.1\0".as_ptr() as *const c_char, libc::RTLD_NOW | libc::RTLD_LOCAL);
-        if lib.is_null() {
-            lib = libc::dlopen(b"libvulkan.so\0".as_ptr() as *const c_char, libc::RTLD_NOW | libc::RTLD_LOCAL);
-        }
+        // Already loaded when the engine is active → same handle (refcounted); harmless otherwise.
+        let lib = libc::dlopen(cso.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
         if lib.is_null() {
             return None;
         }
-        let (Some(create), Some(enumerate), Some(get_props), Some(destroy)) = (
-            sym::<VkCreateInstanceFn>(lib, "vkCreateInstance"),
-            sym::<VkEnumeratePhysicalDevicesFn>(lib, "vkEnumeratePhysicalDevices"),
-            sym::<VkGetPhysicalDevicePropertiesFn>(lib, "vkGetPhysicalDeviceProperties"),
-            sym::<VkDestroyInstanceFn>(lib, "vkDestroyInstance"),
-        ) else {
-            libc::dlclose(lib);
-            return None;
-        };
-        let ci = VkInstanceCreateInfo {
-            s_type: 1,
-            p_next: std::ptr::null(),
-            flags: 0,
-            p_application_info: std::ptr::null(),
-            enabled_layer_count: 0,
-            pp_enabled_layer_names: std::ptr::null(),
-            enabled_extension_count: 0,
-            pp_enabled_extension_names: std::ptr::null(),
-        };
-        let mut inst: *mut c_void = std::ptr::null_mut();
-        if create(&ci, std::ptr::null(), &mut inst) != 0 || inst.is_null() {
-            libc::dlclose(lib);
-            return None;
+        let pick: PickFn = sym(lib, "keryx_vk_pick_discrete_device")?;
+        let d = pick();
+        if d >= 0 {
+            Some(d)
+        } else {
+            None
         }
-        let mut count = 0u32;
-        let mut first_discrete: Option<usize> = None;
-        let mut first_amd_discrete: Option<usize> = None;
-        if enumerate(inst, &mut count, std::ptr::null_mut()) == 0 && count > 0 {
-            let mut devs: Vec<*mut c_void> = vec![std::ptr::null_mut(); count as usize];
-            if enumerate(inst, &mut count, devs.as_mut_ptr()) >= 0 {
-                for (i, d) in devs.iter().take(count as usize).enumerate() {
-                    // VkPhysicalDeviceProperties is ~824 bytes; a u64-aligned 2 KiB buffer is
-                    // safely oversized. Fixed ABI offsets: vendorID@8, deviceType@16, deviceName@20.
-                    let mut buf = [0u64; 256];
-                    let p = buf.as_mut_ptr() as *mut u8;
-                    get_props(*d, p);
-                    let bytes = std::slice::from_raw_parts(p, 2048);
-                    let vendor = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-                    let dtype = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-                    let name = CStr::from_bytes_until_nul(&bytes[20..276])
-                        .map(|c| c.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| "?".into());
-                    let kind = match dtype {
-                        VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => "integrated",
-                        VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => "discrete",
-                        _ => "other",
-                    };
-                    log::info!("llama-vk: Vulkan device {i} = {name} ({kind})");
-                    if dtype == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU {
-                        first_discrete.get_or_insert(i);
-                        if vendor == VK_VENDOR_ID_AMD {
-                            first_amd_discrete.get_or_insert(i);
-                        }
-                    }
-                }
-            }
-        }
-        destroy(inst, std::ptr::null());
-        libc::dlclose(lib);
-        first_amd_discrete.or(first_discrete).map(|i| i.to_string())
     }
 }
 
 /// Load the .so + the model once (idempotent, blocking — a model load takes seconds). Returns
 /// whether the engine is active for `gguf`. Safe to call from multiple threads.
-pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
+pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
     let mut g = match engine().lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -235,28 +163,22 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
             Ok(c) => c,
             Err(_) => return false,
         };
-        // Device pin (issue #18): restrict ggml's visible set to ONE discrete GPU BEFORE its
-        // first Vulkan call — otherwise on rigs with integrated graphics ggml device 0 is the
-        // iGPU and `main_gpu = 0` hosts the model in UMA system RAM. `KERYX_LLAMA_VK_DEVICE`
-        // (a raw Vulkan enumeration index/list — the same GGML_VK_VISIBLE_DEVICES semantics the
-        // llama-server path documents) overrides the auto-pick; `main_gpu` then indexes INTO the
-        // visible set, so it is 0 = the set's first entry. No discrete GPU / no libvulkan =
-        // previous behavior (the caller's `gpu` as a ggml index).
-        let visible = std::env::var("KERYX_LLAMA_VK_DEVICE")
+        // Device pin (issue #18): the model must NOT land on an integrated GPU (UMA system RAM →
+        // the miner exits/restart-loops). The .so resolves `main_gpu < 0` to a discrete GPU
+        // against GGML'S OWN device list — the only index space that is reliably valid, since a
+        // separate-instance enumeration (or GGML_VK_VISIBLE_DEVICES computed from one) orders
+        // devices differently on iGPU rigs and mislocates or asserts. So we do NOT set
+        // GGML_VK_VISIBLE_DEVICES here; we pass -1 = "auto-pick discrete". `KERYX_LLAMA_VK_DEVICE`
+        // overrides with an explicit ggml device index (a `main_gpu` value).
+        let main_gpu: c_int = std::env::var("KERYX_LLAMA_VK_DEVICE")
             .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(pick_discrete_vk_device);
-        let main_gpu: c_int = match &visible {
-            Some(v) => {
-                std::env::set_var("GGML_VK_VISIBLE_DEVICES", v);
-                log::info!(
-                    "llama-vk engine: visible Vulkan device(s) = {v} (GGML_VK_VISIBLE_DEVICES; override with KERYX_LLAMA_VK_DEVICE)"
-                );
-                0
-            }
-            None => gpu as c_int,
-        };
-        log::info!("llama-vk engine: loading {gguf} (ggml GPU {main_gpu}) via {} (in-process, zero-dup)…", so.display());
+            .and_then(|s| s.trim().parse::<c_int>().ok())
+            .unwrap_or(-1);
+        log::info!(
+            "llama-vk engine: loading {gguf} (ggml GPU {}) via {} (in-process, zero-dup)…",
+            if main_gpu < 0 { "auto-discrete".to_string() } else { main_gpu.to_string() },
+            so.display()
+        );
         let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
         let model = load(cg.as_ptr(), main_gpu, n_ctx);
         if model.is_null() {
@@ -277,7 +199,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
             pom_fetch: fetch,
             pom_mine: mine,
             pom_pci: pci,
-            gpu: main_gpu as usize,
+            gpu: main_gpu.max(0) as usize, // -1 = auto; the actual device is read via pom_pci
             gguf: gguf.to_string(),
         });
         true

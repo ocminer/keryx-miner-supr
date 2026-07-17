@@ -38,6 +38,7 @@ extern "C" bool keryx_vk_raw_handles(size_t dev_num, void ** vk_instance, void *
 extern "C" bool keryx_vk_tensor_addr(const struct ggml_tensor * tensor, uint64_t * gpu_addr, uint64_t * size_bytes);
 extern "C" void * keryx_vk_tensor_device(const struct ggml_tensor * tensor);
 extern "C" void keryx_vk_queue_submit(size_t dev_num, const void * submit_info, void * fence);
+extern "C" int keryx_vk_pick_discrete_device();
 
 static constexpr uint64_t CHUNK_BYTES = 32;
 static constexpr uint32_t NO_WINNER = 0xFFFFFFFFu;
@@ -428,7 +429,7 @@ extern "C" {
 
 // Core ABI (load/generate/free) matches the CUDA flavor; the _vk_abi covers the walk exports.
 int keryx_llama_abi() { return 2; }
-int keryx_llama_vk_abi() { return 2; }
+int keryx_llama_vk_abi() { return 3; }
 
 // PCI location of the GPU hosting the model (VK_EXT_pci_bus_info) — lets the OpenCL driver map
 // this engine to its cl_device_id (CL_DEVICE_TOPOLOGY_AMD) so THAT card skips its own blob and
@@ -451,6 +452,15 @@ bool keryx_llama_pom_pci(KeryxLlama* h, uint32_t* domain, uint32_t* bus, uint32_
 
 KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     llama_backend_init();
+    // gpu < 0 = "auto-pick a discrete GPU" (issue #18): resolve it against ggml's OWN device
+    // list so the model never lands on an integrated GPU. main_gpu indexes ggml's device list,
+    // so no GGML_VK_VISIBLE_DEVICES is needed (and it must NOT be set — it uses a different,
+    // cross-instance index space that mislocates or asserts on iGPU rigs).
+    if (gpu < 0) {
+        int d = keryx_vk_pick_discrete_device();
+        gpu = d >= 0 ? d : 0;
+        fprintf(stderr, "keryx-llama-vk: auto-selected discrete ggml device %d\n", gpu);
+    }
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 999;
     mp.split_mode   = LLAMA_SPLIT_MODE_NONE; // ONE GPU — never layer-split across mining cards

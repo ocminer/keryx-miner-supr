@@ -100,18 +100,21 @@ pub fn try_start(gguf_path: &str, port: u16) -> bool {
     .env("LD_LIBRARY_PATH", ld)
     .stdout(Stdio::null())
     .stderr(Stdio::null());
-    // AMD/Vulkan llama-server: pin it to one discrete GPU (see the doc comment above). Same
-    // selection as the in-process engine: KERYX_LLAMA_VK_DEVICE wins, else the first discrete
-    // AMD Vulkan device; neither (pure-APU box / no libvulkan) = llama.cpp's own default.
+    // AMD/Vulkan llama-server: pin it to one discrete GPU (see the doc comment above).
+    // KERYX_LLAMA_VK_DEVICE (an explicit ggml `main_gpu` index) wins; else the engine .so picks
+    // the discrete GPU against ggml's OWN device list (issue #18) — valid for this subprocess
+    // because it shares the same bundled ggml. Passed as --main-gpu with single-GPU split so
+    // ggml never layer-splits onto the iGPU; NOT GGML_VK_VISIBLE_DEVICES (its cross-instance
+    // index mislocates or asserts on iGPU rigs). Neither = llama.cpp's own default.
     #[cfg(all(feature = "pom-opencl", unix))]
     {
         let dev = std::env::var("KERYX_LLAMA_VK_DEVICE")
             .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(crate::llama_engine_vk::pick_discrete_vk_device);
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .or_else(crate::llama_engine_vk::pick_discrete_ggml_device);
         if let Some(dev) = dev {
-            log::info!("llama server: pinning Vulkan llama-server to device(s) {dev} (GGML_VK_VISIBLE_DEVICES).");
-            cmd.env("GGML_VK_VISIBLE_DEVICES", &dev);
+            log::info!("llama server: pinning Vulkan llama-server to ggml device {dev} (--main-gpu, split-mode none).");
+            cmd.args(["--main-gpu", &dev.to_string(), "--split-mode", "none"]);
         }
     }
     #[cfg(not(all(feature = "pom-opencl", unix)))]

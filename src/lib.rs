@@ -32,7 +32,7 @@ pub mod llama_engine_vk;
 #[cfg(all(feature = "pom-opencl", not(unix)))]
 pub mod llama_engine_vk {
     pub fn ensure_loaded(_gguf: &str, _gpu: usize) -> bool { false }
-    pub fn pick_discrete_vk_device() -> Option<String> { None }
+    pub fn pick_discrete_ggml_device() -> Option<i32> { None }
     pub fn available() -> bool { false }
     pub fn generate(_prompt: &str, _max_tokens: usize) -> Option<String> { None }
     pub fn pom_ready() -> bool { false }

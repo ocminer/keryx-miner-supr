@@ -65,6 +65,39 @@ extern "C" void * keryx_vk_tensor_device(const struct ggml_tensor * tensor) {
     return (void *) (VkDevice) dev->device;
 }
 
+// Pick the discrete GPU for the llama engine, as a `main_gpu` index into GGML'S OWN device list
+// (issue #18). ggml enumerates + filters physical devices in its own instance; a device index
+// taken from ANY other Vulkan instance (a separate libvulkan enumeration, or GGML_VK_VISIBLE_
+// DEVICES computed elsewhere) is NOT guaranteed to map to the same device — on a rig with an
+// integrated GPU the orders differ, so such an index silently resolves to the iGPU (model into
+// UMA system RAM) or trips a GGML_ASSERT. Resolving it HERE, against ggml's exact device_indices,
+// is correct by construction. Prefers a discrete AMD GPU; else any discrete; -1 if none found.
+extern "C" int keryx_vk_pick_discrete_device() {
+    try {
+        ggml_vk_instance_init();
+        std::vector<vk::PhysicalDevice> phys = vk_instance.instance.enumeratePhysicalDevices();
+        int first_discrete = -1, first_amd_discrete = -1;
+        for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
+            size_t raw = vk_instance.device_indices[i];
+            if (raw >= phys.size()) {
+                continue;
+            }
+            vk::PhysicalDeviceProperties props = phys[raw].getProperties();
+            if (props.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+                if (first_discrete < 0) {
+                    first_discrete = (int) i;
+                }
+                if (props.vendorID == 0x1002 && first_amd_discrete < 0) {
+                    first_amd_discrete = (int) i;
+                }
+            }
+        }
+        return first_amd_discrete >= 0 ? first_amd_discrete : first_discrete;
+    } catch (...) {
+        return -1;
+    }
+}
+
 extern "C" void keryx_vk_queue_submit(size_t dev_num, const void * submit_info, void * fence) {
     vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
     // The same lock every internal ggml submission takes -> external dispatches serialize
