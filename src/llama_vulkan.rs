@@ -56,9 +56,11 @@ fn server_binary() -> Option<std::path::PathBuf> {
 /// Spawn the Vulkan `llama-server` for `gguf_path` and block until it's healthy (or give up).
 /// Returns true on success. Idempotent-ish: call once at startup. Any failure → false (CPU fallback).
 ///
-/// Device: defaults to llama.cpp's default Vulkan device, which on a headless AMD mining rig is the
-/// AMD GPU. Override with `KERYX_LLAMA_VK_DEVICE` (a `GGML_VK_VISIBLE_DEVICES` value, e.g. "1") on
-/// boxes with an integrated GPU to skip.
+/// Device: pinned to ONE discrete GPU via `GGML_VK_VISIBLE_DEVICES` (first discrete AMD card by
+/// default). Without the pin, ggml-vulkan layer-splits across EVERY visible Vulkan device — iGPU
+/// included (issue #18: on rigs with integrated graphics, Vulkan device 0 is the Intel/AMD APU,
+/// so model layers land in UMA system RAM) — stealing VRAM from every mining card. Override the
+/// auto-pick with `KERYX_LLAMA_VK_DEVICE` (a `GGML_VK_VISIBLE_DEVICES` value, e.g. "1").
 pub fn try_start(gguf_path: &str, port: u16) -> bool {
     if available() {
         return true;
@@ -98,6 +100,21 @@ pub fn try_start(gguf_path: &str, port: u16) -> bool {
     .env("LD_LIBRARY_PATH", ld)
     .stdout(Stdio::null())
     .stderr(Stdio::null());
+    // AMD/Vulkan llama-server: pin it to one discrete GPU (see the doc comment above). Same
+    // selection as the in-process engine: KERYX_LLAMA_VK_DEVICE wins, else the first discrete
+    // AMD Vulkan device; neither (pure-APU box / no libvulkan) = llama.cpp's own default.
+    #[cfg(all(feature = "pom-opencl", unix))]
+    {
+        let dev = std::env::var("KERYX_LLAMA_VK_DEVICE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(crate::llama_engine_vk::pick_discrete_vk_device);
+        if let Some(dev) = dev {
+            log::info!("llama server: pinning Vulkan llama-server to device(s) {dev} (GGML_VK_VISIBLE_DEVICES).");
+            cmd.env("GGML_VK_VISIBLE_DEVICES", &dev);
+        }
+    }
+    #[cfg(not(all(feature = "pom-opencl", unix)))]
     if let Ok(dev) = std::env::var("KERYX_LLAMA_VK_DEVICE") {
         cmd.env("GGML_VK_VISIBLE_DEVICES", dev);
     }

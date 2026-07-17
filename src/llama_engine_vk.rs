@@ -82,6 +82,110 @@ unsafe fn sym<T: Copy>(lib: *mut c_void, name: &str) -> Option<T> {
     Some(std::mem::transmute_copy::<*mut c_void, T>(&p))
 }
 
+// ── Vulkan device auto-pick (issue #18) ─────────────────────────────────────────────────────
+// ggml-vulkan numbers devices in raw `vkEnumeratePhysicalDevices` order and its DEFAULT visible
+// set includes integrated GPUs, so on a rig with an iGPU "device 0" is the Intel/AMD APU: the
+// model loads into UMA system RAM and the engine (or the whole miner) falls over. We enumerate
+// the same raw order through libvulkan directly (no Vulkan crate dep — the runtime always has
+// the loader when any Vulkan mining works at all) and pick a DISCRETE GPU to pin ggml to.
+
+const VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: u32 = 1;
+const VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: u32 = 2;
+const VK_VENDOR_ID_AMD: u32 = 0x1002;
+
+#[repr(C)]
+struct VkInstanceCreateInfo {
+    s_type: u32, // VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
+    p_next: *const c_void,
+    flags: u32,
+    p_application_info: *const c_void,
+    enabled_layer_count: u32,
+    pp_enabled_layer_names: *const *const c_char,
+    enabled_extension_count: u32,
+    pp_enabled_extension_names: *const *const c_char,
+}
+
+type VkCreateInstanceFn = unsafe extern "C" fn(*const VkInstanceCreateInfo, *const c_void, *mut *mut c_void) -> i32;
+type VkEnumeratePhysicalDevicesFn = unsafe extern "C" fn(*mut c_void, *mut u32, *mut *mut c_void) -> i32;
+type VkGetPhysicalDevicePropertiesFn = unsafe extern "C" fn(*mut c_void, *mut u8);
+type VkDestroyInstanceFn = unsafe extern "C" fn(*mut c_void, *const c_void);
+
+/// Raw-enumeration index of the Vulkan device the llama engine should live on, as a
+/// `GGML_VK_VISIBLE_DEVICES` value: the first DISCRETE AMD GPU, else the first discrete GPU of
+/// any vendor. `None` = no discrete GPU (or no usable libvulkan) — leave ggml's own selection
+/// alone. Logs the full device table once so support tickets show the index→card mapping.
+pub fn pick_discrete_vk_device() -> Option<String> {
+    unsafe {
+        let mut lib = libc::dlopen(b"libvulkan.so.1\0".as_ptr() as *const c_char, libc::RTLD_NOW | libc::RTLD_LOCAL);
+        if lib.is_null() {
+            lib = libc::dlopen(b"libvulkan.so\0".as_ptr() as *const c_char, libc::RTLD_NOW | libc::RTLD_LOCAL);
+        }
+        if lib.is_null() {
+            return None;
+        }
+        let (Some(create), Some(enumerate), Some(get_props), Some(destroy)) = (
+            sym::<VkCreateInstanceFn>(lib, "vkCreateInstance"),
+            sym::<VkEnumeratePhysicalDevicesFn>(lib, "vkEnumeratePhysicalDevices"),
+            sym::<VkGetPhysicalDevicePropertiesFn>(lib, "vkGetPhysicalDeviceProperties"),
+            sym::<VkDestroyInstanceFn>(lib, "vkDestroyInstance"),
+        ) else {
+            libc::dlclose(lib);
+            return None;
+        };
+        let ci = VkInstanceCreateInfo {
+            s_type: 1,
+            p_next: std::ptr::null(),
+            flags: 0,
+            p_application_info: std::ptr::null(),
+            enabled_layer_count: 0,
+            pp_enabled_layer_names: std::ptr::null(),
+            enabled_extension_count: 0,
+            pp_enabled_extension_names: std::ptr::null(),
+        };
+        let mut inst: *mut c_void = std::ptr::null_mut();
+        if create(&ci, std::ptr::null(), &mut inst) != 0 || inst.is_null() {
+            libc::dlclose(lib);
+            return None;
+        }
+        let mut count = 0u32;
+        let mut first_discrete: Option<usize> = None;
+        let mut first_amd_discrete: Option<usize> = None;
+        if enumerate(inst, &mut count, std::ptr::null_mut()) == 0 && count > 0 {
+            let mut devs: Vec<*mut c_void> = vec![std::ptr::null_mut(); count as usize];
+            if enumerate(inst, &mut count, devs.as_mut_ptr()) >= 0 {
+                for (i, d) in devs.iter().take(count as usize).enumerate() {
+                    // VkPhysicalDeviceProperties is ~824 bytes; a u64-aligned 2 KiB buffer is
+                    // safely oversized. Fixed ABI offsets: vendorID@8, deviceType@16, deviceName@20.
+                    let mut buf = [0u64; 256];
+                    let p = buf.as_mut_ptr() as *mut u8;
+                    get_props(*d, p);
+                    let bytes = std::slice::from_raw_parts(p, 2048);
+                    let vendor = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                    let dtype = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+                    let name = CStr::from_bytes_until_nul(&bytes[20..276])
+                        .map(|c| c.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| "?".into());
+                    let kind = match dtype {
+                        VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => "integrated",
+                        VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => "discrete",
+                        _ => "other",
+                    };
+                    log::info!("llama-vk: Vulkan device {i} = {name} ({kind})");
+                    if dtype == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU {
+                        first_discrete.get_or_insert(i);
+                        if vendor == VK_VENDOR_ID_AMD {
+                            first_amd_discrete.get_or_insert(i);
+                        }
+                    }
+                }
+            }
+        }
+        destroy(inst, std::ptr::null());
+        libc::dlclose(lib);
+        first_amd_discrete.or(first_discrete).map(|i| i.to_string())
+    }
+}
+
 /// Load the .so + the model once (idempotent, blocking — a model load takes seconds). Returns
 /// whether the engine is active for `gguf`. Safe to call from multiple threads.
 pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
@@ -131,9 +235,30 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
             Ok(c) => c,
             Err(_) => return false,
         };
-        log::info!("llama-vk engine: loading {gguf} (requested GPU {gpu}) via {} (in-process, zero-dup)…", so.display());
+        // Device pin (issue #18): restrict ggml's visible set to ONE discrete GPU BEFORE its
+        // first Vulkan call — otherwise on rigs with integrated graphics ggml device 0 is the
+        // iGPU and `main_gpu = 0` hosts the model in UMA system RAM. `KERYX_LLAMA_VK_DEVICE`
+        // (a raw Vulkan enumeration index/list — the same GGML_VK_VISIBLE_DEVICES semantics the
+        // llama-server path documents) overrides the auto-pick; `main_gpu` then indexes INTO the
+        // visible set, so it is 0 = the set's first entry. No discrete GPU / no libvulkan =
+        // previous behavior (the caller's `gpu` as a ggml index).
+        let visible = std::env::var("KERYX_LLAMA_VK_DEVICE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(pick_discrete_vk_device);
+        let main_gpu: c_int = match &visible {
+            Some(v) => {
+                std::env::set_var("GGML_VK_VISIBLE_DEVICES", v);
+                log::info!(
+                    "llama-vk engine: visible Vulkan device(s) = {v} (GGML_VK_VISIBLE_DEVICES; override with KERYX_LLAMA_VK_DEVICE)"
+                );
+                0
+            }
+            None => gpu as c_int,
+        };
+        log::info!("llama-vk engine: loading {gguf} (ggml GPU {main_gpu}) via {} (in-process, zero-dup)…", so.display());
         let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
-        let model = load(cg.as_ptr(), gpu as c_int, n_ctx);
+        let model = load(cg.as_ptr(), main_gpu, n_ctx);
         if model.is_null() {
             log::warn!("llama-vk engine: model load failed (VRAM? Vulkan ICD?) — fallbacks stay active.");
             return false;
@@ -152,7 +277,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
             pom_fetch: fetch,
             pom_mine: mine,
             pom_pci: pci,
-            gpu,
+            gpu: main_gpu as usize,
             gguf: gguf.to_string(),
         });
         true
