@@ -101,6 +101,7 @@ fn build_flavour() -> &'static str {
 
 /// Compiled-in feature tags (display only).
 fn features() -> Vec<&'static str> {
+    #[allow(unused_mut)] // mutated only when a pom-* feature is enabled
     let mut f = vec!["pom-v2", "opoi"]; // this build carries H4 proof-v2 + OPoI inference
     #[cfg(feature = "pom-cuda")]
     f.push("pom-cuda");
