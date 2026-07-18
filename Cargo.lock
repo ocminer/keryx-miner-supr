@@ -1858,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "keryx-miner-supr"
-version = "0.6.11"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1888,6 +1888,7 @@ dependencies = [
  "nix",
  "num",
  "num_cpus",
+ "nvml-wrapper",
  "objc2-metal",
  "once_cell",
  "opencl3",
