@@ -812,8 +812,12 @@ impl StratumHandler {
                                         // frontier the network is permanently past, so any pool
                                         // forcing PoM today is necessarily post-H3.
                                         if POOL_FORCED_POM.load(std::sync::atomic::Ordering::Relaxed) {
+                                            // 0.7.0 is the H4 binary: floor at the H4 frontier too, so a
+                                            // Short-only pool forcing PoM stamps the H4 tier and builds
+                                            // proof-v2 (h4 dominates H2/H3; env-override respected).
                                             base.max(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA)
                                                 .max(keryx_miner::pom::level_activation_daa())
+                                                .max(keryx_miner::pom::h4_activation_daa())
                                         } else {
                                             base
                                         }

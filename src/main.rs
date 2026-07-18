@@ -380,7 +380,7 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
         vram_mb,
         picked.pom_model_name(),
         picked,
-        models::pom_tier_index(&picked.pom_spec().model_id, models::VERY_LIGHT_ACTIVATION_DAA).unwrap_or(0),
+        models::pom_tier_index(&picked.pom_spec().model_id, keryx_miner::pom::h4_activation_daa()).unwrap_or(0),
         need,
         AUTO_TIER_HEADROOM_MB,
     );
@@ -408,7 +408,7 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
                  ({} will download in the background; restart to use it.)",
                 tier.pom_model_name(),
                 tier,
-                models::pom_tier_index(&tier.pom_spec().model_id, models::VERY_LIGHT_ACTIVATION_DAA).unwrap_or(0),
+                models::pom_tier_index(&tier.pom_spec().model_id, keryx_miner::pom::h4_activation_daa()).unwrap_or(0),
                 picked.pom_model_name(),
             );
             return tier;
@@ -884,7 +884,7 @@ async fn run() -> Result<(), Error> {
     // --force-model contract: the forced model loads REGARDLESS of VRAM fit (power-user knob), so
     // the capability gate is skipped for it — otherwise filter_specs_by_vram silently drops the
     // forced spec and PoM never configures (the "--force-model ignored" bug class, issue #7).
-    let specs_all = keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, tier);
+    let specs_all = keryx_miner::models::specs_for(keryx_miner::pom::h4_activation_daa(), tier);
     let specs_v2 = if tier_forced {
         info!("--force-model: VRAM capability gate skipped for the forced model — it will load regardless of fit (may OOM an undersized card).");
         specs_all
@@ -895,7 +895,7 @@ async fn run() -> Result<(), Error> {
     let pom_spec = specs_v2
         .iter()
         .copied()
-        .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id, keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA).is_some())
+        .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id, keryx_miner::pom::h4_activation_daa()).is_some())
         .max_by_key(|s| s.min_vram_mb);
     keryx_miner::slm::set_v2_lineup(specs_v2);
     keryx_miner::slm::init_supported(specs_v2);
@@ -938,7 +938,7 @@ async fn run() -> Result<(), Error> {
     // with zero-dup VRAM sharing.
     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
     if let Some(spec) = pom_spec {
-        let tier_idx = keryx_miner::models::pom_tier_index(&spec.model_id, keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA).expect("pom_spec has a tier");
+        let tier_idx = keryx_miner::models::pom_tier_index(&spec.model_id, keryx_miner::pom::h4_activation_daa()).expect("pom_spec has a tier");
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         // PoM PASSTHROUGH live test (KERYX_POM_PASSTHROUGH): build the HOST possession index in the
         // background so kHeavyHash shares can carry a PomProof (daemon stores it pre-fork). Heavy
