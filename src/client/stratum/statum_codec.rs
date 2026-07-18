@@ -89,6 +89,14 @@ pub(crate) enum StratumCommand {
     // Phase 2 OPoI: miner → bridge — declare loaded SLM model IDs (sent after authorize)
     #[serde(rename = "mining.declare_capabilities")]
     MiningDeclareCapabilities(Vec<String>),
+    // Telemetry (v0.7.0): miner → pool — STATIC rig identity, sent once after subscribe. params =
+    // [ hello-object ]. DISPLAY/OPS ONLY (spoofable). Best-effort; pool may reply error 20.
+    #[serde(rename = "mining.hello")]
+    MiningHello((Value,)),
+    // Telemetry (v0.7.0): miner → pool — DYNAMIC per-GPU metrics, sent periodically. params =
+    // [ metrics-object ]. DISPLAY/OPS ONLY (spoofable).
+    #[serde(rename = "mining.telemetry")]
+    MiningTelemetry((Value,)),
     // Phase 2 OPoI: bridge → miner — "model_id_hex:nonce_hex" capability challenge
     #[serde(rename = "mining.challenge")]
     MiningChallenge((String, String)),

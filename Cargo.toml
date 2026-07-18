@@ -127,6 +127,13 @@ win32console = "0.1"
 [target.'cfg(all(not(target_arch = "x86_64"), not(target_os = "windows")))'.dependencies]
 keccak = "0.1"
 
+# Stratum telemetry (mining.hello/mining.telemetry) GPU enumeration: NVML per-GPU
+# model/vram/driver/temp/power/clock. Same 0.12 the CUDA plugin already vendors, so no new
+# offline-vendor entry. dlopens libnvidia-ml at runtime → Nvml::init() returns Err gracefully on
+# AMD/CUDA-less hosts (telemetry GPU block is best-effort). Not on macOS (no NVIDIA there).
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+nvml-wrapper = "0.12"
+
 # macOS-only Metal plumbing for the PoM walk kernel: candle's Metal-buffer wrappers
 # (candle-metal-kernels re-exports the objc2-metal handles candle itself holds) + the raw
 # objc2-metal protocol traits. Compiled only on macOS; unused unless `pom-metal` is on.

@@ -200,6 +200,17 @@ pub struct StratumHandler {
     inference_cache: InferenceCache,
     /// True while a capability challenge inference is in flight — prevents duplicate spawns.
     challenge_in_flight: Arc<AtomicBool>,
+
+    /// Miner-telemetry (mining.hello/mining.telemetry, v0.7.0). Best-effort/non-fatal: starts true;
+    /// flips false for the session if the pool rejects `mining.hello`/`mining.telemetry` with error
+    /// 20 (method not supported) — after which we stop sending and just keep mining.
+    telemetry_on: bool,
+    /// Outstanding telemetry request ids (hello + each telemetry) awaiting a pool ack/err, so an
+    /// error-20 reply can be attributed to telemetry (not mistaken for a rejected share) and a
+    /// success ack doesn't log a spurious "ignoring result".
+    telemetry_req_ids: HashSet<u32>,
+    /// Process start, for the telemetry `uptime_s` field.
+    start_time: std::time::Instant,
 }
 
 #[async_trait(?Send)]
@@ -254,6 +265,32 @@ impl Client for StratumHandler {
                 })
                 .await?;
         }
+
+        // Miner telemetry (v0.7.0): STATIC rig identity, sent ONCE. Best-effort & non-fatal — if the
+        // pool doesn't support it, it replies error 20 (handled in handle_message → telemetry_on=false
+        // for the session); a send failure just skips telemetry. NEVER blocks/aborts mining.
+        if self.telemetry_on {
+            let loaded_model = keryx_miner::pom::active_index().map(|(_index, tier)| {
+                let mid = keryx_miner::slm::loaded_model_ids().first().map(hex::encode).unwrap_or_default();
+                (*tier, mid)
+            });
+            let hello = keryx_miner::telemetry::build_hello(loaded_model);
+            let id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
+            self.telemetry_req_ids.insert(id);
+            if self
+                .send_channel
+                .send(StratumLine {
+                    id: Some(id),
+                    payload: StratumLinePayload::StratumCommand(StratumCommand::MiningHello((hello,))),
+                    jsonrpc: None,
+                    error: None,
+                })
+                .await
+                .is_err()
+            {
+                self.telemetry_on = false;
+            }
+        }
         Ok(())
     }
 
@@ -295,6 +332,14 @@ impl Client for StratumHandler {
         // controller has picked a different pool. No-op when no backup is configured (inert flag).
         let mut switch_watch = tokio::time::interval(Duration::from_secs(3));
         switch_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Telemetry sender (v0.7.0): periodic mining.telemetry. Interval from KERYX_TELEMETRY_INTERVAL
+        // (default 120s, min 30s). The first tick fires immediately and is skipped (hello already
+        // carried the static block; the first metrics go out one interval in). Inert while
+        // telemetry_on is false (disabled, or the pool answered mining.hello with error 20).
+        let mut telemetry_watch =
+            tokio::time::interval(Duration::from_secs(keryx_miner::telemetry::interval_secs()));
+        telemetry_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        telemetry_watch.tick().await; // consume the immediate first tick
         let conn_dead = self.conn_dead.clone();
         loop {
             tokio::select! {
@@ -305,6 +350,14 @@ impl Client for StratumHandler {
                 _ = switch_watch.tick() => {
                     if pool_switch_requested() {
                         return Err("failover: switching to a different pool".into());
+                    }
+                }
+                _ = telemetry_watch.tick() => {
+                    // Best-effort periodic metrics. Runs after the tick future resolves (the
+                    // stream future is dropped by then), so borrowing &mut self here is fine —
+                    // same pattern as handle_message. Never returns Err (telemetry is non-fatal).
+                    if self.telemetry_on {
+                        self.send_telemetry(miner).await;
                     }
                 }
                 _ = job_watch.tick() => {
@@ -441,6 +494,9 @@ impl StratumHandler {
             current_task_slot,
             inference_cache,
             challenge_in_flight: Arc::new(AtomicBool::new(false)),
+            telemetry_on: keryx_miner::telemetry::enabled(),
+            telemetry_req_ids: HashSet::new(),
+            start_time: std::time::Instant::now(),
         }))
     }
 
@@ -554,6 +610,39 @@ impl StratumHandler {
         (send, handle)
     }
 
+    /// Send one `mining.telemetry` frame (dynamic per-GPU metrics + local share counters).
+    /// Best-effort/non-fatal: a stats-lock miss or a send error just skips this tick.
+    async fn send_telemetry(&mut self, miner: &mut MinerManager) {
+        // Snapshot the miner's own per-device hashrate (std Mutex — extract + drop the guard BEFORE
+        // any await; never hold it across the send).
+        let (total, per_gpu): (f64, Vec<f64>) = match miner.stats().lock() {
+            Ok(s) => (s.total_hashrate, s.devices.iter().map(|d| d.hashrate).collect()),
+            Err(_) => return,
+        };
+        let acc = self.shares_stats.accepted.load(Ordering::SeqCst);
+        let stale = self.shares_stats.stale.load(Ordering::SeqCst);
+        let rej = self.shares_stats.low_diff.load(Ordering::SeqCst)
+            + self.shares_stats.duplicate.load(Ordering::SeqCst);
+        let uptime = self.start_time.elapsed().as_secs();
+        let obj = keryx_miner::telemetry::build_telemetry(uptime, total, &per_gpu, acc, rej, stale);
+
+        let id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
+        // Track for error-20 attribution; bound the set in case the pool never acks.
+        if self.telemetry_req_ids.len() > 64 {
+            self.telemetry_req_ids.clear();
+        }
+        self.telemetry_req_ids.insert(id);
+        let _ = self
+            .send_channel
+            .send(StratumLine {
+                id: Some(id),
+                payload: StratumLinePayload::StratumCommand(StratumCommand::MiningTelemetry((obj,))),
+                jsonrpc: None,
+                error: None,
+            })
+            .await;
+    }
+
     async fn handle_message(&mut self, msg: StratumLine, miner: &mut MinerManager) -> Result<(), Error> {
         match msg.clone() {
             StratumLine { id, payload, error: None, .. } => {
@@ -561,12 +650,17 @@ impl StratumHandler {
                     StratumLinePayload::StratumResult { result } if id.is_some() => {
                         match result {
                             StratumResult::Plain(Some(true)) | StratumResult::Eth((true, _)) => {
+                                let rid = id.expect("We checked id is not none");
+                                // Telemetry ack (mining.hello/mining.telemetry) — not a share.
+                                if self.telemetry_req_ids.remove(&rid) {
+                                    return Ok(());
+                                }
                                 if let Some(_jobid) = self
                                     .shares_stats
                                     .shares_pending
                                     .try_lock()
                                     .unwrap()
-                                    .remove(&id.expect("We checked id is not none"))
+                                    .remove(&rid)
                                 {
                                     self.shares_stats.accepted.fetch_add(1, Ordering::SeqCst);
                                     info!("Share accepted");
@@ -755,6 +849,20 @@ impl StratumHandler {
                 // which, with failover enabled, could also crash on an unexpected reply from a backup
                 // pool. Treat the job id as optional and never panic; the match on `code` below still
                 // returns Err for Unauthorized/NotSubscribed so the reconnect/failover path fires.
+                // Telemetry method rejected (v0.7.0): if this id was a mining.hello/mining.telemetry
+                // request, an error 20 means the pool doesn't support telemetry → disable it for the
+                // session and keep mining. NEVER counted as a rejected share; never fatal.
+                if self.telemetry_req_ids.remove(&id) {
+                    if matches!(code, ErrorCode::Unknown) && self.telemetry_on {
+                        self.telemetry_on = false;
+                        info!(
+                            "Pool does not support miner telemetry (mining.hello/mining.telemetry): '{}' \
+                             — disabled for this session, mining continues normally.",
+                            error
+                        );
+                    }
+                    return Ok(());
+                }
                 let jobid = { self.shares_stats.shares_pending.try_lock().unwrap().remove(&id) };
                 match code {
                     ErrorCode::Unknown => {
