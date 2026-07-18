@@ -1727,7 +1727,7 @@ mod tests {
         let nonce: u64 = 1366;
         let seed = pom_block_seed(&pph, ts, nonce, false);
         let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
-        let bytes = borsh::to_vec(&proof).expect("borsh");
+        let bytes = proof.to_wire_bytes(); // era-exact wire (matches the real submit path)
         let hexs: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
         println!("proof: {} bytes, pow_value={}", bytes.len(), proof.pow_value.iter().map(|b| format!("{:02x}", b)).collect::<String>());
         let json = format!("{{\"id\":1,\"method\":\"mining.submit\",\"params\":[\"a\",\"j\",\"{:016x}\",\"tag\",\"\",\"{}\"]}}", nonce, hexs);
@@ -2017,7 +2017,7 @@ mod tests {
             verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target, false),
             "sample proof MUST verify locally before handoff"
         );
-        let proof_bytes = borsh::to_vec(&proof).expect("borsh");
+        let proof_bytes = proof.to_wire_bytes(); // era-exact wire (matches the real submit path)
         let proof_hex = hex::encode(&proof_bytes);
         let nonce_hex = format!("{:016x}", nonce);
         let opoi_tag = keryx_inference::tag_fixed(nonce);
@@ -2096,7 +2096,7 @@ mod tests {
             verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, POM_WALK_STEPS, POM_OPENINGS, &idx.r_t, &target, false),
             "Mode B proof MUST verify locally before handoff"
         );
-        let proof_hex = hex::encode(borsh::to_vec(&proof).expect("borsh"));
+        let proof_hex = hex::encode(proof.to_wire_bytes()); // era-exact wire (matches the real submit path)
         let notes = format!(
             "bound to real staging pre_pow_hash {pph} + timestamp {time}; tier {tier}; mined at EASY test \
              target {tgt} (NOT network bits — infeasible here); pom_pow_value {powv} (<= test target); \
