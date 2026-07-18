@@ -2116,6 +2116,94 @@ mod tests {
         eprintln!("{notes}");
     }
 
+    /// Emit a REAL H4 PoM **proof-v2** (recompute-from-chunks) over a REAL H4 model, entirely
+    /// host-side (no GPU), for the pool's PoW / PoM-v2 acceptance test. Builds the WeightIndex from
+    /// the GGUF (canonical R_T = the node's pinned tier root), builds the v2 proof via
+    /// `build_proof_v2`, self-verifies via `verify_proof_v2`, and writes the wire hex + the full
+    /// context the pool feeds into `verify_pom_proof_v2`.
+    ///
+    /// Run (EXAONE = tier 0, the smallest H4 model):
+    ///   KERYX_H4_GGUF=$HOME/keryx-model-cache/EXAONE-4.0-1.2B/model.gguf KERYX_H4_TIER=0 \
+    ///   cargo test --release -p keryx-miner-supr emit_h4_v2_proof -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn emit_h4_v2_proof() {
+        let path = std::env::var("KERYX_H4_GGUF").expect("set KERYX_H4_GGUF to the H4 model.gguf");
+        let tier: u8 = std::env::var("KERYX_H4_TIER").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let idx = WeightIndex::build_from_gguf(&path).expect("build index from H4 GGUF");
+
+        // Synthetic-but-deterministic header inputs (NOT a real chain header). H4 era → H3 salt ON.
+        let h3 = true;
+        let pph = blake(b"keryx-h4-pom-v2-sample-2026-07-18");
+        let time = 1_700_000_000u64;
+        // Max-easy target so the FIRST nonce satisfies it — this is a PLUMBING/acceptance proof, not
+        // network difficulty (same convention as the v1 sample-gen tests). All-0xff => le_leq always
+        // true, so no CPU search is needed. The v2 structure (re-walk + per-step Merkle under R_T +
+        // final_state recompute) is still fully exercised by verify_proof_v2 / verify_pom_proof_v2.
+        let target = [0xffu8; 32];
+        let nonce = 0u64;
+        let seed = pom_block_seed(&pph, time, nonce, h3);
+        let final_state = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o));
+        let pow_value = pom_pow_value(final_state, &pph, h3);
+        assert!(le_leq(&pow_value, &target));
+
+        let proof = build_proof_v2(
+            tier,
+            &pph,
+            seed,
+            idx.n_chunks,
+            POM_WALK_STEPS,
+            |o| idx.read_chunk(o),
+            |o| idx.merkle_path(o),
+            h3,
+        );
+        assert!(
+            verify_proof_v2(&proof, &pph, seed, idx.n_chunks, POM_WALK_STEPS, &idx.r_t, &target, h3),
+            "v2 proof MUST verify locally before handoff"
+        );
+        assert_eq!(proof.final_state, final_state);
+        assert_eq!(proof.steps_v2.as_ref().unwrap().len(), POM_WALK_STEPS as usize);
+
+        let proof_bytes = proof.to_wire_bytes();
+        let proof_hex = hex::encode(&proof_bytes);
+        let nonce_hex = format!("{:016x}", nonce);
+        let vector = format!(
+            "Keryx H4 PoM proof-v2 sample — REAL model, host-built, verify_proof_v2: PASS\n\
+             era:                     H4 (h3 salt = ON)\n\
+             model gguf:              {path}\n\
+             tier (u8):               {tier}\n\
+             pre_pow_hash (32B hex):  {pph}\n\
+             timestamp (u64):         {time}\n\
+             nonce (u64 dec):         {nonce}   (nonceHex {nonce_hex})\n\
+             seed (u64 dec):          {seed}   (= pom_block_seed(pph, timestamp, nonce, h3=true))\n\
+             h3 (bool):               true\n\
+             n_chunks (u64):          {nc}\n\
+             k / POM_WALK_STEPS:      {k}\n\
+             R_T tier root (32B hex): {rt}\n\
+             final_state (u64 dec):   {fs}\n\
+             pom_pow_value (32B hex): {powv}\n\
+             target (32B hex):        {tgt}   (max-easy plumbing target; pow_value <= target ✓)\n\
+             proof wire bytes:        {plen}   (params[5] hex chars {phlen})\n\
+             steps_v2 count:          {sc}\n\
+             proof wire hex:          {proof_hex}\n\
+             --- pool: verify_pom_proof_v2(proof, pre_pow_hash, seed, n_chunks, k, R_T, target, h3) ---\n\
+             NOTE: pph/time/nonce are synthetic (not a chain header). The pool MUST recompute R_T from\n\
+             its own pinned EXAONE GGUF and confirm it equals the R_T above (that IS the possession\n\
+             check), then decode the hex via from_wire_bytes (Some(steps_v2) => v2 branch) and run\n\
+             verify_pom_proof_v2 with h3=true. Expect: ACCEPT.\n",
+            path = path, tier = tier, pph = hex::encode(pph), time = time, nonce = nonce,
+            nonce_hex = nonce_hex, seed = seed, nc = idx.n_chunks, k = POM_WALK_STEPS,
+            rt = hex::encode(idx.r_t), fs = final_state, powv = hex::encode(pow_value),
+            tgt = hex::encode(target), plen = proof_bytes.len(), phlen = proof_hex.len(),
+            sc = proof.steps_v2.as_ref().unwrap().len(), proof_hex = proof_hex,
+        );
+        let out = std::env::var("KERYX_H4_OUT").unwrap_or_else(|_| "/tmp/pom_h4_v2".into());
+        std::fs::write(format!("{out}_vector.txt"), &vector).unwrap();
+        std::fs::write(format!("{out}_proof.hex"), &proof_hex).unwrap();
+        eprintln!("{vector}");
+        eprintln!("proof hex ({} chars) -> {out}_proof.hex ; vector -> {out}_vector.txt", proof_hex.len());
+    }
+
     /// Validate + benchmark candle's CPU backend on the AMD OPoI inference model (Gemma-3-4B, the
     /// post-fork --light tier). Proves candle CPU can load + generate the Gemma3 quantized arch (the
     /// AMD inference path) and reports the real tok/s on this box. Needs the model staged at
