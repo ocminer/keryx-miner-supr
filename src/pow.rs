@@ -189,14 +189,13 @@ impl State {
                     *tier, &pph, nonce, seed, index.n_chunks, pom::POM_WALK_STEPS, pom::POM_OPENINGS,
                     |o| index.read_chunk(o), |o| index.merkle_path(o), h3,
                 );
-                if let Ok(bytes) = borsh::to_vec(&proof) {
-                    let n = bytes.len();
-                    match block_seed {
-                        BlockSeed::FullBlock(ref mut block) => block.pom_proof = bytes,
-                        BlockSeed::PartialBlock { ref mut pom_proof, .. } => *pom_proof = bytes,
-                    }
-                    log::info!("PoM passthrough: attached proof ({} B) to kHeavyHash share", n);
+                let bytes = proof.to_wire_bytes();
+                let n = bytes.len();
+                match block_seed {
+                    BlockSeed::FullBlock(ref mut block) => block.pom_proof = bytes,
+                    BlockSeed::PartialBlock { ref mut pom_proof, .. } => *pom_proof = bytes,
                 }
+                log::info!("PoM passthrough: attached proof ({} B) to kHeavyHash share", n);
             }
         }
         Some(block_seed)
@@ -224,19 +223,37 @@ impl State {
             return None;
         }
 
-        let proof = pom::build_proof(
-            tier,
-            &pph,
-            nonce,
-            seed,
-            index.n_chunks,
-            pom::POM_WALK_STEPS,
-            pom::POM_OPENINGS,
-            |o| index.read_chunk(o),
-            |o| index.merkle_path(o),
-            h3,
-        );
-        let bytes = borsh::to_vec(&proof).ok()?;
+        // H4 (AUTO-SWITCH): at/after the coin-age gate the node runs `verify_pom_proof_v2`
+        // (recompute-from-chunks: it re-walks all K transitions and re-derives final_state), so
+        // we emit the v2 proof — every K chunk read + its Merkle path under R_T, no trace tree,
+        // no Fiat-Shamir openings. Below the gate the legacy trace-tree proof. `to_wire_bytes`
+        // keeps a pre-H4 proof byte-identical to the 7-field layout the not-yet-H4 node decodes.
+        let proof = if self.daa_score >= pom::h4_activation_daa() {
+            pom::build_proof_v2(
+                tier,
+                &pph,
+                seed,
+                index.n_chunks,
+                pom::POM_WALK_STEPS,
+                |o| index.read_chunk(o),
+                |o| index.merkle_path(o),
+                h3,
+            )
+        } else {
+            pom::build_proof(
+                tier,
+                &pph,
+                nonce,
+                seed,
+                index.n_chunks,
+                pom::POM_WALK_STEPS,
+                pom::POM_OPENINGS,
+                |o| index.read_chunk(o),
+                |o| index.merkle_path(o),
+                h3,
+            )
+        };
+        let bytes = proof.to_wire_bytes();
 
         let mut block_seed = (*self.block).clone();
         match block_seed {
