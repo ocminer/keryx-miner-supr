@@ -58,6 +58,14 @@ pub struct PomOpening {
     pub trace_path_after: Vec<[u8; 32]>,
 }
 
+/// H4 recompute-from-chunks walk step — mirror of the node's `PomStep`. The chunk index is
+/// NOT carried (the verifier derives `state % N` while re-walking).
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct PomStep {
+    pub chunk: [u8; 32],
+    pub weight_path: Vec<[u8; 32]>,
+}
+
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct PomProof {
     pub tier: u8,
@@ -67,6 +75,44 @@ pub struct PomProof {
     pub initial_trace_path: Vec<[u8; 32]>,
     pub final_trace_path: Vec<[u8; 32]>,
     pub openings: Vec<PomOpening>,
+    /// H4 recompute-from-chunks walk record. `None` on every pre-H4 proof. MUST keep the exact
+    /// field order/types of the node's `PomProof::steps_v2` (borsh wire format).
+    pub steps_v2: Option<Vec<PomStep>>,
+}
+
+/// Exact pre-H4 layout of `PomProof` (no `steps_v2`) — mirror of the node's `PomProofPreH4`.
+/// A pre-H4 proof MUST serialize through this so the currently-running node (7-field decode)
+/// keeps accepting it byte-for-byte. See `PomProof::to_wire_bytes`.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct PomProofPreH4 {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<PomOpening>,
+}
+
+impl PomProof {
+    /// Canonical wire (borsh) encoding, era-exact — mirror of the node's `to_wire_bytes`. A proof
+    /// without the v2 extension encodes byte-identically to the pre-H4 layout, so a not-yet-H4 node
+    /// (7-field decode) still accepts it. The submit path MUST use this, never `borsh::to_vec`.
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        match &self.steps_v2 {
+            None => borsh::to_vec(&PomProofPreH4 {
+                tier: self.tier,
+                trace_root: self.trace_root,
+                pow_value: self.pow_value,
+                final_state: self.final_state,
+                initial_trace_path: self.initial_trace_path.clone(),
+                final_trace_path: self.final_trace_path.clone(),
+                openings: self.openings.clone(),
+            })
+            .expect("PomProof borsh serialize"),
+            Some(_) => borsh::to_vec(self).expect("PomProof borsh serialize"),
+        }
+    }
 }
 
 // --- byte-exact primitives (mirror node) ---
@@ -373,7 +419,84 @@ where
         initial_trace_path: merkle_proof(&trace_leaves, 0),
         final_trace_path: merkle_proof(&trace_leaves, k as usize),
         openings,
+        steps_v2: None,
     }
+}
+
+/// H4 PROVER (recompute-from-chunks). Re-walk the (already-won) nonce recording, for each of the
+/// K steps, the 32 B chunk read and its Merkle path under R_T. No trace tree, no Fiat-Shamir
+/// openings: the node re-walks all K transitions itself and derives `final_state`, so nothing is
+/// taken on the prover's word. Legacy trace-tree fields are canonically empty. Byte-exact mirror
+/// of the node's `verify_pom_proof_v2` expectations.
+#[allow(clippy::too_many_arguments)]
+pub fn build_proof_v2<F, WP>(
+    tier: u8,
+    pre_pow_hash: &[u8; 32],
+    seed: u64,
+    n_chunks: u64,
+    k: u32,
+    read_chunk: F,
+    weight_path: WP,
+    h3: bool,
+) -> PomProof
+where
+    F: Fn(u64) -> [u64; CHUNK_WORDS],
+    WP: Fn(u64) -> Vec<[u8; 32]>,
+{
+    let mut steps = Vec::with_capacity(k as usize);
+    let mut state = seed;
+    for _ in 0..k {
+        let off = state % n_chunks;
+        let chunk_words = read_chunk(off);
+        steps.push(PomStep { chunk: words_to_bytes(&chunk_words), weight_path: weight_path(off) });
+        state = transition(state, &chunk_words);
+    }
+    let final_state = state;
+    let pow_value = pom_pow_value(final_state, pre_pow_hash, h3);
+
+    PomProof {
+        tier,
+        trace_root: [0u8; 32],
+        pow_value,
+        final_state,
+        initial_trace_path: vec![],
+        final_trace_path: vec![],
+        openings: vec![],
+        steps_v2: Some(steps),
+    }
+}
+
+/// Self-check a built v2 proof before submit — same logic the node's `verify_pom_proof_v2` runs.
+/// Cheap insurance against emitting a block the node will reject.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_proof_v2(proof: &PomProof, pre_pow_hash: &[u8; 32], seed: u64, n_chunks: u64, k: u32, r_t: &[u8; 32], target: &[u8; 32], h3: bool) -> bool {
+    let steps = match &proof.steps_v2 {
+        Some(s) if s.len() == k as usize => s,
+        _ => return false,
+    };
+    if proof.trace_root != [0u8; 32]
+        || !proof.initial_trace_path.is_empty()
+        || !proof.final_trace_path.is_empty()
+        || !proof.openings.is_empty()
+    {
+        return false;
+    }
+    let mut state = seed;
+    for step in steps.iter() {
+        let off = state % n_chunks;
+        if !verify_merkle(blake(&step.chunk), off, &step.weight_path, r_t) {
+            return false;
+        }
+        state = transition(state, &chunk_to_words(&step.chunk));
+    }
+    if state != proof.final_state {
+        return false;
+    }
+    let pow_value = pom_pow_value(state, pre_pow_hash, h3);
+    if pow_value != proof.pow_value {
+        return false;
+    }
+    le_leq(&pow_value, target)
 }
 
 /// Self-check a built proof before submit (same logic the node runs). Cheap insurance
@@ -1294,6 +1417,55 @@ mod tests {
             assert_eq!(idx.r_t, dense, "sparse-built R_T != dense root for N={n}");
             let _ = std::fs::remove_file(&idx.tree_path);
         }
+    }
+
+    /// H4 v2 proof (recompute-from-chunks) builds, self-verifies, and wire round-trips.
+    #[test]
+    fn build_v2_then_self_verify() {
+        let k = 256u32;
+        let idx = synth_index(4096);
+        let pph = blake(b"v2-pph");
+        let seed = pom_block_seed(&pph, 111, 0xabc, true);
+
+        let proof = build_proof_v2(3, &pph, seed, idx.n_chunks, k, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true);
+        assert_eq!(proof.tier, 3);
+        assert!(proof.steps_v2.as_ref().unwrap().len() == k as usize);
+        assert!(proof.openings.is_empty() && proof.trace_root == [0u8; 32]);
+        assert!(verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true));
+
+        // Wrong seed / wrong root / wrong target all fail the self-check.
+        assert!(!verify_proof_v2(&proof, &pph, seed ^ 1, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true));
+        assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &blake(b"wrong"), &[0xff; 32], true));
+        assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0u8; 32], true));
+
+        // borsh wire round-trips through to_wire_bytes (full struct for a v2 proof).
+        let bytes = proof.to_wire_bytes();
+        let back: PomProof = borsh::from_slice(&bytes).unwrap();
+        assert!(verify_proof_v2(&back, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true));
+        let _ = std::fs::remove_file(&idx.tree_path);
+    }
+
+    /// A pre-H4 proof MUST wire-encode byte-identically to the 7-field `PomProofPreH4` layout —
+    /// the invariant that keeps the currently-running (pre-H4) node accepting new-miner blocks.
+    #[test]
+    fn pre_h4_proof_wire_bytes_are_legacy_exact() {
+        let (k, t) = (256u32, 32usize);
+        let idx = synth_index(4096);
+        let pph = blake(b"legacy-pph");
+        let seed = pom_block_seed(&pph, 1, 7, false);
+        let proof = build_proof(1, &pph, 7, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
+        let legacy = borsh::to_vec(&PomProofPreH4 {
+            tier: proof.tier,
+            trace_root: proof.trace_root,
+            pow_value: proof.pow_value,
+            final_state: proof.final_state,
+            initial_trace_path: proof.initial_trace_path.clone(),
+            final_trace_path: proof.final_trace_path.clone(),
+            openings: proof.openings.clone(),
+        })
+        .unwrap();
+        assert_eq!(proof.to_wire_bytes(), legacy);
+        let _ = std::fs::remove_file(&idx.tree_path);
     }
 
     /// GGUF-backed `read_chunk`: lay the canonical chunks across 3 "tensors" with header + inter-
