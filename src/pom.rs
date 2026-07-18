@@ -1120,6 +1120,27 @@ pub fn is_level_activation_overridden() -> bool {
 }
 static LEVEL_ACTIVATION_DAA: OnceLock<u64> = OnceLock::new();
 
+/// H4 hardfork activation DAA — "coin-age verification" + the PoM verifier v2 (recompute-from-chunks
+/// proof). At/after this score: (1) the H4 model lineup is active (`models::pom_tier_index` returns the
+/// EXAONE/Mistral/GLM-4/Qwen3.6/Kimi tiers), and (2) the miner MUST build the recompute-from-chunks
+/// proof v2 (`build_proof_v2`: every K chunk the walk read, each Merkle-proven under R_T) — a pre-H4
+/// proof verifies false at/after the gate → rejected. MUST equal the node's H4 params + upstream
+/// keryx-miner v0.3.7's `COIN_AGE_VERIFICATION_ACTIVATION_DAA`. Mainnet: 54_766_000
+/// (~2026-07-18 20:31 UTC). Testnet builds: 3_000.
+pub const COIN_AGE_VERIFICATION_ACTIVATION_DAA: u64 = 54_766_000;
+
+/// Effective H4 activation DAA. Overridable via `KERYX_H4_ACTIVATION_DAA` for STAGING / pre-gate
+/// testing only (e.g. set to 0 to force H4 proof v2 + lineup on regardless of daa_score). Read once.
+pub fn h4_activation_daa() -> u64 {
+    *H4_ACTIVATION_DAA.get_or_init(|| {
+        std::env::var("KERYX_H4_ACTIVATION_DAA")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(COIN_AGE_VERIFICATION_ACTIVATION_DAA)
+    })
+}
+static H4_ACTIVATION_DAA: OnceLock<u64> = OnceLock::new();
+
 /// AUTO-SWITCH: is this block at/after the H3 gate? Decided per job from the block's `daa_score`,
 /// so an already-running miner flips to the post-fork PoM convention (H3-salted folds) on the first
 /// job past the gate — no restart, no model reload (the salt changes only the seed/pow folds, not

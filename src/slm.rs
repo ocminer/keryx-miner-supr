@@ -545,6 +545,20 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 tokenizer, device, stop_token_ids, stop_strings,
             })
         }
+        // H4 lineup (EXAONE-4 / GLM-4 / Qwen3.6-hybrid-SSM / Kimi-Linear-MoE): candle cannot run these
+        // architectures — they are served ONLY by the in-process llama.cpp engine (llama_engine.rs),
+        // which is tried BEFORE this candle path. Reaching here means the .so was missing/failed to load,
+        // so there is no candle fallback for these archs.
+        ModelFormat::GgufExaone4
+        | ModelFormat::GgufGlm4
+        | ModelFormat::GgufQwen35
+        | ModelFormat::GgufKimiLinear => {
+            anyhow::bail!(
+                "model '{}' ({}) is an H4 arch served only by the in-process llama.cpp engine \
+                 (libkeryx-llama.so) — candle has no loader for it. Ensure the .so is present/loads.",
+                spec.name, spec.dir_name
+            )
+        }
     }
 }
 
@@ -1215,7 +1229,9 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
         log::debug!("SlmEngine: prefetching model '{}'…", spec.name);
         let result = match spec.format {
             ModelFormat::Safetensors => ensure_safetensors(spec).map(|_| ()),
-            ModelFormat::Gguf | ModelFormat::GgufQwen2 | ModelFormat::GgufQwen3 | ModelFormat::GgufGemma3 => ensure_gguf(spec).map(|_| ()),
+            ModelFormat::Gguf | ModelFormat::GgufQwen2 | ModelFormat::GgufQwen3 | ModelFormat::GgufGemma3
+            | ModelFormat::GgufExaone4 | ModelFormat::GgufGlm4 | ModelFormat::GgufQwen35 | ModelFormat::GgufKimiLinear
+                => ensure_gguf(spec).map(|_| ()),
         };
         match result {
             Ok(()) => log::debug!("SlmEngine: '{}' files ready.", spec.name),

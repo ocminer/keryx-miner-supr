@@ -24,6 +24,15 @@ pub enum ModelFormat {
     GgufQwen3,
     /// GGUF quantized — Gemma 3 architecture (Gemma-3-4B, baseline tier).
     GgufGemma3,
+    // ── H4 lineup formats (llama.cpp-served; candle cannot run these archs) ──
+    /// GGUF quantized — EXAONE 4 architecture (H4 tier 0). llama-served.
+    GgufExaone4,
+    /// GGUF quantized — GLM 4 architecture (H4 tier 2). llama-served.
+    GgufGlm4,
+    /// GGUF quantized — Qwen3.5 hybrid-SSM architecture (H4 tier 3, Qwen3.6-27B). llama-served.
+    GgufQwen35,
+    /// GGUF quantized — Kimi-Linear MoE architecture (H4 tier 4). llama-served.
+    GgufKimiLinear,
 }
 
 #[derive(Clone)]
@@ -44,6 +53,92 @@ pub struct ModelSpec {
     /// never announces a model the miner cannot load. 0 = never gated.
     pub min_vram_mb: u64,
 }
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// H4 LINEUP — active at `crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA` (the H4 hardfork).
+// Ported from upstream keryx-miner v0.3.7-OPoI. Every model is UNTIED and llama.cpp-served (candle
+// cannot run these archs). tokenizer_cid/config_cid empty: llama uses the GGUF-embedded tokenizer.
+// model_id = CIDv0[2..34] of the pinned model.gguf — MUST equal the node's H4 params.rs constants.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+pub const EXAONE_4_0_1_2B: ModelSpec = ModelSpec {
+    name: "exaone-4.0-1.2b",
+    model_id: [
+        0x30, 0x0a, 0x99, 0xb3, 0xa8, 0x5b, 0x0a, 0xb4,
+        0x5d, 0x1d, 0x93, 0x0b, 0xb7, 0xb1, 0xd4, 0xb0,
+        0xf3, 0x59, 0x83, 0xd5, 0x21, 0xe7, 0x9f, 0xf2,
+        0x11, 0x93, 0xa6, 0x90, 0x8d, 0xc4, 0xb8, 0x10,
+    ],
+    format: ModelFormat::GgufExaone4,
+    tokenizer_cid: "",
+    config_cid: "",
+    weight_cids: &["QmRaBetZg8SaeWeGrQDBhRMd362mf4Nm3w2YacCSQ8tocb"],
+    dir_name: "EXAONE-4.0-1.2B",
+    min_vram_mb: 0,
+};
+
+pub const MISTRAL_7B_V03: ModelSpec = ModelSpec {
+    name: "mistral-7b-v0.3",
+    model_id: [
+        0x8c, 0x2f, 0xea, 0x60, 0x0f, 0x0e, 0xef, 0xe7,
+        0x04, 0x87, 0x41, 0xa5, 0x11, 0x9c, 0xb7, 0xbe,
+        0x30, 0x30, 0x37, 0xf5, 0x9f, 0xc0, 0x26, 0xe4,
+        0x83, 0x82, 0x65, 0x8f, 0x23, 0x58, 0x1e, 0x0a,
+    ],
+    format: ModelFormat::Gguf,
+    tokenizer_cid: "",
+    config_cid: "",
+    weight_cids: &["QmXmtATpJerCCcWWF515vAe5FanSvqJrD4L1ogZxDurQ3s"],
+    dir_name: "Mistral-7B-v0.3",
+    min_vram_mb: 8_000,
+};
+
+pub const GLM_4_9B_0414: ModelSpec = ModelSpec {
+    name: "glm-4-9b-0414",
+    model_id: [
+        0xfa, 0x2f, 0x13, 0xbe, 0x08, 0x50, 0xe2, 0x6c,
+        0x5c, 0xe8, 0x6c, 0x7a, 0xc7, 0x9d, 0xa8, 0x5e,
+        0x30, 0x0c, 0x1d, 0xa8, 0xb3, 0x29, 0x0f, 0x9a,
+        0x18, 0xd4, 0x71, 0x05, 0xf1, 0xf2, 0x14, 0x0a,
+    ],
+    format: ModelFormat::GgufGlm4,
+    tokenizer_cid: "",
+    config_cid: "",
+    weight_cids: &["QmfBGGZumBR4XGFLLPjYozvhRSt3kXjrgsV3jXciCdAeM7"],
+    dir_name: "GLM-4-9B-0414",
+    min_vram_mb: 12_000,
+};
+
+pub const QWEN3_6_27B: ModelSpec = ModelSpec {
+    name: "qwen3.6-27b",
+    model_id: [
+        0xb8, 0xbd, 0xc0, 0x1f, 0xa4, 0x07, 0xea, 0xb9,
+        0x43, 0xe4, 0xfe, 0xfc, 0x80, 0x74, 0x83, 0xb3,
+        0x9f, 0x81, 0x42, 0x78, 0x52, 0x56, 0x04, 0x9e,
+        0x1f, 0x55, 0x96, 0x98, 0xa5, 0x28, 0x47, 0x46,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    config_cid: "",
+    weight_cids: &["QmamoYQGGAkBaqiWuNmwxeC9AQnt9F7sLyX57VoqbJWeUV"],
+    dir_name: "Qwen3.6-27B",
+    min_vram_mb: 24_000,
+};
+
+pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
+    name: "kimi-linear-48b",
+    model_id: [
+        0x3d, 0xc0, 0x93, 0x58, 0xad, 0x75, 0xc6, 0xef,
+        0x0c, 0x9c, 0x86, 0xee, 0x4f, 0x47, 0xc4, 0xd6,
+        0xac, 0xda, 0x96, 0x1f, 0xec, 0xbd, 0x0e, 0x4f,
+        0x9c, 0xf5, 0x5e, 0x8f, 0x0f, 0xdf, 0xfd, 0xdb,
+    ],
+    format: ModelFormat::GgufKimiLinear,
+    tokenizer_cid: "",
+    config_cid: "",
+    weight_cids: &["QmSVhtoNrL8bWJXZuEXMMWqty8qHScQMRuacuoa9ujsYqp"],
+    dir_name: "Kimi-Linear-48B",
+    min_vram_mb: 30_000,
+};
 
 pub const GEMMA_3_4B: ModelSpec = ModelSpec {
     name: "gemma-3-4b",
@@ -165,7 +260,14 @@ pub const LLAMA_3_3_70B_Q2: ModelSpec = ModelSpec {
 /// used at startup to pick a mineable PoM model before any block DAA is known (the tier *index*
 /// is then computed per block via `pom_tier_index`).
 pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
-    *model_id == QWEN3_1_7B.model_id
+    // H4 lineup
+    *model_id == EXAONE_4_0_1_2B.model_id
+        || *model_id == MISTRAL_7B_V03.model_id
+        || *model_id == GLM_4_9B_0414.model_id
+        || *model_id == QWEN3_6_27B.model_id
+        || *model_id == KIMI_LINEAR_48B.model_id
+        // pre-H4 lineup (era-continuity)
+        || *model_id == QWEN3_1_7B.model_id
         || *model_id == GEMMA_3_4B.model_id
         || *model_id == DOLPHIN_LLAMA3_8B.model_id
         || *model_id == QWEN3_32B.model_id
@@ -179,6 +281,23 @@ pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
 ///   - daa <  H2 (4-tier): Gemma=0, Dolphin=1, Qwen3-32B=2, Llama-70B-Q4=3.
 ///   - daa >= H2 (5-tier): Qwen3-1.7B=0, Gemma=1, Dolphin=2, Qwen3-32B=3, Llama-70B-Q2=4.
 pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
+    if daa >= crate::pom::h4_activation_daa() {
+        // H4 lineup (upstream keryx-miner v0.3.7): the OLD models are no longer valid at/after H4.
+        // MUST mirror the node's POM_TIERS_H4 order, recomputed per block from that block's DAA.
+        return if *model_id == EXAONE_4_0_1_2B.model_id {
+            Some(0)
+        } else if *model_id == MISTRAL_7B_V03.model_id {
+            Some(1)
+        } else if *model_id == GLM_4_9B_0414.model_id {
+            Some(2)
+        } else if *model_id == QWEN3_6_27B.model_id {
+            Some(3)
+        } else if *model_id == KIMI_LINEAR_48B.model_id {
+            Some(4)
+        } else {
+            None
+        };
+    }
     if daa >= VERY_LIGHT_ACTIVATION_DAA {
         // 5-tier scheme: very-light inserted at 0, the existing tiers shift up by one.
         if *model_id == QWEN3_1_7B.model_id {
@@ -371,6 +490,16 @@ pub fn auto_select_tier(vram_mb: u64, headroom_mb: u64) -> (Tier, u64) {
 /// lineup before H and the uncensored lineup at/after H (hot-swapped at the crossing),
 /// so miners can upgrade before the hardfork without a flag-day restart.
 pub fn specs_for(daa: u64, tier: Tier) -> &'static [&'static ModelSpec] {
+    if daa >= crate::pom::h4_activation_daa() {
+        // H4 lineup (upstream keryx-miner v0.3.7): one model per hardware tier, llama.cpp-served.
+        return match tier {
+            Tier::VeryLight => &[&EXAONE_4_0_1_2B],
+            Tier::Light => &[&MISTRAL_7B_V03],
+            Tier::Default => &[&GLM_4_9B_0414],
+            Tier::High => &[&QWEN3_6_27B],
+            Tier::VeryHigh => &[&KIMI_LINEAR_48B],
+        };
+    }
     if daa >= OPOI_V2_ACTIVATION_DAA {
         // PoM era: one flag = one model. Each hardware tier mines AND serves exactly the
         // single model it proves possession of — the cumulative "serve everything below my
@@ -402,6 +531,13 @@ pub fn specs_for(daa: u64, tier: Tier) -> &'static [&'static ModelSpec] {
 
 /// Both lineups combined — resolves a model name/id regardless of era.
 pub const REGISTRY: &[&ModelSpec] = &[
+    // H4 lineup
+    &EXAONE_4_0_1_2B,
+    &MISTRAL_7B_V03,
+    &GLM_4_9B_0414,
+    &QWEN3_6_27B,
+    &KIMI_LINEAR_48B,
+    // pre-H4 lineup
     &GEMMA_3_4B,
     &DOLPHIN_LLAMA3_8B,
     &QWEN3_32B,
