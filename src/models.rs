@@ -448,16 +448,16 @@ impl Tier {
         self.pom_spec().name
     }
 
-    /// The single OPoI-v2 (PoM) model spec this tier proves possession of. Post-H2 lineup
-    /// (Qwen3-1.7B very-light, Q2_K_L very-high) — `VERY_LIGHT_ACTIVATION_DAA` is a frozen
-    /// frontier the network is permanently past, so the current-era model is the H2 one.
+    /// The single OPoI-v2 (PoM) model spec this tier proves possession of. **H4 lineup** — 0.7.0 is
+    /// the H4 binary (it refuses to mine below `h4_activation_daa()`), so the current-era model per
+    /// tier is the H4 one. MUST mirror `specs_for`'s H4 branch and the node's `POM_TIERS_H4`.
     pub fn pom_spec(self) -> &'static ModelSpec {
         match self {
-            Tier::VeryLight => &QWEN3_1_7B,
-            Tier::Light => &GEMMA_3_4B,
-            Tier::Default => &DOLPHIN_LLAMA3_8B,
-            Tier::High => &QWEN3_32B,
-            Tier::VeryHigh => &LLAMA_3_3_70B_Q2,
+            Tier::VeryLight => &EXAONE_4_0_1_2B,
+            Tier::Light => &MISTRAL_7B_V03,
+            Tier::Default => &GLM_4_9B_0414,
+            Tier::High => &QWEN3_6_27B,
+            Tier::VeryHigh => &KIMI_LINEAR_48B,
         }
     }
 }
