@@ -11,12 +11,23 @@
 # ggml-vulkan.cpp before building — every referenced symbol is file-scope static there, so the
 # append is pin-robust (no line-anchored patch).
 #
-# Usage: build-keryx-llama-vk.sh [JOBS]
+# Usage: build-keryx-llama-vk.sh [JOBS] [noavx]
 # Output: hiveos/dist-amd/libkeryx-llama-vk.so  (package-amd.sh bundles it when present)
+#
+# "noavx" 2nd arg: baseline-ISA CPU backend (GGML_AVX/AVX2/FMA/F16C/BMI2 OFF, SSE4.2 kept) →
+# hiveos/dist-amd/libkeryx-llama-vk-noavx.so. The default build bakes AVX2-level SIMD into the
+# ggml CPU path with NO runtime dispatch — pre-AVX rig CPUs SIGILL on it (v0.7.2 fix); the
+# miner auto-selects the -vk-noavx file on such CPUs.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JOBS="${1:-$(nproc)}"
+VARIANT="${2:-avx}"
 TAG=b10015
+case "$VARIANT" in
+  avx)   OUTNAME=libkeryx-llama-vk.so;       SIMD_FLAGS=""; BCACHE=/tmp/kvk-build-cache ;;
+  noavx) OUTNAME=libkeryx-llama-vk-noavx.so; SIMD_FLAGS="-DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF -DGGML_AVX_VNNI=OFF"; BCACHE=/tmp/kvk-build-cache-noavx ;;
+  *) echo "usage: $0 [JOBS] [noavx]"; exit 1 ;;
+esac
 OUT="$REPO/hiveos/dist-amd"
 mkdir -p "$OUT"
 SRC=/tmp/llama-src-$TAG-vk
@@ -34,16 +45,16 @@ if grep -qF "$MARK" "$GV"; then
 fi
 { printf '%s\n' "$MARK"; cat "$REPO/tools/keryx-llama/keryx_vk_exports.inc.cpp"; } >> "$GV"
 
-mkdir -p /tmp/kvk-build-cache
+mkdir -p "$BCACHE"
 docker run --rm \
   -v "$SRC":/llama -v "$REPO":/repo:ro -v "$OUT":/out \
-  -v /tmp/kvk-build-cache:/tmp/kvk-build \
-  -e JOBS="$JOBS" -e KERYX_SPIKE="${KERYX_SPIKE:-0}" \
+  -v "$BCACHE":/tmp/kvk-build \
+  -e JOBS="$JOBS" -e KERYX_SPIKE="${KERYX_SPIKE:-0}" -e SIMD_FLAGS="$SIMD_FLAGS" -e OUTNAME="$OUTNAME" \
   llama-vk-toolchain bash -euo pipefail -c '
     B=/tmp/kvk-build
     cmake -S /llama -B $B \
       -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-      -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF \
+      -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF $SIMD_FLAGS \
       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF \
       -DCMAKE_BUILD_TYPE=Release
     cmake --build $B --target llama -j "$JOBS"
@@ -60,8 +71,8 @@ docker run --rm \
         $B/ggml/src/ggml-vulkan/libggml-vulkan.a \
         $B/ggml/src/libggml-cpu.a $B/ggml/src/libggml.a $B/ggml/src/libggml-base.a \
       -Wl,--end-group \
-      -lvulkan -lpthread -ldl -o /out/libkeryx-llama-vk.so
-    chmod a+rx /out/libkeryx-llama-vk.so
+      -lvulkan -lpthread -ldl -o /out/$OUTNAME
+    chmod a+rx /out/$OUTNAME
 
     # Byte-identity spike (KERYX_SPIKE=1): links the .so itself (one llama/ggml per process).
     if [ "${KERYX_SPIKE:-0}" = "1" ]; then
@@ -72,4 +83,9 @@ docker run --rm \
       chmod a+rx /out/spike_vk
     fi
   '
-echo ">> libkeryx-llama-vk.so: $(ls -la "$OUT/libkeryx-llama-vk.so" | awk '{print $5}') bytes, glibc=$(objdump -T "$OUT/libkeryx-llama-vk.so" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1), syms=$(nm -D "$OUT/libkeryx-llama-vk.so" | grep -c keryx_llama)"
+echo ">> $OUTNAME: $(ls -la "$OUT/$OUTNAME" | awk '{print $5}') bytes, glibc=$(objdump -T "$OUT/$OUTNAME" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1), syms=$(nm -D "$OUT/$OUTNAME" | grep -c keryx_llama)"
+if [ "$VARIANT" = noavx ]; then
+  VEX=$(objdump -d --disassemble="ggml_vec_dot_q8_0_q8_0" "$OUT/$OUTNAME" 2>/dev/null | grep -cE '\bv[a-z]' || true)
+  echo ">> $OUTNAME VEX-instr count in ggml_vec_dot_q8_0_q8_0 (MUST be 0): $VEX"
+  [ "$VEX" = 0 ] || { echo "ERROR: noavx build still contains AVX code"; exit 1; }
+fi

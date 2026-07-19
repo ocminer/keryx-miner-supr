@@ -55,17 +55,54 @@ fn engine() -> &'static Mutex<Option<Engine>> {
     E.get_or_init(|| Mutex::new(None))
 }
 
+/// Same SIGILL gate as llama_engine::cpu_has_baked_simd — libkeryx-llama-vk.so is built with
+/// the same GGML_NATIVE=OFF flags that bake in AVX/AVX2/FMA/F16C/BMI2 with no runtime dispatch.
+#[cfg(target_arch = "x86_64")]
+fn cpu_has_baked_simd() -> bool {
+    is_x86_feature_detected!("avx")
+        && is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("fma")
+        && is_x86_feature_detected!("f16c")
+        && is_x86_feature_detected!("bmi2")
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn cpu_has_baked_simd() -> bool {
+    true
+}
+
 /// `KERYX_LLAMA_VK_SO=<path>` wins; else `libkeryx-llama-vk.so` next to our own executable.
+/// CPUs without the baked-in SIMD set get `libkeryx-llama-vk-noavx.so` if present, else no
+/// engine (graceful fallback) rather than a SIGILL inside the AVX build.
 fn so_path() -> Option<std::path::PathBuf> {
+    let simd_ok = cpu_has_baked_simd();
     if let Ok(p) = std::env::var("KERYX_LLAMA_VK_SO") {
         let pb = std::path::PathBuf::from(p);
         if pb.exists() {
+            if !simd_ok && !pb.to_string_lossy().contains("noavx") {
+                log::warn!(
+                    "llama-vk engine: this CPU lacks AVX2/FMA/F16C — if KERYX_LLAMA_VK_SO is an AVX build the process will crash with SIGILL. Honoring the explicit override anyway."
+                );
+            }
             return Some(pb);
         }
         log::warn!("llama-vk engine: KERYX_LLAMA_VK_SO points at a missing file — ignoring.");
     }
     let exe = std::env::current_exe().ok()?;
-    let p = exe.parent()?.join("libkeryx-llama-vk.so");
+    let dir = exe.parent()?;
+    let want_noavx = !simd_ok
+        || std::env::var("KERYX_LLAMA_FORCE_NOAVX").map_or(false, |v| v == "1");
+    if want_noavx {
+        let p = dir.join("libkeryx-llama-vk-noavx.so");
+        if p.exists() {
+            log::info!("llama-vk engine: using baseline (no-AVX) build {}.", p.display());
+            return Some(p);
+        }
+        log::warn!(
+            "llama-vk engine: this CPU lacks the AVX2/FMA/F16C/BMI2 set baked into libkeryx-llama-vk.so and no libkeryx-llama-vk-noavx.so is present — NOT loading it (would SIGILL). Fallback paths stay active."
+        );
+        return None;
+    }
+    let p = dir.join("libkeryx-llama-vk.so");
     if p.exists() {
         Some(p)
     } else {

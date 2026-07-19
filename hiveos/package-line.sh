@@ -31,6 +31,9 @@ mklib(){ mkdir -p "$1/lib"; for l in "${LIBS[@]}"; do cp -L "$D/lib/$l" "$1/lib/
 # Absent files = the corresponding engine stays dormant (candle fallback).
 bundle_llama(){
   if [ -f "$D/libkeryx-llama.so" ]; then cp "$D/libkeryx-llama.so" "$1/"; chmod +x "$1/libkeryx-llama.so"; fi
+  # Baseline CPU-ISA build for pre-AVX rig CPUs (Celeron/Pentium) — the miner auto-selects it
+  # when the host CPU lacks the AVX2/FMA/F16C/BMI2 set baked into libkeryx-llama.so.
+  if [ -f "$D/libkeryx-llama-noavx.so" ]; then cp "$D/libkeryx-llama-noavx.so" "$1/"; chmod +x "$1/libkeryx-llama-noavx.so"; fi
   if [ -f "$D/llama-server" ]; then cp "$D/llama-server" "$1/"; chmod +x "$1/llama-server"; fi
 }
 # Rewrite the HiveOS miner-dir name in the hardcoded h-* paths + CUSTOM_NAME (the
