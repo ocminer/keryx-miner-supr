@@ -167,6 +167,14 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         }
         let response = match req.call() {
             Ok(r) => r,
+            // A resumed request for an already-complete file gets HTTP 416 (Range Not Satisfiable),
+            // which ureq surfaces as Err(Status(416, _)) — so the `status == 416` arm below is never
+            // reached. Treat it here as "already fully downloaded" (e.g. a GGUF pre-fetched via
+            // aria2, or a re-run over a complete file) instead of looping on it forever.
+            Err(ureq::Error::Status(416, _)) if resume_from > 0 => {
+                eprintln!("  already complete ({} MB).", resume_from / 1_000_000);
+                return Ok(());
+            }
             Err(e) => {
                 attempt += 1;
                 if attempt >= MAX_ATTEMPTS {
