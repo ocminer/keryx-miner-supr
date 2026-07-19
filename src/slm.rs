@@ -293,15 +293,23 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     let gguf = dir.join("model.gguf");
     let ok_flag = dir.join(".ok");
 
+    // H4 (and any GGUF-embedded-tokenizer) models pin NO separate tokenizer.json: `tokenizer_cid`
+    // is empty and llama.cpp uses the tokenizer baked into the GGUF. Only require/fetch a
+    // tokenizer.json when a CID is actually pinned — otherwise ipfs_url("") = "<gateway>/ipfs/"
+    // (empty CID) which 400s forever and the model never stages ("no models ready").
+    let need_tok = !spec.tokenizer_cid.is_empty();
+
     // .ok sentinel written only after a complete download — guards against truncated files
-    if tok.exists() && gguf.exists() && ok_flag.exists() {
+    if gguf.exists() && ok_flag.exists() && (!need_tok || tok.exists()) {
         log::debug!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
         return Ok((tok, gguf));
     }
     std::fs::create_dir_all(&dir)?;
     let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
     eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
-    if !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
+    if need_tok && !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
+    // Unconditional: download_file resumes a truncated GGUF and no-ops a complete one
+    // (Range → 416 → "already complete"), so a pre-staged GGUF isn't re-fetched.
     download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
     std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
     eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
