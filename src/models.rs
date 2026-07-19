@@ -441,7 +441,7 @@ pub enum Tier {
 
 impl Tier {
     /// Tiers from largest to smallest — used by `--tier auto` to pick the biggest that fits.
-    pub const DESCENDING: [Tier; 4] = [Tier::VeryHigh, Tier::High, Tier::Default, Tier::Light];
+    pub const DESCENDING: [Tier; 5] = [Tier::VeryHigh, Tier::High, Tier::Default, Tier::Light, Tier::VeryLight];
 
     /// Human-readable name of the model this tier mines/proves under the OPoI-v2 (PoM) lineup.
     pub fn pom_model_name(self) -> &'static str {
@@ -481,8 +481,12 @@ pub fn auto_select_tier(vram_mb: u64, headroom_mb: u64) -> (Tier, u64) {
             return (tier, need);
         }
     }
-    // Light has min_vram_mb=0; with any non-trivial card it always fits. Floor to Light.
-    (Tier::Light, headroom_mb)
+    // VeryLight (EXAONE) has min_vram_mb=0, so it fits any card — the correct floor for a card too
+    // small for every heavier tier. (The old lineup floored to Light because Light=Gemma was the
+    // min_vram=0 model; in the H4 lineup Light=Mistral needs 8 GB, so flooring to Light would OOM an
+    // 8 GB card's inference context — the 3070+Mistral bug. VeryLight is now in DESCENDING too, so a
+    // card ≥ headroom already selects it in the loop; this floor only catches <headroom cards.)
+    (Tier::VeryLight, headroom_mb)
 }
 
 /// Cumulative model set for a hardware tier within the lineup active at `daa`.
