@@ -41,18 +41,56 @@ fn engine() -> &'static Mutex<Option<Engine>> {
     E.get_or_init(|| Mutex::new(None))
 }
 
+/// The stock `libkeryx-llama.so` bakes in AVX/AVX2/FMA/F16C/BMI2 with no runtime dispatch
+/// (ggml's INS_ENB defaults under GGML_NATIVE=OFF) — on a pre-AVX CPU (mining-rig Celeron/
+/// Pentium, pre-Sandy-Bridge Xeon) the first ggml CPU op dies with SIGILL before any of the
+/// fallback guards below can engage. Gate on the exact feature set the build bakes in.
+#[cfg(target_arch = "x86_64")]
+fn cpu_has_baked_simd() -> bool {
+    is_x86_feature_detected!("avx")
+        && is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("fma")
+        && is_x86_feature_detected!("f16c")
+        && is_x86_feature_detected!("bmi2")
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn cpu_has_baked_simd() -> bool {
+    true
+}
+
 /// `KERYX_LLAMA_SO=<path>` wins; else the platform-native shared library next to our own
-/// executable (`libkeryx-llama.dylib` on macOS, `libkeryx-llama.so` elsewhere).
+/// executable (`libkeryx-llama.dylib` on macOS, `libkeryx-llama.so` elsewhere). CPUs without
+/// the baked-in SIMD set (and `KERYX_LLAMA_FORCE_NOAVX=1` for testing) get the `-noavx`
+/// baseline build instead; absent that file the engine stays off rather than SIGILL.
 fn so_path() -> Option<std::path::PathBuf> {
+    let simd_ok = cpu_has_baked_simd();
     if let Ok(p) = std::env::var("KERYX_LLAMA_SO") {
         let pb = std::path::PathBuf::from(p);
         if pb.exists() {
+            if !simd_ok && !pb.to_string_lossy().contains("noavx") {
+                log::warn!(
+                    "llama engine: this CPU lacks AVX2/FMA/F16C — if KERYX_LLAMA_SO is an AVX build the process will crash with SIGILL. Honoring the explicit override anyway."
+                );
+            }
             return Some(pb);
         }
         log::warn!("llama engine: KERYX_LLAMA_SO points at a missing file — ignoring.");
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
+    let want_noavx = !simd_ok
+        || std::env::var("KERYX_LLAMA_FORCE_NOAVX").map_or(false, |v| v == "1");
+    if want_noavx {
+        let p = dir.join("libkeryx-llama-noavx.so");
+        if p.exists() {
+            log::info!("llama engine: using baseline (no-AVX) build {}.", p.display());
+            return Some(p);
+        }
+        log::warn!(
+            "llama engine: this CPU lacks the AVX2/FMA/F16C/BMI2 set baked into libkeryx-llama.so and no libkeryx-llama-noavx.so is present — NOT loading it (would SIGILL). Candle fallback stays active; ship the -noavx variant from the 0.7.2+ package to enable the llama engine on this CPU."
+        );
+        return None;
+    }
     // macOS ships a .dylib (Mach-O). Every other unix (Linux/BSD) ships a .so (ELF). Probe the
     // native name first, and on macOS also fall back to .so — some HiveOS-adjacent tooling may
     // repackage the Linux .so alongside the macOS binary during cross-arch testing.
