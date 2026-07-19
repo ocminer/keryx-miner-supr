@@ -85,7 +85,11 @@ docker run --rm \
   '
 echo ">> $OUTNAME: $(ls -la "$OUT/$OUTNAME" | awk '{print $5}') bytes, glibc=$(objdump -T "$OUT/$OUTNAME" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1), syms=$(nm -D "$OUT/$OUTNAME" | grep -c keryx_llama)"
 if [ "$VARIANT" = noavx ]; then
-  VEX=$(objdump -d --disassemble="ggml_vec_dot_q8_0_q8_0" "$OUT/$OUTNAME" 2>/dev/null | grep -cE '\bv[a-z]' || true)
+  # Count VEX/AVX mnemonics in the MNEMONIC column only (objdump field 3 after addr<tab>bytes<tab>).
+  # The old `grep '\bv[a-z]'` matched the objdump "file format" header line too → false ERROR on a
+  # genuinely AVX-free build. AVX regs are %xmm/%ymm/%zmm (no operand starts with 'v'), so anchoring
+  # ^v[a-z] on the mnemonic word is exact.
+  VEX=$(objdump -d --disassemble="ggml_vec_dot_q8_0_q8_0" "$OUT/$OUTNAME" 2>/dev/null | awk -F'\t' 'NF>=3{print $3}' | grep -cE '^v[a-z]' || true)
   echo ">> $OUTNAME VEX-instr count in ggml_vec_dot_q8_0_q8_0 (MUST be 0): $VEX"
   [ "$VEX" = 0 ] || { echo "ERROR: noavx build still contains AVX code"; exit 1; }
 fi
