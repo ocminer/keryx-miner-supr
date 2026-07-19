@@ -46,12 +46,25 @@ hrename(){ # $1=dir of h-* files  $2=new miner name
 }
 S=$(mktemp -d); trap 'rm -rf "$S"' EXIT
 
+# mmpOS support files (mmp-external.conf, mmp-launch.sh + mmp-launcher.sh compat alias,
+# mmp-stats.sh, mmp-release-notes.txt) go into EVERY flavor, not just the mmpos_ tarball:
+# field reports show mmpOS users pointing the agent at the HiveOS/linux tarballs and getting
+# "missing mmp-stats.sh / mmp-launcher.sh" — extra files are inert on HiveOS/SMOS/plain Linux.
+bundle_mmp(){ # $1=dest dir  $2=miner name for EXTERNAL_NAME/stats NAME
+  cp "$MPKG"/mmp-external.conf "$MPKG"/mmp-launch.sh "$MPKG"/mmp-launcher.sh "$MPKG"/mmp-stats.sh "$MPKG"/mmp-release-notes.txt "$1/"
+  sed -i -e "s|^EXTERNAL_NAME=.*|EXTERNAL_NAME=\"$2\"|" -e "s|^EXTERNAL_VERSION=.*|EXTERNAL_VERSION=\"${VER}\"|" "$1/mmp-external.conf"
+  # Keep the stats reporter's NAME in step with EXTERNAL_NAME (the line-suffixed name), so the
+  # fallback log-parse path reports the same miner name the package is installed under.
+  sed -i -e "s|^NAME=.*|NAME=\"$2\"|" "$1/mmp-stats.sh"
+  chmod +x "$1"/mmp-launch.sh "$1"/mmp-launcher.sh "$1"/mmp-stats.sh
+}
+
 # 1) HiveOS — miner name = keryx-miner-supr-<line>
 HVN="${NAME}-${LABEL}"
 H="$S/hv/$HVN"; mkdir -p "$H"
 cp "$HPKG"/h-manifest.conf "$HPKG"/h-config.sh "$HPKG"/h-run.sh "$HPKG"/h-stats.sh "$H/"
 hrename "$H" "$HVN"
-cp "$D/keryx-miner-supr" "$H/"; bundle_llama "$H"; mklib "$H"; chmod +x "$H"/h-*.sh "$H"/keryx-miner-supr
+cp "$D/keryx-miner-supr" "$H/"; bundle_llama "$H"; bundle_mmp "$H" "$HVN"; mklib "$H"; chmod +x "$H"/h-*.sh "$H"/keryx-miner-supr
 tar -czf "$D/${HVN}-${VER}.tar.gz" -C "$S/hv" "$HVN"
 
 # 2) SMOS — HiveOS layout, miner name = keryx-miner-supr-smos-<line>
@@ -59,26 +72,20 @@ SMN="${NAME}-smos-${LABEL}"
 SM="$S/sm/$SMN"; mkdir -p "$SM"
 cp "$HPKG"/h-manifest.conf "$HPKG"/h-config.sh "$HPKG"/h-run.sh "$HPKG"/h-stats.sh "$SM/"
 hrename "$SM" "$SMN"
-cp "$D/keryx-miner-supr" "$SM/"; bundle_llama "$SM"; mklib "$SM"; chmod +x "$SM"/h-*.sh "$SM"/keryx-miner-supr
+cp "$D/keryx-miner-supr" "$SM/"; bundle_llama "$SM"; bundle_mmp "$SM" "$SMN"; mklib "$SM"; chmod +x "$SM"/h-*.sh "$SM"/keryx-miner-supr
 tar -czf "$D/${SMN}-${VER}.tar.gz" -C "$S/sm" "$SMN"
 
 # 3) mmpOS — folder = <name>-<line>-mmpos_<ver>, EXTERNAL_NAME set to the line
 MMN="${NAME}-${LABEL}"
 MM="$S/mm/${MMN}-mmpos_${VER}"; mkdir -p "$MM"
-cp "$MPKG"/mmp-external.conf "$MPKG"/mmp-launch.sh "$MPKG"/mmp-stats.sh "$MM/"
-sed -i -e "s|^EXTERNAL_NAME=.*|EXTERNAL_NAME=\"${MMN}\"|" -e "s|^EXTERNAL_VERSION=.*|EXTERNAL_VERSION=\"${VER}\"|" "$MM/mmp-external.conf"
-# Keep the stats reporter's NAME in step with EXTERNAL_NAME (the line-suffixed name), so the
-# fallback log-parse path reports the same miner name the package is installed under. The AMD
-# mmpOS package keeps these consistent; this brings the per-line NVIDIA packages in line.
-sed -i -e "s|^NAME=.*|NAME=\"${MMN}\"|" "$MM/mmp-stats.sh"
-cp "$D/keryx-miner-supr" "$MM/"; bundle_llama "$MM"; mklib "$MM"; chmod +x "$MM"/keryx-miner-supr "$MM"/*.sh
+cp "$D/keryx-miner-supr" "$MM/"; bundle_llama "$MM"; bundle_mmp "$MM" "$MMN"; mklib "$MM"; chmod +x "$MM"/keryx-miner-supr
 tar -czf "$D/${MMN}-mmpos_${VER}.tar.gz" -C "$S/mm" "${MMN}-mmpos_${VER}"
 
 # 4) Generic Linux (dynamic binary + plugins + lib + run.sh)
 LXN="${NAME}-${LABEL}"
 LX="$S/lx/$LXN"; mkdir -p "$LX"
 cp "$D/keryx-miner-supr-dynamic" "$LX/keryx-miner-supr"
-cp "$D/libkeryxcuda.so" "$D/libkeryxopencl.so" "$LX/"; bundle_llama "$LX"; mklib "$LX"; chmod +x "$LX/keryx-miner-supr"
+cp "$D/libkeryxcuda.so" "$D/libkeryxopencl.so" "$LX/"; bundle_llama "$LX"; bundle_mmp "$LX" "$LXN"; mklib "$LX"; chmod +x "$LX/keryx-miner-supr"
 cat > "$LX/run.sh" <<'SH'
 #!/usr/bin/env bash
 cd "$(dirname "$(realpath "$0")")"

@@ -1,0 +1,1 @@
+keryx-miner-supr — release notes: https://github.com/ocminer/keryx-miner-supr/releases
