@@ -842,8 +842,8 @@ async fn run() -> Result<(), Error> {
             info!("AMD/OpenCL: tier {} (pinned by flag, process-wide — the model must fit the card's VRAM).", t.pom_model_name());
             (t, false)
         } else {
-            info!("AMD/OpenCL: tier light (Gemma-3-4B) — the OOM-safe default; pass --tier/--force-model to override.");
-            (Tier::Light, false)
+            info!("AMD/OpenCL: tier very-light (EXAONE-4.0-1.2B) — the OOM-safe default (fits any card); pass --light/--high/--force-model to override.");
+            (Tier::VeryLight, false)
         }
     };
     // Resolve the mining tier PER CUDA DEVICE (mixed-rig best-fit / --force-model). `tier` below is
