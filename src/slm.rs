@@ -295,6 +295,17 @@ fn ensure_safetensors(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path
     Ok((tok, cfg, wts))
 }
 
+/// Cheap sanity check that a file begins with the GGUF magic ("GGUF"). Used to decide whether to
+/// ADOPT a pre-staged / already-present weight file (see `ensure_gguf`) rather than re-downloading
+/// it. This is only a smoke test (rejects empty/non-GGUF drops); the authoritative content check is
+/// the PoM tier-root (R_T) recomputation when the possession index is built.
+fn gguf_has_magic(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok() && &magic == b"GGUF"
+}
+
 fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     let dir = model_dir(spec);
     let tok = dir.join("tokenizer.json");
@@ -307,17 +318,41 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     // (empty CID) which 400s forever and the model never stages ("no models ready").
     let need_tok = !spec.tokenizer_cid.is_empty();
 
-    // .ok sentinel written only after a complete download — guards against truncated files
-    if gguf.exists() && ok_flag.exists() && (!need_tok || tok.exists()) {
-        log::debug!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
-        return Ok((tok, gguf));
+    // ADOPT a weight file that is already present instead of re-downloading it. Operators commonly
+    // pre-fetch the multi-GB GGUF themselves and drop model.gguf into the dir — the miner MUST use
+    // that file, never delete + re-download it. Our own completed downloads leave a `.ok` sentinel;
+    // a user-dropped file won't have one, so `.ok` alone can't gate adoption. Instead:
+    //   - `.ok` present  → trust it (we wrote it after a verified download).
+    //   - no `.ok` but a valid GGUF is present → adopt it (write `.ok`), do NOT re-download.
+    // We only sanity-check the GGUF magic here (cheap); the FULL content is verified downstream when
+    // the PoM possession index is built (WeightIndex::build_from_gguf recomputes the tier root R_T
+    // and checks it), so a wrong/corrupt/truncated drop fails there loudly rather than mining garbage.
+    // (model_id is the IPFS CID multihash, NOT a flat sha256 of the file, so it can't be used as a
+    // whole-file checksum here.)
+    if gguf.exists() && (!need_tok || tok.exists()) {
+        if ok_flag.exists() {
+            log::debug!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
+            return Ok((tok, gguf));
+        }
+        if gguf_has_magic(&gguf) {
+            std::fs::write(&ok_flag, b"").ok();
+            log::info!(
+                "SlmEngine: adopting pre-staged model '{}' at {} (GGUF ok; not re-downloading — \
+                 content is verified when the PoM index builds).",
+                spec.name, dir.display()
+            );
+            return Ok((tok, gguf));
+        }
+        log::warn!(
+            "SlmEngine: '{}' at {} is not a valid GGUF (bad/short magic) — re-downloading.",
+            spec.name, gguf.display()
+        );
     }
     std::fs::create_dir_all(&dir)?;
     let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
     eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
     if need_tok && !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
-    // Unconditional: download_file resumes a truncated GGUF and no-ops a complete one
-    // (Range → 416 → "already complete"), so a pre-staged GGUF isn't re-fetched.
+    // download_file resumes a truncated GGUF and no-ops a complete one (Range → 416 → already complete).
     download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
     std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
     eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
