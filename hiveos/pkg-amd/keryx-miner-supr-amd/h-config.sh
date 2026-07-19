@@ -32,17 +32,16 @@ args="-a ${CUSTOM_TEMPLATE} -s ${url}"
 # prepend the default. As of v0.6.9.3 the AMD/OpenCL build HONORS these overrides (was hardcoded Light
 # — issue #7): a user override is applied PROCESS-WIDE (one resident tier for all cards; there is no
 # per-card model map on AMD, unlike CUDA), and --force-model bypasses the VRAM gate. The default is
-# --very-light (EXAONE-4.0-1.2B) — the OOM-safe choice for the H4 lineup: AMD loads the whole tier blob
-# AND the model's inference context into VRAM, and post-H4 the light tier is Mistral-7B (needs 8 GB, OOMs
-# an 8 GB card), so we default to very-light which fits ANY card (min_vram_mb=0, ~883 MiB blob). This is
-# the direct H4 analog of the pre-H4 --light=Gemma default (Gemma WAS the min-VRAM model). AMD has no
-# real --tier auto (the pom-opencl path falls back to Light, i.e. Mistral, on "auto"), so we pin the
-# safe floor explicitly; operators with bigger cards opt up: --light (Mistral, 8 GB) / --high (Qwen3.6,
-# 24 GB) / --force-model qwen3.6-27b. A future enhancement is real AMD auto-tier (biggest tier that fits).
+# --tier auto — the AMD/OpenCL build now has REAL auto-tier (as of v0.7.1): it picks the largest H4 tier
+# that fits card 0's VRAM (CL_DEVICE_GLOBAL_MEM_SIZE) with a conservative AMD margin (AMD holds the PoM
+# possession blob AND the inference context, ~2× the model on non-zero-dup cards). So an 8 GB card gets
+# EXAONE (very-light, fits any card = the floor), a 16 GB card reaches Mistral-7B (light), etc. — more
+# reward on bigger cards, never OOM. Override to PIN a specific tier regardless of fit: --light (Mistral)
+# / --high (Qwen3.6-27B, 24 GB) / --very-light (force EXAONE) / --force-model <name> (bypasses the gate).
 extra="$CUSTOM_USER_CONFIG"
 case " $extra " in
   *" --very-light "*|*" --light "*|*" --high "*|*" --very-high "*|*" --tier "*|*" --tier="*|*" --force-model "*|*" --force-model="*) : ;;  # model chosen
-  *) extra="--very-light $extra" ;;   # default: --very-light (EXAONE) — fits any card; OOM-safe on H4. Override with --light/--high.
+  *) extra="--tier auto $extra" ;;   # default: --tier auto — largest H4 tier that fits card 0 VRAM (EXAONE floor); OOM-safe
 esac
 
 args="$args ${extra}"

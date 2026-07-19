@@ -290,6 +290,42 @@ fn filter_specs_by_vram(
 #[cfg(not(feature = "pom-opencl"))]
 const AUTO_TIER_HEADROOM_MB: u64 = 2_048;
 
+/// AMD auto-tier VRAM headroom (MiB) — LARGER than NVIDIA's 2 GB. The AMD/OpenCL path holds the PoM
+/// possession blob (≈ the model's raw chunk bytes) resident in VRAM AND the llama.cpp inference
+/// context; on a non-zero-dup (GCN/older) card that is roughly TWO model copies on the inference
+/// card (zero-dup on RDNA shares one copy — this margin is conservative there, favouring no-OOM over
+/// max tier). `auto_select_tier` already budgets `min_vram_mb` (weights+KV+ctx); this ~5 GB margin
+/// covers the extra resident blob + fragmentation, so an 8 GB card stays on EXAONE (not Mistral) and
+/// a 16 GB card safely reaches Mistral (tier 1).
+#[cfg(feature = "pom-opencl")]
+const AUTO_TIER_HEADROOM_MB: u64 = 5_120;
+
+/// `--tier auto` for the AMD/OpenCL path: pick the largest H4 tier that fits card 0's VRAM
+/// (`CL_DEVICE_GLOBAL_MEM_SIZE` via `pom_opencl::gpu0_global_mem_mb`) with the AMD margin above.
+/// The tier is PROCESS-WIDE on AMD (one resident model for all cards — no per-card map), so it is
+/// gated on card 0. Falls back to VeryLight (EXAONE, fits any card) if VRAM can't be queried.
+#[cfg(feature = "pom-opencl")]
+fn select_tier_auto() -> keryx_miner::models::Tier {
+    use keryx_miner::models::{self, Tier};
+    let Some(vram_mb) = query_vram_mb() else {
+        warn!("AMD/OpenCL --tier auto: cannot query GPU 0 VRAM — falling back to --very-light (EXAONE, fits any card).");
+        return Tier::VeryLight;
+    };
+    let (picked, need) = models::auto_select_tier(vram_mb, AUTO_TIER_HEADROOM_MB);
+    info!(
+        "AMD/OpenCL tier auto: {} MiB VRAM (card 0) -> {} ({:?}, tier {}) — budget {} MiB \
+         (model weights+KV+ctx + resident PoM blob + {} MiB AMD margin). Pin a tier with \
+         --light/--high/--force-model to override.",
+        vram_mb,
+        picked.pom_model_name(),
+        picked,
+        models::pom_tier_index(&picked.pom_spec().model_id, keryx_miner::pom::h4_activation_daa()).unwrap_or(0),
+        need,
+        AUTO_TIER_HEADROOM_MB,
+    );
+    picked
+}
+
 /// Resolve the model tier for the NVIDIA (pom-cuda) path. `--tier <value>` takes precedence over
 /// the legacy `--light/--high/--very-high` bool flags (clap enforces they are mutually exclusive).
 ///
@@ -824,7 +860,6 @@ async fn run() -> Result<(), Error> {
     // llama-server falls back to candle-CPU if inference doesn't fit next to the blob.
     #[cfg(feature = "pom-opencl")]
     let (tier, tier_forced) = {
-        use keryx_miner::models::Tier;
         let forced = opt.force_model.as_deref().and_then(|raw| {
             let entries: Vec<&str> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
             let first = entries.first().and_then(|s| parse_tier_name(s));
@@ -842,8 +877,10 @@ async fn run() -> Result<(), Error> {
             info!("AMD/OpenCL: tier {} (pinned by flag, process-wide — the model must fit the card's VRAM).", t.pom_model_name());
             (t, false)
         } else {
-            info!("AMD/OpenCL: tier very-light (EXAONE-4.0-1.2B) — the OOM-safe default (fits any card); pass --light/--high/--force-model to override.");
-            (Tier::VeryLight, false)
+            // No explicit tier, or `--tier auto` (pinned_tier returns None for "auto"): pick the
+            // largest H4 tier that fits card 0's VRAM. Heavier tier = higher PoM reward; the AMD
+            // margin keeps it OOM-safe (8 GB → EXAONE, 16 GB → Mistral). VeryLight is the floor.
+            (select_tier_auto(), false)
         }
     };
     // Resolve the mining tier PER CUDA DEVICE (mixed-rig best-fit / --force-model). `tier` below is
