@@ -52,7 +52,7 @@ if [[ -f "$DIST/llama-server" ]]; then
   chmod +x "$DEST/llama-server"
   echo ">> bundled Vulkan GPU inference (llama-server + ggml/llama libs)"
 fi
-cp "$SRC/mmp-external.conf" "$SRC/mmp-launch.sh" "$SRC/mmp-stats.sh" "$DEST/"
+cp "$SRC/mmp-external.conf" "$SRC/mmp-launch.sh" "$SRC/mmp-launcher.sh" "$SRC/mmp-stats.sh" "$SRC/mmp-release-notes.txt" "$DEST/"
 chmod +x "$DEST/keryx-miner-supr" "$DEST"/*.sh
 
 # Pin the version in the manifest.

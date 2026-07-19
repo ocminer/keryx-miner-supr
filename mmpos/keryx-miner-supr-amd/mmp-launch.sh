@@ -25,6 +25,7 @@ while [[ $i -lt ${#ARGS[@]} ]]; do
         --user)     USER_VAL="${ARGS[$((i+1))]}"; ((i+=2)) ;;
         --password) PASS_VAL="${ARGS[$((i+1))]}"; ((i+=2)) ;;
         --algo)     ((i+=2)) ;;                       # keryx is single-algo; ignore
+        --coin)     ((i+=2)) ;;                       # mmpOS passes --coin <COIN>; unknown tokens must be discarded (spec)
         --api-port) API_PORT="${ARGS[$((i+1))]}"; ((i+=2)) ;;
         *)          FINAL_ARGS+=("${ARGS[$i]}"); ((i+=1)) ;;
     esac
