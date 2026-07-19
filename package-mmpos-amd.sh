@@ -44,6 +44,12 @@ if [[ -f "$DIST/libkeryx-llama-vk.so" ]]; then
   cp -P "$DIST/libkeryx-llama-vk.so" "$DEST/"
   echo ">> bundled zero-dup in-process engine (libkeryx-llama-vk.so)"
 fi
+# Baseline CPU-ISA build for pre-AVX rig CPUs — auto-selected by the miner when the host CPU lacks
+# the AVX2/FMA/F16C/BMI2 set baked into the default .so (v0.7.2 SIGILL fix).
+if [[ -f "$DIST/libkeryx-llama-vk-noavx.so" ]]; then
+  cp -P "$DIST/libkeryx-llama-vk-noavx.so" "$DEST/"
+  echo ">> bundled no-AVX in-process engine (libkeryx-llama-vk-noavx.so)"
+fi
 # Vulkan GPU inference (fallback): bundle llama-server + its ggml/llama .so (miner spawns it for
 # OPoI inference only when the in-process engine is unavailable; absent / no Vulkan ICD → CPU).
 if [[ -f "$DIST/llama-server" ]]; then
