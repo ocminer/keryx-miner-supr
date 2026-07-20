@@ -193,7 +193,14 @@ impl Opt {
             };
             self.keryxd_address = format!("grpc://{}:{}", keryxd, port);
         }
-        log::info!("keryxd address: {}", self.keryxd_address);
+        // Name the mode explicitly: `-s` doubles as pool URL and node address, and "keryxd address:
+        // stratum+tcp://…" read as a bug to users. This line is the first thing to check when a
+        // solo miner cannot reach its node (see README "Solo mining").
+        if self.keryxd_address.starts_with("stratum+tcp://") {
+            log::info!("pool address: {} (stratum)", self.keryxd_address);
+        } else {
+            log::info!("keryxd address: {} (solo — mining direct to node)", self.keryxd_address);
+        }
 
         if self.num_threads.is_none() {
             self.num_threads = Some(0);
