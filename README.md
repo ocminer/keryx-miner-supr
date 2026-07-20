@@ -30,6 +30,10 @@ acceptance, 0 rejects. Re-benchmarked 2026-07-08:
 | CMP 170HX | light (Gemma-3-4B) | **~20 MH/s** | ~115 W |
 | RTX 3070 | light (Gemma-3-4B) | **~18.5 MH/s** | ~173 W |
 
+⚠️ Measured **before the H4 hardfork**, on the pre-H4 model lineup named above. The PoM walk is
+memory-bandwidth bound, so per-card hashrate is broadly comparable on the current
+[H4 models](#model-tiers), but these exact figures have not been re-measured post-H4.
+
 Full per-card data (H100/H200, AMD, power sweeps) and tuning guidance:
 [BENCHMARKS.md](BENCHMARKS.md) — PRs with your own cards welcome.
 
@@ -79,20 +83,88 @@ LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64 \
 
 Add `--cuda-device N` to run a single GPU, a tier flag (`--very-high`, …) to pin all cards to one tier, or `--force-model` to set a model per card (see [Model tiers](#model-tiers) below).
 
-`-s` must be a full URL with the `stratum+tcp://` scheme — without it the miner silently picks gRPC. Port MUST be embedded in the URL; the standalone `-p` flag is ignored when a scheme is present.
+For **pool** mining, `-s` must be a full URL with the `stratum+tcp://` scheme — without it the miner treats the address as a keryxd node and speaks gRPC instead (see [Solo mining](#solo-mining--straight-to-your-own-keryxd-node-grpc)). Port MUST be embedded in the URL; the standalone `-p` flag is ignored when a scheme is present.
+
+### Solo mining — straight to your own keryxd node (gRPC)
+
+Point `-s` at the node instead of a pool. All three forms are equivalent:
+
+```bash
+# node on the same machine (127.0.0.1:22110 are the defaults — both flags optional)
+./keryx-miner-supr -a keryx:<your_mining_address>
+
+# node on another box in your LAN — any of these
+./keryx-miner-supr -a keryx:<addr> -s grpc://192.168.0.2:22110
+./keryx-miner-supr -a keryx:<addr> -s 192.168.0.2:22110
+./keryx-miner-supr -a keryx:<addr> -s 192.168.0.2 -p 22110
+```
+
+`-s` takes the **host** and `-p` the **port** (`-p` is the port, *not* the pool password — that's
+`--pool-password`). A `host:port` value or an explicit `grpc://host:port` URL works too — the miner
+normalises all of them to `grpc://host:port` internally.
+
+A successful connection logs the node's version, and each block you find is submitted straight to it:
+
+```
+INFO keryx_miner_supr::client::grpc] Keryxd version: 1.3.2
+INFO keryx_miner_supr::client::grpc] Registered for new template notifications
+INFO keryx_miner_supr::pow] Found a block: 7b9d30fe… (Timestamp: …)
+INFO keryx_miner_supr::client::grpc] block submitted successfully!
+```
+
+On the node side the same block appears as `Accepted N blocks …<hash>, N-1 via relay and 1 via
+submit block`. Note that solo mining pays only whole blocks — expect long dry spells unless you have
+significant hashrate.
+
+#### ⚠️ Multiple rigs → one node: the node must listen on the network
+
+**keryxd binds its gRPC port to `127.0.0.1` only by default.** A miner on a *different* machine will
+therefore fail with:
+
+```
+ERROR keryx_miner_supr] Client closed with error … ConnectError("tcp connect error",
+  Os { code: 111, kind: ConnectionRefused, message: "Connection refused" })
+```
+
+This is a **node** setting, not a miner bug — no miner flag can work around it. Start keryxd with:
+
+```bash
+keryxd --appdir=/path/to/keryx-data --utxoindex --rpclisten=0.0.0.0:22110
+```
+
+Then verify it is really listening on all interfaces (`0.0.0.0:22110`, not `127.0.0.1:22110`):
+
+```bash
+ss -tln | grep 22110
+```
+
+🔒 Only expose port 22110 to your own rig subnet (firewall / LAN-only). It is an unauthenticated RPC —
+never open it to the internet.
+
+Checklist when a rig can't reach the node:
+1. `ss -tln | grep 22110` on the **node** box → must show `0.0.0.0:22110`, not `127.0.0.1:22110`.
+2. From the **rig**: `nc -vz <node-ip> 22110` → must connect (else firewall/routing).
+3. Miner log must show `Keryxd version: …` shortly after start; a repeating `ConnectionRefused` means
+   1 or 2 is still unmet.
 
 ### Model tiers
 
 Heavier tiers earn more (higher tier-reward + higher OPoI inference-reward floor), so each card should
 run the heaviest model its VRAM can hold. The tiers (lightest → heaviest):
 
-| Tier flag      | Model            | GPU VRAM |
-|----------------|------------------|----------|
-| `--very-light` | Qwen3-1.7B       | ≥ 4 GB   |
-| `--light`      | Gemma-3-4B       | ≥ 6 GB   |
-| *(default)*    | Dolphin-Llama3-8B| ≥ 8 GB   |
-| `--high`       | Qwen3-32B        | ≥ 24 GB  |
-| `--very-high`  | Llama-3.3-70B-Q2 | ≥ 32 GB  |
+Current (post-**H4** hardfork, DAA 54,766,000) lineup:
+
+| Tier flag      | Model             | GPU VRAM |
+|----------------|-------------------|----------|
+| `--very-light` | EXAONE-4.0-1.2B   | any      |
+| `--light`      | Mistral-7B-v0.3   | ≥ 8 GB   |
+| *(default)*    | GLM-4-9B-0414     | ≥ 12 GB  |
+| `--high`       | Qwen3.6-27B       | ≥ 24 GB  |
+| `--very-high`  | Kimi-Linear-48B   | ≥ 30 GB  |
+
+The tier *flags* are unchanged — only the models behind them changed at H4. (Pre-H4 the lineup was
+Qwen3-1.7B / Gemma-3-4B / Dolphin-Llama3-8B / Qwen3-32B / Llama-3.3-70B-Q2; those models are no
+longer mined.) The models carry a GGUF-embedded tokenizer, so only `model.gguf` is downloaded.
 
 You can also pin one with `--tier <auto|very-light|light|default|high|very-high>`.
 
@@ -100,7 +172,7 @@ You can also pin one with `--tier <auto|very-light|light|default|high|very-high>
 
 With **no tier flag**, the miner runs in **AUTO** mode: it queries each GPU's VRAM independently and loads the
 **heaviest tier that fits that card**. In a mixed rig every card gets its own best-fit model — e.g. on a box
-with a 5090 + two 3070s, the 5090 loads Llama-70B while each 3070 loads Gemma, all in one process. A single
+with a 5090 + two 3070s, the 5090 loads Kimi-Linear-48B while each 3070 loads Mistral-7B, all in one process. A single
 tier flag (`--very-high`, `--tier high`, …) instead pins **every** card to that one tier.
 
 ### Forcing a model per card — `--force-model`
@@ -112,7 +184,7 @@ device order**:
 # GPU0 → very-high, GPU1 → light, GPU2 → default, GPU3 → high
 --force-model very-high,light,default,high
 
-# force every card to Gemma
+# force every card to the light tier (Mistral-7B)
 --force-model light,light,light,light
 
 # pin only GPU0; every other card falls back to AUTO best-fit
