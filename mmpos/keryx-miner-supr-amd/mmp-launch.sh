@@ -8,8 +8,10 @@
 # next to this binary. OPoI inference runs on CPU on AMD.
 cd "$(dirname "$(realpath "$0")")"
 
-# AMD OpenCL ICD loader (libOpenCL.so.1) lives in the system lib dir.
-export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Resolve the bundled libs from THIS package dir first (the Vulkan loader libvulkan.so.1 + the
+# ggml/llama .so we ship next to the binary), then the system dirs for the AMD OpenCL ICD loader
+# (libOpenCL.so.1). We've already cd'd here, so "$(pwd)" is the package dir.
+export LD_LIBRARY_PATH="$(pwd):/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 EXEC="./keryx-miner-supr"
 CONF_FILE="mmp-external.conf"
