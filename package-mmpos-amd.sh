@@ -50,6 +50,15 @@ if [[ -f "$DIST/libkeryx-llama-vk-noavx.so" ]]; then
   cp -P "$DIST/libkeryx-llama-vk-noavx.so" "$DEST/"
   echo ">> bundled no-AVX in-process engine (libkeryx-llama-vk-noavx.so)"
 fi
+# Vulkan loader (libvulkan.so.1): our vk .so + ggml-vulkan + llama-server all NEED it, but it's a
+# SYSTEM library (libvulkan1) absent on stock HiveOS/mmpOS where users can't apt-install → the miner
+# died with "libvulkan.so.1: cannot open shared object file". Bundle the glibc-2.29 loader from the
+# ubuntu-20.04 build image; the launcher's LD_LIBRARY_PATH resolves it. Reaching the GPU still needs
+# an AMD ICD (mesa RADV); if absent the miner falls back to CPU inference and keeps mining.
+if [[ -f "$DIST/libvulkan.so.1" ]]; then
+  cp -P "$DIST"/libvulkan.so.1* "$DEST/"
+  echo ">> bundled Vulkan loader (libvulkan.so.1 -> $(readlink "$DIST/libvulkan.so.1"))"
+fi
 # Vulkan GPU inference (fallback): bundle llama-server + its ggml/llama .so (miner spawns it for
 # OPoI inference only when the in-process engine is unavailable; absent / no Vulkan ICD → CPU).
 if [[ -f "$DIST/llama-server" ]]; then
