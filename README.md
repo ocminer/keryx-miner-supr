@@ -103,7 +103,15 @@ Point `-s` at the node instead of a pool. All three forms are equivalent:
 `--pool-password`). A `host:port` value or an explicit `grpc://host:port` URL works too — the miner
 normalises all of them to `grpc://host:port` internally.
 
-A successful connection logs the node's version, and each block you find is submitted straight to it:
+Whatever form you pass, the miner echoes the address it resolved at startup — check this line first if
+a rig can't reach its node:
+
+```
+INFO keryx_miner_supr::cli] keryxd address: grpc://192.168.0.2:22110 (solo — mining direct to node)
+```
+
+(Pool mining logs `pool address: stratum+tcp://… (stratum)` instead.) A successful connection then
+logs the node's version, and each block you find is submitted straight to it:
 
 ```
 INFO keryx_miner_supr::client::grpc] Keryxd version: 1.3.2
@@ -144,8 +152,11 @@ never open it to the internet.
 Checklist when a rig can't reach the node:
 1. `ss -tln | grep 22110` on the **node** box → must show `0.0.0.0:22110`, not `127.0.0.1:22110`.
 2. From the **rig**: `nc -vz <node-ip> 22110` → must connect (else firewall/routing).
-3. Miner log must show `Keryxd version: …` shortly after start; a repeating `ConnectionRefused` means
-   1 or 2 is still unmet.
+3. Miner log: the `keryxd address:` line must show the node's IP, and `Keryxd version: …` must follow
+   shortly after. A repeating `ConnectionRefused` means 1 or 2 is still unmet.
+
+*(The `keryxd address:` line requires v0.7.3+; in 0.7.2.x and earlier it was logged before the logger
+was initialised and never printed.)*
 
 ### Model tiers
 

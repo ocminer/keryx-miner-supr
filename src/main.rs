@@ -717,10 +717,13 @@ async fn run() -> Result<(), Error> {
     if opt.disable_gpu && opt.num_threads.is_none() {
         opt.num_threads = Some(crate::miner::get_num_cpus(None));
     }
-    opt.process()?;
+    // Init the logger BEFORE opt.process(): process() logs the resolved keryxd address, and with the
+    // init after it that line was swallowed — exactly the line a solo miner needs to confirm which
+    // node the miner is dialing. log_level() only reads the --debug flag, already parsed here.
     // try_init: in the static-cuda build CudaPlugin::new already set a logger;
     // init() would panic on the second call.
     let _ = env_logger::builder().filter_level(opt.log_level()).parse_default_env().try_init();
+    opt.process()?;
 
     // Clean shutdown: respond to SIGINT (Ctrl-C) and SIGTERM — the signals HiveOS / mmpOS / SMOS /
     // systemd send to STOP a miner. The GPU worker threads sit in long, uninterruptible CUDA calls
