@@ -142,6 +142,59 @@ impl PomGpuMiner {
         Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: tensors, _shared: Vec::new(), _uploads: Vec::new() })
     }
 
+    /// Standalone walk source: upload the mining model's RAW GGUF bytes to `device_id` (canonical
+    /// name-sorted order) and gather over our own device copies. Unlike `load` (candle QTensor
+    /// parse), this only reads the GGUF header for each tensor's offset/size and uploads the
+    /// bytes verbatim — so it works for ANY architecture, including the H4 llama-only archs
+    /// (Qwen3.5-hybrid-SSM / GLM-4 / EXAONE-4 / Kimi-Linear-MoE) that candle has no loader for.
+    /// Used on mining-only GPUs (multi-GPU rigs) and whenever llama's resident layout is not
+    /// byte-compatible — the uploaded bytes ARE the canonical on-disk bytes, so no byte-gate is
+    /// needed here (the N-guard in `ensure_installed_inner` still cross-checks the host index).
+    pub fn load_raw(gguf_path: &str, device_id: usize) -> candle_core::Result<Self> {
+        let device = Device::new_cuda(device_id)?;
+        let cuda = match &device {
+            Device::Cuda(c) => c.clone(),
+            _ => return Err(candle_core::Error::Msg("PoM GPU: not a CUDA device".into())),
+        };
+        let stream = cuda.cuda_stream();
+
+        let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::wrap)?;
+        let meta = crate::gguf::GgufMeta::read(&mut file)
+            .map_err(|e| candle_core::Error::Msg(format!("PoM GPU: GGUF header parse failed: {e}")))?;
+        let names = meta.sorted_names(); // canonical order — matches pom-rt-builder / the node R_T
+
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        let mut uploads: Vec<CudaSlice<u8>> = Vec::new();
+        let mut bases: Vec<u64> = Vec::new();
+        let mut prefix: Vec<u64> = vec![0];
+        let mut host_buf: Vec<u8> = Vec::new();
+        for name in &names {
+            let t = &meta.tensors[name];
+            let chunks = t.nbytes / CHUNK_BYTES as u64;
+            if chunks == 0 {
+                continue;
+            }
+            host_buf.resize(t.nbytes as usize, 0);
+            crate::pom::read_exact_at(&file, &mut host_buf, meta.tensor_data_offset + t.offset)
+                .map_err(candle_core::Error::wrap)?;
+            let dev = stream.clone_htod(host_buf.as_slice()).map_err(candle_core::Error::wrap)?;
+            bases.push(dev.device_ptr(&stream).0 as u64);
+            uploads.push(dev);
+            prefix.push(prefix.last().unwrap() + chunks);
+        }
+        let n_total_chunks = *prefix.last().unwrap();
+        if n_total_chunks == 0 {
+            return Err(candle_core::Error::Msg("PoM GPU: model produced 0 chunks".into()));
+        }
+        info!("PoM raw gather: {} tensors uploaded, N={} chunks (candle-free, arch-agnostic)", bases.len(), n_total_chunks);
+
+        let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
+        let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
+        let _ = load_walk_func(&cuda)?;
+
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
+    }
+
     /// Zero-dup load (Option C): build the gather over the SAME canonical name-sorted layout as
     /// `R_T`, but for each tensor reuse the inference engine's resident VRAM buffer when it holds
     /// it quantized (`shared`, the big matrices) instead of loading a second copy. Only the
@@ -581,10 +634,9 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // BYTE-COMPAT GATE: llama.cpp repacks some architectures on load (e.g. Gemma-3 materialises a
     // separate output.weight from its tied embeddings), so its resident chunk count differs from
     // the canonical GGUF the walk MUST gather and R_T pins. When that happens the zero-dup walk is
-    // impossible — free llama's VRAM and fall back to candle for BOTH the walk and inference for
-    // this model (llama byte-clean archs like Dolphin/Llama-70B keep the zero-dup path). Cheaper
-    // than letting load_llama build a doomed gather that the N-guard then rejects into a mine-
-    // refusing loop (the bug that made Gemma-tier/6-8GB cards, incl. Pascal P106, sit idle).
+    // impossible — free llama's VRAM and walk a raw canonical copy (`load_raw`) instead (inference
+    // for this model is then unavailable). Cheaper than letting load_llama build a doomed gather
+    // that the N-guard then rejects into a mine-refusing loop.
     if use_llama {
         let host_n = crate::pom::active_index_for(device_id as u32).map(|t| t.0.n_chunks)
             .or_else(|| crate::pom::active_index().map(|(i, _)| i.n_chunks));
@@ -594,25 +646,29 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         if let (Some(hn), Some(ln)) = (host_n, llama_n) {
             if ln != hn {
                 info!(
-                    "PoM[gpu{}]: llama-resident layout N={} != canonical N={} (llama repacks this model arch)                      — using candle for the walk + inference on this card.", device_id, ln, hn
+                    "PoM[gpu{}]: llama-resident layout N={} != canonical N={} (llama repacks this model arch) — walking a raw canonical copy; inference for this model is unavailable.", device_id, ln, hn
                 );
                 crate::llama_engine::unload();
                 use_llama = false;
             }
         }
     }
-    let m = if use_llama {
-        info!("PoM[gpu{}]: zero-dup — walking the llama.cpp engine's resident weights (candle dormant)", device_id);
-        PomGpuMiner::load_llama(device_id as usize)
-    } else {
-        match crate::slm::pom_shared(&model_id) {
-            Some((inf_dev, shared)) if cuda_gpu_id(&inf_dev) == Some(device_id as usize) => {
-                info!("PoM[gpu{}]: zero-dup — sharing the inference engine's resident weights (no 2nd VRAM copy)", device_id);
-                PomGpuMiner::load_shared(&gguf, &inf_dev, &shared)
-            }
-            _ => PomGpuMiner::load(&gguf, device_id as usize),
+    // Non-inference GPUs (and byte-gate failures) walk a standalone raw upload of the canonical
+    // GGUF bytes (`load_raw`) — candle-free, so it works for the H4 llama-only archs
+    // (Qwen3.5-hybrid-SSM / GLM-4 / EXAONE-4 / Kimi-Linear-MoE) that candle cannot load at all.
+    // This is what makes MULTI-GPU H4 mining work: only the single inference GPU can do the
+    // llama zero-dup gather; every other card needs its own copy. catch_unwind so a driver-level
+    // panic in one card's load doesn't abort the whole miner.
+    let m = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if use_llama {
+            info!("PoM[gpu{}]: zero-dup — walking the llama.cpp engine's resident weights (candle dormant)", device_id);
+            PomGpuMiner::load_llama(device_id as usize)
+        } else {
+            info!("PoM[gpu{}]: raw gather — standalone canonical GGUF upload (mining-only card)", device_id);
+            PomGpuMiner::load_raw(&gguf, device_id as usize)
         }
-    };
+    }))
+    .unwrap_or_else(|_| Err(candle_core::Error::Msg(format!("PoM[gpu{}]: loader panicked", device_id))));
     match m {
         Ok(gm) => {
             let n = gm.n_chunks();
