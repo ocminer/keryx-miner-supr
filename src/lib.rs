@@ -1,6 +1,7 @@
 use clap::ArgMatches;
 use libloading::{Library, Symbol};
 
+pub mod gguf;
 pub mod inference;
 pub mod models;
 pub mod slm;

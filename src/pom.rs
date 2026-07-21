@@ -11,13 +11,11 @@
 //! same challenges and recomputes the same transitions). See POM_CONSENSUS_SPEC.md.
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use candle_core::quantized::gguf_file;
-use candle_core::Device;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(target_family = "unix")]
     {
         use std::os::unix::fs::FileExt;
@@ -805,11 +803,16 @@ impl WeightIndex {
     /// batches of 2^K leaves up K levels (`fold_levels`) and writes only the level-K node, then builds
     /// the higher checkpoints. Returns the index + a snapshot of the chunk `table` (for the meta).
     fn build_tree_to(path: &str, tree_path: PathBuf, persistent: bool) -> candle_core::Result<(Self, Vec<(u64, u64)>)> {
-        let device = Device::Cpu;
         let mut file = File::open(path).map_err(candle_core::Error::wrap)?;
-        let content = gguf_file::Content::read(&mut file)?;
-        let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
-        names.sort(); // canonical order
+        // Read the GGUF header with our own minimal parser (raw offsets/sizes only) rather than
+        // candle's QTensor loader: the H4 llama-only archs (Qwen3.5-hybrid-SSM / GLM-4 / EXAONE-4 /
+        // Kimi-Linear-MoE) have tensors candle cannot dequantize, so `content.tensor()` would fail
+        // and the possession-index build would never complete. The leaf bytes we hash are the raw
+        // on-disk quantized bytes either way (`read_chunk` already preads them), so this is
+        // byte-identical for candle-clean models and simply also works for the new archs.
+        let meta = crate::gguf::GgufMeta::read(&mut file)
+            .map_err(|e| candle_core::Error::Msg(format!("PoM: GGUF header parse failed: {e}")))?;
+        let names = meta.sorted_names(); // canonical order
 
         // DISK PRE-CHECK (best-effort). The sparse tree is only ~N/63 of the leaves (≈ gguf/32), so
         // this almost never trips now — but a truly tiny/full disk still gets a clear message instead
@@ -844,22 +847,33 @@ impl WeightIndex {
         let mut table: Vec<(u64, u64)> = Vec::with_capacity(names.len());
         let mut n_chunks: u64 = 0;
         let mut batch_buf: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
+        // Stream each tensor's raw on-disk bytes in bounded slabs (the biggest tensors are multi-GB
+        // — no full-tensor buffering needed to hash 32 B chunks). Byte-for-byte the same chunks
+        // candle's qt.data() yielded, but arch-agnostic (see the GgufMeta note above).
+        const SLAB_CHUNKS: u64 = 1 << 16; // 2 MiB per read
+        let mut slab = vec![0u8; (SLAB_CHUNKS * 32) as usize];
         for name in &names {
-            let file_off = content.tensor_data_offset + content.tensor_infos[name].offset;
-            let qt = content.tensor(&mut file, name, &device)?;
-            let bytes = qt.data()?;
-            let full = bytes.len() / 32;
+            let t = &meta.tensors[name];
+            let file_off = meta.tensor_data_offset + t.offset;
+            let full = t.nbytes / 32;
             if full > 0 {
                 table.push((n_chunks, file_off));
             }
-            for c in 0..full {
-                let chunk = &bytes[c * 32..c * 32 + 32];
-                batch_buf.push(blake(chunk));
-                n_chunks += 1;
-                if batch_buf.len() == batch_size as usize {
-                    writer.write_all(&fold_levels(&batch_buf, k)).map_err(candle_core::Error::wrap)?;
-                    batch_buf.clear();
+            let mut done: u64 = 0;
+            while done < full {
+                let take = SLAB_CHUNKS.min(full - done);
+                let buf = &mut slab[..(take * 32) as usize];
+                read_exact_at(&file, buf, file_off + done * 32).map_err(candle_core::Error::wrap)?;
+                for c in 0..take as usize {
+                    let chunk = &buf[c * 32..c * 32 + 32];
+                    batch_buf.push(blake(chunk));
+                    n_chunks += 1;
+                    if batch_buf.len() == batch_size as usize {
+                        writer.write_all(&fold_levels(&batch_buf, k)).map_err(candle_core::Error::wrap)?;
+                        batch_buf.clear();
+                    }
                 }
+                done += take;
             }
         }
         if !batch_buf.is_empty() {
