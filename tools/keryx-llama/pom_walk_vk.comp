@@ -43,7 +43,7 @@ layout(push_constant) uniform Push {
     uint     k;                // POM_WALK_STEPS (256)
     uint     batch;            // nonces in this dispatch
     uint     n_tensors;
-    uint     _pad;
+    uint     walk_v2;          // H5 era flag: 0 = frozen v1 fold, 1 = non-foldable mix64-chain
 } pc;
 
 // SplitMix64 finalizer — exactly pom.rs mix64 (u64 * wraps).
@@ -69,6 +69,17 @@ uint64_t step_state(uint64_t state, uint64_t off) {
     // pointer, never the index.
     Tensor chunk = Tensor(ADDRS.addr[lo] + (off - PREFIX.prefix[lo]) * 32UL);
     uint64_t h = state;
+    if (pc.walk_v2 != 0u) {
+        // H5 non-foldable walk (at/after H5_ACTIVATION_DAA): chain mix64 through each of the 4
+        // chunk words so all 32 bytes are load-bearing and order-dependent — byte-exact with
+        // pom.rs transition_v2, pom_mine.cl, and pom_mine.cu. walk_v2 is uniform -> no divergence.
+        h = mix64(h ^ chunk.words[0]);
+        h = mix64(h ^ chunk.words[1]);
+        h = mix64(h ^ chunk.words[2]);
+        h = mix64(h ^ chunk.words[3]);
+        return h;
+    }
+    // Pre-H5 fold (frozen — validates every block below H5_ACTIVATION_DAA).
     h ^= chunk.words[0];
     h ^= chunk.words[1];
     h ^= chunk.words[2];
