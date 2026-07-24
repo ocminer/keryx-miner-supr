@@ -35,7 +35,10 @@ docker run --rm --network none \
     export CUDA_HOME=$KCUDA CUDA_PATH=$KCUDA CUDA_COMPUTE_CAP=$CCAP
     if [ -n "$POMARCH" ]; then export POM_CUDA_ARCH="$POMARCH"; fi
     export PATH=$KCUDA/bin:/usr/local/cargo/bin:/root/.cargo/bin:$PATH
-    export RUSTFLAGS="-L $KCUDA/lib64/stubs"
+    # -rpath $ORIGIN/lib so the binary finds the bundled CUDA runtime (libcurand/libcublas/…) next
+    # to itself on a clean rig (NVIDIA driver only, no system CUDA), without needing a launcher to
+    # set LD_LIBRARY_PATH. \$ORIGIN is kept literal for the linker (escaped past the container shell).
+    export RUSTFLAGS="-L $KCUDA/lib64/stubs -C link-arg=-Wl,-rpath,\$ORIGIN/lib"
     export CARGO_TARGET_DIR=/src/'"$TGT"'
     O=/src/hiveos/'"$OUTDIR"'
     echo "building against CUDA: $(nvcc --version | grep -oE "release [0-9.]+") walk-arch=${POMARCH:-default} candle-cap=$CCAP"

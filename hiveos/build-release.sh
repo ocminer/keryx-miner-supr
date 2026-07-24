@@ -38,7 +38,10 @@ docker run --rm --network host --dns 1.1.1.1 --dns 8.8.8.8 -v "$REPO":/src -w /s
     # Pascal sm_61 fails to compile (reduce.cu half atomicAdd) → --cpu-inference.
     export CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda CUDA_COMPUTE_CAP=70
     export PATH=/usr/local/cuda/bin:$PATH
-    export RUSTFLAGS="-L /usr/local/cuda/lib64/stubs"
+    # -rpath $ORIGIN/lib so the binary finds the bundled CUDA runtime next to itself on a clean rig
+    # (NVIDIA driver only, no system CUDA) without a launcher setting LD_LIBRARY_PATH. \$ORIGIN kept
+    # literal for the linker (escaped past the container shell).
+    export RUSTFLAGS="-L /usr/local/cuda/lib64/stubs -C link-arg=-Wl,-rpath,\$ORIGIN/lib"
     export CARGO_TARGET_DIR=/src/target-hiveos
 
     # candle-kernels stale-PTX guard: bindgen_cuda skips nvcc when its OUT_DIR .ptx
