@@ -219,7 +219,7 @@ impl State {
         let h3 = pom::h3_active(self.daa_score);
         // H5: non-foldable mix64-chained walk at/after the gate. MUST match the GPU search era
         // (`pom_gpu::mine(.., walk_v2)`) or the CPU rebuild derives a different final_state.
-        let walk_v2 = self.daa_score >= pom::H5_ACTIVATION_DAA;
+        let walk_v2 = self.daa_score >= pom::h5_activation_daa();
         let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3);
         let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), walk_v2);
         if !pom::le_leq(&pom::pom_pow_value(final_state, &pph, h3), &self.target.to_le_bytes()) {

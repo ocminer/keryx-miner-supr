@@ -10,7 +10,7 @@ pub struct Opt {
 
     #[clap(
         long = "very-light",
-        help = "Model tier: Qwen3-1.7B-abliterated — 4 GB+ GPU, smallest tier (PoM tier 0, post-H2)",
+        help = "Model tier: Qwen3-8B-abliterated (Q4_K_S) — 6 GB+ GPU, smallest tier (PoM tier 0, post-H5; EXAONE-4.0-1.2B in the H4→H5 window)",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["light", "high", "very_high", "tier"]
     )]

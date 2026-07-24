@@ -390,7 +390,7 @@ impl MinerManager {
                         let h3 = keryx_miner::pom::h3_active(daa);
                         // H5 era: non-foldable mix64-chained walk at/after the gate (must match the
                         // host proof rebuild in pow::generate_block_if_pom). Dormant until scheduled.
-                        let walk_v2 = daa >= keryx_miner::pom::H5_ACTIVATION_DAA;
+                        let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
                         // NVIDIA (CUDA) + Apple Silicon (Metal): per-device PoM. Each GPU thread
                         // builds + walks its OWN device's blob (per-device MINERS map) so no-flag
                         // multi-GPU works without CUDA_VISIBLE_DEVICES. Device id = the worker's
