@@ -1478,7 +1478,8 @@ mod tests {
         }
     }
 
-    /// H4 v2 proof (recompute-from-chunks) builds, self-verifies, and wire round-trips.
+    /// H4 v2 proof (recompute-from-chunks) builds, self-verifies, and wire round-trips — for BOTH
+    /// walk eras (v1 fold in [H4,H5), v2 mix64-chain at/after H5), and the cross-era boundary holds.
     #[test]
     fn build_v2_then_self_verify() {
         let k = 256u32;
@@ -1486,21 +1487,28 @@ mod tests {
         let pph = blake(b"v2-pph");
         let seed = pom_block_seed(&pph, 111, 0xabc, true);
 
-        let proof = build_proof_v2(3, &pph, seed, idx.n_chunks, k, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true);
-        assert_eq!(proof.tier, 3);
-        assert!(proof.steps_v2.as_ref().unwrap().len() == k as usize);
-        assert!(proof.openings.is_empty() && proof.trace_root == [0u8; 32]);
-        assert!(verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true));
+        for walk_v2 in [false, true] {
+            let proof = build_proof_v2(3, &pph, seed, idx.n_chunks, k, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true, walk_v2);
+            assert_eq!(proof.tier, 3);
+            assert!(proof.steps_v2.as_ref().unwrap().len() == k as usize);
+            assert!(proof.openings.is_empty() && proof.trace_root == [0u8; 32]);
+            assert!(verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, walk_v2));
 
-        // Wrong seed / wrong root / wrong target all fail the self-check.
-        assert!(!verify_proof_v2(&proof, &pph, seed ^ 1, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true));
-        assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &blake(b"wrong"), &[0xff; 32], true));
-        assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0u8; 32], true));
+            // Wrong seed / wrong root / wrong target all fail the self-check.
+            assert!(!verify_proof_v2(&proof, &pph, seed ^ 1, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, walk_v2));
+            assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &blake(b"wrong"), &[0xff; 32], true, walk_v2));
+            assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0u8; 32], true, walk_v2));
 
-        // borsh wire round-trips through to_wire_bytes (full struct for a v2 proof).
-        let bytes = proof.to_wire_bytes();
-        let back: PomProof = borsh::from_slice(&bytes).unwrap();
-        assert!(verify_proof_v2(&back, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true));
+            // CROSS-ERA BOUNDARY: a proof built under one walk era must NOT verify under the other
+            // (the final_state differs) — this is the whole point of the H5 transition swap.
+            assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, !walk_v2),
+                "walk_v2={walk_v2} proof must fail verification under the opposite era");
+
+            // borsh wire round-trips through to_wire_bytes (full struct for a v2 proof).
+            let bytes = proof.to_wire_bytes();
+            let back: PomProof = borsh::from_slice(&bytes).unwrap();
+            assert!(verify_proof_v2(&back, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, walk_v2));
+        }
         let _ = std::fs::remove_file(&idx.tree_path);
     }
 
@@ -1822,7 +1830,7 @@ mod tests {
         let mut base = 0u64;
         let mut found = None;
         for _ in 0..512 {
-            if let Some(n) = crate::llama_engine_vk::pom_mine(p, time, t, base, 1 << 16) {
+            if let Some(n) = crate::llama_engine_vk::pom_mine(p, time, t, base, 1 << 16, false) {
                 found = Some(n);
                 break;
             }
@@ -1840,6 +1848,76 @@ mod tests {
             "ZERO-DUP engine walk mined nonce {nonce} over the REAL Gemma tier ({} chunks); proof verifies vs pinned R_T ✅",
             idx.n_chunks
         );
+    }
+
+    /// H5 on-hardware correctness: the OpenCL blob kernel with walk_v2=1 must find a nonce whose v2
+    /// walk the CPU `transition_v2` (via `walk_final(.., true)`) independently confirms passes the
+    /// target — proving `pom_mine.cl`'s mix64-chain branch is byte-exact with `pom.rs`. The winner
+    /// must ALSO differ from the v1 winner (9559 for this pph/target), i.e. the eras really diverge.
+    #[test]
+    #[ignore]
+    #[cfg(all(feature = "pom-opencl", unix))]
+    fn gpu_walk_v2_opencl_matches_cpu() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let pph = blake(b"gpu-real-e2e"); // same pph/target as gpu_real_tier_end_to_end (v1 winner = 9559)
+        let time = 1_700_000_000u64;
+        let mut target = [0xffu8; 32];
+        target[24..32].copy_from_slice(&0x0010_0000_0000_0000u64.to_le_bytes());
+        let cpu_passes = |n: u64, v2: bool| {
+            let seed = pom_block_seed(&pph, time, n, false);
+            let fs = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o), v2);
+            le_leq(&pom_pow_value(fs, &pph, false), &target)
+        };
+        let devs = opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU).expect("cl devices");
+        crate::pom_opencl::bind_thread_device(devs[0] as usize);
+        crate::pom_opencl::set_mining_tier(path, 1);
+        crate::pom_opencl::ensure_installed();
+        let mut base = 0u64;
+        let mut nonce = None;
+        for _ in 0..2048 {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, true) { nonce = Some(n); break; }
+            base = base.wrapping_add(1 << 16);
+        }
+        let nonce = nonce.expect("opencl walk_v2 found no winner");
+        assert!(cpu_passes(nonce, true), "OpenCL kernel walk_v2 disagrees with CPU transition_v2 (nonce {nonce})");
+        assert_ne!(nonce, 9559, "walk_v2 winner must differ from the v1 winner (else v2 == v1)");
+        assert!(!cpu_passes(nonce, false) || nonce < 9559, "v2 winner should not trivially be a v1 winner");
+        eprintln!("OpenCL walk_v2 nonce {nonce} confirmed by CPU transition_v2 ✅ (v1 winner was 9559 — eras diverge)");
+    }
+
+    /// H5 on-hardware correctness for the ZERO-DUP Vulkan shader: same oracle as
+    /// gpu_walk_v2_opencl_matches_cpu but through `pom_walk_vk.comp`'s walk_v2 branch. Needs the .so
+    /// (KERYX_LLAMA_VK_SO) + a Vulkan GPU (KERYX_LLAMA_VK_DEVICE).
+    #[test]
+    #[ignore]
+    #[cfg(all(feature = "pom-opencl", unix))]
+    fn gpu_walk_v2_llama_vk_matches_cpu() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        assert!(crate::llama_engine_vk::ensure_loaded(&path, gpu), "engine load failed (.so present? VRAM?)");
+        assert!(crate::llama_engine_vk::pom_ready(), "engine walk not ready");
+        assert!(crate::llama_engine_vk::pom_byte_gate(&idx), "byte gate must pass before mining");
+        let pph = blake(b"gpu-real-e2e");
+        let time = 1_700_000_000u64;
+        let mut target = [0xffu8; 32];
+        target[24..32].copy_from_slice(&0x0010_0000_0000_0000u64.to_le_bytes());
+        let p = pph_words_for_era(&pph, false);
+        let mut t = [0u64; 4];
+        for (i, w) in t.iter_mut().enumerate() { *w = u64::from_le_bytes(target[i * 8..i * 8 + 8].try_into().unwrap()); }
+        let mut base = 0u64;
+        let mut nonce = None;
+        for _ in 0..2048 {
+            if let Some(n) = crate::llama_engine_vk::pom_mine(p, time, t, base, 1 << 16, true) { nonce = Some(n); break; }
+            base = base.wrapping_add(1 << 16);
+        }
+        let nonce = nonce.expect("vk walk_v2 found no winner");
+        let seed = pom_block_seed(&pph, time, nonce, false);
+        let fs = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o), true);
+        assert!(le_leq(&pom_pow_value(fs, &pph, false), &target), "vk shader walk_v2 disagrees with CPU transition_v2 (nonce {nonce})");
+        assert_ne!(nonce, 9559, "walk_v2 winner must differ from the v1 winner");
+        eprintln!("zero-dup Vulkan walk_v2 nonce {nonce} confirmed by CPU transition_v2 ✅");
     }
 
     /// Wall-clock throughput bench for the OPENCL blob walk on a chosen card — the apples-to-
@@ -1861,11 +1939,11 @@ mod tests {
         let pph = blake(b"bench-llama-vk");
         let target = [0u8; 32]; // impossible target -> full grind
         let batch: u64 = 1 << 21;
-        let _ = crate::pom_opencl::mine(&pph, 1_700_000_000, &target, 0, batch, false); // warmup
+        let _ = crate::pom_opencl::mine(&pph, 1_700_000_000, &target, 0, batch, false, false); // warmup
         let start = std::time::Instant::now();
         let rounds: u64 = 8;
         for i in 0..rounds {
-            let _ = crate::pom_opencl::mine(&pph, 1_700_000_000, &target, i * batch, batch, false);
+            let _ = crate::pom_opencl::mine(&pph, 1_700_000_000, &target, i * batch, batch, false, false);
         }
         let secs = start.elapsed().as_secs_f64();
         eprintln!(
@@ -1891,11 +1969,11 @@ mod tests {
         let t = [0u64; 4]; // impossible target -> full grind, no early exit
         let batch: u64 = 1 << 21;
         // warmup
-        let _ = crate::llama_engine_vk::pom_mine(p, 1_700_000_000, t, 0, batch);
+        let _ = crate::llama_engine_vk::pom_mine(p, 1_700_000_000, t, 0, batch, false);
         let start = std::time::Instant::now();
         let rounds: u64 = 8;
         for i in 0..rounds {
-            let _ = crate::llama_engine_vk::pom_mine(p, 1_700_000_000, t, i * batch, batch);
+            let _ = crate::llama_engine_vk::pom_mine(p, 1_700_000_000, t, i * batch, batch, false);
         }
         let secs = start.elapsed().as_secs_f64();
         eprintln!(
@@ -1923,7 +2001,7 @@ mod tests {
         let mut base = 0u64;
         let mut found = None;
         for _ in 0..512 {
-            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false) {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, false) {
                 found = Some(n);
                 break;
             }
@@ -2057,7 +2135,7 @@ mod tests {
         let mut base = 0u64;
         let mut found = None;
         for _ in 0..1024 {
-            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false) {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, false) {
                 found = Some(n);
                 break;
             }
@@ -2065,7 +2143,7 @@ mod tests {
         }
         let nonce = found.expect("GPU found no winner over the real tier");
         let seed = pom_block_seed(&pph, time, nonce, false);
-        let final_state = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o));
+        let final_state = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o), false);
         let pow_value = pom_pow_value(final_state, &pph, false);
         assert!(le_leq(&pow_value, &target), "pow_value must satisfy the share target");
         let proof = build_proof(
@@ -2136,7 +2214,7 @@ mod tests {
         let mut base = 0u64;
         let mut found = None;
         for _ in 0..2048 {
-            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false) {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, false) {
                 found = Some(n);
                 break;
             }
@@ -2144,7 +2222,7 @@ mod tests {
         }
         let nonce = found.expect("GPU found no winner");
         let seed = pom_block_seed(&pph, time, nonce, false);
-        let final_state = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o));
+        let final_state = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o), false);
         let pow_value = pom_pow_value(final_state, &pph, false);
         assert!(le_leq(&pow_value, &target), "pow_value must satisfy the easy target");
         let proof = build_proof(
@@ -2202,7 +2280,7 @@ mod tests {
         let target = [0xffu8; 32];
         let nonce = 0u64;
         let seed = pom_block_seed(&pph, time, nonce, h3);
-        let final_state = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o));
+        let final_state = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o), false);
         let pow_value = pom_pow_value(final_state, &pph, h3);
         assert!(le_leq(&pow_value, &target));
 
@@ -2215,9 +2293,10 @@ mod tests {
             |o| idx.read_chunk(o),
             |o| idx.merkle_path(o),
             h3,
+            false, // H4-era sample: the walk stays v1 (pre-H5)
         );
         assert!(
-            verify_proof_v2(&proof, &pph, seed, idx.n_chunks, POM_WALK_STEPS, &idx.r_t, &target, h3),
+            verify_proof_v2(&proof, &pph, seed, idx.n_chunks, POM_WALK_STEPS, &idx.r_t, &target, h3, false),
             "v2 proof MUST verify locally before handoff"
         );
         assert_eq!(proof.final_state, final_state);

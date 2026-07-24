@@ -21,12 +21,12 @@ type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char
 type ReadyFn = unsafe extern "C" fn(*mut c_void) -> bool;
 type U64Fn = unsafe extern "C" fn(*mut c_void) -> u64;
 type FetchFn = unsafe extern "C" fn(*mut c_void, u64, *mut u8) -> bool;
-type MineFn = unsafe extern "C" fn(*mut c_void, *const u64, *const u64, u64, u64, u32, u32) -> i64;
+type MineFn = unsafe extern "C" fn(*mut c_void, *const u64, *const u64, u64, u64, u32, u32, u32) -> i64;
 type PciFn = unsafe extern "C" fn(*mut c_void, *mut u32, *mut u32, *mut u32, *mut u32) -> bool;
 type PickFn = unsafe extern "C" fn() -> c_int;
 
 const ABI: c_int = 2;
-const VK_ABI: c_int = 3;
+const VK_ABI: c_int = 4; // bumped 3->4 at H5: keryx_llama_pom_mine gained the walk_v2 param
 
 /// Max nonces per engine dispatch (ascending sub-batches, early exit on the first winner =
 /// identical lowest-nonce semantics). Larger than the OpenCL driver's 2^18: this engine is
@@ -336,15 +336,16 @@ pub fn pom_byte_gate(index: &crate::pom::WeightIndex) -> bool {
 /// TDR-safe sub-dispatches (ascending, early exit on the first winning sub-batch — identical
 /// semantics to `PomMiner::mine`). `p`/`t` are the pph words (era-salted by the caller) and the
 /// LE target words. Returns the lowest winning nonce, or None.
-pub fn pom_mine(p: [u64; 4], time: u64, t: [u64; 4], nonce_base: u64, batch: u64) -> Option<u64> {
+pub fn pom_mine(p: [u64; 4], time: u64, t: [u64; 4], nonce_base: u64, batch: u64, walk_v2: bool) -> Option<u64> {
     let g = engine().lock().ok()?;
     let e = g.as_ref()?;
+    let wv2: u32 = walk_v2 as u32; // H5 era flag -> shader push-constant (v1 fold vs mix64-chain)
     let mut done: u64 = 0;
     while done < batch {
         let sub = (batch - done).min(SUB_DISPATCH_NONCES) as u32;
         let base = nonce_base.wrapping_add(done);
         let r = unsafe {
-            (e.pom_mine)(e.model, p.as_ptr(), t.as_ptr(), time, base, sub, crate::pom::POM_WALK_STEPS)
+            (e.pom_mine)(e.model, p.as_ptr(), t.as_ptr(), time, base, sub, crate::pom::POM_WALK_STEPS, wv2)
         };
         match r {
             -2 => {

@@ -82,7 +82,8 @@ impl PomMiner {
 
     /// Grind one batch of `batch` nonces from `nonce_base` in TDR-safe sub-dispatches. Returns
     /// the lowest nonce whose pom_pow_value <= target, or None.
-    pub fn mine(&mut self, pph: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64) -> Option<u64> {
+    pub fn mine(&mut self, pph: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64, walk_v2: bool) -> Option<u64> {
+        let wv2: u32 = walk_v2 as u32; // H5 era flag -> kernel `const uint walk_v2`
         let mut done: u64 = 0;
         while done < batch {
             let sub = (batch - done).min(SUB_DISPATCH_NONCES);
@@ -97,6 +98,7 @@ impl PomMiner {
                 .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
                 .set_arg(&base).set_arg(&sub)
                 .set_arg(&self.winner)
+                .set_arg(&wv2)
                 .set_global_work_size(sub as usize)
                 .enqueue_nd_range(&self.queue)
                 .ok()?;
@@ -392,19 +394,22 @@ pub fn ensure_installed() {
 /// Grind one batch of `batch` nonces from `nonce_base` on THIS thread's bound GPU. Returns the
 /// lowest nonce whose pom_pow_value <= target, or None. pph/target are the 32-byte LE forms.
 /// Per-card lock → the other GPUs' threads grind concurrently.
-pub fn mine(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64, h3: bool) -> Option<u64> {
+pub fn mine(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64, h3: bool, walk_v2: bool) -> Option<u64> {
     let id = target_dev()?;
     // H3: salt the pph words host-side (POM_H3_PPH_SALT) — both walk backends fold whatever
     // words they receive, so no kernel/shader change at the gate.
+    // H5 (walk_v2): the non-foldable mix64-chain transition IS a kernel/shader change — threaded
+    // into BOTH backends (the OpenCL blob kernel `pom_mine.cl` and the zero-dup Vulkan walk shader)
+    // so a block at/after H5_ACTIVATION_DAA computes the same final_state the node re-verifies.
     let p = crate::pom::pph_words_for_era(pph, h3);
     let t = words(target_le);
     // Zero-dup card: grind over the llama-engine-resident weights (byte-gate-verified).
     if is_shared_dev(id) {
-        return crate::llama_engine_vk::pom_mine(p, time, t, nonce_base, batch);
+        return crate::llama_engine_vk::pom_mine(p, time, t, nonce_base, batch, walk_v2);
     }
     let miner = miner_for(id)?;
     let mut g = miner.lock().unwrap();
-    g.mine(p, time, t, nonce_base, batch)
+    g.mine(p, time, t, nonce_base, batch, walk_v2)
 }
 
 /// Build the resident tier from a GGUF (shared proof WeightIndex, streamed to VRAM) and make it

@@ -52,7 +52,7 @@ struct PushWalk {
     uint32_t k;
     uint32_t batch;
     uint32_t n_tensors;
-    uint32_t pad;
+    uint32_t walk_v2;   // H5 era flag: 0 = frozen v1 fold, 1 = non-foldable mix64-chain
 };
 struct PushFetch {
     uint64_t first_chunk;
@@ -429,7 +429,7 @@ extern "C" {
 
 // Core ABI (load/generate/free) matches the CUDA flavor; the _vk_abi covers the walk exports.
 int keryx_llama_abi() { return 2; }
-int keryx_llama_vk_abi() { return 3; }
+int keryx_llama_vk_abi() { return 4; } // 3->4 at H5: keryx_llama_pom_mine gained the walk_v2 param
 
 // PCI location of the GPU hosting the model (VK_EXT_pci_bus_info) — lets the OpenCL driver map
 // this engine to its cl_device_id (CL_DEVICE_TOPOLOGY_AMD) so THAT card skips its own blob and
@@ -523,7 +523,8 @@ bool keryx_llama_pom_fetch(KeryxLlama* h, uint64_t off, uint8_t out[32]) {
 // and lowest-nonce early exit, exactly like the OpenCL driver). Returns the lowest winning
 // in-dispatch offset, or -1 for none / -2 on dispatch error.
 int64_t keryx_llama_pom_mine(KeryxLlama* h, const uint64_t p[4], const uint64_t t[4],
-                             uint64_t timestamp, uint64_t start_nonce, uint32_t batch, uint32_t k) {
+                             uint64_t timestamp, uint64_t start_nonce, uint32_t batch, uint32_t k,
+                             uint32_t walk_v2) {
     if (!h || !h->walk_ready || batch == 0) return -2;
     std::lock_guard<std::mutex> g(h->walk_lock);
     PushWalk pw{};
@@ -535,6 +536,7 @@ int64_t keryx_llama_pom_mine(KeryxLlama* h, const uint64_t p[4], const uint64_t 
     pw.k = k;
     pw.batch = batch;
     pw.n_tensors = h->n_tensors;
+    pw.walk_v2 = walk_v2;   // H5: select the non-foldable mix64-chain transition in the shader
     uint32_t groups = (batch + 63) / 64;
     if (!run_dispatch(h, h->walk_pipe, h->walk_pl, h->walk_ds, &pw, sizeof(pw), groups, h->winner_buf)) return -2;
     uint32_t w;

@@ -68,7 +68,8 @@ __kernel void pom_mine(
     const u64 time_,
     const u64 t0, const u64 t1, const u64 t2, const u64 t3,   // target as 4 LE u64
     const u64 nonce_base, const u64 n_nonces,
-    volatile __global u64* winner)
+    volatile __global u64* winner,
+    const uint walk_v2)   // H5 era flag: 0 = frozen v1 fold, 1 = non-foldable mix64-chain
 {
     u64 tid = get_global_id(0);
     if (tid >= n_nonces) return;
@@ -78,8 +79,22 @@ __kernel void pom_mine(
     u64 off = state % n_total_chunks;
     for (uint i = 0; i < K; i++) {
         u64 base = off * 4UL;
-        u64 h = state ^ weights[base] ^ weights[base + 1] ^ weights[base + 2] ^ weights[base + 3];
-        state = pom_mix64(h);
+        u64 w0 = weights[base], w1 = weights[base + 1], w2 = weights[base + 2], w3 = weights[base + 3];
+        if (walk_v2) {
+            // H5 non-foldable walk (at/after H5_ACTIVATION_DAA): chain mix64 through each of the 4
+            // chunk words (w0..w3) so all 32 bytes are load-bearing and order-dependent — byte-exact
+            // with pom.rs transition_v2 and pom_mine.cu. walk_v2 is uniform across work-items -> no
+            // divergence.
+            u64 h = pom_mix64(state ^ w0);
+            h = pom_mix64(h ^ w1);
+            h = pom_mix64(h ^ w2);
+            h = pom_mix64(h ^ w3);
+            state = h;
+        } else {
+            // Pre-H5 fold (frozen — validates every block below H5_ACTIVATION_DAA).
+            u64 h = state ^ w0 ^ w1 ^ w2 ^ w3;
+            state = pom_mix64(h);
+        }
         off = state % n_total_chunks;
     }
 
