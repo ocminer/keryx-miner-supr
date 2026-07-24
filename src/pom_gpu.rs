@@ -349,20 +349,21 @@ impl PomGpuMiner {
     /// is `<= target_le`, or None. `target_le` is the header's compact target as 32 LE bytes.
     /// `h3` salts the pph words host-side (`POM_H3_PPH_SALT`) — the PTX kernel is era-agnostic,
     /// it folds whatever words it receives, so there is no kernel change at the H3 gate.
-    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool) -> candle_core::Result<Option<u64>> {
+    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool) -> candle_core::Result<Option<u64>> {
         let p = crate::pom::pph_words_for_era(pre_pow_hash, h3);
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
         let grid = ((batch + 255) / 256) as u32;
         let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let wv2: u32 = walk_v2 as u32; // H5 era flag -> kernel `unsigned int walk_v2`
 
         let func = load_walk_func(&self.cuda)?; // cached
         let mut b = func.builder();
         b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&self.n_total_chunks).arg(&k)
             .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3]).arg(&timestamp)
             .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
-            .arg(&start).arg(&batch).arg(&winner);
+            .arg(&start).arg(&batch).arg(&winner).arg(&wv2);
         unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
         self.stream.synchronize().map_err(candle_core::Error::wrap)?;
 
@@ -446,12 +447,12 @@ pub fn is_loading() -> bool {
 }
 
 /// Convenience: search a nonce batch via the installed miner for a specific device.
-pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool) -> Option<u64> {
+pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool) -> Option<u64> {
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
-    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3).ok().flatten()
+    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2).ok().flatten()
 }
 
 /// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup.
