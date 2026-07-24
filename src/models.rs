@@ -76,6 +76,28 @@ pub const EXAONE_4_0_1_2B: ModelSpec = ModelSpec {
     min_vram_mb: 0,
 };
 
+/// H5 tier-0 model — Qwen3-8B-abliterated Q4_K_S. Active from `crate::pom::h5_activation_daa()`,
+/// it replaces EXAONE at tier 0 and raises the tier-0 VRAM floor to ~6 GB (closing the "any 2 GB
+/// card mines tier 0" gap that the fold exploit leaned on). `model_id` = CIDv0[2..34] of the pinned
+/// GGUF; `weight_cids` points at the same GGUF the node's `POM_TIERS_H5[0]` R_T was built over, so
+/// the miner's runtime R_T matches. Ported verbatim from upstream keryx-miner v0.3.8-OPoI.
+pub const QWEN3_8B_ABLITERATED: ModelSpec = ModelSpec {
+    name: "qwen3-8b-abliterated",
+    model_id: [
+        0xd4, 0x2f, 0xa6, 0xee, 0x00, 0xe0, 0x7d, 0x49,
+        0xb0, 0x46, 0x09, 0x0a, 0x56, 0xaf, 0x0e, 0x7b,
+        0xd6, 0x10, 0x25, 0x93, 0x7c, 0x50, 0x2e, 0x2c,
+        0x57, 0x4a, 0x72, 0x87, 0x4c, 0x35, 0x0d, 0x24,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "QmcuGkJvR343ry3b4jy7u5L9ior3ujas3yGAFMSyZdACb5",
+    config_cid: "",
+    weight_cids: &["QmccwHVeZYVzEq6A5ofk76MxrnwzMnSjAVt9PaUQ7zfLXm"],
+    dir_name: "Qwen3-8B-abliterated",
+    // ~4.6 GB Q4_K_S weights + ~1.2 GB KV/workspace → fits a 6 GB card (measured 5,409 MiB @ ctx 4096).
+    min_vram_mb: 6_000,
+};
+
 pub const MISTRAL_7B_V03: ModelSpec = ModelSpec {
     name: "mistral-7b-v0.3",
     model_id: [
@@ -260,8 +282,9 @@ pub const LLAMA_3_3_70B_Q2: ModelSpec = ModelSpec {
 /// used at startup to pick a mineable PoM model before any block DAA is known (the tier *index*
 /// is then computed per block via `pom_tier_index`).
 pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
-    // H4 lineup
-    *model_id == EXAONE_4_0_1_2B.model_id
+    // H4/H5 lineup
+    *model_id == QWEN3_8B_ABLITERATED.model_id
+        || *model_id == EXAONE_4_0_1_2B.model_id
         || *model_id == MISTRAL_7B_V03.model_id
         || *model_id == GLM_4_9B_0414.model_id
         || *model_id == QWEN3_6_27B.model_id
@@ -283,9 +306,14 @@ pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
 pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     if daa >= crate::pom::h4_activation_daa() {
         // H4 lineup (upstream keryx-miner v0.3.7): the OLD models are no longer valid at/after H4.
-        // MUST mirror the node's POM_TIERS_H4 order, recomputed per block from that block's DAA.
-        return if *model_id == EXAONE_4_0_1_2B.model_id {
-            Some(0)
+        // MUST mirror the node's POM_TIERS_H4/H5 order, recomputed per block from that block's DAA.
+        // H5 (upstream v0.3.8): tier 0 EXAONE → Qwen3-8B at `h5_activation_daa()`. Both are gated to
+        // their era so a block's tier-0 model matches the node's active tier table (a wrong R_T →
+        // rejected block): EXAONE valid only in [H4, H5), Qwen3-8B valid only at/after H5.
+        return if *model_id == QWEN3_8B_ABLITERATED.model_id {
+            if daa >= crate::pom::h5_activation_daa() { Some(0) } else { None }
+        } else if *model_id == EXAONE_4_0_1_2B.model_id {
+            if daa < crate::pom::h5_activation_daa() { Some(0) } else { None }
         } else if *model_id == MISTRAL_7B_V03.model_id {
             Some(1)
         } else if *model_id == GLM_4_9B_0414.model_id {
@@ -495,8 +523,12 @@ pub fn auto_select_tier(vram_mb: u64, headroom_mb: u64) -> (Tier, u64) {
 /// so miners can upgrade before the hardfork without a flag-day restart.
 pub fn specs_for(daa: u64, tier: Tier) -> &'static [&'static ModelSpec] {
     if daa >= crate::pom::h4_activation_daa() {
-        // H4 lineup (upstream keryx-miner v0.3.7): one model per hardware tier, llama.cpp-served.
+        // H4/H5 lineup (upstream keryx-miner v0.3.7/v0.3.8): one model per hardware tier,
+        // llama.cpp-served. H5 swaps tier-0 EXAONE → Qwen3-8B at `h5_activation_daa()`; the swap is
+        // daa-gated here so a card started in the [H4, H5) window prefetches+mines EXAONE (no idle)
+        // and a card started at/after H5 (or restarted at the crossing) mines Qwen3-8B.
         return match tier {
+            Tier::VeryLight if daa >= crate::pom::h5_activation_daa() => &[&QWEN3_8B_ABLITERATED],
             Tier::VeryLight => &[&EXAONE_4_0_1_2B],
             Tier::Light => &[&MISTRAL_7B_V03],
             Tier::Default => &[&GLM_4_9B_0414],
@@ -535,7 +567,8 @@ pub fn specs_for(daa: u64, tier: Tier) -> &'static [&'static ModelSpec] {
 
 /// Both lineups combined — resolves a model name/id regardless of era.
 pub const REGISTRY: &[&ModelSpec] = &[
-    // H4 lineup
+    // H4/H5 lineup
+    &QWEN3_8B_ABLITERATED,
     &EXAONE_4_0_1_2B,
     &MISTRAL_7B_V03,
     &GLM_4_9B_0414,

@@ -135,7 +135,6 @@ pub fn seed_state(pow_seed: u64) -> u64 {
     mix64(pow_seed ^ SEED_SALT)
 }
 
-#[inline]
 /// Pre-H5 possession transition (FROZEN — produces all blocks below `H5_ACTIVATION_DAA`). The 4
 /// chunk words are XOR-folded into one accumulator before a single `mix64`, so only their XOR
 /// (8 bytes) is load-bearing. Kept verbatim for historical parity with the node's `transition_v1`.
@@ -1294,9 +1293,23 @@ pub const COIN_AGE_VERIFICATION_ACTIVATION_DAA: u64 = 54_766_000;
 /// XOR-fold (`transition_v1`) to the non-foldable mix64-chained `transition_v2`, both on the GPU
 /// kernel (`pom_mine.cu`, `walk_v2` param) and the CPU walk/proof path — closing the pre-H5 fold
 /// shortcut. MUST equal the node's `MAINNET_PARAMS.h5_activation` (= node `H5_ACTIVATION_DAA`),
-/// node↔miner lockstep exactly like `COIN_AGE_VERIFICATION_ACTIVATION_DAA`. `u64::MAX` = dormant
-/// until H5 is scheduled; set the real DAA at release. Testnet builds: 3_000.
-pub const H5_ACTIVATION_DAA: u64 = u64::MAX;
+/// node↔miner lockstep exactly like `COIN_AGE_VERIFICATION_ACTIVATION_DAA`. Mainnet: 59_009_037
+/// (upstream keryx-miner v0.3.8-OPoI / keryx-node v1.3.4+, the H5 relaunch tip with a difficulty
+/// reset). Pair with node v1.3.4+.
+pub const H5_ACTIVATION_DAA: u64 = 59_009_037;
+
+/// Effective H5 activation DAA. Overridable via `KERYX_H5_ACTIVATION_DAA` for STAGING / crossing
+/// tests only (e.g. set it just above the current tip to exercise the walk_v2 + Qwen3-8B tier-0
+/// crossing before mainnet reaches 59_009_037). Read once. Production (unset) = the const above.
+pub fn h5_activation_daa() -> u64 {
+    *H5_ACTIVATION_DAA_CELL.get_or_init(|| {
+        std::env::var("KERYX_H5_ACTIVATION_DAA")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(H5_ACTIVATION_DAA)
+    })
+}
+static H5_ACTIVATION_DAA_CELL: OnceLock<u64> = OnceLock::new();
 
 /// Effective H4 activation DAA. Overridable via `KERYX_H4_ACTIVATION_DAA` for STAGING / pre-gate
 /// testing only (e.g. set to 0 to force H4 proof v2 + lineup on regardless of daa_score). Read once.
