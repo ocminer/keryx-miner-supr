@@ -388,6 +388,9 @@ impl MinerManager {
                         // the block's daa_score, so a running miner flips at the gate with no restart.
                         // The kernel (CUDA/Metal) is unchanged — the host salts the words it uploads.
                         let h3 = keryx_miner::pom::h3_active(daa);
+                        // H5 era: non-foldable mix64-chained walk at/after the gate (must match the
+                        // host proof rebuild in pow::generate_block_if_pom). Dormant until scheduled.
+                        let walk_v2 = daa >= keryx_miner::pom::H5_ACTIVATION_DAA;
                         // NVIDIA (CUDA) + Apple Silicon (Metal): per-device PoM. Each GPU thread
                         // builds + walks its OWN device's blob (per-device MINERS map) so no-flag
                         // multi-GPU works without CUDA_VISIBLE_DEVICES. Device id = the worker's
@@ -417,7 +420,7 @@ impl MinerManager {
                                 }
                                 pom_driver::ensure_installed(wdid, daa);
                             }
-                            pom_driver::mine(wdid, &pph, time, &target_le, pom_nonce, POM_BATCH, h3)
+                            pom_driver::mine(wdid, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2)
                         };
                         // AMD: the thread is already bound to its card (bind_thread_device), so the
                         // deviceless OpenCL API is per-GPU via thread-local binding.
