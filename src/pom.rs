@@ -1873,7 +1873,7 @@ mod tests {
         let mut base = 0u64;
         let mut found = None;
         for _ in 0..512 {
-            if let Some(n) = crate::llama_engine_vk::pom_mine(p, time, t, base, 1 << 16, false) {
+            if let Some(n) = crate::llama_engine_vk::pom_mine(p, p, time, t, base, 1 << 16, false) {
                 found = Some(n);
                 break;
             }
@@ -1919,7 +1919,7 @@ mod tests {
         let mut base = 0u64;
         let mut nonce = None;
         for _ in 0..2048 {
-            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, true) { nonce = Some(n); break; }
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, true, false) { nonce = Some(n); break; }
             base = base.wrapping_add(1 << 16);
         }
         let nonce = nonce.expect("opencl walk_v2 found no winner");
@@ -1952,7 +1952,7 @@ mod tests {
         let mut base = 0u64;
         let mut nonce = None;
         for _ in 0..2048 {
-            if let Some(n) = crate::llama_engine_vk::pom_mine(p, time, t, base, 1 << 16, true) { nonce = Some(n); break; }
+            if let Some(n) = crate::llama_engine_vk::pom_mine(p, p, time, t, base, 1 << 16, true) { nonce = Some(n); break; }
             base = base.wrapping_add(1 << 16);
         }
         let nonce = nonce.expect("vk walk_v2 found no winner");
@@ -1961,6 +1961,80 @@ mod tests {
         assert!(le_leq(&pom_pow_value(fs, &pph, false), &target), "vk shader walk_v2 disagrees with CPU transition_v2 (nonce {nonce})");
         assert_ne!(nonce, 9559, "walk_v2 winner must differ from the v1 winner");
         eprintln!("zero-dup Vulkan walk_v2 nonce {nonce} confirmed by CPU transition_v2 ✅");
+    }
+
+    /// H5.1 on-hardware correctness: mining with h5_1=1 (realistic H5.1 = walk_v2=1 too) must find a
+    /// nonce whose SEED derives from the H5.1-salted pph words — the CPU `pom_block_seed(.., h5_1=true)`
+    /// + v2 walk independently confirms it passes target. Proves both GPU backends thread the seed
+    /// words s0..s3 correctly. The H5.1 winner MUST differ from the h5_1=false v2 winner (1053), since
+    /// a different seed = a different walk trajectory. OpenCL blob leg.
+    #[test]
+    #[ignore]
+    #[cfg(all(feature = "pom-opencl", unix))]
+    fn gpu_h5_1_seed_opencl_matches_cpu() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let pph = blake(b"gpu-real-e2e");
+        let time = 1_700_000_000u64;
+        let mut target = [0xffu8; 32];
+        target[24..32].copy_from_slice(&0x0010_0000_0000_0000u64.to_le_bytes());
+        // CPU oracle: nonce n under (walk_v2, h5_1) — seed uses h5_1-salted words, walk uses v2.
+        let cpu_passes = |n: u64, walk_v2: bool, h5_1: bool| {
+            let seed = pom_block_seed(&pph, time, n, false, h5_1);
+            let fs = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o), walk_v2);
+            le_leq(&pom_pow_value(fs, &pph, false), &target)
+        };
+        let devs = opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU).expect("cl devices");
+        crate::pom_opencl::bind_thread_device(devs[0] as usize);
+        crate::pom_opencl::set_mining_tier(path, 1);
+        crate::pom_opencl::ensure_installed();
+        let mut base = 0u64;
+        let mut nonce = None;
+        for _ in 0..2048 {
+            // realistic H5.1: walk_v2=true, h5_1=true
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, true, true) { nonce = Some(n); break; }
+            base = base.wrapping_add(1 << 16);
+        }
+        let nonce = nonce.expect("opencl h5_1 walk found no winner");
+        assert!(cpu_passes(nonce, true, true), "OpenCL h5_1 seed words disagree with CPU pom_block_seed(h5_1) (nonce {nonce})");
+        assert_ne!(nonce, 1053, "H5.1 winner must differ from the h5_1=false v2 winner (1053) — the salt changes the seed");
+        assert!(!cpu_passes(nonce, true, false), "the H5.1 winner must NOT pass under the pre-H5.1 seed (forced-update lever)");
+        eprintln!("OpenCL H5.1 seed nonce {nonce} confirmed by CPU pom_block_seed(h5_1) ✅ (differs from the pre-H5.1 v2 winner 1053)");
+    }
+
+    /// H5.1 seed correctness for the ZERO-DUP Vulkan shader (s0..s3 push-constants). Same oracle as
+    /// gpu_h5_1_seed_opencl_matches_cpu, through pom_walk_vk.comp. Needs KERYX_LLAMA_VK_SO + a Vulkan GPU.
+    #[test]
+    #[ignore]
+    #[cfg(all(feature = "pom-opencl", unix))]
+    fn gpu_h5_1_seed_llama_vk_matches_cpu() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        assert!(crate::llama_engine_vk::ensure_loaded(&path, gpu), "engine load failed (.so present? vk_abi 5?)");
+        assert!(crate::llama_engine_vk::pom_ready(), "engine walk not ready");
+        assert!(crate::llama_engine_vk::pom_byte_gate(&idx), "byte gate must pass before mining");
+        let pph = blake(b"gpu-real-e2e");
+        let time = 1_700_000_000u64;
+        let mut target = [0xffu8; 32];
+        target[24..32].copy_from_slice(&0x0010_0000_0000_0000u64.to_le_bytes());
+        // POW words (p) and SEED words (s, H5.1-salted) — the host split the miner does at H5.1.
+        let p = pph_words_for_era(&pph, false);
+        let s = seed_pph_words_for_era(&pph, false, true);
+        let mut t = [0u64; 4];
+        for (i, w) in t.iter_mut().enumerate() { *w = u64::from_le_bytes(target[i * 8..i * 8 + 8].try_into().unwrap()); }
+        let mut base = 0u64;
+        let mut nonce = None;
+        for _ in 0..2048 {
+            if let Some(n) = crate::llama_engine_vk::pom_mine(p, s, time, t, base, 1 << 16, true) { nonce = Some(n); break; }
+            base = base.wrapping_add(1 << 16);
+        }
+        let nonce = nonce.expect("vk h5_1 walk found no winner");
+        let seed = pom_block_seed(&pph, time, nonce, false, true);
+        let fs = walk_final(seed, idx.n_chunks, POM_WALK_STEPS, |o| idx.read_chunk(o), true);
+        assert!(le_leq(&pom_pow_value(fs, &pph, false), &target), "vk shader H5.1 seed disagrees with CPU (nonce {nonce})");
+        assert_ne!(nonce, 1053, "H5.1 winner must differ from the h5_1=false v2 winner (1053)");
+        eprintln!("zero-dup Vulkan H5.1 seed nonce {nonce} confirmed by CPU pom_block_seed(h5_1) ✅");
     }
 
     /// Wall-clock throughput bench for the OPENCL blob walk on a chosen card — the apples-to-
@@ -1982,11 +2056,11 @@ mod tests {
         let pph = blake(b"bench-llama-vk");
         let target = [0u8; 32]; // impossible target -> full grind
         let batch: u64 = 1 << 21;
-        let _ = crate::pom_opencl::mine(&pph, 1_700_000_000, &target, 0, batch, false, false); // warmup
+        let _ = crate::pom_opencl::mine(&pph, 1_700_000_000, &target, 0, batch, false, false, false); // warmup
         let start = std::time::Instant::now();
         let rounds: u64 = 8;
         for i in 0..rounds {
-            let _ = crate::pom_opencl::mine(&pph, 1_700_000_000, &target, i * batch, batch, false, false);
+            let _ = crate::pom_opencl::mine(&pph, 1_700_000_000, &target, i * batch, batch, false, false, false);
         }
         let secs = start.elapsed().as_secs_f64();
         eprintln!(
@@ -2012,11 +2086,11 @@ mod tests {
         let t = [0u64; 4]; // impossible target -> full grind, no early exit
         let batch: u64 = 1 << 21;
         // warmup
-        let _ = crate::llama_engine_vk::pom_mine(p, 1_700_000_000, t, 0, batch, false);
+        let _ = crate::llama_engine_vk::pom_mine(p, p, 1_700_000_000, t, 0, batch, false);
         let start = std::time::Instant::now();
         let rounds: u64 = 8;
         for i in 0..rounds {
-            let _ = crate::llama_engine_vk::pom_mine(p, 1_700_000_000, t, i * batch, batch, false);
+            let _ = crate::llama_engine_vk::pom_mine(p, p, 1_700_000_000, t, i * batch, batch, false);
         }
         let secs = start.elapsed().as_secs_f64();
         eprintln!(
@@ -2044,7 +2118,7 @@ mod tests {
         let mut base = 0u64;
         let mut found = None;
         for _ in 0..512 {
-            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, false) {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, false, false) {
                 found = Some(n);
                 break;
             }
@@ -2178,7 +2252,7 @@ mod tests {
         let mut base = 0u64;
         let mut found = None;
         for _ in 0..1024 {
-            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, false) {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, false, false) {
                 found = Some(n);
                 break;
             }
@@ -2257,7 +2331,7 @@ mod tests {
         let mut base = 0u64;
         let mut found = None;
         for _ in 0..2048 {
-            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, false) {
+            if let Some(n) = crate::pom_opencl::mine(&pph, time, &target, base, 1 << 16, false, false, false) {
                 found = Some(n);
                 break;
             }
