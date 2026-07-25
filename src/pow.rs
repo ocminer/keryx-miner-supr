@@ -184,8 +184,8 @@ impl State {
                 pph.copy_from_slice(&self.pow_hash_header[0..32]);
                 let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
                 let h3 = pom::h3_active(self.daa_score);
-                // Pre-fork kHeavyHash passthrough — never reaches H5.1 (H5.1 > H4 > PoM fork), h5_1=false.
-                let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3, false);
+                // Pre-fork kHeavyHash passthrough — never reaches H5.1/H5.2 (both > H4 > PoM fork).
+                let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3, false, false);
                 let proof = pom::build_proof(
                     *tier, &pph, nonce, seed, index.n_chunks, pom::POM_WALK_STEPS, pom::POM_OPENINGS,
                     |o| index.read_chunk(o), |o| index.merkle_path(o), h3,
@@ -225,7 +225,10 @@ impl State {
         // the gate (the pow fold stays H3-salted). MUST match the GPU search era (`pom_gpu::mine(..,
         // h5_1)`) or the CPU rebuild derives a different seed → wrong walk → node rejects the block.
         let h5_1 = self.daa_score >= pom::h5_1_activation_daa();
-        let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3, h5_1);
+        // H5.2 (chain anchoring, keryxd v1.4.0): H5.2-salted seed words at/after the gate. Same
+        // MUST-match-GPU-era rule as h5_1 (seed selection: h5_2 > h5_1 > h3 > base).
+        let h5_2 = self.daa_score >= pom::h5_2_activation_daa();
+        let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3, h5_1, h5_2);
         let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), walk_v2);
         if !pom::le_leq(&pom::pom_pow_value(final_state, &pph, h3), &self.target.to_le_bytes()) {
             return None;
