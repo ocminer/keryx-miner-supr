@@ -481,7 +481,9 @@ impl Tier {
     /// tier is the H4 one. MUST mirror `specs_for`'s H4 branch and the node's `POM_TIERS_H4`.
     pub fn pom_spec(self) -> &'static ModelSpec {
         match self {
-            Tier::VeryLight => &EXAONE_4_0_1_2B,
+            // H5 is live: tier-0 is Qwen3-8B (EXAONE retired). This daa-independent spec drives
+            // startup staging + auto_select_tier; `specs_for` keeps the daa-gated history.
+            Tier::VeryLight => &QWEN3_8B_ABLITERATED,
             Tier::Light => &MISTRAL_7B_V03,
             Tier::Default => &GLM_4_9B_0414,
             Tier::High => &QWEN3_6_27B,

@@ -677,7 +677,7 @@ mod tests {
     /// Byte-exact CPU oracle: reproduce the walk over the same blob using pom.rs primitives.
     /// Pre-H3 era (h3=false) to match the `mine(…, false)` call below.
     fn cpu_pow_value(bytes: &[u8], n_chunks: u64, pph: &[u8; 32], ts: u64, nonce: u64) -> [u8; 32] {
-        let seed = pom::pom_block_seed(pph, ts, nonce, false);
+        let seed = pom::pom_block_seed(pph, ts, nonce, false, false);
         let read = |off: u64| -> [u64; pom::CHUNK_WORDS] {
             let o = (off as usize) * CHUNK_BYTES;
             let mut c = [0u8; 32];
@@ -766,7 +766,7 @@ mod tests {
         let ts: u64 = 0x1122_3344_5566_7788;
         let test_nonces: &[u64] = &[0, 1, 42, 100_000, 12345678];
         for &nonce in test_nonces {
-            let seed = pom::pom_block_seed(&pph, ts, nonce, false);
+            let seed = pom::pom_block_seed(&pph, ts, nonce, false, false);
             let host_state = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
             let gpu_states = miner.debug_walk_states(&pph, ts, nonce, 8, false).expect("debug_walk_states");
             let gpu_state = gpu_states[0];
@@ -785,7 +785,7 @@ mod tests {
         let mut disagreements = 0usize;
         for i in 0..sweep_batch {
             let nonce = sweep_start + i;
-            let seed = pom::pom_block_seed(&pph, ts, nonce, false);
+            let seed = pom::pom_block_seed(&pph, ts, nonce, false, false);
             let host = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
             if host != sweep_gpu[i as usize] {
                 if disagreements < 5 {
@@ -803,11 +803,11 @@ mod tests {
         let winner_start: u64 = 500_000;
         let winner_batch: u64 = 8192;
         let n_star = winner_start + winner_batch / 3;
-        let seed_star = pom::pom_block_seed(&pph, ts, n_star, false);
+        let seed_star = pom::pom_block_seed(&pph, ts, n_star, false, false);
         let final_star = pom::walk_final(seed_star, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
         let target = pom::pom_pow_value(final_star, &pph, false);
         let expected = (winner_start..winner_start + winner_batch).find(|&nn| {
-            let s = pom::pom_block_seed(&pph, ts, nn, false);
+            let s = pom::pom_block_seed(&pph, ts, nn, false, false);
             let fs = pom::walk_final(s, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
             pom::le_leq(&pom::pom_pow_value(fs, &pph, false), &target)
         });
@@ -822,7 +822,7 @@ mod tests {
         let mut h3_disagreements = 0usize;
         for i in 0..h3_sweep {
             let nonce = sweep_start + i;
-            let seed = pom::pom_block_seed(&pph, ts, nonce, true);
+            let seed = pom::pom_block_seed(&pph, ts, nonce, true, false);
             let host = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
             if host != h3_gpu[i as usize] {
                 if h3_disagreements < 5 {
@@ -834,11 +834,11 @@ mod tests {
         eprintln!("H3 batch: {h3_disagreements}/{h3_sweep} disagreements");
         assert_eq!(h3_disagreements, 0, "H3 kernel walk diverges");
 
-        let h3_seed = pom::pom_block_seed(&pph, ts, n_star, true);
+        let h3_seed = pom::pom_block_seed(&pph, ts, n_star, true, false);
         let h3_final = pom::walk_final(h3_seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
         let h3_target = pom::pom_pow_value(h3_final, &pph, true);
         let h3_expected = (winner_start..winner_start + winner_batch).find(|&nn| {
-            let s = pom::pom_block_seed(&pph, ts, nn, true);
+            let s = pom::pom_block_seed(&pph, ts, nn, true, false);
             let fs = pom::walk_final(s, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
             pom::le_leq(&pom::pom_pow_value(fs, &pph, true), &h3_target)
         });
@@ -898,7 +898,7 @@ mod tests {
 
         // Same batch under h3=true — proves the pph-salt plumbing is byte-exact for both eras.
         let target_h3 = {
-            let seed = pom::pom_block_seed(&pph, ts, n_star, true);
+            let seed = pom::pom_block_seed(&pph, ts, n_star, true, false);
             let read = |off: u64| -> [u64; pom::CHUNK_WORDS] {
                 let o = (off as usize) * CHUNK_BYTES;
                 let mut c = [0u8; 32];
@@ -909,7 +909,7 @@ mod tests {
             pom::pom_pow_value(final_state, &pph, true)
         };
         let expected_h3 = (start..start + batch).find(|&n| {
-            let seed = pom::pom_block_seed(&pph, ts, n, true);
+            let seed = pom::pom_block_seed(&pph, ts, n, true, false);
             let read = |off: u64| -> [u64; pom::CHUNK_WORDS] {
                 let o = (off as usize) * CHUNK_BYTES;
                 let mut c = [0u8; 32];

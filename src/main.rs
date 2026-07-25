@@ -924,7 +924,10 @@ async fn run() -> Result<(), Error> {
     // --force-model contract: the forced model loads REGARDLESS of VRAM fit (power-user knob), so
     // the capability gate is skipped for it — otherwise filter_specs_by_vram silently drops the
     // forced spec and PoM never configures (the "--force-model ignored" bug class, issue #7).
-    let specs_all = keryx_miner::models::specs_for(keryx_miner::pom::h4_activation_daa(), tier);
+    // Stage the CURRENT-era lineup: H5 is live, so resolve at the H5 gate (tier-0 = Qwen3-8B). Using
+    // the H4 gate here wrongly staged `--very-light` as the retired EXAONE (h4 < h5). Higher tiers are
+    // unchanged across H5, so h5 gives the same models for them.
+    let specs_all = keryx_miner::models::specs_for(keryx_miner::pom::h5_activation_daa(), tier);
     let specs_v2 = if tier_forced {
         info!("--force-model: VRAM capability gate skipped for the forced model — it will load regardless of fit (may OOM an undersized card).");
         specs_all
