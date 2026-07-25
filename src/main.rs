@@ -938,7 +938,7 @@ async fn run() -> Result<(), Error> {
     let pom_spec = specs_v2
         .iter()
         .copied()
-        .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id, keryx_miner::pom::h4_activation_daa()).is_some())
+        .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id, keryx_miner::pom::h5_activation_daa()).is_some())
         .max_by_key(|s| s.min_vram_mb);
     keryx_miner::slm::set_v2_lineup(specs_v2);
     keryx_miner::slm::init_supported(specs_v2);
@@ -981,7 +981,7 @@ async fn run() -> Result<(), Error> {
     // with zero-dup VRAM sharing.
     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
     if let Some(spec) = pom_spec {
-        let tier_idx = keryx_miner::models::pom_tier_index(&spec.model_id, keryx_miner::pom::h4_activation_daa()).expect("pom_spec has a tier");
+        let tier_idx = keryx_miner::models::pom_tier_index(&spec.model_id, keryx_miner::pom::h5_activation_daa()).expect("pom_spec has a tier");
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         // PoM PASSTHROUGH live test (KERYX_POM_PASSTHROUGH): build the HOST possession index in the
         // background so kHeavyHash shares can carry a PomProof (daemon stores it pre-fork). Heavy
