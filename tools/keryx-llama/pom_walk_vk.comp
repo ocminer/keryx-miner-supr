@@ -35,7 +35,8 @@ layout(std430, binding = 2) readonly buffer Addrs {
 } ADDRS;
 
 layout(push_constant) uniform Push {
-    uint64_t p0, p1, p2, p3;   // pre_pow_hash as 4 LE u64 (caller pre-salts for the H3 era)
+    uint64_t p0, p1, p2, p3;   // POW-fold pph words (H3-salted), 4 LE u64
+    uint64_t s0, s1, s2, s3;   // SEED-fold pph words (H5.1-salted at/after gate; == p pre-H5.1)
     uint64_t t0, t1, t2, t3;   // target (256-bit LE) as 4 u64
     uint64_t timestamp;
     uint64_t n_chunks;
@@ -94,13 +95,15 @@ void main() {
     }
     uint64_t nonce = pc.start_nonce + uint64_t(idx);
 
-    // pom_block_seed (pom.rs): mix64 fold of (nonce, timestamp, pph words).
+    // pom_block_seed (pom.rs): mix64 fold of (nonce, timestamp, SEED words). H5.1 swaps the seed
+    // words to the H5.1-salted set (s); the pow fold below keeps the H3-salted words (p). Pre-H5.1
+    // the host passes s == p, byte-identical to the H5 build.
     uint64_t state = mix64(nonce ^ 0x4B65727978531UL);
     state = mix64(state ^ pc.timestamp);
-    state = mix64(state ^ pc.p0);
-    state = mix64(state ^ pc.p1);
-    state = mix64(state ^ pc.p2);
-    state = mix64(state ^ pc.p3);
+    state = mix64(state ^ pc.s0);
+    state = mix64(state ^ pc.s1);
+    state = mix64(state ^ pc.s2);
+    state = mix64(state ^ pc.s3);
 
     // walk_final: K data-dependent reads, off = state % n_chunks.
     uint64_t off = state % pc.n_chunks;

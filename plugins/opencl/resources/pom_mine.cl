@@ -64,7 +64,8 @@ __kernel void pom_mine(
     __global const u64* restrict weights,
     const u64 n_total_chunks,
     const uint K,
-    const u64 p0, const u64 p1, const u64 p2, const u64 p3,   // pre_pow_hash as 4 LE u64
+    const u64 p0, const u64 p1, const u64 p2, const u64 p3,   // POW-fold pph words (H3-salted), 4 LE u64
+    const u64 s0, const u64 s1, const u64 s2, const u64 s3,   // SEED-fold pph words (H5.1-salted at/after gate)
     const u64 time_,
     const u64 t0, const u64 t1, const u64 t2, const u64 t3,   // target as 4 LE u64
     const u64 nonce_base, const u64 n_nonces,
@@ -75,7 +76,9 @@ __kernel void pom_mine(
     if (tid >= n_nonces) return;
     u64 nonce = nonce_base + tid;
 
-    u64 state = pom_seed_fold(nonce, time_, p0, p1, p2, p3);
+    // H5.1: the SEED fold reads the (host-salted) seed words s0..s3; the pow fold below keeps p0..p3.
+    // Pre-H5.1 the host passes s == p, so this is byte-identical to the H5 build.
+    u64 state = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
     u64 off = state % n_total_chunks;
     for (uint i = 0; i < K; i++) {
         u64 base = off * 4UL;

@@ -44,7 +44,8 @@ static constexpr uint64_t CHUNK_BYTES = 32;
 static constexpr uint32_t NO_WINNER = 0xFFFFFFFFu;
 
 struct PushWalk {
-    uint64_t p[4];
+    uint64_t p[4];   // POW-fold pph words (H3-salted)
+    uint64_t s[4];   // SEED-fold pph words (H5.1-salted at/after gate; == p pre-H5.1)
     uint64_t t[4];
     uint64_t timestamp;
     uint64_t n_chunks;
@@ -429,7 +430,7 @@ extern "C" {
 
 // Core ABI (load/generate/free) matches the CUDA flavor; the _vk_abi covers the walk exports.
 int keryx_llama_abi() { return 2; }
-int keryx_llama_vk_abi() { return 4; } // 3->4 at H5: keryx_llama_pom_mine gained the walk_v2 param
+int keryx_llama_vk_abi() { return 5; } // 4->5 at H5.1: keryx_llama_pom_mine gained the seed-words arg
 
 // PCI location of the GPU hosting the model (VK_EXT_pci_bus_info) — lets the OpenCL driver map
 // this engine to its cl_device_id (CL_DEVICE_TOPOLOGY_AMD) so THAT card skips its own blob and
@@ -522,13 +523,14 @@ bool keryx_llama_pom_fetch(KeryxLlama* h, uint64_t off, uint8_t out[32]) {
 // Grind ONE dispatch of `batch` nonces from `start_nonce` (the caller sub-batches for TDR safety
 // and lowest-nonce early exit, exactly like the OpenCL driver). Returns the lowest winning
 // in-dispatch offset, or -1 for none / -2 on dispatch error.
-int64_t keryx_llama_pom_mine(KeryxLlama* h, const uint64_t p[4], const uint64_t t[4],
+int64_t keryx_llama_pom_mine(KeryxLlama* h, const uint64_t p[4], const uint64_t s[4], const uint64_t t[4],
                              uint64_t timestamp, uint64_t start_nonce, uint32_t batch, uint32_t k,
                              uint32_t walk_v2) {
     if (!h || !h->walk_ready || batch == 0) return -2;
     std::lock_guard<std::mutex> g(h->walk_lock);
     PushWalk pw{};
     memcpy(pw.p, p, 32);
+    memcpy(pw.s, s, 32);   // H5.1: separate SEED words (== p pre-H5.1)
     memcpy(pw.t, t, 32);
     pw.timestamp = timestamp;
     pw.n_chunks = h->n_chunks;
