@@ -349,11 +349,11 @@ impl PomGpuMiner {
     /// is `<= target_le`, or None. `target_le` is the header's compact target as 32 LE bytes.
     /// `h3` salts the pph words host-side (`POM_H3_PPH_SALT`) — the PTX kernel is era-agnostic,
     /// it folds whatever words it receives, so there is no kernel change at the H3 gate.
-    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool) -> candle_core::Result<Option<u64>> {
-        // POW fold words (H3-salted). SEED fold words swap to the H5.1 salt at/after the gate
-        // (`h5_1`); pre-H5.1 s == p, keeping the kernel byte-identical to the H5 build.
+    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool) -> candle_core::Result<Option<u64>> {
+        // POW fold words (H3-salted). SEED fold words swap to the H5.1/H5.2 salt at/after the
+        // gates; pre-H5.1 s == p, keeping the kernel byte-identical to the H5 build.
         let p = crate::pom::pph_words_for_era(pre_pow_hash, h3);
-        let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1);
+        let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
@@ -451,12 +451,12 @@ pub fn is_loading() -> bool {
 }
 
 /// Convenience: search a nonce batch via the installed miner for a specific device.
-pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool) -> Option<u64> {
+pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool) -> Option<u64> {
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
-    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1).ok().flatten()
+    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2).ok().flatten()
 }
 
 /// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup.

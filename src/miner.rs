@@ -394,6 +394,10 @@ impl MinerManager {
                         // H5.1 (emergency relaunch): swap the SEED pph words to the H5.1 salt at/after
                         // the gate (pow words stay H3). Host-side per pom_gpu::mine; kernel-agnostic.
                         let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
+                        // H5.2 (chain anchoring, keryxd v1.4.0): swap the SEED pph words to the
+                        // H5.2 salt at/after the gate (pow words stay H3). Host-side per
+                        // pom_gpu::mine; kernel-agnostic. Selection: h5_2 > h5_1 > h3 > base.
+                        let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
                         // NVIDIA (CUDA) + Apple Silicon (Metal): per-device PoM. Each GPU thread
                         // builds + walks its OWN device's blob (per-device MINERS map) so no-flag
                         // multi-GPU works without CUDA_VISIBLE_DEVICES. Device id = the worker's
@@ -423,7 +427,7 @@ impl MinerManager {
                                 }
                                 pom_driver::ensure_installed(wdid, daa);
                             }
-                            pom_driver::mine(wdid, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1)
+                            pom_driver::mine(wdid, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1, h5_2)
                         };
                         // AMD: the thread is already bound to its card (bind_thread_device), so the
                         // deviceless OpenCL API is per-GPU via thread-local binding.
