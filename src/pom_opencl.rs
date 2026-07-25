@@ -395,17 +395,19 @@ pub fn ensure_installed() {
 /// Grind one batch of `batch` nonces from `nonce_base` on THIS thread's bound GPU. Returns the
 /// lowest nonce whose pom_pow_value <= target, or None. pph/target are the 32-byte LE forms.
 /// Per-card lock → the other GPUs' threads grind concurrently.
-pub fn mine(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool) -> Option<u64> {
+pub fn mine(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool) -> Option<u64> {
     let id = target_dev()?;
     // H3: salt the pph words host-side (POM_H3_PPH_SALT) — both walk backends fold whatever
     // words they receive, so no kernel/shader change at the gate.
     // H5 (walk_v2): the non-foldable mix64-chain transition IS a kernel/shader change — threaded
     // into BOTH backends (the OpenCL blob kernel `pom_mine.cl` and the zero-dup Vulkan walk shader).
-    // H5.1 (h5_1): the SEED fold swaps to the H5.1-salted pph words (`seed_pph_words_for_era`) while
-    // the POW fold keeps the H3-salted words — so both backends now take TWO word sets (pow `p` +
-    // seed `s`); pre-H5.1 s == p, byte-identical to the H5 build.
+    // H5.1/H5.2 (h5_1/h5_2): the SEED fold swaps to that era's salted pph words
+    // (`seed_pph_words_for_era` selects h5_2 > h5_1 > h3 > base) while the POW fold keeps the
+    // H3-salted words — both backends take TWO word sets (pow `p` + seed `s`). The GPU kernels are
+    // era-agnostic on the seed words: a new seed salt is a pure host-side change (like H3), so
+    // pom_mine.cl / pom_walk_vk.comp / the vk .so are UNCHANGED — only the words we upload differ.
     let p = crate::pom::pph_words_for_era(pph, h3);
-    let s = crate::pom::seed_pph_words_for_era(pph, h3, h5_1);
+    let s = crate::pom::seed_pph_words_for_era(pph, h3, h5_1, h5_2);
     let t = words(target_le);
     // Zero-dup card: grind over the llama-engine-resident weights (byte-gate-verified).
     if is_shared_dev(id) {
