@@ -42,6 +42,7 @@ __device__ __forceinline__ bool pom_le_leq(const unsigned long long a[4],
 extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsigned long long* prefix,
                                     unsigned int T, unsigned long long n_total_chunks, unsigned int K,
                                     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+                                    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
                                     unsigned long long time_,
                                     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
                                     unsigned long long nonce_base, unsigned long long n_nonces,
@@ -50,7 +51,9 @@ extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsig
     if (tid >= n_nonces) return;
     unsigned long long nonce = nonce_base + tid;
 
-    unsigned long long state = pom_seed_fold(nonce, time_, p0, p1, p2, p3);
+    // H5.1: the SEED fold reads the (host-salted) seed words s0..s3; the pow fold below keeps p0..p3.
+    // Pre-H5.1 the host passes s == p, so this stays byte-identical to the H5 build.
+    unsigned long long state = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
     unsigned long long off = state % n_total_chunks;
     for (unsigned int i = 0; i < K; i++) {
         unsigned int lo = 0, hi = T;
