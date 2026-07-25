@@ -250,13 +250,18 @@ pub const POM_H5_1_PPH_SALT: [u64; 4] = [0x0F86D1400D3F8664, 0xC296B67C7A7A6A5B,
 /// salt is XOR'd into the (already H3-salted) words; the pow fold keeps using `pph_words_for_era`.
 #[inline]
 pub fn seed_pph_words_for_era(pre_pow_hash: &[u8; 32], h3: bool, h5_1: bool) -> [u64; 4] {
-    let mut w = pph_words_for_era(pre_pow_hash, h3);
     if h5_1 {
+        // H5.1 seed words = RAW pph XOR the H5.1 salt ONLY. The H3 salt is NOT stacked here —
+        // node `pph_words_h5_1` = `pph_words` (raw) XOR POM_H5_1_PPH_SALT. H3 still salts the POW
+        // fold (`pom_pow_value` via `pph_words_for_era`), just not the seed at/after the H5.1 gate.
+        let mut w = pph_words(pre_pow_hash);
         for (wi, si) in w.iter_mut().zip(POM_H5_1_PPH_SALT.iter()) {
             *wi ^= si;
         }
+        w
+    } else {
+        pph_words_for_era(pre_pow_hash, h3)
     }
-    w
 }
 
 #[inline]
