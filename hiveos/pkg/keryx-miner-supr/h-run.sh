@@ -23,6 +23,14 @@ mkdir -p "$(dirname "$CUSTOM_LOG_BASENAME")"
 # are bundled in ./lib here. libcuda.so.1 comes from the installed NVIDIA driver.
 export LD_LIBRARY_PATH="$(pwd):$(pwd)/lib:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+# --hiveos keeps the 6-28 GB models in /hive/miners/custom/models (outside this
+# versioned miner dir) so they survive miner upgrades. Skip if the flight sheet's
+# extra args already carry --hiveos or an explicit --model-dir (which overrides).
+case " $CLI_ARGS " in
+  *" --hiveos "*|*" --model-dir "*|*" --model-dir="*) ;;
+  *) CLI_ARGS="$CLI_ARGS --hiveos" ;;
+esac
+
 echo "[keryx-miner-supr] launching: ./keryx-miner-supr $CLI_ARGS"
 # tee (not exec) so the log file exists for h-stats.sh.
 ./keryx-miner-supr $CLI_ARGS 2>&1 | tee "$CUSTOM_LOG_BASENAME.log"

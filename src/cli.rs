@@ -183,6 +183,56 @@ share), pre-staged models still load but downloads of missing models will fail. 
 Default: the 'models' folder next to the miner binary."
     )]
     pub model_dir: Option<String>,
+
+    #[clap(
+        long = "hiveos",
+        help = "HiveOS mode: keep models in /hive/miners/custom/models so they survive miner upgrades",
+        long_help = "HiveOS mode. Defaults the model directory to /hive/miners/custom/models — OUTSIDE the \
+versioned miner directory — so the 6-28 GB models survive miner upgrades (HiveOS extracts each new version \
+into a fresh folder, wiping a models/ kept next to the binary). The bundled h-run.sh passes this flag \
+automatically. An explicit --model-dir overrides it. If /hive/miners/custom/models cannot be created/used, \
+the miner warns and falls back to the default 'models' folder next to the binary (mining continues)."
+    )]
+    pub hiveos: bool,
+}
+
+/// The `--hiveos` default model store — outside the versioned miner dir, survives upgrades.
+const HIVEOS_MODEL_DIR: &str = "/hive/miners/custom/models";
+
+/// Validate a model-dir path and return the canonical directory: expand a leading `~/`, create the
+/// directory if missing, reject non-directories, canonicalize. Warns (does not fail) when the dir is
+/// not writable — pre-staged models still load there; only downloads of missing models would fail.
+fn resolve_model_dir(raw: &str) -> Result<std::path::PathBuf, Error> {
+    let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+        std::env::var("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(rest))
+            .map_err(|_| Error::from(format!("model dir '{}': cannot expand '~' (HOME not set)", raw)))?
+    } else {
+        std::path::PathBuf::from(raw)
+    };
+    if !expanded.exists() {
+        std::fs::create_dir_all(&expanded)
+            .map_err(|e| Error::from(format!("model dir '{}': cannot create directory: {}", raw, e)))?;
+    }
+    if !expanded.is_dir() {
+        return Err(format!("model dir '{}': exists but is not a directory", raw).into());
+    }
+    let dir = expanded
+        .canonicalize()
+        .map_err(|e| Error::from(format!("model dir '{}': cannot resolve path: {}", raw, e)))?;
+    let probe = dir.join(".keryx-writetest");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+        }
+        Err(e) => log::warn!(
+            "model dir '{}' is not writable ({}) — pre-staged models will load, but downloads of missing models will FAIL. \
+             Fix permissions if the miner needs to download.",
+            dir.display(),
+            e
+        ),
+    }
+    Ok(dir)
 }
 
 impl Opt {
@@ -193,37 +243,27 @@ impl Opt {
         if self.mining_address.is_none() {
             return Err("--mining-address is required".into());
         }
-        // --model-dir: validate + install the override BEFORE any model staging/prefetch runs.
-        // Must be a usable directory: expand a leading `~/`, create it if missing, reject a
-        // non-directory path. A read-only dir (network share of pre-staged models) is allowed
-        // with a warning — lookups work, only downloads of missing models would fail.
+        // Model-dir resolution (BEFORE any model staging/prefetch runs). Precedence:
+        //   1. explicit --model-dir — hard error on an unusable path (the user asked for it);
+        //   2. --hiveos → /hive/miners/custom/models (survives miner upgrades) — falls back to
+        //      the default <exe>/models with a WARN if /hive is unusable (packaging default:
+        //      mining must not die on a box without the HiveOS layout).
         if let Some(raw) = &self.model_dir {
-            let expanded = if let Some(rest) = raw.strip_prefix("~/") {
-                std::env::var("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join(rest))
-                    .map_err(|_| Error::from("--model-dir: cannot expand '~' (HOME not set)"))?
-            } else {
-                std::path::PathBuf::from(raw)
-            };
-            if !expanded.exists() {
-                std::fs::create_dir_all(&expanded)
-                    .map_err(|e| Error::from(format!("--model-dir '{}': cannot create directory: {}", raw, e)))?;
-            }
-            if !expanded.is_dir() {
-                return Err(format!("--model-dir '{}': exists but is not a directory", raw).into());
-            }
-            let dir = expanded.canonicalize()
-                .map_err(|e| Error::from(format!("--model-dir '{}': cannot resolve path: {}", raw, e)))?;
-            let probe = dir.join(".keryx-writetest");
-            match std::fs::File::create(&probe) {
-                Ok(_) => { let _ = std::fs::remove_file(&probe); }
-                Err(e) => log::warn!(
-                    "--model-dir '{}' is not writable ({}) — pre-staged models will load, but downloads of missing models will FAIL. \
-                     Fix permissions if the miner needs to download.", dir.display(), e
-                ),
-            }
+            let dir = resolve_model_dir(raw)?;
             log::info!("model dir: {} (via --model-dir)", dir.display());
             keryx_miner::slm::set_model_dir(dir);
+        } else if self.hiveos {
+            match resolve_model_dir(HIVEOS_MODEL_DIR) {
+                Ok(dir) => {
+                    log::info!("model dir: {} (via --hiveos — models survive miner upgrades)", dir.display());
+                    keryx_miner::slm::set_model_dir(dir);
+                }
+                Err(e) => log::warn!(
+                    "--hiveos: {} — falling back to the 'models' folder next to the miner binary \
+                     (models will NOT survive miner upgrades).",
+                    e
+                ),
+            }
         }
         if self.keryxd_address.is_empty() {
             self.keryxd_address = "127.0.0.1".to_string();
