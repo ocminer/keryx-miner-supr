@@ -195,6 +195,14 @@ missing. A **read-only** share works for pre-staged models — the miner warns a
 missing models would fail. The possession-tree cache (`pom-tree.bin`) is stored per model in the same
 directory, so a shared store also skips the one-time index build on every rig after the first.
 
+**HiveOS**: the bundled `h-run.sh` passes `--hiveos`, which defaults the model directory to
+`/hive/miners/custom/models` — *outside* the versioned miner folder — so the 6-28 GB models **survive miner
+upgrades** instead of being re-downloaded after every update. An explicit `--model-dir` in the flight sheet's
+extra arguments overrides it; on a box without the HiveOS layout the flag falls back to the default with a
+warning. Existing rigs upgrade seamlessly: on the first run with v0.9.4+ the model is re-downloaded once into
+`/hive/miners/custom/models` (or copy it there yourself: `mkdir -p /hive/miners/custom/models && mv
+<old-miner-dir>/models/* /hive/miners/custom/models/`) and every later upgrade reuses it.
+
 ### Automatic per-card selection (default — recommended)
 
 With **no tier flag**, the miner runs in **AUTO** mode: it queries each GPU's VRAM independently and loads the
