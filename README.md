@@ -167,7 +167,7 @@ Current (post-**H4** hardfork, DAA 54,766,000) lineup:
 
 | Tier flag      | Model             | GPU VRAM |
 |----------------|-------------------|----------|
-| `--very-light` | EXAONE-4.0-1.2B   | any      |
+| `--very-light` | Qwen3-8B-abliterated | any   |
 | `--light`      | Mistral-7B-v0.3   | ≥ 8 GB   |
 | *(default)*    | GLM-4-9B-0414     | ≥ 12 GB  |
 | `--high`       | Qwen3.6-27B       | ≥ 24 GB  |
@@ -178,6 +178,22 @@ Qwen3-1.7B / Gemma-3-4B / Dolphin-Llama3-8B / Qwen3-32B / Llama-3.3-70B-Q2; thos
 longer mined.) The models carry a GGUF-embedded tokenizer, so only `model.gguf` is downloaded.
 
 You can also pin one with `--tier <auto|very-light|light|default|high|very-high>`.
+
+### Model directory (`--model-dir`)
+
+By default the miner looks for models in the `models/` folder **next to the miner binary** and downloads
+missing ones there. `--model-dir <DIR>` points both the lookup **and** the downloads somewhere else — e.g. a
+directory shared over the network so many rigs reuse ONE model store instead of each downloading 6-28 GB:
+
+```
+./keryx-miner-supr -a <wallet> -s stratum+tcp://pool:port --high --model-dir /mnt/share/keryx-models
+```
+
+Layout inside the directory is the usual `<DIR>/<Model-Name>/model.gguf` (exactly what the miner's own
+downloads create — you can seed it by copying an existing `models/` folder). The directory is created if
+missing. A **read-only** share works for pre-staged models — the miner warns at startup that downloads of
+missing models would fail. The possession-tree cache (`pom-tree.bin`) is stored per model in the same
+directory, so a shared store also skips the one-time index build on every rig after the first.
 
 ### Automatic per-card selection (default — recommended)
 

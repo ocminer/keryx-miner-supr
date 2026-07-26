@@ -171,6 +171,18 @@ If --threads is not given, it defaults to the number of physical CPU cores. Note
         long_help = "Mine even when keryxd says it is not synced, only useful when passing `--allow-submit-block-when-not-synced` to keryxd  [default: false]"
     )]
     pub mine_when_not_synced: bool,
+
+    #[clap(
+        long = "model-dir",
+        value_name = "DIR",
+        help = "Directory to look for AND download the OPoI models (default: 'models' next to the miner binary)",
+        long_help = "Directory holding the OPoI model folders (<DIR>/<Model-Name>/model.gguf). The miner LOOKS for \
+models here and also SAVES downloads here — point it at a shared/network directory to reuse one model store across \
+rigs (e.g. --model-dir /mnt/share/keryx-models). Created if missing. If the directory is not writable (read-only \
+share), pre-staged models still load but downloads of missing models will fail. \
+Default: the 'models' folder next to the miner binary."
+    )]
+    pub model_dir: Option<String>,
 }
 
 impl Opt {
@@ -180,6 +192,38 @@ impl Opt {
         }
         if self.mining_address.is_none() {
             return Err("--mining-address is required".into());
+        }
+        // --model-dir: validate + install the override BEFORE any model staging/prefetch runs.
+        // Must be a usable directory: expand a leading `~/`, create it if missing, reject a
+        // non-directory path. A read-only dir (network share of pre-staged models) is allowed
+        // with a warning — lookups work, only downloads of missing models would fail.
+        if let Some(raw) = &self.model_dir {
+            let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+                std::env::var("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(rest))
+                    .map_err(|_| Error::from("--model-dir: cannot expand '~' (HOME not set)"))?
+            } else {
+                std::path::PathBuf::from(raw)
+            };
+            if !expanded.exists() {
+                std::fs::create_dir_all(&expanded)
+                    .map_err(|e| Error::from(format!("--model-dir '{}': cannot create directory: {}", raw, e)))?;
+            }
+            if !expanded.is_dir() {
+                return Err(format!("--model-dir '{}': exists but is not a directory", raw).into());
+            }
+            let dir = expanded.canonicalize()
+                .map_err(|e| Error::from(format!("--model-dir '{}': cannot resolve path: {}", raw, e)))?;
+            let probe = dir.join(".keryx-writetest");
+            match std::fs::File::create(&probe) {
+                Ok(_) => { let _ = std::fs::remove_file(&probe); }
+                Err(e) => log::warn!(
+                    "--model-dir '{}' is not writable ({}) — pre-staged models will load, but downloads of missing models will FAIL. \
+                     Fix permissions if the miner needs to download.", dir.display(), e
+                ),
+            }
+            log::info!("model dir: {} (via --model-dir)", dir.display());
+            keryx_miner::slm::set_model_dir(dir);
         }
         if self.keryxd_address.is_empty() {
             self.keryxd_address = "127.0.0.1".to_string();
