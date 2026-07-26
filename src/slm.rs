@@ -131,7 +131,20 @@ unsafe impl Sync for SlmEngine {}
 
 // ── File management ──────────────────────────────────────────────────────────
 
+/// `--model-dir` override: when set, models are looked up AND downloaded under this directory
+/// instead of `<exe_dir>/models`. Set once at CLI-processing time (before any staging/prefetch).
+static MODEL_DIR_OVERRIDE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Install the `--model-dir` override (validated by the CLI). First call wins; must run before
+/// model staging/prefetch so every `model_dir()` lookup and download uses the same root.
+pub fn set_model_dir(dir: std::path::PathBuf) {
+    let _ = MODEL_DIR_OVERRIDE.set(dir);
+}
+
 fn model_dir(spec: &ModelSpec) -> std::path::PathBuf {
+    if let Some(root) = MODEL_DIR_OVERRIDE.get() {
+        return root.join(spec.dir_name);
+    }
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
