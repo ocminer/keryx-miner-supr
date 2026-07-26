@@ -79,6 +79,15 @@ else
 fi
 # ---------------------------------------------------------------------------
 
+# --hiveos keeps the 4-28 GB models in /hive/miners/custom/models (OUTSIDE this versioned miner
+# dir, which HiveOS wipes on every upgrade → forced multi-GB re-download). The binary defaults the
+# model dir there and falls back to <exe>/models if /hive is unusable. Skip if the flight-sheet
+# extra args already carry --hiveos or an explicit --model-dir (which overrides).
+case " $CLI_ARGS " in
+  *" --hiveos "*|*" --model-dir "*|*" --model-dir="*) ;;
+  *) CLI_ARGS="$CLI_ARGS --hiveos" ;;
+esac
+
 echo "[keryx-miner-supr-amd] launching: ./keryx-miner-supr $CLI_ARGS" | tee -a "$LOG"
 # tee -a (not exec) so the log keeps the preflight lines + miner output for h-stats.sh.
 ./keryx-miner-supr $CLI_ARGS 2>&1 | tee -a "$LOG"
