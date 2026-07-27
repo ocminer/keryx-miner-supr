@@ -28,12 +28,13 @@ struct PomUniforms {
     ulong  n_total_chunks;
     uint   k_steps;
     uint   n_tensors;
-    ulong  p0; ulong p1; ulong p2; ulong p3;
+    ulong  p0; ulong p1; ulong p2; ulong p3;      // POW-fold words (H3-salted)
     ulong  time_;
     ulong  t0; ulong t1; ulong t2; ulong t3;
     ulong  nonce_base;
     uint   n_nonces;
-    uint   _pad;
+    uint   walk_v2;                                // H5 non-foldable transition (era gate)
+    ulong  s0; ulong s1; ulong s2; ulong s3;      // SEED-fold words (H5.1/H5.2-salted; == p pre-H5.1)
 };
 
 inline ulong mix64(ulong x) {
@@ -89,7 +90,9 @@ kernel void pom_mine(
     if (tid >= u.n_nonces) return;
     ulong nonce = u.nonce_base + (ulong)tid;
 
-    ulong state = pom_seed_fold(nonce, u.time_, u.p0, u.p1, u.p2, u.p3);
+    // SEED fold reads the (host-salted) seed words s0..s3; the POW fold below keeps p0..p3.
+    // Pre-H5.1 the host passes s == p, so this stays byte-identical to the pre-H5 build.
+    ulong state = pom_seed_fold(nonce, u.time_, u.s0, u.s1, u.s2, u.s3);
     ulong off = state % u.n_total_chunks;
     for (uint i = 0; i < u.k_steps; i++) {
         uint idx = upper_bound_prefix(prefix, u.n_tensors, off);
@@ -100,11 +103,22 @@ kernel void pom_mine(
             reinterpret_cast<device const ulong*>(tensor_addrs[idx]);
         ulong base = local * 4UL;
         ulong h = state;
-        h ^= ptr[base + 0];
-        h ^= ptr[base + 1];
-        h ^= ptr[base + 2];
-        h ^= ptr[base + 3];
-        state = mix64(h);
+        if (u.walk_v2) {
+            // H5 non-foldable walk: chain mix64 through each of the 4 chunk words (w0..w3) so all
+            // 32 bytes are load-bearing. walk_v2 is uniform across the grid -> no thread divergence.
+            h = mix64(h ^ ptr[base + 0]);
+            h = mix64(h ^ ptr[base + 1]);
+            h = mix64(h ^ ptr[base + 2]);
+            h = mix64(h ^ ptr[base + 3]);
+            state = h;
+        } else {
+            // Pre-H5 fold (frozen — validates all blocks below H5_ACTIVATION_DAA).
+            h ^= ptr[base + 0];
+            h ^= ptr[base + 1];
+            h ^= ptr[base + 2];
+            h ^= ptr[base + 3];
+            state = mix64(h);
+        }
         off = state % u.n_total_chunks;
     }
     ulong pv[4];
@@ -125,7 +139,7 @@ kernel void pom_walk_states(
 {
     if (tid >= u.n_nonces) return;
     ulong nonce = u.nonce_base + (ulong)tid;
-    ulong state = pom_seed_fold(nonce, u.time_, u.p0, u.p1, u.p2, u.p3);
+    ulong state = pom_seed_fold(nonce, u.time_, u.s0, u.s1, u.s2, u.s3);
     ulong off = state % u.n_total_chunks;
     for (uint i = 0; i < u.k_steps; i++) {
         uint idx = upper_bound_prefix(prefix, u.n_tensors, off);
@@ -134,11 +148,19 @@ kernel void pom_walk_states(
             reinterpret_cast<device const ulong*>(tensor_addrs[idx]);
         ulong base = local * 4UL;
         ulong h = state;
-        h ^= ptr[base + 0];
-        h ^= ptr[base + 1];
-        h ^= ptr[base + 2];
-        h ^= ptr[base + 3];
-        state = mix64(h);
+        if (u.walk_v2) {
+            h = mix64(h ^ ptr[base + 0]);
+            h = mix64(h ^ ptr[base + 1]);
+            h = mix64(h ^ ptr[base + 2]);
+            h = mix64(h ^ ptr[base + 3]);
+            state = h;
+        } else {
+            h ^= ptr[base + 0];
+            h ^= ptr[base + 1];
+            h ^= ptr[base + 2];
+            h ^= ptr[base + 3];
+            state = mix64(h);
+        }
         off = state % u.n_total_chunks;
     }
     states[tid] = state;

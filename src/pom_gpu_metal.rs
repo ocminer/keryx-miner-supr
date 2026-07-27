@@ -66,7 +66,7 @@ struct Uniforms {
     n_total_chunks: u64,
     k_steps: u32,
     n_tensors: u32,
-    p0: u64,
+    p0: u64, // POW-fold words (H3-salted)
     p1: u64,
     p2: u64,
     p3: u64,
@@ -77,7 +77,11 @@ struct Uniforms {
     t3: u64,
     nonce_base: u64,
     n_nonces: u32,
-    _pad: u32,
+    walk_v2: u32,   // H5 non-foldable transition era gate (0/1)
+    s0: u64, // SEED-fold words (H5.1/H5.2-salted; == p pre-H5.1)
+    s1: u64,
+    s2: u64,
+    s3: u64,
 }
 
 pub struct PomGpuMiner {
@@ -277,6 +281,9 @@ impl PomGpuMiner {
         start: u64,
         batch: u64,
         h3: bool,
+        walk_v2: bool,
+        h5_1: bool,
+        h5_2: bool,
     ) -> candle_core::Result<Option<u64>> {
         if batch > u32::MAX as u64 {
             return Err(candle_core::Error::Msg("PoM Metal: batch exceeds u32".into()));
@@ -284,7 +291,11 @@ impl PomGpuMiner {
         if batch == 0 {
             return Ok(None);
         }
+        // POW fold keeps the H3-salted words; the SEED fold uses the era-salted words (H5.1/H5.2).
+        // Pre-H5.1 (h5_1=h5_2=false) seed_pph_words_for_era == pph_words_for_era, so s == p and the
+        // walk is byte-identical to the pre-H5 build. See pom.rs::seed_pph_words_for_era.
         let p = crate::pom::pph_words_for_era(pre_pow_hash, h3);
+        let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
         let t = words4(target_le);
         let uniforms = Uniforms {
             n_total_chunks: self.n_total_chunks,
@@ -301,7 +312,11 @@ impl PomGpuMiner {
             t3: t[3],
             nonce_base: start,
             n_nonces: batch as u32,
-            _pad: 0,
+            walk_v2: walk_v2 as u32,
+            s0: s[0],
+            s1: s[1],
+            s2: s[2],
+            s3: s[3],
         };
 
         let uniforms_buf = self
@@ -351,9 +366,13 @@ impl PomGpuMiner {
         start: u64,
         batch: u64,
         h3: bool,
+        walk_v2: bool,
+        h5_1: bool,
+        h5_2: bool,
     ) -> candle_core::Result<Vec<u64>> {
         assert!(batch > 0 && batch <= u32::MAX as u64);
         let p = crate::pom::pph_words_for_era(pre_pow_hash, h3);
+        let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
         let uniforms = Uniforms {
             n_total_chunks: self.n_total_chunks,
             k_steps: crate::pom::POM_WALK_STEPS,
@@ -369,7 +388,11 @@ impl PomGpuMiner {
             t3: 0,
             nonce_base: start,
             n_nonces: batch as u32,
-            _pad: 0,
+            walk_v2: walk_v2 as u32,
+            s0: s[0],
+            s1: s[1],
+            s2: s[2],
+            s3: s[3],
         };
         let uniforms_buf = self
             .device
@@ -467,12 +490,15 @@ pub fn mine(
     start: u64,
     batch: u64,
     h3: bool,
+    walk_v2: bool,
+    h5_1: bool,
+    h5_2: bool,
 ) -> Option<u64> {
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
-    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3).ok().flatten()
+    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2).ok().flatten()
 }
 
 /// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup — the PROCESS-WIDE
@@ -675,8 +701,8 @@ mod tests {
     }
 
     /// Byte-exact CPU oracle: reproduce the walk over the same blob using pom.rs primitives.
-    /// Pre-H3 era (h3=false) to match the `mine(…, false)` call below.
-    fn cpu_pow_value(bytes: &[u8], n_chunks: u64, pph: &[u8; 32], ts: u64, nonce: u64) -> [u8; 32] {
+    /// Pre-H3 era (h3=false). `walk_v2` selects the H5 non-foldable transition (false = pre-H5 fold).
+    fn cpu_pow_value(bytes: &[u8], n_chunks: u64, pph: &[u8; 32], ts: u64, nonce: u64, walk_v2: bool) -> [u8; 32] {
         let seed = pom::pom_block_seed(pph, ts, nonce, false, false, false);
         let read = |off: u64| -> [u64; pom::CHUNK_WORDS] {
             let o = (off as usize) * CHUNK_BYTES;
@@ -684,7 +710,7 @@ mod tests {
             c.copy_from_slice(&bytes[o..o + 32]);
             pom::chunk_to_words(&c)
         };
-        let final_state = pom::walk_final(seed, n_chunks, pom::POM_WALK_STEPS, read);
+        let final_state = pom::walk_final(seed, n_chunks, pom::POM_WALK_STEPS, read, walk_v2);
         pom::pom_pow_value(final_state, pph, false)
     }
 
@@ -767,8 +793,8 @@ mod tests {
         let test_nonces: &[u64] = &[0, 1, 42, 100_000, 12345678];
         for &nonce in test_nonces {
             let seed = pom::pom_block_seed(&pph, ts, nonce, false, false, false);
-            let host_state = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
-            let gpu_states = miner.debug_walk_states(&pph, ts, nonce, 8, false).expect("debug_walk_states");
+            let host_state = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
+            let gpu_states = miner.debug_walk_states(&pph, ts, nonce, 8, false, false, false, false).expect("debug_walk_states");
             let gpu_state = gpu_states[0];
             eprintln!(
                 "  nonce={nonce:<10}  host=0x{host_state:016x}  metal=0x{gpu_state:016x}  {}",
@@ -781,12 +807,12 @@ mod tests {
         eprintln!("\n── large-batch (4096 nonces) Metal-kernel walk vs host walk ──");
         let sweep_batch: u64 = 4096;
         let sweep_start: u64 = 100_000;
-        let sweep_gpu = miner.debug_walk_states(&pph, ts, sweep_start, sweep_batch, false).expect("sweep");
+        let sweep_gpu = miner.debug_walk_states(&pph, ts, sweep_start, sweep_batch, false, false, false, false).expect("sweep");
         let mut disagreements = 0usize;
         for i in 0..sweep_batch {
             let nonce = sweep_start + i;
             let seed = pom::pom_block_seed(&pph, ts, nonce, false, false, false);
-            let host = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+            let host = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
             if host != sweep_gpu[i as usize] {
                 if disagreements < 5 {
                     eprintln!("  DIVERGE nonce={nonce} host=0x{host:016x} gpu=0x{:016x}", sweep_gpu[i as usize]);
@@ -804,26 +830,26 @@ mod tests {
         let winner_batch: u64 = 8192;
         let n_star = winner_start + winner_batch / 3;
         let seed_star = pom::pom_block_seed(&pph, ts, n_star, false, false, false);
-        let final_star = pom::walk_final(seed_star, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+        let final_star = pom::walk_final(seed_star, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
         let target = pom::pom_pow_value(final_star, &pph, false);
         let expected = (winner_start..winner_start + winner_batch).find(|&nn| {
             let s = pom::pom_block_seed(&pph, ts, nn, false, false, false);
-            let fs = pom::walk_final(s, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+            let fs = pom::walk_final(s, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
             pom::le_leq(&pom::pom_pow_value(fs, &pph, false), &target)
         });
-        let got = miner.mine(&pph, ts, &target, winner_start, winner_batch, false).expect("mine");
+        let got = miner.mine(&pph, ts, &target, winner_start, winner_batch, false, false, false, false).expect("mine");
         eprintln!("  mine() returned {got:?} — expected {expected:?}");
         assert_eq!(got, expected, "mine() winner disagrees with host reference");
 
         // ── (5) H3 era: pph-salt plumbing byte-exact under h3=true. 1024-nonce sweep + winner.
         eprintln!("\n── H3 era (h3=true) walk parity ──");
         let h3_sweep: u64 = 1024;
-        let h3_gpu = miner.debug_walk_states(&pph, ts, sweep_start, h3_sweep, true).expect("h3 sweep");
+        let h3_gpu = miner.debug_walk_states(&pph, ts, sweep_start, h3_sweep, true, false, false, false).expect("h3 sweep");
         let mut h3_disagreements = 0usize;
         for i in 0..h3_sweep {
             let nonce = sweep_start + i;
             let seed = pom::pom_block_seed(&pph, ts, nonce, true, false, false);
-            let host = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+            let host = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
             if host != h3_gpu[i as usize] {
                 if h3_disagreements < 5 {
                     eprintln!("  H3 DIVERGE nonce={nonce} host=0x{host:016x} gpu=0x{:016x}", h3_gpu[i as usize]);
@@ -835,14 +861,14 @@ mod tests {
         assert_eq!(h3_disagreements, 0, "H3 kernel walk diverges");
 
         let h3_seed = pom::pom_block_seed(&pph, ts, n_star, true, false, false);
-        let h3_final = pom::walk_final(h3_seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+        let h3_final = pom::walk_final(h3_seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
         let h3_target = pom::pom_pow_value(h3_final, &pph, true);
         let h3_expected = (winner_start..winner_start + winner_batch).find(|&nn| {
             let s = pom::pom_block_seed(&pph, ts, nn, true, false, false);
-            let fs = pom::walk_final(s, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o));
+            let fs = pom::walk_final(s, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
             pom::le_leq(&pom::pom_pow_value(fs, &pph, true), &h3_target)
         });
-        let h3_got = miner.mine(&pph, ts, &h3_target, winner_start, winner_batch, true).expect("mine h3");
+        let h3_got = miner.mine(&pph, ts, &h3_target, winner_start, winner_batch, true, false, false, false).expect("mine h3");
         eprintln!("  H3 mine() returned {h3_got:?} — expected {h3_expected:?}");
         assert_eq!(h3_got, h3_expected, "H3 mine() winner disagrees");
     }
@@ -890,10 +916,10 @@ mod tests {
         let ts: u64 = 0xcafebabe_deadbeef;
         let (start, batch) = (777u64, 8192u64);
         let n_star = start + batch / 2;
-        let target = cpu_pow_value(&bytes, n_chunks, &pph, ts, n_star);
+        let target = cpu_pow_value(&bytes, n_chunks, &pph, ts, n_star, false);
         let expected = (start..start + batch)
-            .find(|&n| pom::le_leq(&cpu_pow_value(&bytes, n_chunks, &pph, ts, n), &target));
-        let got = miner.mine(&pph, ts, &target, start, batch, false).expect("metal mine");
+            .find(|&n| pom::le_leq(&cpu_pow_value(&bytes, n_chunks, &pph, ts, n, false), &target));
+        let got = miner.mine(&pph, ts, &target, start, batch, false, false, false, false).expect("metal mine");
         assert_eq!(got, expected, "multi-tensor Metal winner != host reference");
 
         // Same batch under h3=true — proves the pph-salt plumbing is byte-exact for both eras.
@@ -905,7 +931,7 @@ mod tests {
                 c.copy_from_slice(&bytes[o..o + 32]);
                 pom::chunk_to_words(&c)
             };
-            let final_state = pom::walk_final(seed, n_chunks, pom::POM_WALK_STEPS, read);
+            let final_state = pom::walk_final(seed, n_chunks, pom::POM_WALK_STEPS, read, false);
             pom::pom_pow_value(final_state, &pph, true)
         };
         let expected_h3 = (start..start + batch).find(|&n| {
@@ -916,11 +942,80 @@ mod tests {
                 c.copy_from_slice(&bytes[o..o + 32]);
                 pom::chunk_to_words(&c)
             };
-            let fs = pom::walk_final(seed, n_chunks, pom::POM_WALK_STEPS, read);
+            let fs = pom::walk_final(seed, n_chunks, pom::POM_WALK_STEPS, read, false);
             pom::le_leq(&pom::pom_pow_value(fs, &pph, true), &target_h3)
         });
-        let got_h3 = miner.mine(&pph, ts, &target_h3, start, batch, true).expect("metal mine h3");
+        let got_h3 = miner.mine(&pph, ts, &target_h3, start, batch, true, false, false, false).expect("metal mine h3");
         assert_eq!(got_h3, expected_h3, "multi-tensor Metal winner (h3) != host reference");
+    }
+
+    /// H5 / H5.2 byte-exact guard: exercises BOTH new consensus pieces the H5 fork introduced and
+    /// that the Metal port was missing —
+    ///   (a) `walk_v2` — the non-foldable transition (`mix64` chained per chunk word), and
+    ///   (b) the seed/pow word SPLIT — under H5.2 the SEED fold uses `seed_pph_words_for_era`
+    ///       (RAW pph XOR POM_H5_2_PPH_SALT) while the POW fold keeps the H3-salted words. A kernel
+    ///       that reused one word set for both, or kept the v1 fold, diverges here.
+    /// Runs on the same 12-tensor synthetic blob as the reference test (no GGUF needed).
+    #[test]
+    fn metal_walk_matches_host_reference_h5_2() {
+        let per_tensor: [usize; 12] = [
+            5 * 32, 17 * 32, 41 * 32, 128 * 32, 257 * 32, 511 * 32,
+            1024 * 32, 2001 * 32, 4096 * 32, 512 * 32, 91 * 32, 331 * 32,
+        ];
+        let total_bytes: usize = per_tensor.iter().sum();
+        let mut bytes = vec![0u8; total_bytes];
+        let mut s = 0x51ec_a5d0_1234_9f27u64;
+        for b in bytes.iter_mut() {
+            s = pom::mix64(s);
+            *b = (s & 0xff) as u8;
+        }
+        let tensors: Vec<&[u8]> = {
+            let mut v = Vec::with_capacity(per_tensor.len());
+            let mut off = 0usize;
+            for &sz in &per_tensor {
+                v.push(&bytes[off..off + sz]);
+                off += sz;
+            }
+            v
+        };
+        let n_chunks = (total_bytes / CHUNK_BYTES) as u64;
+        let miner = miner_from_tensor_blobs(&tensors);
+        assert_eq!(miner.n_chunks(), n_chunks);
+
+        let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(101).wrapping_add(3));
+        let ts: u64 = 0x0badf00d_1337c0de;
+        let (start, batch) = (4242u64, 8192u64);
+        // H5.2 live-era flags: h3 pow salt on, walk_v2 on, h5_2 seed salt on (h5_1 subsumed).
+        let (h3, walk_v2, h5_1, h5_2) = (true, true, false, true);
+
+        let read = |off: u64| -> [u64; pom::CHUNK_WORDS] {
+            let o = (off as usize) * CHUNK_BYTES;
+            let mut c = [0u8; 32];
+            c.copy_from_slice(&bytes[o..o + 32]);
+            pom::chunk_to_words(&c)
+        };
+        // Host oracle: pom_block_seed(h3,h5_1,h5_2) selects the H5.2-salted SEED words; walk_final
+        // with walk_v2=true uses the non-foldable transition; pom_pow_value(h3) keeps the H3 words.
+        let host_pv = |nonce: u64| -> [u8; 32] {
+            let seed = pom::pom_block_seed(&pph, ts, nonce, h3, h5_1, h5_2);
+            let fs = pom::walk_final(seed, n_chunks, pom::POM_WALK_STEPS, read, walk_v2);
+            pom::pom_pow_value(fs, &pph, h3)
+        };
+        let n_star = start + batch / 2;
+        let target = host_pv(n_star);
+        let expected = (start..start + batch).find(|&n| pom::le_leq(&host_pv(n), &target));
+        let got = miner
+            .mine(&pph, ts, &target, start, batch, h3, walk_v2, h5_1, h5_2)
+            .expect("metal mine h5.2");
+        assert_eq!(got, expected, "H5.2 Metal winner (walk_v2 + seed-salt split) != host reference");
+        assert!(got.is_some(), "n_star must be a winner under H5.2");
+
+        // Negative control: the pre-H5 fold (walk_v2=false) must NOT reproduce the v2 target, i.e.
+        // the two transitions are genuinely different (guards against a no-op walk_v2 branch).
+        let got_v1 = miner
+            .mine(&pph, ts, &target, start, batch, h3, false, h5_1, h5_2)
+            .expect("metal mine v1");
+        assert_ne!(got_v1, got, "walk_v2 branch is a no-op — v1 and v2 produced the same winner");
     }
 
     // Requires a real Metal device — runs on Apple Silicon (CI macos runner / dev Mac), skipped
@@ -945,11 +1040,11 @@ mod tests {
         // Pick a target that at least one nonce in the batch satisfies: use the pow value of a
         // known mid-batch nonce, so the search must find the LOWEST nonce whose pv <= target.
         let n_star = start + batch / 2;
-        let target = cpu_pow_value(&bytes, n_chunks, &pph, ts, n_star);
+        let target = cpu_pow_value(&bytes, n_chunks, &pph, ts, n_star, false);
 
         let expected = (start..start + batch)
-            .find(|&n| pom::le_leq(&cpu_pow_value(&bytes, n_chunks, &pph, ts, n), &target));
-        let got = miner.mine(&pph, ts, &target, start, batch, false).expect("metal mine");
+            .find(|&n| pom::le_leq(&cpu_pow_value(&bytes, n_chunks, &pph, ts, n, false), &target));
+        let got = miner.mine(&pph, ts, &target, start, batch, false, false, false, false).expect("metal mine");
         assert_eq!(got, expected, "Metal winner != host reference");
         assert!(got.is_some(), "n_star must be a winner");
         assert!(got.unwrap() <= n_star);
