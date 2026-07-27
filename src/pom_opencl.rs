@@ -115,6 +115,14 @@ impl PomMiner {
         // small (a driver that ignores the env var) so the failure is diagnosable, not silent.
         let blob_bytes = n_chunks.saturating_mul(32);
         if let Ok(max_alloc) = device.max_mem_alloc_size() {
+            // Always log the numbers — makes "hashing but no shares" reports diagnosable from the
+            // log alone (is the blob within this driver's single-buffer cap or not?).
+            log::info!(
+                "PoM: tier blob {} MiB; device max single-buffer alloc {} MiB, global mem {} MiB.",
+                blob_bytes / (1024 * 1024),
+                max_alloc / (1024 * 1024),
+                device.global_mem_size().map(|b| b / (1024 * 1024)).unwrap_or(0),
+            );
             if blob_bytes > max_alloc {
                 log::error!(
                     "PoM: tier possession blob is {} MiB but this GPU's OpenCL max single-buffer \

@@ -229,6 +229,14 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         let mut reader = response.into_reader();
         let mut buf = vec![0u8; 65_536];
         let mut stream_err: Option<String> = None;
+        // Progress: the `\r` line is for interactive terminals only — through the HiveOS log tee
+        // its fragments concatenate into one unreadable line, so rigs looked "hung" for the whole
+        // multi-GB download ("models are not downloading correctly" reports). Emit a REAL log line
+        // every 30 s with speed + ETA so the miner screen / agent log shows live progress, and say
+        // explicitly that mining starts only after the download.
+        let seg_start = std::time::Instant::now();
+        let seg_base = downloaded;
+        let mut last_log = std::time::Instant::now();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
@@ -244,6 +252,19 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                             t as f64 / 1_000_000.0,
                             downloaded * 100 / t.max(1));
                         let _ = std::io::stderr().flush();
+                        if last_log.elapsed().as_secs() >= 30 {
+                            last_log = std::time::Instant::now();
+                            let rate = (downloaded - seg_base) as f64 / seg_start.elapsed().as_secs_f64().max(0.001);
+                            let eta_min = t.saturating_sub(downloaded) as f64 / rate.max(1.0) / 60.0;
+                            log::info!(
+                                "model download: {:.0}/{:.0} MB ({}%), {:.1} MB/s, ETA ~{:.0} min — mining starts \
+                                 after the download + possession-index build. Do NOT restart the miner: the \
+                                 download resumes, but every restart prolongs it (disable rig watchdogs until \
+                                 the first accepted share).",
+                                downloaded as f64 / 1e6, t as f64 / 1e6,
+                                downloaded * 100 / t.max(1), rate / 1e6, eta_min.max(1.0),
+                            );
+                        }
                     }
                 }
                 Err(e) => { stream_err = Some(e.to_string()); break; }
