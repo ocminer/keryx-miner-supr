@@ -22,6 +22,18 @@
 
 typedef ulong u64;
 
+// The per-step `state % n_chunks` is a 64-bit division with a RUNTIME divisor — a slow ALU library
+// call (hundreds of cycles), issued 256×/nonce. The host JIT-compiles this source per tier, so it
+// bakes the tier's chunk count in as -D POM_NC=<n>UL: the compiler then emits the exact
+// Granlund-Montgomery multiply-high sequence for the constant divisor (byte-exact by construction —
+// it's the compiler's own proven strength reduction, same result for every input). The kernel arg
+// stays in the signature; without the define we fall back to the runtime divisor.
+#ifdef POM_NC
+#define POM_N(nc_arg) ((u64)(POM_NC))
+#else
+#define POM_N(nc_arg) (nc_arg)
+#endif
+
 // SplitMix64 finalizer (pom.rs:117-124). All `*` are wrapping (ulong overflow wraps).
 inline u64 pom_mix64(u64 x) {
     x ^= x >> 30; x *= 0xbf58476d1ce4e5b9UL;
@@ -76,29 +88,32 @@ __kernel void pom_mine(
     if (tid >= n_nonces) return;
     u64 nonce = nonce_base + tid;
 
+    // Chunk view: element i = canonical chunk i (32 B, 32-byte aligned) → one vectorized load
+    // (2× global_load_dwordx4) instead of 4 scalar 8 B loads. Word order s0..s3 = w0..w3 exactly.
+    const __global ulong4* restrict chunks = (const __global ulong4* restrict)weights;
+
     // H5.1: the SEED fold reads the (host-salted) seed words s0..s3; the pow fold below keeps p0..p3.
     // Pre-H5.1 the host passes s == p, so this is byte-identical to the H5 build.
     u64 state = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
-    u64 off = state % n_total_chunks;
+    u64 off = state % POM_N(n_total_chunks);
     for (uint i = 0; i < K; i++) {
-        u64 base = off * 4UL;
-        u64 w0 = weights[base], w1 = weights[base + 1], w2 = weights[base + 2], w3 = weights[base + 3];
+        ulong4 w = chunks[off];
         if (walk_v2) {
             // H5 non-foldable walk (at/after H5_ACTIVATION_DAA): chain mix64 through each of the 4
             // chunk words (w0..w3) so all 32 bytes are load-bearing and order-dependent — byte-exact
             // with pom.rs transition_v2 and pom_mine.cu. walk_v2 is uniform across work-items -> no
             // divergence.
-            u64 h = pom_mix64(state ^ w0);
-            h = pom_mix64(h ^ w1);
-            h = pom_mix64(h ^ w2);
-            h = pom_mix64(h ^ w3);
+            u64 h = pom_mix64(state ^ w.s0);
+            h = pom_mix64(h ^ w.s1);
+            h = pom_mix64(h ^ w.s2);
+            h = pom_mix64(h ^ w.s3);
             state = h;
         } else {
             // Pre-H5 fold (frozen — validates every block below H5_ACTIVATION_DAA).
-            u64 h = state ^ w0 ^ w1 ^ w2 ^ w3;
+            u64 h = state ^ w.s0 ^ w.s1 ^ w.s2 ^ w.s3;
             state = pom_mix64(h);
         }
-        off = state % n_total_chunks;
+        off = state % POM_N(n_total_chunks);
     }
 
     u64 pv[4];
@@ -113,4 +128,135 @@ __kernel void pom_mine(
             old = prev;
         }
     }
+}
+
+// Atomic-min helper shared by the ILP variants (same CAS loop as above).
+inline void pom_submit(volatile __global u64* winner, u64 nonce) {
+    u64 old = *winner;
+    while (nonce < old) {
+        u64 prev = atom_cmpxchg(winner, old, nonce);
+        if (prev == old) break;
+        old = prev;
+    }
+}
+
+// ILP x2: each work-item grinds TWO nonces with their walk steps interleaved — both chunk loads
+// issue back-to-back so their DRAM latencies overlap. BYTE-EXACT per nonce (each walk's math is
+// untouched; only the scheduling interleaves — mirror of cuda pom_mine_ilp2). Wins where a card
+// doesn't already saturate its outstanding-miss slots at 1 nonce/lane (our MI50/MI60 runs at ~17%
+// of HBM2 bandwidth = latency-bound with idle slots). The host autotunes ILP1/2/4 per device and
+// only uses what actually measures faster. Host launches ceil(batch/2) items.
+__kernel void pom_mine_ilp2(
+    __global const u64* restrict weights,
+    const u64 n_total_chunks,
+    const uint K,
+    const u64 p0, const u64 p1, const u64 p2, const u64 p3,
+    const u64 s0, const u64 s1, const u64 s2, const u64 s3,
+    const u64 time_,
+    const u64 t0, const u64 t1, const u64 t2, const u64 t3,
+    const u64 nonce_base, const u64 n_nonces,
+    volatile __global u64* winner,
+    const uint walk_v2)
+{
+    u64 tid = get_global_id(0);
+    u64 i0 = tid * 2UL;
+    if (i0 >= n_nonces) return;
+    u64 i1 = i0 + 1UL;
+    bool has1 = i1 < n_nonces;
+    u64 nonce0 = nonce_base + i0;
+    // Odd-batch boundary item: walk nonce0 twice (duplicate result dropped below) instead of
+    // branching the whole body — keeps the lane busy, byte-exact for nonce0 (CUDA-identical trick).
+    u64 nonce1 = nonce_base + (has1 ? i1 : i0);
+    const __global ulong4* restrict chunks = (const __global ulong4* restrict)weights;
+
+    u64 state0 = pom_seed_fold(nonce0, time_, s0, s1, s2, s3);
+    u64 state1 = pom_seed_fold(nonce1, time_, s0, s1, s2, s3);
+    u64 off0 = state0 % POM_N(n_total_chunks);
+    u64 off1 = state1 % POM_N(n_total_chunks);
+    for (uint i = 0; i < K; i++) {
+        ulong4 a = chunks[off0];   // both loads issue back-to-back ->
+        ulong4 b = chunks[off1];   // their DRAM latencies overlap
+        if (walk_v2) {
+            u64 h0 = pom_mix64(state0 ^ a.s0), h1 = pom_mix64(state1 ^ b.s0);
+            h0 = pom_mix64(h0 ^ a.s1); h1 = pom_mix64(h1 ^ b.s1);
+            h0 = pom_mix64(h0 ^ a.s2); h1 = pom_mix64(h1 ^ b.s2);
+            h0 = pom_mix64(h0 ^ a.s3); h1 = pom_mix64(h1 ^ b.s3);
+            state0 = h0; state1 = h1;
+        } else {
+            state0 = pom_mix64(state0 ^ a.s0 ^ a.s1 ^ a.s2 ^ a.s3);
+            state1 = pom_mix64(state1 ^ b.s0 ^ b.s1 ^ b.s2 ^ b.s3);
+        }
+        off0 = state0 % POM_N(n_total_chunks);
+        off1 = state1 % POM_N(n_total_chunks);
+    }
+
+    u64 pv[4];
+    pom_pow_fold(state0, p0, p1, p2, p3, pv);
+    if (pom_le_leq(pv, t0, t1, t2, t3)) pom_submit(winner, nonce0);
+    if (has1) {
+        pom_pow_fold(state1, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) pom_submit(winner, nonce1);
+    }
+}
+
+// ILP x4: four interleaved walks per work-item — four outstanding chunk loads per lane. More VGPRs
+// per lane (fewer waves in flight), but on a latency-bound card with idle bandwidth the added
+// memory-level parallelism can more than compensate. Autotuned; never a forced default.
+// Host launches ceil(batch/4) items.
+__kernel void pom_mine_ilp4(
+    __global const u64* restrict weights,
+    const u64 n_total_chunks,
+    const uint K,
+    const u64 p0, const u64 p1, const u64 p2, const u64 p3,
+    const u64 s0, const u64 s1, const u64 s2, const u64 s3,
+    const u64 time_,
+    const u64 t0, const u64 t1, const u64 t2, const u64 t3,
+    const u64 nonce_base, const u64 n_nonces,
+    volatile __global u64* winner,
+    const uint walk_v2)
+{
+    u64 tid = get_global_id(0);
+    u64 i0 = tid * 4UL;
+    if (i0 >= n_nonces) return;
+    const __global ulong4* restrict chunks = (const __global ulong4* restrict)weights;
+
+    // Boundary items re-walk nonce i0 in the missing lanes (duplicates dropped at submit).
+    u64 idx1 = i0 + 1UL < n_nonces ? i0 + 1UL : i0;
+    u64 idx2 = i0 + 2UL < n_nonces ? i0 + 2UL : i0;
+    u64 idx3 = i0 + 3UL < n_nonces ? i0 + 3UL : i0;
+    u64 n0 = nonce_base + i0, n1 = nonce_base + idx1, n2 = nonce_base + idx2, n3 = nonce_base + idx3;
+
+    u64 st0 = pom_seed_fold(n0, time_, s0, s1, s2, s3);
+    u64 st1 = pom_seed_fold(n1, time_, s0, s1, s2, s3);
+    u64 st2 = pom_seed_fold(n2, time_, s0, s1, s2, s3);
+    u64 st3 = pom_seed_fold(n3, time_, s0, s1, s2, s3);
+    u64 of0 = st0 % POM_N(n_total_chunks), of1 = st1 % POM_N(n_total_chunks);
+    u64 of2 = st2 % POM_N(n_total_chunks), of3 = st3 % POM_N(n_total_chunks);
+    for (uint i = 0; i < K; i++) {
+        ulong4 a = chunks[of0];
+        ulong4 b = chunks[of1];
+        ulong4 c = chunks[of2];
+        ulong4 d = chunks[of3];
+        if (walk_v2) {
+            u64 h0 = pom_mix64(st0 ^ a.s0), h1 = pom_mix64(st1 ^ b.s0), h2 = pom_mix64(st2 ^ c.s0), h3 = pom_mix64(st3 ^ d.s0);
+            h0 = pom_mix64(h0 ^ a.s1); h1 = pom_mix64(h1 ^ b.s1); h2 = pom_mix64(h2 ^ c.s1); h3 = pom_mix64(h3 ^ d.s1);
+            h0 = pom_mix64(h0 ^ a.s2); h1 = pom_mix64(h1 ^ b.s2); h2 = pom_mix64(h2 ^ c.s2); h3 = pom_mix64(h3 ^ d.s2);
+            h0 = pom_mix64(h0 ^ a.s3); h1 = pom_mix64(h1 ^ b.s3); h2 = pom_mix64(h2 ^ c.s3); h3 = pom_mix64(h3 ^ d.s3);
+            st0 = h0; st1 = h1; st2 = h2; st3 = h3;
+        } else {
+            st0 = pom_mix64(st0 ^ a.s0 ^ a.s1 ^ a.s2 ^ a.s3);
+            st1 = pom_mix64(st1 ^ b.s0 ^ b.s1 ^ b.s2 ^ b.s3);
+            st2 = pom_mix64(st2 ^ c.s0 ^ c.s1 ^ c.s2 ^ c.s3);
+            st3 = pom_mix64(st3 ^ d.s0 ^ d.s1 ^ d.s2 ^ d.s3);
+        }
+        of0 = st0 % POM_N(n_total_chunks); of1 = st1 % POM_N(n_total_chunks);
+        of2 = st2 % POM_N(n_total_chunks); of3 = st3 % POM_N(n_total_chunks);
+    }
+
+    u64 pv[4];
+    pom_pow_fold(st0, p0, p1, p2, p3, pv);
+    if (pom_le_leq(pv, t0, t1, t2, t3)) pom_submit(winner, n0);
+    if (idx1 != i0) { pom_pow_fold(st1, p0, p1, p2, p3, pv); if (pom_le_leq(pv, t0, t1, t2, t3)) pom_submit(winner, n1); }
+    if (idx2 != i0) { pom_pow_fold(st2, p0, p1, p2, p3, pv); if (pom_le_leq(pv, t0, t1, t2, t3)) pom_submit(winner, n2); }
+    if (idx3 != i0) { pom_pow_fold(st3, p0, p1, p2, p3, pv); if (pom_le_leq(pv, t0, t1, t2, t3)) pom_submit(winner, n3); }
 }
