@@ -83,7 +83,11 @@ fn so_path() -> Option<std::path::PathBuf> {
     if want_noavx {
         let p = dir.join("libkeryx-llama-noavx.so");
         if p.exists() {
-            log::info!("llama engine: using baseline (no-AVX) build {}.", p.display());
+            log::info!(
+                "llama engine: CPU lacks the AVX2/FMA/F16C/BMI2 set (or KERYX_LLAMA_FORCE_NOAVX) — \
+                 selected the baseline no-AVX/no-BMI2 build: {}",
+                p.display()
+            );
             return Some(p);
         }
         log::warn!(
@@ -101,6 +105,10 @@ fn so_path() -> Option<std::path::PathBuf> {
     for name in candidates {
         let p = dir.join(name);
         if p.exists() {
+            log::info!(
+                "llama engine: CPU has the AVX2/FMA/F16C/BMI2 set — selected the standard build: {}",
+                p.display()
+            );
             return Some(p);
         }
     }
