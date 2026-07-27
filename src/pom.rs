@@ -695,6 +695,19 @@ fn pom_tree_mtime_secs(md: &std::fs::Metadata) -> i64 {
 }
 
 fn pom_tree_lock_is_stale(lock_path: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Ok(pid) = std::fs::read_to_string(lock_path).and_then(|s| {
+        s.trim()
+            .parse::<u32>()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }) {
+        if pid != std::process::id()
+            && !std::path::Path::new(&format!("/proc/{pid}")).exists()
+        {
+            return true;
+        }
+    }
+
     std::fs::metadata(lock_path)
         .ok()
         .and_then(|md| md.modified().ok())
@@ -1485,6 +1498,18 @@ pub fn has_device_index(device_id: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pom_tree_lock_from_dead_process_is_stale() {
+        let path = std::env::temp_dir().join(format!(
+            "keryx-pom-dead-lock-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, u32::MAX.to_string()).unwrap();
+        assert!(pom_tree_lock_is_stale(&path));
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn synth_chunk(off: u64) -> [u64; CHUNK_WORDS] {
         let mut c = [0u64; CHUNK_WORDS];
