@@ -944,6 +944,30 @@ impl StratumHandler {
 
         self.target_pool = Uint256::new(buf);
         info!("Difficulty: {:?}, Target: 0x{}", difficulty, hex::encode(self.target_pool.to_be_bytes()));
+        // Expected work per share at this target, as wall-clock at typical PoM rates. Answers the
+        // recurring "the card is hashing but never finds a share" report: PoM rates are MH/s (the
+        // walk is memory-hard), so at the common pool default (d=16 ≈ 2^36 hashes/share) a single
+        // small card legitimately averages HOURS per share — that's the pool difficulty, not a fault.
+        {
+            let t = buf; // LE u64 words of the 256-bit target
+            let tf = t[0] as f64 + t[1] as f64 * 2f64.powi(64) + t[2] as f64 * 2f64.powi(128) + t[3] as f64 * 2f64.powi(192);
+            if tf > 0.0 {
+                let hashes = 2f64.powi(256) / tf;
+                let fmt = |mhs: f64| -> String {
+                    let s = hashes / (mhs * 1e6);
+                    if s >= 5400.0 { format!("~{:.1} h", s / 3600.0) }
+                    else if s >= 90.0 { format!("~{:.0} min", s / 60.0) }
+                    else { format!("~{:.0} s", s) }
+                };
+                info!(
+                    "Share expectation at this difficulty: ≈{:.1} Ghashes/share on AVERAGE — e.g. {} at 5 MH/s \
+                     (one small GPU), {} at 30 MH/s (multi-GPU rig). Long share-less stretches on a single card \
+                     are NORMAL at high difficulty; on suprnova set a lower static difficulty (password d=4 or \
+                     d=1) for faster share feedback.",
+                    hashes / 1e9, fmt(5.0), fmt(30.0),
+                );
+            }
+        }
         Ok(())
     }
 
