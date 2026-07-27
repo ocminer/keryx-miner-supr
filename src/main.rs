@@ -636,6 +636,23 @@ fn tokio_blocking_threads() -> Option<usize> {
 }
 
 fn main() -> Result<(), Error> {
+    // AMD OpenCL caps a SINGLE cl_mem buffer at CL_DEVICE_MAX_MEM_ALLOC_SIZE. On Polaris (RX 580 and
+    // kin) that cap is often ~25% of VRAM (or a hard ~4 GB), which was fine for the old ≤2.5 GB tier
+    // blobs (Gemma/EXAONE) but is TOO SMALL for the post-H5 tier-0 model: the Qwen3-8B possession
+    // blob is ~4.8 GB in one buffer. When it exceeds the cap the driver hands back a partial/broken
+    // buffer, so the card hashes at full rate but the walk reads garbage → it NEVER finds a valid
+    // share and submits nothing. Raise the single-allocation cap to ~100% of VRAM BEFORE the AMD
+    // OpenCL runtime initializes (it reads these env vars at platform init). Operator overrides win.
+    #[cfg(feature = "pom-opencl")]
+    for (k, v) in [
+        ("GPU_SINGLE_ALLOC_PERCENT", "100"),
+        ("GPU_MAX_ALLOC_PERCENT", "100"),
+        ("GPU_MAX_HEAP_SIZE", "100"),
+    ] {
+        if std::env::var_os(k).is_none() {
+            std::env::set_var(k, v);
+        }
+    }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(tokio_worker_threads()).enable_all();
     if let Some(n) = tokio_blocking_threads() {

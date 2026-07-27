@@ -23,6 +23,13 @@ LOG="$CUSTOM_LOG_BASENAME.log"
 # next to it). libOpenCL.so.1 comes from the AMD/ROCm driver on the HiveOS rig.
 export LD_LIBRARY_PATH="$(pwd):/opt/rocm/lib:/opt/rocm/lib64:/opt/amdgpu-pro/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+# Raise the AMD OpenCL single-buffer allocation cap so the post-H5 tier blob (Qwen3-8B ~4.8 GB in
+# ONE cl_mem) fits. Polaris (RX 580) defaults CL_DEVICE_MAX_MEM_ALLOC_SIZE to ~25% of VRAM / ~4 GB —
+# a partial buffer there makes the card hash but never find a share. The binary also sets these, but
+# exporting here guarantees they're in the environment before the OpenCL runtime loads. Operator override wins.
+: "${GPU_SINGLE_ALLOC_PERCENT:=100}"; : "${GPU_MAX_ALLOC_PERCENT:=100}"; : "${GPU_MAX_HEAP_SIZE:=100}"
+export GPU_SINGLE_ALLOC_PERCENT GPU_MAX_ALLOC_PERCENT GPU_MAX_HEAP_SIZE
+
 # --- OpenCL preflight -------------------------------------------------------
 # This dynamic AMD build mines via libkeryxopencl.so, which needs libOpenCL.so.1
 # (the ICD loader) PLUS a registered AMD OpenCL ICD on the rig. If either is

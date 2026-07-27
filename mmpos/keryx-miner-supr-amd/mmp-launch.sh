@@ -13,6 +13,12 @@ cd "$(dirname "$(realpath "$0")")"
 # (libOpenCL.so.1). We've already cd'd here, so "$(pwd)" is the package dir.
 export LD_LIBRARY_PATH="$(pwd):/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+# Raise the AMD OpenCL single-buffer alloc cap so the post-H5 tier blob (Qwen3-8B ~4.8 GB in ONE
+# cl_mem) fits — Polaris (RX 580) defaults it to ~25% of VRAM / ~4 GB, and a partial buffer makes the
+# card hash but never find a share. The binary sets these too; exporting here is belt-and-suspenders.
+: "${GPU_SINGLE_ALLOC_PERCENT:=100}"; : "${GPU_MAX_ALLOC_PERCENT:=100}"; : "${GPU_MAX_HEAP_SIZE:=100}"
+export GPU_SINGLE_ALLOC_PERCENT GPU_MAX_ALLOC_PERCENT GPU_MAX_HEAP_SIZE
+
 EXEC="./keryx-miner-supr"
 CONF_FILE="mmp-external.conf"
 
