@@ -10,7 +10,7 @@
 //! so a nonce found here builds a `PomProof` (host) the node accepts.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use log::info;
@@ -94,6 +94,11 @@ pub struct PomGpuMiner {
     prefix_dev: CudaSlice<u64>,
     t_count: u32,
     n_total_chunks: u64,
+    /// CUDA block size for the walk launch, chosen ONCE per device by `autotune_block()` (a startup
+    /// micro-benchmark) so every arch runs its fastest config. Defaults to 256 until tuned; block
+    /// size does not affect results (byte-exact), only occupancy/scheduling. Env: KERYX_POM_BLOCK
+    /// forces a value (skips the sweep); KERYX_POM_NO_AUTOTUNE=1 keeps 256.
+    block_dim: AtomicU32,
     _tensors: Vec<QTensor>, // raw-loaded tensors kept alive so the gather pointers stay valid
     _shared: Vec<Arc<QTensor>>, // shared-with-inference tensors kept alive (zero-dup, Option C)
     _uploads: Vec<CudaSlice<u8>>, // our own device copies of llama-engine host-resident tensors
@@ -139,7 +144,7 @@ impl PomGpuMiner {
         // Warm the module cache so mine() never compiles on the hot path.
         let _ = load_walk_func(&cuda)?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: tensors, _shared: Vec::new(), _uploads: Vec::new() })
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), _tensors: tensors, _shared: Vec::new(), _uploads: Vec::new() })
     }
 
     /// Standalone walk source: upload the mining model's RAW GGUF bytes to `device_id` (canonical
@@ -192,7 +197,7 @@ impl PomGpuMiner {
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
         let _ = load_walk_func(&cuda)?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
     }
 
     /// Zero-dup load (Option C): build the gather over the SAME canonical name-sorted layout as
@@ -257,7 +262,7 @@ impl PomGpuMiner {
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
         let _ = load_walk_func(&cuda)?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: raw, _shared: kept_shared, _uploads: Vec::new() })
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), _tensors: raw, _shared: kept_shared, _uploads: Vec::new() })
     }
 
     /// Phase-2 zero-dup over the IN-PROCESS llama.cpp engine (candle hosts nothing): bases/prefix
@@ -338,7 +343,7 @@ impl PomGpuMiner {
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
         let _ = load_walk_func(&cuda)?;
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
     }
 
     pub fn n_chunks(&self) -> u64 {
@@ -357,8 +362,9 @@ impl PomGpuMiner {
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
-        let grid = ((batch + 255) / 256) as u32;
-        let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let block = self.block_dim.load(Ordering::Relaxed).max(1);
+        let grid = ((batch + block as u64 - 1) / block as u64) as u32;
+        let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
         let wv2: u32 = walk_v2 as u32; // H5 era flag -> kernel `unsigned int walk_v2`
 
         let func = load_walk_func(&self.cuda)?; // cached
@@ -374,6 +380,62 @@ impl PomGpuMiner {
         let w = self.stream.clone_dtoh(&winner).map_err(candle_core::Error::wrap)?[0];
         Ok(if w == u64::MAX { None } else { Some(w) })
     }
+
+    /// Startup micro-benchmark: sweep candidate CUDA block sizes over the resident blob and pin the
+    /// fastest into `self.block_dim`. Runs ONCE per device (guarded by the caller). Byte-exact —
+    /// block size changes only occupancy/scheduling, never results — so it needs no re-validation.
+    /// Different archs have very different optima (sm_86 3070: 64/1024; sm_80 170HX: 64; sm_120
+    /// 5090: flat), which a single hard-coded 256 leaves on the table. Env: KERYX_POM_BLOCK=<n>
+    /// forces a value (skips the sweep); KERYX_POM_NO_AUTOTUNE=1 keeps the 256 default.
+    fn autotune_block(&self, device_id: u32) {
+        if let Ok(s) = std::env::var("KERYX_POM_BLOCK") {
+            if let Some(n) = s.trim().parse::<u32>().ok().filter(|n| (1..=1024).contains(n)) {
+                self.block_dim.store(n, Ordering::Relaxed);
+                info!("PoM[gpu{device_id}]: block size forced to {n} (KERYX_POM_BLOCK)");
+                return;
+            }
+        }
+        if std::env::var("KERYX_POM_NO_AUTOTUNE").is_ok() {
+            info!("PoM[gpu{device_id}]: block autotune disabled (KERYX_POM_NO_AUTOTUNE) — block=256");
+            return;
+        }
+        // Pure-walk timing: zero target so no nonce "wins" (no atomicMin storm); walk_v2=true to
+        // match the live per-step cost (4x mix64). Errors leave the 256 default.
+        let (pph, tgt) = ([0u8; 32], [0u8; 32]);
+        let bench: u64 = 1 << 20;
+        let candidates = [64u32, 128, 256, 512, 1024];
+        let mut best_block = 256u32;
+        let mut best_ms = f64::MAX;
+        for &bs in &candidates {
+            self.block_dim.store(bs, Ordering::Relaxed);
+            let _ = self.mine(&pph, 0, &tgt, 0, bench, false, true, false, false); // warmup
+            let mut ms = f64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                if self.mine(&pph, 0, &tgt, 0, bench, false, true, false, false).is_err() {
+                    self.block_dim.store(256, Ordering::Relaxed);
+                    info!("PoM[gpu{device_id}]: block autotune hit an error — falling back to block=256");
+                    return;
+                }
+                ms = ms.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            if ms < best_ms {
+                best_ms = ms;
+                best_block = bs;
+            }
+        }
+        self.block_dim.store(best_block, Ordering::Relaxed);
+        info!(
+            "PoM[gpu{device_id}]: autotuned block size = {best_block} ({:.1} Mnonce/s on the walk bench)",
+            (bench as f64) / (best_ms / 1e3) / 1e6
+        );
+    }
+}
+
+/// Devices whose block size has already been autotuned (once per device, ever).
+fn tuned_devices() -> &'static Mutex<std::collections::HashSet<u32>> {
+    static T: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 // Per-GPU PoM miners. Host-side WeightIndex remains shared; only the CUDA-resident worker state
@@ -456,6 +518,11 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
+    // One-time-per-device block autotune (HashSet::insert = true only the first time).
+    let first = tuned_devices().lock().ok().map(|mut g| g.insert(device_id)).unwrap_or(false);
+    if first {
+        miner.autotune_block(device_id);
+    }
     miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2).ok().flatten()
 }
 
