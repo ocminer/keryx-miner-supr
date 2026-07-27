@@ -87,3 +87,66 @@ extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsig
         atomicMin(winner, nonce);
     }
 }
+
+// ILP x2 variant: each thread grinds TWO nonces with their walk steps interleaved, so the second
+// walk's search/mix work overlaps the first walk's DRAM fetch (both chunk loads issue back-to-back
+// -> their latencies overlap). BYTE-EXACT per nonce — each walk's math is untouched, only the
+// scheduling interleaves. Helps latency-bound parts that DON'T already saturate their outstanding-
+// miss slots at 1 nonce/thread (e.g. GDDR6X 3090). NEUTRAL-to-NEGATIVE where the slots are already
+// full (measured: 5090/GDDR7 -6%, 3070/GDDR6 ~0). The miner autotunes ILP1-vs-ILP2 per device
+// (pom_gpu::autotune_block) and only uses this where it actually wins — never a forced default.
+// Host launches ceil(batch/2) threads (grid in pom_gpu.rs). Identical signature to pom_mine.
+extern "C" __global__ void pom_mine_ilp2(const unsigned long long* bases, const unsigned long long* prefix,
+                                    unsigned int T, unsigned long long n_total_chunks, unsigned int K,
+                                    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+                                    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
+                                    unsigned long long time_,
+                                    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
+                                    unsigned long long nonce_base, unsigned long long n_nonces,
+                                    unsigned long long* winner, unsigned int walk_v2) {
+    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long i0 = tid * 2ULL;
+    if (i0 >= n_nonces) return;
+    unsigned long long i1 = i0 + 1ULL;
+    bool has1 = i1 < n_nonces;
+    unsigned long long nonce0 = nonce_base + i0;
+    // Odd-batch boundary thread: walk nonce0 twice (the duplicate result is dropped below) rather
+    // than branching the whole body on has1 — keeps both lanes busy, byte-exact for nonce0.
+    unsigned long long nonce1 = nonce_base + (has1 ? i1 : i0);
+
+    unsigned long long state0 = pom_seed_fold(nonce0, time_, s0, s1, s2, s3);
+    unsigned long long state1 = pom_seed_fold(nonce1, time_, s0, s1, s2, s3);
+    unsigned long long off0 = state0 % n_total_chunks;
+    unsigned long long off1 = state1 % n_total_chunks;
+    for (unsigned int i = 0; i < K; i++) {
+        unsigned int lo0 = 0, hi0 = T;
+        while (lo0 + 1 < hi0) { unsigned int mid = (lo0 + hi0) >> 1; if (prefix[mid] <= off0) lo0 = mid; else hi0 = mid; }
+        unsigned int lo1 = 0, hi1 = T;
+        while (lo1 + 1 < hi1) { unsigned int mid = (lo1 + hi1) >> 1; if (prefix[mid] <= off1) lo1 = mid; else hi1 = mid; }
+        const ulonglong2* q0 = (const ulonglong2*)bases[lo0];
+        const ulonglong2* q1 = (const ulonglong2*)bases[lo1];
+        unsigned long long b0 = (off0 - prefix[lo0]) * 2ULL;
+        unsigned long long b1 = (off1 - prefix[lo1]) * 2ULL;
+        ulonglong2 a0 = q0[b0], c0 = q0[b0 + 1]; // both fetches issue back-to-back ->
+        ulonglong2 a1 = q1[b1], c1 = q1[b1 + 1]; // their DRAM latencies overlap
+        unsigned long long h0 = state0, h1 = state1;
+        if (walk_v2) {
+            h0 = mix64(h0 ^ a0.x); h1 = mix64(h1 ^ a1.x);
+            h0 = mix64(h0 ^ a0.y); h1 = mix64(h1 ^ a1.y);
+            h0 = mix64(h0 ^ c0.x); h1 = mix64(h1 ^ c1.x);
+            h0 = mix64(h0 ^ c0.y); h1 = mix64(h1 ^ c1.y);
+            state0 = h0; state1 = h1;
+        } else {
+            h0 ^= a0.x; h0 ^= a0.y; h0 ^= c0.x; h0 ^= c0.y; state0 = mix64(h0);
+            h1 ^= a1.x; h1 ^= a1.y; h1 ^= c1.x; h1 ^= c1.y; state1 = mix64(h1);
+        }
+        off0 = state0 % n_total_chunks;
+        off1 = state1 % n_total_chunks;
+    }
+    unsigned long long pv0[4]; pom_pow_fold(state0, p0, p1, p2, p3, pv0);
+    if (pom_le_leq(pv0, t0, t1, t2, t3)) atomicMin(winner, nonce0);
+    if (has1) {
+        unsigned long long pv1[4]; pom_pow_fold(state1, p0, p1, p2, p3, pv1);
+        if (pom_le_leq(pv1, t0, t1, t2, t3)) atomicMin(winner, nonce1);
+    }
+}

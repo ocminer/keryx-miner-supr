@@ -10,7 +10,7 @@
 //! so a nonce found here builds a `PomProof` (host) the node accepts.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use log::info;
@@ -61,7 +61,7 @@ fn walk_load_err(e: impl std::fmt::Display) -> candle_core::Error {
 /// Load the walk kernel, turning a bare driver error (typically CUDA_ERROR_INVALID_PTX when the
 /// GPU is OLDER than the PTX target — PTX only JITs forward) into an actionable message naming
 /// this build's PTX arch and the right build line for older cards.
-fn load_walk_func(cuda: &CudaDevice) -> candle_core::Result<WalkFunc> {
+fn load_walk_func(cuda: &CudaDevice, name: &str) -> candle_core::Result<WalkFunc> {
     let stream = cuda.cuda_stream();
     let ctx = stream.context().clone();
     let module = {
@@ -75,7 +75,7 @@ fn load_walk_func(cuda: &CudaDevice) -> candle_core::Result<WalkFunc> {
             }
         }
     };
-    let func = module.load_function("pom_mine").map_err(walk_load_err)?;
+    let func = module.load_function(name).map_err(walk_load_err)?;
     Ok(WalkFunc { func, stream })
 }
 
@@ -99,6 +99,9 @@ pub struct PomGpuMiner {
     /// size does not affect results (byte-exact), only occupancy/scheduling. Env: KERYX_POM_BLOCK
     /// forces a value (skips the sweep); KERYX_POM_NO_AUTOTUNE=1 keeps 256.
     block_dim: AtomicU32,
+    /// Whether to use the ILP-x2 walk kernel (two interleaved nonces/thread). Chosen per device by
+    /// autotune_block() only where it beats ILP1 (GDDR6X-class); default false. Env KERYX_POM_ILP2.
+    use_ilp2: AtomicBool,
     _tensors: Vec<QTensor>, // raw-loaded tensors kept alive so the gather pointers stay valid
     _shared: Vec<Arc<QTensor>>, // shared-with-inference tensors kept alive (zero-dup, Option C)
     _uploads: Vec<CudaSlice<u8>>, // our own device copies of llama-engine host-resident tensors
@@ -142,9 +145,9 @@ impl PomGpuMiner {
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
         // Warm the module cache so mine() never compiles on the hot path.
-        let _ = load_walk_func(&cuda)?;
+        let _ = load_walk_func(&cuda, "pom_mine")?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), _tensors: tensors, _shared: Vec::new(), _uploads: Vec::new() })
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), use_ilp2: AtomicBool::new(false), _tensors: tensors, _shared: Vec::new(), _uploads: Vec::new() })
     }
 
     /// Standalone walk source: upload the mining model's RAW GGUF bytes to `device_id` (canonical
@@ -195,9 +198,9 @@ impl PomGpuMiner {
 
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
-        let _ = load_walk_func(&cuda)?;
+        let _ = load_walk_func(&cuda, "pom_mine")?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), use_ilp2: AtomicBool::new(false), _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
     }
 
     /// Zero-dup load (Option C): build the gather over the SAME canonical name-sorted layout as
@@ -260,9 +263,9 @@ impl PomGpuMiner {
 
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
-        let _ = load_walk_func(&cuda)?;
+        let _ = load_walk_func(&cuda, "pom_mine")?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), _tensors: raw, _shared: kept_shared, _uploads: Vec::new() })
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), use_ilp2: AtomicBool::new(false), _tensors: raw, _shared: kept_shared, _uploads: Vec::new() })
     }
 
     /// Phase-2 zero-dup over the IN-PROCESS llama.cpp engine (candle hosts nothing): bases/prefix
@@ -342,8 +345,8 @@ impl PomGpuMiner {
         }
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
-        let _ = load_walk_func(&cuda)?;
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
+        let _ = load_walk_func(&cuda, "pom_mine")?;
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), use_ilp2: AtomicBool::new(false), _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
     }
 
     pub fn n_chunks(&self) -> u64 {
@@ -363,11 +366,14 @@ impl PomGpuMiner {
         let k = crate::pom::POM_WALK_STEPS;
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
         let block = self.block_dim.load(Ordering::Relaxed).max(1);
-        let grid = ((batch + block as u64 - 1) / block as u64) as u32;
+        // ILP-x2 kernel grinds 2 nonces/thread -> ceil(batch/2) threads; ILP1 -> `batch` threads.
+        let ilp2 = self.use_ilp2.load(Ordering::Relaxed);
+        let threads = if ilp2 { (batch + 1) / 2 } else { batch };
+        let grid = ((threads + block as u64 - 1) / block as u64) as u32;
         let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
         let wv2: u32 = walk_v2 as u32; // H5 era flag -> kernel `unsigned int walk_v2`
 
-        let func = load_walk_func(&self.cuda)?; // cached
+        let func = load_walk_func(&self.cuda, if ilp2 { "pom_mine_ilp2" } else { "pom_mine" })?; // cached
         let mut b = func.builder();
         b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&self.n_total_chunks).arg(&k)
             .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
@@ -396,28 +402,22 @@ impl PomGpuMiner {
             }
         }
         if std::env::var("KERYX_POM_NO_AUTOTUNE").is_ok() {
-            info!("PoM[gpu{device_id}]: block autotune disabled (KERYX_POM_NO_AUTOTUNE) — block=256");
+            info!("PoM[gpu{device_id}]: block autotune disabled (KERYX_POM_NO_AUTOTUNE) — block=256, ILP1");
             return;
         }
-        // Pure-walk timing: zero target so no nonce "wins" (no atomicMin storm); walk_v2=true to
-        // match the live per-step cost (4x mix64). Errors leave the 256 default.
-        let (pph, tgt) = ([0u8; 32], [0u8; 32]);
         let bench: u64 = 1 << 20;
+        // Block sweep with ILP1 (use_ilp2 is false here). f64::MAX return = launch error.
         let candidates = [64u32, 128, 256, 512, 1024];
         let mut best_block = 256u32;
         let mut best_ms = f64::MAX;
+        self.use_ilp2.store(false, Ordering::Relaxed);
         for &bs in &candidates {
             self.block_dim.store(bs, Ordering::Relaxed);
-            let _ = self.mine(&pph, 0, &tgt, 0, bench, false, true, false, false); // warmup
-            let mut ms = f64::MAX;
-            for _ in 0..3 {
-                let t = std::time::Instant::now();
-                if self.mine(&pph, 0, &tgt, 0, bench, false, true, false, false).is_err() {
-                    self.block_dim.store(256, Ordering::Relaxed);
-                    info!("PoM[gpu{device_id}]: block autotune hit an error — falling back to block=256");
-                    return;
-                }
-                ms = ms.min(t.elapsed().as_secs_f64() * 1e3);
+            let ms = self.bench_walk_ms(bench);
+            if ms == f64::MAX {
+                self.block_dim.store(256, Ordering::Relaxed);
+                info!("PoM[gpu{device_id}]: block autotune hit an error — falling back to block=256, ILP1");
+                return;
             }
             if ms < best_ms {
                 best_ms = ms;
@@ -425,10 +425,50 @@ impl PomGpuMiner {
             }
         }
         self.block_dim.store(best_block, Ordering::Relaxed);
+
+        // ILP dimension at the winning block. ILP-x2 helps only where a single nonce/thread leaves
+        // outstanding-miss slots unused (GDDR6X-class); it regresses parts that already saturate
+        // them (measured: 5090 -6%, 3070 ~0). Require a >2% win to switch, so noise never flips it.
+        // Env KERYX_POM_ILP2=0/1 forces.
+        let (mn1, ilp2_on) = if let Some(f) = std::env::var("KERYX_POM_ILP2").ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+            self.use_ilp2.store(f != 0, Ordering::Relaxed);
+            info!("PoM[gpu{device_id}]: ILP2 {} (KERYX_POM_ILP2)", if f != 0 { "forced ON" } else { "forced OFF" });
+            ((bench as f64) / (best_ms / 1e3) / 1e6, f != 0)
+        } else {
+            self.use_ilp2.store(false, Ordering::Relaxed);
+            let t1 = self.bench_walk_ms(bench);
+            self.use_ilp2.store(true, Ordering::Relaxed);
+            let t2 = self.bench_walk_ms(bench);
+            let use2 = t2 != f64::MAX && t1 != f64::MAX && t2 < t1 * 0.98;
+            self.use_ilp2.store(use2, Ordering::Relaxed);
+            let mn1 = (bench as f64) / (t1 / 1e3) / 1e6;
+            let mn2 = (bench as f64) / (t2 / 1e3) / 1e6;
+            info!("PoM[gpu{device_id}]: ILP1 {mn1:.1} vs ILP2 {mn2:.1} Mnonce/s");
+            (mn1, use2)
+        };
         info!(
-            "PoM[gpu{device_id}]: autotuned block size = {best_block} ({:.1} Mnonce/s on the walk bench)",
-            (bench as f64) / (best_ms / 1e3) / 1e6
+            "PoM[gpu{device_id}]: autotuned config = block {best_block}, ILP{} (~{mn1:.1} Mnonce/s walk bench)",
+            if ilp2_on { "2" } else { "1" }
         );
+    }
+
+    /// Time the walk kernel with the CURRENT (block_dim, use_ilp2) at a fixed nonce count: 1 warmup
+    /// + best-of-3. Pure walk (zero target = no atomicMin storm; walk_v2 = live per-step cost).
+    /// Returns ms, or f64::MAX on launch error.
+    fn bench_walk_ms(&self, bench: u64) -> f64 {
+        let (pph, tgt) = ([0u8; 32], [0u8; 32]);
+        if self.mine(&pph, 0, &tgt, 0, bench, false, true, false, false).is_err() {
+            return f64::MAX;
+        }
+        let mut ms = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            if self.mine(&pph, 0, &tgt, 0, bench, false, true, false, false).is_err() {
+                return f64::MAX;
+            }
+            ms = ms.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        ms
     }
 }
 
