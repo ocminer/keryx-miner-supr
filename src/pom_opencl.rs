@@ -24,11 +24,49 @@ pub struct PomMiner {
     weights: Buffer<cl_ulong>,
     winner: Buffer<cl_ulong>,
     pub n_chunks: u64,
+    /// Nonces per work-item of the chosen kernel (1 = pom_mine, 2 = _ilp2, 4 = _ilp4). Autotuned.
+    ilp: u64,
+    /// Chosen work-group size (autotuned). Global size is rounded up to a multiple of this.
+    local: usize,
 }
 
 // OpenCL handles are plain cl_* pointers usable from any single thread; the global Mutex
 // serializes all access (one mining thread), so sending the miner across threads is sound.
 unsafe impl Send for PomMiner {}
+
+/// One raw kernel dispatch: `n_nonces` nonces on `kernel` with `ilp` nonces/work-item and the given
+/// work-group size, blocking until complete. `None` = OpenCL error; `Some(None)` = ran clean with no
+/// winner; `Some(Some(n))` = winning nonce. Free function (not a method) so mine() and the autotune
+/// sweep can pass disjoint field borrows. The tid guard in every kernel makes the rounded-up global
+/// size safe (padding items exit immediately).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_raw(queue: &CommandQueue, kernel: &Kernel, weights: &Buffer<cl_ulong>, winner: &mut Buffer<cl_ulong>, n_chunks: u64,
+                ilp: u64, local: usize, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4],
+                base: u64, n_nonces: u64, walk_v2: bool) -> Option<Option<u64>> {
+    let wv2: u32 = walk_v2 as u32;
+    queue.enqueue_write_buffer(winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
+    let items = n_nonces.div_ceil(ilp);
+    let global = (items.div_ceil(local as u64) * local as u64) as usize;
+    ExecuteKernel::new(kernel)
+        .set_arg(weights)
+        .set_arg(&n_chunks)
+        .set_arg(&POM_WALK_STEPS)
+        .set_arg(&pph[0]).set_arg(&pph[1]).set_arg(&pph[2]).set_arg(&pph[3])
+        .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
+        .set_arg(&time)
+        .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
+        .set_arg(&base).set_arg(&n_nonces)
+        .set_arg(winner)
+        .set_arg(&wv2)
+        .set_global_work_size(global)
+        .set_local_work_size(local)
+        .enqueue_nd_range(queue)
+        .ok()?;
+    queue.finish().ok()?;
+    let mut w = [u64::MAX];
+    queue.enqueue_read_buffer(winner, CL_BLOCKING, 0, &mut w, &[]).ok()?;
+    Some(if w[0] != u64::MAX { Some(w[0]) } else { None })
+}
 
 /// Staging window for the VRAM upload: 2^22 chunks × 32 B = 128 MiB. The blob is streamed
 /// GGUF → window → cl_mem, so no full host copy of the tier ever exists (the old design cached
@@ -51,8 +89,22 @@ impl PomMiner {
     pub fn new(device: Device, index: &crate::pom::WeightIndex, n_chunks: u64) -> Result<Self, String> {
         let context = Arc::new(Context::from_device(&device).map_err(|e| e.to_string())?);
         let queue = CommandQueue::create(&context, device.id(), 0).map_err(|e| e.to_string())?;
-        let program = Program::create_and_build_from_source(&context, POM_SRC, "")?;
+        // Bake the tier's chunk count into the JIT build: the per-step `state % n` is a 64-bit
+        // division with a runtime divisor (a slow ALU library routine, 256×/nonce); with -D POM_NC
+        // the compiler strength-reduces it to its exact multiply-high sequence (byte-exact — the
+        // compiler's own constant-division transform). Falls back to the arg if the build with the
+        // define fails for any reason.
+        let opts = format!("-D POM_NC={}UL", n_chunks);
+        let program = match Program::create_and_build_from_source(&context, POM_SRC, &opts) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("PoM: JIT with baked chunk-count failed ({e}) — rebuilding with the runtime divisor.");
+                Program::create_and_build_from_source(&context, POM_SRC, "")?
+            }
+        };
         let kernel = Kernel::create(&program, "pom_mine").map_err(|e| e.to_string())?;
+        let kernel_ilp2 = Kernel::create(&program, "pom_mine_ilp2").map_err(|e| e.to_string())?;
+        let kernel_ilp4 = Kernel::create(&program, "pom_mine_ilp4").map_err(|e| e.to_string())?;
         // worker.rs pattern: a context ref that outlives the borrow checker (Arc kept in struct).
         let cref = unsafe { Arc::as_ptr(&context).as_ref().unwrap() };
         // The whole tier blob lives in ONE cl_mem. AMD caps a single allocation at
@@ -97,39 +149,78 @@ impl PomMiner {
                 .map_err(|e| e.to_string())?;
             done += n;
         }
-        let winner = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_WRITE, 1, ptr::null_mut())
+        let mut winner = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_WRITE, 1, ptr::null_mut())
             .map_err(|e| e.to_string())?;
-        Ok(Self { _context: context, queue, kernel, weights, winner, n_chunks })
+
+        // ---- per-device launch autotune (mirror of pom_gpu::autotune_block for CUDA) ----------
+        // Time each (kernel-ILP × work-group size) over the resident blob with an impossible
+        // target and pin the fastest. Block size + ILP affect only scheduling/occupancy, never a
+        // nonce's math — byte-exact by construction; the walk is latency-bound, and how many
+        // independent walks a lane carries decides how much DRAM latency it can hide (our MI50/
+        // MI60 runs at ~17% of HBM2 bandwidth at ILP1 = idle miss slots). Env pins for ops:
+        // KERYX_POM_CL_ILP (1|2|4) and KERYX_POM_CL_LOCAL skip the sweep.
+        let pin_ilp = std::env::var("KERYX_POM_CL_ILP").ok().and_then(|s| s.parse::<u64>().ok());
+        let pin_local = std::env::var("KERYX_POM_CL_LOCAL").ok().and_then(|s| s.parse::<usize>().ok());
+        let variants: [(u64, &str, &Kernel); 3] =
+            [(1, "pom_mine", &kernel), (2, "pom_mine_ilp2", &kernel_ilp2), (4, "pom_mine_ilp4", &kernel_ilp4)];
+        let locals: &[usize] = &[64, 128, 256];
+        // 2^18 per timed run: the top configs sit ~1% apart, so the sample must be big enough to
+        // rank them above run-to-run noise. Full sweep ≈ 9 configs × 3 runs ≈ 0.7 s per card, once
+        // per tier load.
+        let tune_nonces: u64 = 1 << 18;
+        let (mut best_name, mut best_ilp, mut best_local, mut best_rate) = ("pom_mine", 1u64, 256usize, 0f64);
+        for (ilp, name, k) in variants {
+            if pin_ilp.is_some_and(|p| p != ilp) { continue; }
+            for &local in locals {
+                if pin_local.is_some_and(|p| p != local) { continue; }
+                // 1 warmup + 2 timed, best-of (steadier on a busy card).
+                let mut rate = 0f64;
+                let mut ok = true;
+                for round in 0..3 {
+                    let t0 = std::time::Instant::now();
+                    if dispatch_raw(&queue, k, &weights, &mut winner, n_chunks, ilp, local,
+                                    [1, 2, 3, 4], [1, 2, 3, 4], 1, [0; 4], 0, tune_nonces, true).is_none() {
+                        ok = false;
+                        break;
+                    }
+                    if round > 0 {
+                        rate = rate.max(tune_nonces as f64 / t0.elapsed().as_secs_f64());
+                    }
+                }
+                if ok && rate > best_rate {
+                    best_rate = rate;
+                    best_ilp = ilp;
+                    best_local = local;
+                    best_name = name;
+                }
+            }
+        }
+        let chosen = match best_name {
+            "pom_mine_ilp2" => kernel_ilp2,
+            "pom_mine_ilp4" => kernel_ilp4,
+            _ => kernel,
+        };
+        log::info!(
+            "PoM: OpenCL walk autotune -> {} (ILP x{}) @ work-group {} ({:.2} MH/s in-tune){}",
+            best_name, best_ilp, best_local, best_rate / 1e6,
+            if pin_ilp.is_some() || pin_local.is_some() { " [env-pinned]" } else { "" },
+        );
+        Ok(Self { _context: context, queue, kernel: chosen, weights, winner, n_chunks, ilp: best_ilp, local: best_local })
     }
 
     /// Grind one batch of `batch` nonces from `nonce_base` in TDR-safe sub-dispatches. Returns
     /// the lowest nonce whose pom_pow_value <= target, or None.
     pub fn mine(&mut self, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64, walk_v2: bool) -> Option<u64> {
-        let wv2: u32 = walk_v2 as u32; // H5 era flag -> kernel `const uint walk_v2`
         let mut done: u64 = 0;
         while done < batch {
             let sub = (batch - done).min(SUB_DISPATCH_NONCES);
             let base = nonce_base.wrapping_add(done);
-            self.queue.enqueue_write_buffer(&mut self.winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
-            ExecuteKernel::new(&self.kernel)
-                .set_arg(&self.weights)
-                .set_arg(&self.n_chunks)
-                .set_arg(&POM_WALK_STEPS)
-                .set_arg(&pph[0]).set_arg(&pph[1]).set_arg(&pph[2]).set_arg(&pph[3])
-                .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
-                .set_arg(&time)
-                .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
-                .set_arg(&base).set_arg(&sub)
-                .set_arg(&self.winner)
-                .set_arg(&wv2)
-                .set_global_work_size(sub as usize)
-                .enqueue_nd_range(&self.queue)
-                .ok()?;
-            self.queue.finish().ok()?;
-            let mut w = [u64::MAX];
-            self.queue.enqueue_read_buffer(&self.winner, CL_BLOCKING, 0, &mut w, &[]).ok()?;
-            if w[0] != u64::MAX {
-                return Some(w[0]);
+            // Disjoint field borrows: kernel/queue/weights immutably, winner mutably.
+            match dispatch_raw(&self.queue, &self.kernel, &self.weights, &mut self.winner, self.n_chunks,
+                               self.ilp, self.local, pph, seed, time, target, base, sub, walk_v2) {
+                None => return None,             // OpenCL error — abort the batch (old ok()? behavior)
+                Some(Some(w)) => return Some(w), // lowest winner in this ascending sub-batch
+                Some(None) => {}                 // clean, no winner — next sub-batch
             }
             done += sub;
         }
