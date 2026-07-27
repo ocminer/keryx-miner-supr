@@ -55,6 +55,28 @@ impl PomMiner {
         let kernel = Kernel::create(&program, "pom_mine").map_err(|e| e.to_string())?;
         // worker.rs pattern: a context ref that outlives the borrow checker (Arc kept in struct).
         let cref = unsafe { Arc::as_ptr(&context).as_ref().unwrap() };
+        // The whole tier blob lives in ONE cl_mem. AMD caps a single allocation at
+        // CL_DEVICE_MAX_MEM_ALLOC_SIZE; if the blob exceeds it the driver returns a partial/broken
+        // buffer and the walk reads garbage → the card hashes but never finds a valid share (the
+        // classic Polaris/RX-580 post-H5 failure — the Qwen3-8B blob is ~4.8 GB). main() raises the
+        // cap via GPU_SINGLE_ALLOC_PERCENT=100 before OpenCL inits; warn loudly if it's STILL too
+        // small (a driver that ignores the env var) so the failure is diagnosable, not silent.
+        let blob_bytes = n_chunks.saturating_mul(32);
+        if let Ok(max_alloc) = device.max_mem_alloc_size() {
+            if blob_bytes > max_alloc {
+                log::error!(
+                    "PoM: tier possession blob is {} MiB but this GPU's OpenCL max single-buffer \
+                     allocation is only {} MiB (CL_DEVICE_MAX_MEM_ALLOC_SIZE). The blob can't fit in \
+                     one buffer → the walk reads garbage and the card will hash but NEVER find a valid \
+                     share. Set GPU_SINGLE_ALLOC_PERCENT=100 GPU_MAX_ALLOC_PERCENT=100 in the \
+                     environment before launch (the miner sets these automatically unless overridden; \
+                     if this still fires your OpenCL driver is ignoring them — update the AMD GPU \
+                     driver, or the card can't hold this tier).",
+                    blob_bytes / (1024 * 1024),
+                    max_alloc / (1024 * 1024),
+                );
+            }
+        }
         let mut weights = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_ONLY, (n_chunks * 4) as usize, ptr::null_mut())
             .map_err(|e| e.to_string())?;
         let mut staging = vec![0u64; (UPLOAD_WINDOW_CHUNKS.min(n_chunks) * 4) as usize];
