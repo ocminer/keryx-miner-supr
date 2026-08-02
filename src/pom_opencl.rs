@@ -380,6 +380,19 @@ fn try_claim_shared(_device_id: usize) -> bool {
     false
 }
 
+/// True if the in-process llama engine holds its model on this OpenCL card (PCI match).
+#[cfg(unix)]
+fn engine_hosts_card(device_id: usize) -> bool {
+    match (crate::llama_engine_vk::pom_pci(), device_pci(device_id)) {
+        (Some((_, eb, ed, ef)), Some((b, d, f))) => (eb, ed, ef) == (b, d, f),
+        _ => false,
+    }
+}
+#[cfg(not(unix))]
+fn engine_hosts_card(_device_id: usize) -> bool {
+    false
+}
+
 /// Cards whose streaming upload is currently in flight. Uploads for DIFFERENT cards run
 /// concurrently (each thread streams its own card); a second caller for the SAME card waits
 /// here instead of double-building (only the unbound/test fallback path can race like that —
@@ -506,6 +519,29 @@ pub fn ensure_installed() {
             }
             match install_resident(id) {
                 Ok(()) => log::info!("PoM: tier {t} installed (GPU-resident) on card {id:#x}."),
+                // If the failing card is the one the in-process engine holds its model on (a
+                // failed/refused zero-dup claim, e.g. "byte gate fetch failed"), the resident
+                // model (~6 GB) + the blob (~4.8 GB post-H5) may simply not both fit — on 8 GB
+                // cards the blob alloc fails and the card would idle at 0 hash forever (the
+                // field-reported "GPU 1 idle" bug). Mining beats in-process inference: unload
+                // the engine to free its VRAM and retry the install once; OPoI falls back to
+                // the llama-server subprocess / CPU.
+                Err(e) if engine_hosts_card(id) => {
+                    log::warn!(
+                        "PoM: install on card {id:#x} failed ({e}) while the in-process llama engine \
+                         holds the model on that card — unloading the engine to free VRAM and retrying."
+                    );
+                    #[cfg(unix)]
+                    let unloaded = crate::llama_engine_vk::unload();
+                    #[cfg(not(unix))]
+                    let unloaded = false;
+                    if unloaded {
+                        match install_resident(id) {
+                            Ok(()) => log::info!("PoM: tier {t} installed (GPU-resident) on card {id:#x} after engine unload."),
+                            Err(e2) => log::warn!("PoM: install on card {id:#x} STILL failed after engine unload: {e2}"),
+                        }
+                    }
+                }
                 Err(e) => log::warn!("PoM: install on card {id:#x} failed: {e}"),
             }
         }

@@ -17,6 +17,7 @@ use nix::libc;
 
 type AbiFn = unsafe extern "C" fn() -> c_int;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
+type FreeFn = unsafe extern "C" fn(*mut c_void);
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
 type ReadyFn = unsafe extern "C" fn(*mut c_void) -> bool;
 type U64Fn = unsafe extern "C" fn(*mut c_void) -> u64;
@@ -37,6 +38,7 @@ const SUB_DISPATCH_NONCES: u64 = 1 << 20;
 
 struct Engine {
     model: *mut c_void,
+    free: FreeFn,
     generate: GenFn,
     pom_ready: ReadyFn,
     pom_n_chunks: U64Fn,
@@ -174,10 +176,11 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
             log::warn!("llama-vk engine: dlopen({}) failed: {} — llama-server/candle fallbacks stay active.", so.display(), msg);
             return false;
         }
-        let (Some(abi), Some(vk_abi), Some(load), Some(gen), Some(ready), Some(nch), Some(supl), Some(fetch), Some(mine), Some(pci)) = (
+        let (Some(abi), Some(vk_abi), Some(load), Some(free_fn), Some(gen), Some(ready), Some(nch), Some(supl), Some(fetch), Some(mine), Some(pci)) = (
             sym::<AbiFn>(lib, "keryx_llama_abi"),
             sym::<AbiFn>(lib, "keryx_llama_vk_abi"),
             sym::<LoadFn>(lib, "keryx_llama_load"),
+            sym::<FreeFn>(lib, "keryx_llama_free"),
             sym::<GenFn>(lib, "keryx_llama_generate"),
             sym::<ReadyFn>(lib, "keryx_llama_pom_ready"),
             sym::<U64Fn>(lib, "keryx_llama_pom_n_chunks"),
@@ -229,6 +232,7 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
         );
         *g = Some(Engine {
             model,
+            free: free_fn,
             generate: gen,
             pom_ready: ready,
             pom_n_chunks: nch,
@@ -336,6 +340,29 @@ pub fn pom_byte_gate(index: &crate::pom::WeightIndex) -> bool {
 /// TDR-safe sub-dispatches (ascending, early exit on the first winning sub-batch — identical
 /// semantics to `PomMiner::mine`). `p`/`t` are the pph words (era-salted by the caller) and the
 /// LE target words. Returns the lowest winning nonce, or None.
+/// Unload the in-process engine and free ALL its VRAM (model + walk/fetch buffers). Used when this
+/// engine's card must host the OpenCL possession blob instead: on a small card (e.g. 8 GB RDNA1)
+/// the resident model (~6 GB) + the post-H5 blob (~4.8 GB) cannot coexist, so a failed zero-dup
+/// (byte-gate) leaves the blob install OOM-ing and the card idle at 0 hash. Mining beats
+/// in-process inference — after unload OPoI falls back to the llama-server subprocess / CPU.
+/// Returns true if an engine was actually unloaded.
+pub fn unload() -> bool {
+    let mut g = match engine().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(e) = g.take() {
+        unsafe { (e.free)(e.model) };
+        log::warn!(
+            "llama-vk engine: unloaded — VRAM freed for the OpenCL possession blob; OPoI inference \
+             falls back to the llama-server subprocess / CPU."
+        );
+        true
+    } else {
+        false
+    }
+}
+
 pub fn pom_mine(p: [u64; 4], s: [u64; 4], time: u64, t: [u64; 4], nonce_base: u64, batch: u64, walk_v2: bool) -> Option<u64> {
     let g = engine().lock().ok()?;
     let e = g.as_ref()?;
