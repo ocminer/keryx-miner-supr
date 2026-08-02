@@ -2034,6 +2034,24 @@ mod tests {
         eprintln!("OpenCL H5.1 seed nonce {nonce} confirmed by CPU pom_block_seed(h5_1) ✅ (differs from the pre-H5.1 v2 winner 1053)");
     }
 
+    /// Engine unload frees the model + VRAM and a fresh ensure_loaded works after it — the rescue
+    /// path for "byte gate failed on a small card" (unload the engine, give the VRAM to the blob).
+    #[test]
+    #[ignore]
+    #[cfg(all(feature = "pom-opencl", unix))]
+    fn gpu_engine_unload_reload() {
+        let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
+        let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        assert!(crate::llama_engine_vk::ensure_loaded(&path, gpu), "initial engine load failed");
+        assert!(crate::llama_engine_vk::available());
+        assert!(crate::llama_engine_vk::unload(), "unload must report an engine was freed");
+        assert!(!crate::llama_engine_vk::available(), "engine must be gone after unload");
+        assert!(!crate::llama_engine_vk::unload(), "second unload is a no-op");
+        assert!(crate::llama_engine_vk::ensure_loaded(&path, gpu), "reload after unload failed");
+        assert!(crate::llama_engine_vk::pom_ready(), "walk must be ready after reload");
+        eprintln!("engine unload -> VRAM freed -> reload OK ✅");
+    }
+
     /// H5.1 seed correctness for the ZERO-DUP Vulkan shader (s0..s3 push-constants). Same oracle as
     /// gpu_h5_1_seed_opencl_matches_cpu, through pom_walk_vk.comp. Needs KERYX_LLAMA_VK_SO + a Vulkan GPU.
     #[test]
