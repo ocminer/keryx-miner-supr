@@ -346,12 +346,22 @@ pub fn pom_byte_gate(index: &crate::pom::WeightIndex) -> bool {
 /// (byte-gate) leaves the blob install OOM-ing and the card idle at 0 hash. Mining beats
 /// in-process inference — after unload OPoI falls back to the llama-server subprocess / CPU.
 /// Returns true if an engine was actually unloaded.
+/// True once the engine was unloaded to give its VRAM to the possession blob. The llama-server
+/// GPU fallback consults this: it would pin to the SAME discrete card (pick_discrete_ggml_device)
+/// and re-occupy the VRAM the unload just freed — recreating the small-card squeeze. With the flag
+/// set (and no explicit KERYX_LLAMA_VK_DEVICE), OPoI inference goes to CPU instead: mining wins.
+pub fn evicted_for_vram() -> bool {
+    EVICTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+static EVICTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn unload() -> bool {
     let mut g = match engine().lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
     if let Some(e) = g.take() {
+        EVICTED.store(true, std::sync::atomic::Ordering::Relaxed);
         unsafe { (e.free)(e.model) };
         log::warn!(
             "llama-vk engine: unloaded — VRAM freed for the OpenCL possession blob; OPoI inference \

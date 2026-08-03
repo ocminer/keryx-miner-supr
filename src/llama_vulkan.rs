@@ -62,6 +62,19 @@ fn server_binary() -> Option<std::path::PathBuf> {
 /// so model layers land in UMA system RAM) — stealing VRAM from every mining card. Override the
 /// auto-pick with `KERYX_LLAMA_VK_DEVICE` (a `GGML_VK_VISIBLE_DEVICES` value, e.g. "1").
 pub fn try_start(gguf_path: &str, port: u16) -> bool {
+    // The engine was unloaded to give its card's VRAM to the possession blob — a GPU llama-server
+    // would pin to that SAME discrete card (pick_discrete_ggml_device) and re-occupy it, starving
+    // the blob/walk again on small cards. Explicit KERYX_LLAMA_VK_DEVICE (operator pins another
+    // card) still wins; otherwise OPoI inference stays on CPU. Mining beats inference.
+    #[cfg(all(feature = "pom-opencl", unix))]
+    if crate::llama_engine_vk::evicted_for_vram() && std::env::var("KERYX_LLAMA_VK_DEVICE").is_err() {
+        log::warn!(
+            "llama server: NOT starting the GPU inference server — the in-process engine was unloaded \
+             to free VRAM for the PoM blob, and the server would land on the same card. OPoI inference \
+             runs on CPU (set KERYX_LLAMA_VK_DEVICE=<other ggml device> to pin GPU inference elsewhere)."
+        );
+        return false;
+    }
     if available() {
         return true;
     }
