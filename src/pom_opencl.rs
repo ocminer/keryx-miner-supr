@@ -370,15 +370,24 @@ fn device_pci(device_id: usize) -> Option<(u32, u32, u32)> {
     Some((v[21] as u32, v[22] as u32, v[23] as u32))
 }
 
-/// True if `device_id` is an RDNA (gfx10/11/12) card — the Vulkan zero-dup walk matches or beats
-/// the OpenCL blob walk there (measured +1.7% on gfx1102). On GCN (gfx9 and older) the Vulkan
-/// walk is ~15-24% slower at equal clocks (a RADV-vs-ROCm memory-path gap the shader can't close),
-/// so those cards keep their full-speed OpenCL blob by default. gfx name via CL_DEVICE_NAME.
+/// True if `device_id` is a zero-dup-SAFE RDNA card (RDNA2+: gfx103x / gfx11 / gfx12) — the
+/// Vulkan zero-dup walk matches or beats the OpenCL blob walk there (measured +1.7% on gfx1102).
+/// EXCLUDED:
+/// - GCN (gfx9 and older): the Vulkan walk is ~15-24% slower at equal clocks.
+/// - RDNA1 (gfx101x, RX 5600/5700 series): FIELD-VERIFIED GPU HANG — the byte-gate fetch dispatch
+///   (buffer-device-address gather on RADV/NAVI10) hard-hangs the GPU at the first dispatch
+///   ("byte gate fetch failed at chunk 0" is the hang, not a soft failure); every later GPU call
+///   on that device blocks forever, and unloading the engine (vkDeviceWaitIdle) wedges the whole
+///   rig until reboot. Never dispatch the gate there — the policy check runs BEFORE the gate.
+/// KERYX_ZERO_DUP=force still overrides for experiments. gfx name via CL_DEVICE_NAME.
 #[cfg(unix)]
 fn device_is_rdna(device_id: usize) -> bool {
     let name = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id)
         .name()
         .unwrap_or_default();
+    if name.contains("gfx101") {
+        return false; // RDNA1: BDA fetch hangs the GPU (RX 5700 XT field logs)
+    }
     name.contains("gfx10") || name.contains("gfx11") || name.contains("gfx12")
 }
 
