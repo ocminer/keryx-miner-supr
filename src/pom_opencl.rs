@@ -21,7 +21,8 @@ pub struct PomMiner {
     _context: Arc<Context>,
     queue: CommandQueue,
     kernel: Kernel,
-    weights: Buffer<cl_ulong>,
+    weights: Vec<Buffer<cl_ulong>>,
+    slab_shift: u32,
     winner: Buffer<cl_ulong>,
     pub n_chunks: u64,
     /// Nonces per work-item of the chosen kernel (1 = pom_mine, 2 = _ilp2, 4 = _ilp4). Autotuned.
@@ -40,17 +41,20 @@ unsafe impl Send for PomMiner {}
 /// sweep can pass disjoint field borrows. The tid guard in every kernel makes the rounded-up global
 /// size safe (padding items exit immediately).
 #[allow(clippy::too_many_arguments)]
-fn dispatch_raw(queue: &CommandQueue, kernel: &Kernel, weights: &Buffer<cl_ulong>, winner: &mut Buffer<cl_ulong>, n_chunks: u64,
+fn dispatch_raw(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>], slab_shift: u32, winner: &mut Buffer<cl_ulong>, n_chunks: u64,
                 ilp: u64, local: usize, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4],
                 base: u64, n_nonces: u64, walk_v2: bool) -> Option<Option<u64>> {
     let wv2: u32 = walk_v2 as u32;
     queue.enqueue_write_buffer(winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
     let items = n_nonces.div_ceil(ilp);
     let global = (items.div_ceil(local as u64) * local as u64) as usize;
+    // 4 slab args; absent slabs repeat slab 0 (never addressed: off>>shift bounds to real slabs).
+    let sl = |i: usize| weights.get(i).unwrap_or(&weights[0]);
     ExecuteKernel::new(kernel)
-        .set_arg(weights)
+        .set_arg(sl(0)).set_arg(sl(1)).set_arg(sl(2)).set_arg(sl(3))
         .set_arg(&n_chunks)
         .set_arg(&POM_WALK_STEPS)
+        .set_arg(&slab_shift)
         .set_arg(&pph[0]).set_arg(&pph[1]).set_arg(&pph[2]).set_arg(&pph[3])
         .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
         .set_arg(&time)
@@ -124,39 +128,52 @@ impl PomMiner {
                 device.global_mem_size().map(|b| b / (1024 * 1024)).unwrap_or(0),
             );
             if blob_bytes > max_alloc {
-                log::error!(
-                    "PoM: tier possession blob is {} MiB but this GPU's OpenCL max single-buffer \
-                     allocation is only {} MiB (CL_DEVICE_MAX_MEM_ALLOC_SIZE). The blob can't fit in \
-                     one buffer → the walk reads garbage and the card will hash but NEVER find a valid \
-                     share. Set GPU_SINGLE_ALLOC_PERCENT=100 GPU_MAX_ALLOC_PERCENT=100 in the \
-                     environment before launch (the miner sets these automatically unless overridden; \
-                     if this still fires your OpenCL driver is ignoring them — update the AMD GPU \
-                     driver, or the card can't hold this tier).",
-                    blob_bytes / (1024 * 1024),
-                    max_alloc / (1024 * 1024),
+                log::info!(
+                    "PoM: tier blob ({} MiB) exceeds this GPU's reported max single-buffer allocation \
+                     ({} MiB) — the blob will be SPLIT across multiple buffers (slab layout).",
+                    blob_bytes / (1024 * 1024), max_alloc / (1024 * 1024),
                 );
             }
         }
-        let mut weights = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_ONLY, (n_chunks * 4) as usize, ptr::null_mut())
-            .map_err(|e| e.to_string())?;
-        let mut staging = vec![0u64; (UPLOAD_WINDOW_CHUNKS.min(n_chunks) * 4) as usize];
-        let mut done: u64 = 0;
-        while done < n_chunks {
-            let n = (n_chunks - done).min(UPLOAD_WINDOW_CHUNKS);
-            let words = &mut staging[..(n * 4) as usize];
-            // Fill the window with the raw chunk bytes, then normalize to the LE word values the
-            // kernel folds (u64::from_le is a no-op on our little-endian targets) — identical to
-            // chunk_to_words / u64::from_le_bytes on every chunk.
-            let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8) };
-            index.read_chunks_into(done, bytes);
-            for w in words.iter_mut() {
-                *w = u64::from_le(*w);
+        // Slab layout: single buffer first (fast path, existing fleet unchanged). If ANY create or
+        // write in that path fails — Polaris/ORCA rejects >~4 GiB per buffer with
+        // CL_MEM_OBJECT_ALLOCATION_FAILURE even though it REPORTS an 8 GiB max-alloc (RX 580 field
+        // report), so the reported limit cannot be trusted — retry with 2^SLAB_SHIFT_FALLBACK-chunk
+        // (2 GiB) slabs, up to 4 (kernel arg count). KERYX_POM_CL_SLAB_SHIFT forces a slab size
+        // (testing / stubborn drivers). Byte-exact either way: the kernel's pom_fetch maps canonical
+        // chunk index -> (slab, intra) and the chunk bytes are identical.
+        const SLAB_SHIFT_FALLBACK: u32 = 26; // 2^26 chunks * 32 B = 2 GiB per slab
+        let forced_shift = std::env::var("KERYX_POM_CL_SLAB_SHIFT").ok().and_then(|v| v.parse::<u32>().ok());
+        let attempts: Vec<u32> = match forced_shift {
+            Some(sh) => vec![sh.clamp(20, 63)],
+            None => vec![63, SLAB_SHIFT_FALLBACK],
+        };
+        let mut built: Option<(Vec<Buffer<cl_ulong>>, u32)> = None;
+        let mut last_err = String::new();
+        for shift in attempts {
+            match Self::build_slabs(cref, &queue, index, n_chunks, shift) {
+                Ok(v) => {
+                    if shift < 63 {
+                        log::info!(
+                            "PoM: blob resident as {} slab(s) of {} MiB (slab_shift {shift}).",
+                            v.len(), (1u64 << shift) * 32 / (1024 * 1024),
+                        );
+                    }
+                    built = Some((v, shift));
+                    break;
+                }
+                Err(e) => {
+                    last_err = e;
+                    log::warn!(
+                        "PoM: blob layout with slab_shift {shift} failed ({last_err}) — {}",
+                        if shift == 63 { "retrying with 2 GiB slabs (Polaris per-buffer limit workaround)." } else { "no smaller layout available." },
+                    );
+                }
             }
-            queue
-                .enqueue_write_buffer(&mut weights, CL_BLOCKING, (done * 32) as usize, words, &[])
-                .map_err(|e| e.to_string())?;
-            done += n;
         }
+        let Some((weights, slab_shift)) = built else {
+            return Err(format!("blob allocation failed in every layout: {last_err}"));
+        };
         let mut winner = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_WRITE, 1, ptr::null_mut())
             .map_err(|e| e.to_string())?;
 
@@ -186,7 +203,7 @@ impl PomMiner {
                 let mut ok = true;
                 for round in 0..3 {
                     let t0 = std::time::Instant::now();
-                    if dispatch_raw(&queue, k, &weights, &mut winner, n_chunks, ilp, local,
+                    if dispatch_raw(&queue, k, &weights, slab_shift, &mut winner, n_chunks, ilp, local,
                                     [1, 2, 3, 4], [1, 2, 3, 4], 1, [0; 4], 0, tune_nonces, true).is_none() {
                         ok = false;
                         break;
@@ -213,7 +230,43 @@ impl PomMiner {
             best_name, best_ilp, best_local, best_rate / 1e6,
             if pin_ilp.is_some() || pin_local.is_some() { " [env-pinned]" } else { "" },
         );
-        Ok(Self { _context: context, queue, kernel: chosen, weights, winner, n_chunks, ilp: best_ilp, local: best_local })
+        Ok(Self { _context: context, queue, kernel: chosen, weights, slab_shift, winner, n_chunks, ilp: best_ilp, local: best_local })
+    }
+
+    /// Create + stream the blob as ceil(n_chunks / 2^shift) buffers (shift>=63 = one buffer).
+    /// Fails cleanly on any create/write error so the caller can retry a smaller layout.
+    fn build_slabs(cref: &Context, queue: &CommandQueue, index: &crate::pom::WeightIndex, n_chunks: u64, shift: u32) -> Result<Vec<Buffer<cl_ulong>>, String> {
+        let slab_chunks: u64 = if shift >= 63 { n_chunks } else { 1u64 << shift };
+        let n_slabs = n_chunks.div_ceil(slab_chunks.max(1));
+        if n_slabs > 4 {
+            return Err(format!("{n_slabs} slabs needed but the kernel takes at most 4 — tier too big for this layout"));
+        }
+        let mut slabs: Vec<Buffer<cl_ulong>> = Vec::with_capacity(n_slabs as usize);
+        let mut staging = vec![0u64; (UPLOAD_WINDOW_CHUNKS.min(slab_chunks) * 4) as usize];
+        for si in 0..n_slabs {
+            let start = si * slab_chunks;
+            let count = slab_chunks.min(n_chunks - start);
+            let mut buf = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_ONLY, (count * 4) as usize, ptr::null_mut())
+                .map_err(|e| format!("slab {si} create ({} MiB): {e}", count * 32 / (1024 * 1024)))?;
+            let mut done: u64 = 0;
+            while done < count {
+                let n = (count - done).min(UPLOAD_WINDOW_CHUNKS);
+                let words = &mut staging[..(n * 4) as usize];
+                // Raw chunk bytes -> LE word values (no-op on LE targets) — identical to
+                // chunk_to_words / u64::from_le_bytes on every chunk.
+                let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8) };
+                index.read_chunks_into(start + done, bytes);
+                for w in words.iter_mut() {
+                    *w = u64::from_le(*w);
+                }
+                queue
+                    .enqueue_write_buffer(&mut buf, CL_BLOCKING, (done * 32) as usize, words, &[])
+                    .map_err(|e| format!("slab {si} write @{} MiB: {e}", done * 32 / (1024 * 1024)))?;
+                done += n;
+            }
+            slabs.push(buf);
+        }
+        Ok(slabs)
     }
 
     /// Grind one batch of `batch` nonces from `nonce_base` in TDR-safe sub-dispatches. Returns
@@ -224,7 +277,7 @@ impl PomMiner {
             let sub = (batch - done).min(SUB_DISPATCH_NONCES);
             let base = nonce_base.wrapping_add(done);
             // Disjoint field borrows: kernel/queue/weights immutably, winner mutably.
-            match dispatch_raw(&self.queue, &self.kernel, &self.weights, &mut self.winner, self.n_chunks,
+            match dispatch_raw(&self.queue, &self.kernel, &self.weights, self.slab_shift, &mut self.winner, self.n_chunks,
                                self.ilp, self.local, pph, seed, time, target, base, sub, walk_v2) {
                 None => return None,             // OpenCL error — abort the batch (old ok()? behavior)
                 Some(Some(w)) => return Some(w), // lowest winner in this ascending sub-batch
