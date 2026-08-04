@@ -219,8 +219,38 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                 eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
                 return Ok(());
             } else {
-                // 200, or the server ignored Range ⇒ (re)start from scratch.
+                // 200, or the server ignored Range. Never wipe a local file that already matches
+                // the remote size — IPFS gateways often ignore Range and answer 200 + full
+                // Content-Length, which previously truncated multi-GB GGUFs back to zero.
                 let total = response.header("Content-Length").and_then(|s| s.parse::<u64>().ok());
+                if resume_from > 0 {
+                    if let Some(t) = total {
+                        if resume_from >= t {
+                            eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
+                            return Ok(());
+                        }
+                    }
+                    // Partial local file + no Range support: keep the bytes and resume via a
+                    // fresh request without Range only when we have nothing useful; otherwise
+                    // refuse to truncate and retry later (gateway may regain Range support).
+                    if resume_from > 1_000_000 {
+                        drop(response);
+                        attempt += 1;
+                        if attempt >= MAX_ATTEMPTS {
+                            return Err(anyhow!(
+                                "download {} cannot resume: server ignored Range and local partial is {} MB",
+                                url,
+                                resume_from / 1_000_000
+                            ));
+                        }
+                        eprintln!(
+                            "\n[keryx-miner] server ignored Range (HTTP {status}); keeping local {} MB, retry {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s…",
+                            resume_from / 1_000_000
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS));
+                        continue;
+                    }
+                }
                 let f = std::fs::File::create(dest)
                     .with_context(|| format!("create {}", dest.display()))?;
                 (f, 0u64, total)
@@ -329,16 +359,8 @@ fn ensure_safetensors(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path
     Ok((tok, cfg, wts))
 }
 
-/// Cheap sanity check that a file begins with the GGUF magic ("GGUF"). Used to decide whether to
-/// ADOPT a pre-staged / already-present weight file (see `ensure_gguf`) rather than re-downloading
-/// it. This is only a smoke test (rejects empty/non-GGUF drops); the authoritative content check is
-/// the PoM tier-root (R_T) recomputation when the possession index is built.
-fn gguf_has_magic(path: &std::path::Path) -> bool {
-    use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else { return false };
-    let mut magic = [0u8; 4];
-    f.read_exact(&mut magic).is_ok() && &magic == b"GGUF"
-}
+// (gguf_has_magic removed — adoption now uses crate::gguf::is_complete_file, which parses the
+// header AND checks tensor coverage; upstream 8c1d64b.)
 
 fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     let dir = model_dir(spec);
@@ -354,40 +376,52 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
 
     // ADOPT a weight file that is already present instead of re-downloading it. Operators commonly
     // pre-fetch the multi-GB GGUF themselves and drop model.gguf into the dir — the miner MUST use
-    // that file, never delete + re-download it. Our own completed downloads leave a `.ok` sentinel;
-    // a user-dropped file won't have one, so `.ok` alone can't gate adoption. Instead:
-    //   - `.ok` present  → trust it (we wrote it after a verified download).
-    //   - no `.ok` but a valid GGUF is present → adopt it (write `.ok`), do NOT re-download.
-    // We only sanity-check the GGUF magic here (cheap); the FULL content is verified downstream when
-    // the PoM possession index is built (WeightIndex::build_from_gguf recomputes the tier root R_T
-    // and checks it), so a wrong/corrupt/truncated drop fails there loudly rather than mining garbage.
-    // (model_id is the IPFS CID multihash, NOT a flat sha256 of the file, so it can't be used as a
-    // whole-file checksum here.)
-    if gguf.exists() && (!need_tok || tok.exists()) {
+    // that file, never delete + re-download it. Completeness is judged by TENSOR COVERAGE
+    // (crate::gguf::is_complete_file: header parses AND the on-disk size covers every tensor —
+    // upstream 8c1d64b), which supersedes the old magic-only check and also catches a truncated
+    // file hiding behind a stale `.ok` (the "watchdog corrupts mid-download models" class). The
+    // FULL content is still verified downstream when the PoM possession index recomputes the tier
+    // root R_T, so a wrong drop fails there loudly rather than mining garbage.
+    let gguf_ready = crate::gguf::is_complete_file(&gguf);
+    if gguf_ready && (!need_tok || tok.exists()) {
         if ok_flag.exists() {
             log::debug!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
-            return Ok((tok, gguf));
-        }
-        if gguf_has_magic(&gguf) {
+        } else {
             std::fs::write(&ok_flag, b"").ok();
             log::info!(
-                "SlmEngine: adopting pre-staged model '{}' at {} (GGUF ok; not re-downloading — \
-                 content is verified when the PoM index builds).",
+                "SlmEngine: adopting pre-staged model '{}' at {} (GGUF complete by tensor \
+                 coverage; not re-downloading).",
                 spec.name, dir.display()
             );
-            return Ok((tok, gguf));
         }
+        return Ok((tok, gguf));
+    }
+
+    std::fs::create_dir_all(&dir)?;
+    if ok_flag.exists() && !gguf_ready {
         log::warn!(
-            "SlmEngine: '{}' at {} is not a valid GGUF (bad/short magic) — re-downloading.",
+            "SlmEngine: '{}' at {} has a stale .ok but the GGUF is incomplete (truncated?) — repairing.",
             spec.name, gguf.display()
         );
     }
-    std::fs::create_dir_all(&dir)?;
-    let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
-    eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
-    if need_tok && !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
-    // download_file resumes a truncated GGUF and no-ops a complete one (Range → 416 → already complete).
-    download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
+    let _ = std::fs::remove_file(&ok_flag); // clear stale flag before (re)downloading
+
+    if !gguf_ready {
+        eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
+        // download_file resumes a truncated GGUF, refuses to wipe a partial on Range-less
+        // gateways (keeps bytes + backoff-retries), and no-ops a complete one (Range → 416).
+        download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
+        if !crate::gguf::is_complete_file(&gguf) {
+            return Err(anyhow!(
+                "model '{}' download finished but GGUF is incomplete at {}",
+                spec.name, gguf.display()
+            ));
+        }
+    }
+    if need_tok && !tok.exists() {
+        download_file(&ipfs_url(spec.tokenizer_cid), &tok)?;
+    }
+
     std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
     eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
     Ok((tok, gguf))
