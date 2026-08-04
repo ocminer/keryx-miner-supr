@@ -34,6 +34,24 @@ typedef ulong u64;
 #define POM_N(nc_arg) (nc_arg)
 #endif
 
+// Slab-split fetch: Polaris-class OpenCL stacks (ORCA) enforce a hard per-buffer limit (~4 GiB)
+// REGARDLESS of the reported CL_DEVICE_MAX_MEM_ALLOC_SIZE / GPU_SINGLE_ALLOC_PERCENT — a single
+// 4.6 GiB post-H5 blob fails with CL_MEM_OBJECT_ALLOCATION_FAILURE (RX 580 8 GB field report).
+// The host therefore splits the blob into up to 4 slabs of 2^slab_shift chunks each and passes
+// them as c0..c3. Chunk off lives in slab off>>slab_shift at index off&mask. Single-slab rigs
+// (the common case) pass slab_shift=63 -> s==0 always, i==off: the address math degenerates to
+// the old one-buffer layout. BYTE-EXACT either way — only WHERE a chunk lives changes, never its
+// bytes, and the walk consumes chunks by canonical index.
+inline ulong4 pom_fetch(const __global ulong4* restrict c0, const __global ulong4* restrict c1,
+                        const __global ulong4* restrict c2, const __global ulong4* restrict c3,
+                        u64 off, uint slab_shift) {
+    u64 s = off >> slab_shift;
+    u64 i = off & ((1UL << slab_shift) - 1UL);
+    const __global ulong4* b = (s == 0UL) ? c0 : (s == 1UL) ? c1 : (s == 2UL) ? c2 : c3;
+    return b[i];
+}
+
+
 // SplitMix64 finalizer (pom.rs:117-124). All `*` are wrapping (ulong overflow wraps).
 inline u64 pom_mix64(u64 x) {
     x ^= x >> 30; x *= 0xbf58476d1ce4e5b9UL;
@@ -73,9 +91,13 @@ inline bool pom_le_leq(const u64 a[4], u64 b0, u64 b1, u64 b2, u64 b3) {
 // in canonical chunk order (R_T is built over exactly this order). `winner` is a single
 // u64 pre-set to U64_MAX by the host; lowest passing nonce wins (host re-verifies).
 __kernel void pom_mine(
-    __global const u64* restrict weights,
+    __global const ulong4* restrict w0,   // blob slab 0 (single-slab rigs: the whole blob; unused slabs = slab 0 repeated)
+    __global const ulong4* restrict w1,
+    __global const ulong4* restrict w2,
+    __global const ulong4* restrict w3,
     const u64 n_total_chunks,
     const uint K,
+    const uint slab_shift,                 // chunks per slab = 2^slab_shift; 63 = single-slab layout
     const u64 p0, const u64 p1, const u64 p2, const u64 p3,   // POW-fold pph words (H3-salted), 4 LE u64
     const u64 s0, const u64 s1, const u64 s2, const u64 s3,   // SEED-fold pph words (H5.1-salted at/after gate)
     const u64 time_,
@@ -88,16 +110,12 @@ __kernel void pom_mine(
     if (tid >= n_nonces) return;
     u64 nonce = nonce_base + tid;
 
-    // Chunk view: element i = canonical chunk i (32 B, 32-byte aligned) → one vectorized load
-    // (2× global_load_dwordx4) instead of 4 scalar 8 B loads. Word order s0..s3 = w0..w3 exactly.
-    const __global ulong4* restrict chunks = (const __global ulong4* restrict)weights;
-
     // H5.1: the SEED fold reads the (host-salted) seed words s0..s3; the pow fold below keeps p0..p3.
     // Pre-H5.1 the host passes s == p, so this is byte-identical to the H5 build.
     u64 state = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
     u64 off = state % POM_N(n_total_chunks);
     for (uint i = 0; i < K; i++) {
-        ulong4 w = chunks[off];
+        ulong4 w = pom_fetch(w0, w1, w2, w3, off, slab_shift);
         if (walk_v2) {
             // H5 non-foldable walk (at/after H5_ACTIVATION_DAA): chain mix64 through each of the 4
             // chunk words (w0..w3) so all 32 bytes are load-bearing and order-dependent — byte-exact
@@ -147,9 +165,13 @@ inline void pom_submit(volatile __global u64* winner, u64 nonce) {
 // of HBM2 bandwidth = latency-bound with idle slots). The host autotunes ILP1/2/4 per device and
 // only uses what actually measures faster. Host launches ceil(batch/2) items.
 __kernel void pom_mine_ilp2(
-    __global const u64* restrict weights,
+    __global const ulong4* restrict w0,   // blob slab 0 (single-slab rigs: the whole blob; unused slabs = slab 0 repeated)
+    __global const ulong4* restrict w1,
+    __global const ulong4* restrict w2,
+    __global const ulong4* restrict w3,
     const u64 n_total_chunks,
     const uint K,
+    const uint slab_shift,                 // chunks per slab = 2^slab_shift; 63 = single-slab layout
     const u64 p0, const u64 p1, const u64 p2, const u64 p3,
     const u64 s0, const u64 s1, const u64 s2, const u64 s3,
     const u64 time_,
@@ -167,15 +189,14 @@ __kernel void pom_mine_ilp2(
     // Odd-batch boundary item: walk nonce0 twice (duplicate result dropped below) instead of
     // branching the whole body — keeps the lane busy, byte-exact for nonce0 (CUDA-identical trick).
     u64 nonce1 = nonce_base + (has1 ? i1 : i0);
-    const __global ulong4* restrict chunks = (const __global ulong4* restrict)weights;
 
     u64 state0 = pom_seed_fold(nonce0, time_, s0, s1, s2, s3);
     u64 state1 = pom_seed_fold(nonce1, time_, s0, s1, s2, s3);
     u64 off0 = state0 % POM_N(n_total_chunks);
     u64 off1 = state1 % POM_N(n_total_chunks);
     for (uint i = 0; i < K; i++) {
-        ulong4 a = chunks[off0];   // both loads issue back-to-back ->
-        ulong4 b = chunks[off1];   // their DRAM latencies overlap
+        ulong4 a = pom_fetch(w0, w1, w2, w3, off0, slab_shift);   // both loads issue back-to-back ->
+        ulong4 b = pom_fetch(w0, w1, w2, w3, off1, slab_shift);   // their DRAM latencies overlap
         if (walk_v2) {
             u64 h0 = pom_mix64(state0 ^ a.s0), h1 = pom_mix64(state1 ^ b.s0);
             h0 = pom_mix64(h0 ^ a.s1); h1 = pom_mix64(h1 ^ b.s1);
@@ -204,9 +225,13 @@ __kernel void pom_mine_ilp2(
 // memory-level parallelism can more than compensate. Autotuned; never a forced default.
 // Host launches ceil(batch/4) items.
 __kernel void pom_mine_ilp4(
-    __global const u64* restrict weights,
+    __global const ulong4* restrict w0,   // blob slab 0 (single-slab rigs: the whole blob; unused slabs = slab 0 repeated)
+    __global const ulong4* restrict w1,
+    __global const ulong4* restrict w2,
+    __global const ulong4* restrict w3,
     const u64 n_total_chunks,
     const uint K,
+    const uint slab_shift,                 // chunks per slab = 2^slab_shift; 63 = single-slab layout
     const u64 p0, const u64 p1, const u64 p2, const u64 p3,
     const u64 s0, const u64 s1, const u64 s2, const u64 s3,
     const u64 time_,
@@ -218,7 +243,6 @@ __kernel void pom_mine_ilp4(
     u64 tid = get_global_id(0);
     u64 i0 = tid * 4UL;
     if (i0 >= n_nonces) return;
-    const __global ulong4* restrict chunks = (const __global ulong4* restrict)weights;
 
     // Boundary items re-walk nonce i0 in the missing lanes (duplicates dropped at submit).
     u64 idx1 = i0 + 1UL < n_nonces ? i0 + 1UL : i0;
@@ -233,10 +257,10 @@ __kernel void pom_mine_ilp4(
     u64 of0 = st0 % POM_N(n_total_chunks), of1 = st1 % POM_N(n_total_chunks);
     u64 of2 = st2 % POM_N(n_total_chunks), of3 = st3 % POM_N(n_total_chunks);
     for (uint i = 0; i < K; i++) {
-        ulong4 a = chunks[of0];
-        ulong4 b = chunks[of1];
-        ulong4 c = chunks[of2];
-        ulong4 d = chunks[of3];
+        ulong4 a = pom_fetch(w0, w1, w2, w3, of0, slab_shift);
+        ulong4 b = pom_fetch(w0, w1, w2, w3, of1, slab_shift);
+        ulong4 c = pom_fetch(w0, w1, w2, w3, of2, slab_shift);
+        ulong4 d = pom_fetch(w0, w1, w2, w3, of3, slab_shift);
         if (walk_v2) {
             u64 h0 = pom_mix64(st0 ^ a.s0), h1 = pom_mix64(st1 ^ b.s0), h2 = pom_mix64(st2 ^ c.s0), h3 = pom_mix64(st3 ^ d.s0);
             h0 = pom_mix64(h0 ^ a.s1); h1 = pom_mix64(h1 ^ b.s1); h2 = pom_mix64(h2 ^ c.s1); h3 = pom_mix64(h3 ^ d.s1);
