@@ -352,6 +352,9 @@ fn words(b: &[u8; 32]) -> [u64; 4] {
 /// OpenCL blob — its mine() routes over the engine's resident weights instead. Claimed once by
 /// the card whose PCI location matches the engine's, after the startup byte gate passes.
 static SHARED_DEV: Mutex<Option<usize>> = Mutex::new(None);
+/// Card DEDICATED to OPoI inference (engine-hosted model; model + blob can't share its VRAM):
+/// it deliberately mines nothing — no blob install, no walk. The other cards mine at full rate.
+static DEDICATED_DEV: Mutex<Option<usize>> = Mutex::new(None);
 
 fn is_shared_dev(device_id: usize) -> bool {
     SHARED_DEV.lock().unwrap().map_or(false, |d| d == device_id)
@@ -443,12 +446,16 @@ fn try_claim_shared(device_id: usize) -> bool {
     if !zero_dup_allowed(device_id) {
         let blob = crate::pom::active_index().map(|(i, _)| i.n_chunks.saturating_mul(32)).unwrap_or(0);
         if blob > 0 && !model_plus_blob_fits(device_id, blob) {
-            log::warn!(
-                "PoM: card {device_id:#x} hosts the llama engine (zero-dup off by policy) and model + \
-                 blob exceed its VRAM — unloading the engine so the blob gets real VRAM (no GTT spill; \
-                 OPoI inference falls back to CPU)."
+            // Model + blob can't share this card. DEDICATE it to OPoI inference (8x-reward path,
+            // fast GPU answers) instead of unloading: no blob is installed here, the card mines
+            // nothing, every other card mines at full rate. (Operator call: CPU inference is too
+            // slow to be worth trading for one card's hashrate.) KERYX_ZERO_DUP=force overrides
+            // on zero-dup-capable archs.
+            *DEDICATED_DEV.lock().unwrap() = Some(device_id);
+            log::info!(
+                "PoM: card {device_id:#x} DEDICATED to OPoI inference (hosts the model; model + blob \
+                 exceed its VRAM so it does not mine). Other cards mine at full rate."
             );
-            crate::llama_engine_vk::unload();
         } else {
             log::info!(
                 "PoM: card {device_id:#x} hosts the llama engine but is not RDNA — keeping its OpenCL blob \
@@ -557,6 +564,13 @@ fn install_resident(device_id: usize) -> Result<(), String> {
 /// True if THIS thread's bound card has the tier resident — either its own OpenCL blob or the
 /// zero-dup engine walk (or, with no binding, any card does).
 pub fn is_installed() -> bool {
+    // A DEDICATED inference card is deliberately not mining — treat it as resolved so the worker
+    // doesn't loop ensure_installed/heartbeat on it (its 0 hash is intentional and logged once).
+    if let (Some(id), Some(d)) = (bound_dev(), *DEDICATED_DEV.lock().unwrap()) {
+        if id == d {
+            return true;
+        }
+    }
     match bound_dev() {
         Some(id) => miner_for(id).is_some() || is_shared_dev(id),
         None => !POM_BY_DEV.lock().unwrap().is_empty() || SHARED_DEV.lock().unwrap().is_some(),
