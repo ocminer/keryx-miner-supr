@@ -397,6 +397,26 @@ fn zero_dup_allowed(device_id: usize) -> bool {
 /// policy allows it, and its gather passes the byte gate against the possession index, this card
 /// walks the engine's resident weights — no OpenCL blob is uploaded for it. Returns whether the
 /// claim succeeded (false = the card keeps its own OpenCL blob).
+/// True if this card's total VRAM comfortably holds the resident engine model PLUS the blob
+/// (gguf file size ≈ model VRAM + 1 GiB margin for KV/ctx/driver). When it does NOT, keeping the
+/// engine while installing the blob makes RADV silently OVERCOMMIT into GTT (the create/write
+/// SUCCEED — nothing fails) and the walk crawls at PCIe latency: the autotune sweep alone can run
+/// for an hour, so the card looks permanently dead at 0 hash (RX 5700 XT 8 GB field log). So the
+/// engine must be unloaded BEFORE the install on such cards, not on install *failure*.
+#[cfg(unix)]
+fn model_plus_blob_fits(device_id: usize, blob_bytes: u64) -> bool {
+    let model_bytes = TIER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|(path, _)| std::fs::metadata(path).ok().map(|m| m.len()))
+        .unwrap_or(6 << 30); // unknown → assume a big model (conservative: prefer unloading)
+    let Ok(total) = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id).global_mem_size() else {
+        return false;
+    };
+    total >= blob_bytes + model_bytes + (1 << 30)
+}
+
 #[cfg(unix)]
 fn try_claim_shared(device_id: usize) -> bool {
     if is_shared_dev(device_id) {
@@ -412,14 +432,33 @@ fn try_claim_shared(device_id: usize) -> bool {
         return false; // the engine hosts the model on a different card
     }
     if !zero_dup_allowed(device_id) {
-        log::info!(
-            "PoM: card {device_id:#x} hosts the llama engine but is not RDNA — keeping its OpenCL blob \
-             (full hashrate; set KERYX_ZERO_DUP=force to trade ~2.4 GB VRAM for it)."
-        );
+        let blob = crate::pom::active_index().map(|(i, _)| i.n_chunks.saturating_mul(32)).unwrap_or(0);
+        if blob > 0 && !model_plus_blob_fits(device_id, blob) {
+            log::warn!(
+                "PoM: card {device_id:#x} hosts the llama engine (zero-dup off by policy) and model + \
+                 blob exceed its VRAM — unloading the engine so the blob gets real VRAM (no GTT spill; \
+                 OPoI inference falls back to CPU)."
+            );
+            crate::llama_engine_vk::unload();
+        } else {
+            log::info!(
+                "PoM: card {device_id:#x} hosts the llama engine but is not RDNA — keeping its OpenCL blob \
+                 (full hashrate; set KERYX_ZERO_DUP=force to trade ~2.4 GB VRAM for it)."
+            );
+        }
         return false;
     }
     let Some((idx, _)) = crate::pom::active_index() else { return false };
     if !crate::llama_engine_vk::pom_byte_gate(idx) {
+        // Zero-dup is OFF for this card, but the engine still holds the model on it. If model +
+        // blob can't BOTH fit, unload NOW: with RADV overcommit the upcoming blob install would
+        // not fail — it would silently spill to GTT and the card would crawl at ~0 hash forever.
+        if !model_plus_blob_fits(device_id, idx.n_chunks.saturating_mul(32)) {
+            log::warn!(
+                "PoM: byte gate failed on card {device_id:#x} and model + blob exceed its VRAM —                  unloading the in-process engine so the blob gets real VRAM (OPoI inference falls                  back to CPU; mining beats inference)."
+            );
+            crate::llama_engine_vk::unload();
+        }
         return false;
     }
     *SHARED_DEV.lock().unwrap() = Some(device_id);
@@ -470,6 +509,11 @@ fn install_resident(device_id: usize) -> Result<(), String> {
     let result = (|| {
         let (index, _) = crate::pom::active_index().ok_or("PoM: no index")?;
         let n = index.n_chunks;
+        log::info!(
+            "PoM: streaming tier blob ({} MiB) to card {device_id:#x} + autotune — the card shows \
+             0 hash until this completes (typically 1-3 min).",
+            (n * 32) / (1024 * 1024)
+        );
         let dev = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id);
         let miner = PomMiner::new(dev, index, n)?;
         POM_BY_DEV.lock().unwrap().push((device_id, Arc::new(Mutex::new(miner))));
