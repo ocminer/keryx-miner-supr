@@ -1050,7 +1050,21 @@ async fn run() -> Result<(), Error> {
                 // Device selection lives INSIDE ensure_loaded/try_start (issue #18: pin to a
                 // discrete GPU, KERYX_LLAMA_VK_DEVICE overrides) — the `0` here is only the
                 // last-resort ggml index when no discrete Vulkan device is found at all.
-                if !keryx_miner::llama_engine_vk::ensure_loaded(&gpath_llama, 0) {
+                // UP-FRONT feasibility (field request): if even the LARGEST card can't hold the
+                // model AND its possession blob (≈ gguf + gguf + 1.5 GiB KV/ctx/margin), loading
+                // the model onto any mining GPU is knowably doomed — the old flow spent ~6 min
+                // loading it, then unloaded it again (or worse, spilled/hung). Decide from VRAM
+                // math BEFORE loading anything: unfit → skip the in-process engine AND the GPU
+                // llama-server (same squeeze) and use CPU inference from the start. Mining wins.
+                let gguf_mb = std::fs::metadata(&gpath_llama).map(|m| m.len() / (1024 * 1024)).unwrap_or(6144);
+                let need_mb = gguf_mb * 2 + 1536;
+                let vram_mb = keryx_miner::pom_opencl::max_gpu_global_mem_mb().unwrap_or(0);
+                if vram_mb > 0 && vram_mb < need_mb {
+                    info!(
+                        "PoM(AMD): GPU inference skipped up front — model ({gguf_mb} MiB) + possession                          blob need ~{need_mb} MiB on one card, largest card has {vram_mb} MiB. All cards                          mine at full rate; OPoI inference runs on CPU (KERYX_LLAMA_VK_DEVICE pins a                          dedicated inference GPU to override)."
+                    );
+                    keryx_miner::llama_engine_vk::mark_gpu_inference_unfit();
+                } else if !keryx_miner::llama_engine_vk::ensure_loaded(&gpath_llama, 0) {
                     keryx_miner::llama_vulkan::try_start(&gpath_llama, port);
                 }
             });
