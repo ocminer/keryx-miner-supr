@@ -774,6 +774,7 @@ async fn run() -> Result<(), Error> {
 
     info!("=================================================================================");
     info!("                 Keryx-Miner GPU {}", env!("CARGO_PKG_VERSION"));
+    info!("                 build {}", env!("KERYX_BUILD_STAMP"));
     info!(" Mining for: {}", opt.mining_address.as_deref().unwrap_or("(recovery mode)"));
     info!("=================================================================================");
 

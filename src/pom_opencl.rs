@@ -494,6 +494,7 @@ static INSTALLING: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Make the resident tier GPU-resident on `device_id` — its own OpenCL context + buffer, filled
 /// by streaming from the shared WeightIndex's GGUF. Idempotent per card. The index must exist.
 fn install_resident(device_id: usize) -> Result<(), String> {
+    let wait_start = std::time::Instant::now();
     loop {
         let mut ins = INSTALLING.lock().unwrap();
         if miner_for(device_id).is_some() {
@@ -504,8 +505,29 @@ fn install_resident(device_id: usize) -> Result<(), String> {
             break;
         }
         drop(ins); // another thread is streaming this card; wait for it to finish
+        // A streamer that died WITHOUT unwinding (or is wedged inside a driver call) used to
+        // leave its id in INSTALLING forever — every later attempt for that card spun here
+        // SILENTLY and the card idled at 0 hash with no log at all (RX 5700 XT field log:
+        // one byte-gate line, then nothing ever again). Bounded wait + takeover instead.
+        if wait_start.elapsed().as_secs() > 600 {
+            log::warn!(
+                "PoM: card {device_id:#x} waited >10 min for another install of the same card — \
+                 assuming that installer is dead/wedged and taking over."
+            );
+            INSTALLING.lock().unwrap().retain(|d| *d != device_id);
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+    // Unwind-safe claim release: if anything below panics, the Drop still clears the id so the
+    // card can be retried instead of wedging every future attempt in the wait loop above.
+    struct InstallClaim(usize);
+    impl Drop for InstallClaim {
+        fn drop(&mut self) {
+            INSTALLING.lock().unwrap().retain(|d| *d != self.0);
+        }
+    }
+    let _claim = InstallClaim(device_id);
+    log::info!("PoM: initializing OpenCL context + kernel JIT on card {device_id:#x}…");
     let result = (|| {
         let (index, _) = crate::pom::active_index().ok_or("PoM: no index")?;
         let n = index.n_chunks;
@@ -520,7 +542,6 @@ fn install_resident(device_id: usize) -> Result<(), String> {
         log::info!("PoM: tier resident on GPU {device_id:#x} ({} MiB).", (n * 32) / (1024 * 1024));
         Ok(())
     })();
-    INSTALLING.lock().unwrap().retain(|d| *d != device_id);
     result
 }
 
@@ -585,6 +606,26 @@ fn ensure_index(gguf_path: &str, tier: u8) -> Result<(), String> {
 pub fn ensure_installed() {
     if is_installed() {
         return; // this thread's card is already resident
+    }
+    // Attempt heartbeat: a card that repeatedly fails/loops here must SAY so — a silent 0-hash
+    // card is undiagnosable from the field (the whole RX 580 / 5700 XT saga).
+    {
+        static ATTEMPTS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+        if let Some(id) = target_dev() {
+            let mut a = ATTEMPTS.lock().unwrap();
+            let e = if let Some(e) = a.iter_mut().find(|(d, _)| *d == id) { e } else { a.push((id, 0)); a.last_mut().unwrap() };
+            e.1 += 1;
+            if e.1 % 30 == 0 {
+                log::warn!(
+                    "PoM: card {id:#x} still has NO resident tier after {} attempts (installing={:?}, \
+                     zero-dup card={:?}) — the install keeps failing or is stuck; send this log line \
+                     when reporting.",
+                    e.1,
+                    INSTALLING.lock().unwrap().clone(),
+                    *SHARED_DEV.lock().unwrap(),
+                );
+            }
+        }
     }
     let tier = TIER.lock().unwrap().clone();
     let (path, t) = match tier {
