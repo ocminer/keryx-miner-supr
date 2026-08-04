@@ -361,6 +361,12 @@ static EVICTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// Set when a byte-gate FETCH dispatch fails — the engine's device may be hung; skip free/wait-idle.
 static DEVICE_SUSPECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Pre-flight verdict: GPU inference is UNFIT on this rig (no card can hold model + blob) —
+/// set before any engine/server load so neither ever starts. Same flag the try_start guard reads.
+pub fn mark_gpu_inference_unfit() {
+    EVICTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn unload() -> bool {
     let mut g = match engine().lock() {
         Ok(g) => g,

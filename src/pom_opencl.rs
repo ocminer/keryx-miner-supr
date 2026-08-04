@@ -563,6 +563,18 @@ pub fn is_installed() -> bool {
     }
 }
 
+/// LARGEST global memory (MB) across all OpenCL GPUs — the up-front GPU-inference feasibility
+/// check: if even the biggest card can't hold model + possession blob together, loading the model
+/// onto ANY mining GPU is doomed (spill/unload later), so skip GPU inference from the start.
+pub fn max_gpu_global_mem_mb() -> Option<u64> {
+    let dev_ids = opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU).ok()?;
+    dev_ids
+        .iter()
+        .filter_map(|id| opencl3::device::Device::new(*id).global_mem_size().ok())
+        .max()
+        .map(|b| b / (1024 * 1024))
+}
+
 /// GPU 0 total global memory in MB via OpenCL (CL_DEVICE_GLOBAL_MEM_SIZE) — the AMD analog of
 /// nvidia-smi's `memory.total`, so the model VRAM capability gate (filter_specs_by_vram) works on
 /// AMD too. None if there is no OpenCL GPU.

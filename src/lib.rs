@@ -44,6 +44,7 @@ pub mod llama_engine_vk {
     pub fn pom_mine(_p: [u64; 4], _s: [u64; 4], _time: u64, _t: [u64; 4], _nonce_base: u64, _batch: u64, _walk_v2: bool) -> Option<u64> { None }
     pub fn unload() -> bool { false }
     pub fn evicted_for_vram() -> bool { false }
+    pub fn mark_gpu_inference_unfit() {}
 }
 // In-process llama.cpp engine (dlopen'd libkeryx-llama.{so,dylib}): candle-independence — when
 // present it hosts the model (the walk gathers over its VRAM on CUDA / zero-dup; on Metal the
