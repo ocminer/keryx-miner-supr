@@ -319,6 +319,10 @@ pub fn pom_byte_gate(index: &crate::pom::WeightIndex) -> bool {
         let mut got = [0u8; 32];
         if !unsafe { (e.pom_fetch)(e.model, off, got.as_mut_ptr()) } {
             log::warn!("llama-vk engine: byte gate fetch failed at chunk {off} — keeping the OpenCL blob.");
+            // A failed fetch DISPATCH means the device may be hung (RDNA1 field logs: this was a
+            // hard GPU hang, not a soft error). Mark it so unload() never calls vkDeviceWaitIdle/
+            // free on a possibly-dead device — that blocks forever and wedges the whole rig.
+            DEVICE_SUSPECT.store(true, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         if got != index.read_chunk_bytes(off) {
@@ -354,6 +358,8 @@ pub fn evicted_for_vram() -> bool {
     EVICTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 static EVICTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set when a byte-gate FETCH dispatch fails — the engine's device may be hung; skip free/wait-idle.
+static DEVICE_SUSPECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn unload() -> bool {
     let mut g = match engine().lock() {
@@ -362,6 +368,16 @@ pub fn unload() -> bool {
     };
     if let Some(e) = g.take() {
         EVICTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        if DEVICE_SUSPECT.load(std::sync::atomic::Ordering::Relaxed) {
+            // The device may be hung (failed gate-fetch dispatch): freeing would vkDeviceWaitIdle
+            // on it and block forever. Leak the engine's objects instead — the handle is dropped,
+            // the flag stays, and the process keeps running (that card is lost until reboot anyway).
+            log::warn!(
+                "llama-vk engine: NOT freeing engine VRAM — the device is suspect (failed gate \
+                 dispatch); freeing would block on a hung GPU. Objects are leaked deliberately."
+            );
+            return true;
+        }
         unsafe { (e.free)(e.model) };
         log::warn!(
             "llama-vk engine: unloaded — VRAM freed for the OpenCL possession blob; OPoI inference \
