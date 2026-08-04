@@ -476,6 +476,10 @@ KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     if (!ctx) { llama_model_free(model); return nullptr; }
 
     llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    // Repeat penalty before top_p/temp — stops Q4 small-model sentence loops; NOT consensus
+    // (OPoI text only). 256-tok window / 1.10, mirrors keryx_llama.cpp (upstream 76047d9).
+    // ⚠️ AMD claude: rebuild libkeryx-llama-vk.so to pick this up.
+    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, 1.10f, 0.0f, 0.0f));
     llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
