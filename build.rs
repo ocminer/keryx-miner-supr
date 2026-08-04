@@ -2,6 +2,19 @@ use std::env;
 use time::{format_description, OffsetDateTime};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Build stamp for field diagnosis: every 0.9.5 asset repack printed the same bare "0.9.5"
+    // banner, making it impossible to tell WHICH build a user's log came from. git hash + UTC time.
+    let git = std::process::Command::new("git")
+        .args(["rev-parse", "--short=9", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    println!("cargo:rustc-env=KERYX_BUILD_STAMP={git} @{secs}");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+
     let format = format_description::parse("[year repr:last_two][month][day][hour][minute]")?;
     let dt = OffsetDateTime::now_utc().format(&format)?;
     println!("cargo:rustc-env=PACKAGE_COMPILE_TIME={}", dt);
