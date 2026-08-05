@@ -133,7 +133,21 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
         Err(p) => p.into_inner(),
     };
     if let Some(e) = g.as_ref() {
-        return e.gguf == gguf && e.gpu == gpu;
+        if e.gguf == gguf && e.gpu == gpu {
+            return true;
+        }
+        // Only a SAME-GPU model swap may free-and-reload: the caller reaches here from
+        // `ensure_installed_inner` with its own walk uninstalled. A different GPU must not
+        // steal the engine — the hosting GPU's zero-dup walk still gathers over these
+        // resident tensors, so freeing them here would be a device use-after-free (and the
+        // two GPUs would thrash full model loads stealing the singleton back and forth).
+        // (upstream Keryx-Labs/keryx-miner@278098b)
+        if e.gpu != gpu {
+            return false;
+        }
+        if let Some(e) = g.take() {
+            unsafe { (e.free)(e.model) };
+        }
     }
     let Some(so) = so_path() else { return false };
     let cso = match CString::new(so.to_string_lossy().as_bytes()) {
@@ -202,6 +216,21 @@ pub fn available() -> bool {
 /// so we free llama's VRAM and let the caller fall back to candle for BOTH walk and inference.
 pub fn unload() {
     if let Ok(mut g) = engine().lock() {
+        if let Some(e) = g.take() {
+            unsafe { (e.free)(e.model) };
+        }
+    }
+}
+
+/// Free the resident model and disable the engine only if the given GPU currently hosts it.
+/// This is used for stale-GPU recovery after a transient fault on that specific device — a
+/// GPU that does NOT host the engine must not be able to free another card's resident model.
+/// (upstream Keryx-Labs/keryx-miner@278098b)
+pub fn unload_for_gpu(gpu: usize) {
+    if let Ok(mut g) = engine().lock() {
+        if g.as_ref().is_some_and(|e| e.gpu != gpu) {
+            return;
+        }
         if let Some(e) = g.take() {
             unsafe { (e.free)(e.model) };
         }

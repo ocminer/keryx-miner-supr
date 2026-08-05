@@ -552,6 +552,52 @@ pub fn is_loading() -> bool {
     LOADING.load(Ordering::Relaxed) > 0
 }
 
+/// Transient GPU runtime fault classifier (upstream Keryx-Labs/keryx-miner@278098b): the
+/// ILLEGAL_ADDRESS class — a kernel dereferenced garbage (driver hiccup, ECC blip, a stale
+/// gather pointer after an inference eviction race). The faulting CUDA context is poisoned but
+/// the DEVICE is fine: dropping every resource bound to that context and rebuilding recovers it.
+/// Explicitly NOT transient: OOM (retrying the same load just fails again — the existing
+/// fallback/eviction logic handles it) and the box-wide poison class (CUDA_ERROR_DEINITIALIZED /
+/// Xid-79 "fell off the bus" — no rebuild can help, existing behavior/reboot applies).
+///
+/// Error-string sources this must match (all funnel through `candle_core::Error` `Display`):
+/// cudarc `DriverError` Display/Debug prints the enum name + driver text, e.g.
+/// `DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, "an illegal memory access was encountered")` —
+/// wrapped unchanged by `candle_core::Error::wrap` in `PomGpuMiner::{mine,load*}`.
+fn is_transient_gpu_runtime_fault(err: &str) -> bool {
+    let s = err.to_ascii_lowercase();
+    s.contains("illegal address")
+        || s.contains("illegal memory")
+        || s.contains("cuda_error_illegal_address")
+        || s.contains("invalid device pointer")
+        || s.contains("misaligned address")
+}
+
+/// Drop everything the faulted GPU's next cycle would otherwise reuse: its walk miner (gather
+/// pointers into now-poisoned context memory) and — only if THIS gpu hosts it — the in-process
+/// llama engine (the zero-dup walk gathers over its resident tensors; `unload_for_gpu` is a
+/// scoped no-op when the engine lives on another card, so other GPUs keep mining untouched).
+/// Order matters: uninstall the walk FIRST so no gather can run over tensors llama then frees.
+/// The worker loop rebuilds via `ensure_installed` on its next iteration (`is_installed` = false).
+fn reset_stale_gpu_state(device_id: u32) {
+    uninstall(device_id);
+    crate::llama_engine::unload_for_gpu(device_id as usize);
+}
+
+/// TEST-ONLY fault injection — dev knob, never set this in production. `KERYX_FAULT_INJECT_GPU=
+/// <cuda ordinal>` makes the NEXT mine() call on that ordinal report a synthetic transient fault
+/// (ILLEGAL_ADDRESS class) exactly ONCE per process (armed at first check, consumed by an
+/// AtomicBool swap), so the per-GPU recovery path can be live-validated on a healthy rig: the
+/// injected fault must drop that GPU's state and rebuild next cycle while other GPUs keep mining.
+fn take_injected_fault(device_id: u32) -> bool {
+    static TARGET: OnceLock<Option<u32>> = OnceLock::new();
+    static ARMED: AtomicBool = AtomicBool::new(true);
+    let target = *TARGET.get_or_init(|| {
+        std::env::var("KERYX_FAULT_INJECT_GPU").ok().and_then(|s| s.trim().parse::<u32>().ok())
+    });
+    matches!(target, Some(t) if t == device_id) && ARMED.swap(false, Ordering::Relaxed)
+}
+
 /// Convenience: search a nonce batch via the installed miner for a specific device.
 pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool) -> Option<u64> {
     let miner = {
@@ -563,7 +609,46 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
     if first {
         miner.autotune_block(device_id);
     }
-    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2).ok().flatten()
+    // TEST-ONLY: one-shot synthetic transient fault (see `take_injected_fault`).
+    let res = if take_injected_fault(device_id) {
+        Err(candle_core::Error::Msg(
+            "injected transient fault (KERYX_FAULT_INJECT_GPU): CUDA_ERROR_ILLEGAL_ADDRESS, \
+             an illegal memory access was encountered".into(),
+        ))
+    } else {
+        miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2)
+    };
+    match res {
+        Ok(w) => w,
+        Err(e) => {
+            let msg = e.to_string();
+            if is_transient_gpu_runtime_fault(&msg) {
+                log::warn!(
+                    "PoM[gpu{}]: TRANSIENT GPU RUNTIME FAULT during the walk ({}) — dropping this \
+                     GPU's stale miner state (walk ctx{}) and rebuilding on the next cycle; other \
+                     GPUs keep mining.",
+                    device_id,
+                    msg,
+                    if device_id as usize == crate::slm::inference_gpu_ordinal() { " + llama engine if hosted here" } else { "" }
+                );
+                reset_stale_gpu_state(device_id);
+            } else {
+                // NOT transient (OOM / deinitialized / bus drop): keep the pre-existing behavior —
+                // state stays installed, the error is reported but nothing is torn down. Logged
+                // once per process (it repeats every batch on a wedged card; it used to be
+                // swallowed silently by `.ok().flatten()`, which made wedges invisible).
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    log::error!(
+                        "PoM[gpu{}]: walk failed with a NON-transient error ({}) — not resetting \
+                         GPU state (OOM/bus-drop class keeps existing behavior). Logged once.",
+                        device_id, msg
+                    );
+                }
+            }
+            None
+        }
+    }
 }
 
 /// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup.
@@ -796,6 +881,20 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             true
         }
         Err(e) => {
+            let e_msg = e.to_string();
+            // upstream Keryx-Labs/keryx-miner@278098b: a transient runtime fault during the load
+            // (stale llama gather pointers, byte-gate readback over a poisoned context, …) drops
+            // this GPU's state — including its llama engine if hosted here — so the next cycle
+            // rebuilds from scratch instead of retrying over poisoned resources forever.
+            if is_transient_gpu_runtime_fault(&e_msg) {
+                log::warn!(
+                    "PoM[gpu{}]: transient GPU runtime fault while loading miner ({}); dropping stale miner state and forcing a rebuild on the next cycle.",
+                    device_id,
+                    e_msg
+                );
+                reset_stale_gpu_state(device_id);
+                return false;
+            }
             log::error!("PoM[gpu{}]: device miner build failed: {}", device_id, e);
             false
         }
@@ -837,5 +936,41 @@ mod tests {
 
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&1), Some(&"gpu1-miner"));
+    }
+
+    // upstream Keryx-Labs/keryx-miner@278098b (extended): only the ILLEGAL_ADDRESS class is
+    // transient/recoverable. OOM and the box-wide poison class (DEINITIALIZED / Xid-79 bus drop)
+    // must NOT match — they keep the pre-existing (non-reset) behavior.
+    #[test]
+    fn detects_transient_illegal_address_faults() {
+        assert!(is_transient_gpu_runtime_fault("CUDA_ERROR_ILLEGAL_ADDRESS"));
+        assert!(is_transient_gpu_runtime_fault("an illegal memory access was encountered"));
+        // cudarc DriverError Display shape, as wrapped by candle_core::Error::wrap in mine()/load*():
+        assert!(is_transient_gpu_runtime_fault(
+            "DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")"
+        ));
+        assert!(is_transient_gpu_runtime_fault("misaligned address"));
+        assert!(is_transient_gpu_runtime_fault("invalid device pointer"));
+        // The one-shot injection knob's synthetic message must classify transient too:
+        assert!(is_transient_gpu_runtime_fault(
+            "injected transient fault (KERYX_FAULT_INJECT_GPU): CUDA_ERROR_ILLEGAL_ADDRESS, an illegal memory access was encountered"
+        ));
+    }
+
+    #[test]
+    fn oom_and_bus_drop_are_not_transient() {
+        assert!(!is_transient_gpu_runtime_fault("out of memory"));
+        assert!(!is_transient_gpu_runtime_fault("CUDA_ERROR_OUT_OF_MEMORY"));
+        assert!(!is_transient_gpu_runtime_fault(
+            "DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
+        ));
+        // Box-wide poison class (Xid-79 / fell off the bus / driver teardown): reboot-only, never reset.
+        assert!(!is_transient_gpu_runtime_fault("CUDA_ERROR_DEINITIALIZED"));
+        assert!(!is_transient_gpu_runtime_fault(
+            "DriverError(CUDA_ERROR_DEINITIALIZED, \"driver shutting down\")"
+        ));
+        assert!(!is_transient_gpu_runtime_fault("CUDA_ERROR_LAUNCH_TIMEOUT"));
+        assert!(!is_transient_gpu_runtime_fault("CUDA_ERROR_INVALID_PTX"));
+        assert!(!is_transient_gpu_runtime_fault("PoM GPU: model produced 0 chunks"));
     }
 }
