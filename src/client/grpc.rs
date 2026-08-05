@@ -6,8 +6,14 @@ use crate::proto::rpc_client::RpcClient;
 use crate::proto::{
     GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage, KaspadMessage,
     NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
+    NotifyVirtualSelectedParentChainChangedRequestMessage,
 };
 use crate::{miner::MinerManager, Error};
+
+/// Max boot-time escrow-validation GetBlock requests in flight at once — each answer
+/// sends the next queued one, so thousands of state entries never overwhelm the
+/// HTTP/2 flow-control window or delay the mining stream.
+const VALIDATION_WINDOW: usize = 64;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use log::{error, info, warn};
@@ -72,6 +78,15 @@ pub struct KeryxdHandler {
 
     /// Auto-claim module: present when an escrow private key is available.
     escrow_watcher: Option<crate::escrow::EscrowWatcher>,
+
+    /// Block hashes queued for boot-time escrow-state validation, drained in slices of
+    /// VALIDATION_WINDOW so thousands of GetBlock requests never saturate the HTTP/2
+    /// flow-control window (each consumed answer sends the next queued request).
+    validation_queue: VecDeque<String>,
+
+    /// Last reported pending-escrow figure (outputs, sompi) — the pending total is
+    /// logged only when it changes, keeping the log quiet between changes.
+    last_pending_escrow: Option<(u64, u64)>,
 }
 
 #[async_trait(?Send)]
@@ -185,6 +200,8 @@ impl KeryxdHandler {
             ipfs_url,
             escrow_pubkey,
             escrow_watcher,
+            validation_queue: VecDeque::new(),
+            last_pending_escrow: None,
         }))
     }
 
@@ -208,6 +225,18 @@ impl KeryxdHandler {
 
     async fn client_send(&self, msg: impl Into<KaspadMessage>) -> Result<(), SendError<KaspadMessage>> {
         self.send_channel.send(msg.into()).await
+    }
+
+    /// Log the pending escrow total (outputs awaiting claim + KRX) whenever it changes.
+    /// We have no stats module — this is the metric surface for upstream's
+    /// `miner.record_escrow_pending`; quiet while the figure is unchanged.
+    fn report_pending_escrow(&mut self) {
+        let Some(w) = self.escrow_watcher.as_ref() else { return };
+        let pending = w.pending_escrow();
+        if self.last_pending_escrow != Some(pending) {
+            info!("Escrow pending: {} output(s) awaiting claim, {:.8} KRX", pending.0, pending.1 as f64 / 1e8);
+            self.last_pending_escrow = Some(pending);
+        }
     }
 
     async fn client_get_block_template(&mut self) -> Result<(), SendError<KaspadMessage>> {
@@ -514,6 +543,7 @@ impl KeryxdHandler {
                         self.try_start_inference();
                         // Escrow: check for new escrow UTXOs and mature claims.
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
+                        self.report_pending_escrow();
                         if let Some(tx) = claim_tx {
                             self.client_send(KaspadMessage::submit_transaction(tx)).await?;
                         }
@@ -617,17 +647,45 @@ impl KeryxdHandler {
                     (None, true, None) => error!("No block and No Error!"),
                 }
             }
-            // GetBlock response: arrives after we requested a full block from BlockAdded.
-            // Scan its transactions for AiRequests and escrow UTXOs.
+            // GetBlock response: either a boot-time escrow-validation answer, or a full block
+            // we requested (BlockAdded / VirtualChainChanged) — scanned for AiRequests and
+            // escrow UTXOs.
             Payload::GetBlockResponse(msg) => {
+                let mut was_validation = false;
                 if let Some(e) = msg.error {
-                    warn!("GetBlockResponse error: {}", e.message);
+                    // Validation answer: "cannot find header <hash>" — the block never
+                    // existed on this chain, its escrow entries are ghosts.
+                    was_validation = self
+                        .escrow_watcher
+                        .as_mut()
+                        .map_or(false, |w| w.on_block_validation_error(&e.message));
+                    if !was_validation {
+                        warn!("GetBlockResponse error: {}", e.message);
+                    }
                 } else if let Some(block) = msg.block {
-                    self.scan_txs_for_ai_requests(&block.transactions.clone());
-                    self.try_start_inference();
-                    let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
-                    if let Some(tx) = claim_tx {
-                        self.client_send(KaspadMessage::submit_transaction(tx)).await?;
+                    let hash = block.verbose_data.as_ref().map(|v| v.hash.clone()).unwrap_or_default();
+                    // Chain membership from the node's live verdict: a stored-but-reorged
+                    // block must purge its entries just like a missing one.
+                    let is_chain = block.verbose_data.as_ref().map_or(false, |v| v.is_chain_block);
+                    was_validation = self
+                        .escrow_watcher
+                        .as_mut()
+                        .map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
+                    if !was_validation {
+                        self.scan_txs_for_ai_requests(&block.transactions.clone());
+                        self.try_start_inference();
+                        let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
+                        self.report_pending_escrow();
+                        if let Some(tx) = claim_tx {
+                            self.client_send(KaspadMessage::submit_transaction(tx)).await?;
+                        }
+                    }
+                }
+                // Self-paced validation flow: every consumed answer pulls the next
+                // queued request, keeping at most VALIDATION_WINDOW in flight.
+                if was_validation {
+                    if let Some(hash) = self.validation_queue.pop_front() {
+                        self.client_send(GetBlockRequestMessage { hash, include_transactions: false }).await?;
                     }
                 }
             }
@@ -636,21 +694,56 @@ impl KeryxdHandler {
                 Some(e) => warn!("Failed submitting block: {:?}", e),
             },
             Payload::SubmitTransactionResponse(res) => {
-                if self.escrow_watcher.as_ref().map_or(false, |w| w.pending_claim_txid.is_some()) {
-                    let err = res.error.map(|e| e.message);
-                    self.escrow_watcher.as_mut().unwrap().on_submit_response(err);
-                } else if let Some(e) = res.error {
-                    warn!("OPoI: submit_transaction error: {:?}", e);
+                // Escrow claims and OPoI submissions share this stream. Match responses to
+                // in-flight claims by identity (txid, or the txid embedded in the rejection
+                // text) — attributing by position slashed valid escrow entries before.
+                use crate::escrow::SubmitResponseOutcome;
+                let err = res.error.as_ref().map(|e| e.message.clone());
+                let outcome = self
+                    .escrow_watcher
+                    .as_mut()
+                    .map_or(SubmitResponseOutcome::NotOurs, |w| {
+                        w.on_submit_response(&res.transaction_id, err.as_deref())
+                    });
+                match outcome {
+                    SubmitResponseOutcome::Accepted { outputs, amount_sompi } => {
+                        info!(
+                            "Escrow claim accepted: {} output(s), {:.8} KRX",
+                            outputs,
+                            amount_sompi as f64 / 1e8
+                        );
+                        self.report_pending_escrow();
+                    }
+                    SubmitResponseOutcome::Handled => {}
+                    SubmitResponseOutcome::NotOurs => {
+                        if let Some(e) = err {
+                            warn!("OPoI: submit_transaction error: {}", e);
+                        }
+                    }
                 }
             }
             Payload::GetInfoResponse(info) => {
                 info!("Keryxd version: {}", info.server_version);
-                // Register for both notification types:
+                // Register for all notification types:
                 // - NewBlockTemplate drives the mining loop
                 // - BlockAdded lets us scan confirmed blocks for AiRequests
                 //   that were confirmed before the miner saw them in mempool
+                // - VirtualChainChanged drives escrow tracking: only chain-block coinbases
+                //   materialize UTXOs, so escrow outputs are tracked from chain blocks only
                 self.client_send(NotifyNewBlockTemplateRequestMessage {}).await?;
                 self.client_send(NotifyBlockAddedRequestMessage {}).await?;
+                self.client_send(NotifyVirtualSelectedParentChainChangedRequestMessage {}).await?;
+                // Boot-time escrow-state validation: check every referenced block against
+                // the node so ghost entries (orphaned-chain coinbases) are purged before
+                // any claim ships. Send an initial slice; each answer sends the next.
+                if let Some(hashes) = self.escrow_watcher.as_mut().map(|w| w.start_state_validation()) {
+                    self.validation_queue = hashes.into();
+                    for _ in 0..VALIDATION_WINDOW {
+                        if let Some(hash) = self.validation_queue.pop_front() {
+                            self.client_send(GetBlockRequestMessage { hash, include_transactions: false }).await?;
+                        }
+                    }
+                }
                 self.client_get_block_template().await?;
             }
             Payload::NotifyNewBlockTemplateResponse(res) => match res.error {
@@ -661,6 +754,20 @@ impl KeryxdHandler {
                 None => info!("Registered for block added notifications (AI request scanning)"),
                 Some(e) => error!("Failed registering for block added notifications: {:?}", e),
             },
+            Payload::NotifyVirtualSelectedParentChainChangedResponse(res) => match res.error {
+                None => info!("Registered for virtual chain notifications (escrow tracking)"),
+                Some(e) => error!("Failed registering for virtual chain notifications: {:?}", e),
+            },
+            // Virtual chain advanced: fetch every added chain block in full. Their coinbases
+            // are the only ones that materialize UTXOs, so escrow tracking feeds off this
+            // stream (handle_block gates tracking on is_chain_block). Removed chain blocks
+            // are ignored: entries from reorged-out blocks fail their claims as orphans and
+            // are cleaned up by the existing retry/slash machinery.
+            Payload::VirtualSelectedParentChainChangedNotification(notif) => {
+                for hash in notif.added_chain_block_hashes {
+                    self.client_send(GetBlockRequestMessage { hash, include_transactions: true }).await?;
+                }
+            }
             msg => info!("got unknown msg: {:?}", msg),
         }
         Ok(())

@@ -832,6 +832,9 @@ async fn run() -> Result<(), Error> {
                 orphan_slashed: false,
                 orphan_retries: 0,
                 orphan_retry_after_daa: None,
+                submit_retries: 0,
+                batch_cap: 0,
+                cap_set_daa: 0,
                 is_inference: false,
             })
             .collect();

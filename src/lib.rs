@@ -61,6 +61,7 @@ pub mod llama_engine {
     pub fn active_for(_gguf: &str, _gpu: usize) -> bool { false }
     pub fn available() -> bool { false }
     pub fn unload() {}
+    pub fn unload_for_gpu(_gpu: usize) {}
     pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> { None }
     pub fn generate(_prompt: &str, _max_tokens: usize) -> Option<String> { None }
 }
