@@ -165,6 +165,8 @@ pub struct EscrowWatcher {
     /// In-memory only: a reconnect rebuilds the watcher and clears it, which is correct —
     /// responses for the old connection can no longer arrive.
     in_flight: HashMap<String, InFlightClaim>,
+    /// When true (keryxd < 1.4.4 solo-safety gate), find_claim ships nothing; tracking continues.
+    claims_held: bool,
     /// "{txid}:{index}" of every outpoint inside an in-flight claim, so eligibility
     /// checks stay O(1).
     in_flight_outpoints: HashSet<String>,
@@ -238,6 +240,7 @@ impl EscrowWatcher {
             state,
             state_path,
             in_flight: HashMap::new(),
+            claims_held: false,
             in_flight_outpoints: HashSet::new(),
             last_daa_score: 0,
             outpoint_set: HashSet::new(),
@@ -293,6 +296,11 @@ impl EscrowWatcher {
     }
 
     /// Return the 64-char hex x-only public key of the mining key.
+    /// Hold/release claim submission (node-version safety gate — grpc.rs GetInfoResponse).
+    pub fn set_claims_held(&mut self, held: bool) {
+        self.claims_held = held;
+    }
+
     pub fn pubkey_hex(&self) -> String {
         hex::encode(self.pubkey_bytes)
     }
@@ -559,6 +567,12 @@ impl EscrowWatcher {
 
     /// Scan for matured, eligible escrow entries and build a batched claim TX (if any).
     fn find_claim(&mut self, daa_score: u64) -> Option<RpcTransaction> {
+        // Claims held (keryxd < 1.4.4 solo-safety gate, see grpc.rs GetInfoResponse):
+        // tracking/maturity accounting continue, but no claim TX ships — pre-1.4.4 nodes
+        // can reject their own template blocks over coin-age claim spends ("block invalid").
+        if self.claims_held {
+            return None;
+        }
         if self.in_flight.len() >= MAX_IN_FLIGHT_CLAIMS {
             return None;
         }

@@ -724,6 +724,31 @@ impl KeryxdHandler {
             }
             Payload::GetInfoResponse(info) => {
                 info!("Keryxd version: {}", info.server_version);
+                // SOLO SAFETY GATE: keryxd < 1.4.4 has a consensus bug ("coin-age maturation
+                // entry lost on tx re-accepted during reorg", fixed by node commit 0a7d5473)
+                // that makes the node reject blocks containing coin-age spends its own
+                // maturation table forgot — and escrow CLAIM transactions are exactly that
+                // class. Since the batched-claim engine keeps claims flowing, mining solo
+                // against a pre-1.4.4 node yields recurring "Block was not submitted: block
+                // invalid" on templates carrying our own claims. Hold claims on old nodes
+                // (tracking continues; claims resume automatically once the node is upgraded
+                // or with KERYX_ESCROW_FORCE=1 to override).
+                if let Some(w) = self.escrow_watcher.as_mut() {
+                    let old_node = version_lt(&info.server_version, (1, 4, 4));
+                    let forced = std::env::var("KERYX_ESCROW_FORCE").map(|v| v == "1").unwrap_or(false);
+                    if old_node && !forced {
+                        w.set_claims_held(true);
+                        log::warn!(
+                            "ESCROW: keryxd {} is older than 1.4.4 — claim submission is HELD to avoid \
+                             'block invalid' rejections from the pre-1.4.4 coin-age maturation bug. \
+                             UPGRADE keryxd to >= 1.4.4 to claim (escrow outputs keep accruing safely; \
+                             KERYX_ESCROW_FORCE=1 overrides at your own risk).",
+                            info.server_version
+                        );
+                    } else {
+                        w.set_claims_held(false);
+                    }
+                }
                 // Register for all notification types:
                 // - NewBlockTemplate drives the mining loop
                 // - BlockAdded lets us scan confirmed blocks for AiRequests
@@ -777,5 +802,37 @@ impl KeryxdHandler {
 impl Drop for KeryxdHandler {
     fn drop(&mut self) {
         self.block_handle.abort();
+    }
+}
+
+/// True when a keryxd `server_version` string (e.g. "1.4.3", "v1.4.3-OPoI/...") is older than
+/// `min` (major, minor, patch). Unparseable versions return FALSE (fail-open: never hold claims
+/// on a version we can't read — the gate is a convenience guard, not consensus).
+fn version_lt(server_version: &str, min: (u64, u64, u64)) -> bool {
+    let v = server_version.trim_start_matches(|c: char| !c.is_ascii_digit());
+    let mut parts = v.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty());
+    let (a, b, c) = (
+        parts.next().and_then(|s| s.parse::<u64>().ok()),
+        parts.next().and_then(|s| s.parse::<u64>().ok()),
+        parts.next().and_then(|s| s.parse::<u64>().ok()),
+    );
+    match (a, b, c) {
+        (Some(a), Some(b), Some(c)) => (a, b, c) < min,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod version_gate_tests {
+    use super::version_lt;
+    #[test]
+    fn version_gate_parses_real_keryxd_strings() {
+        assert!(version_lt("1.4.3", (1, 4, 4)));
+        assert!(version_lt("v1.4.3-OPoI", (1, 4, 4)));
+        assert!(version_lt("1.3.41", (1, 4, 4)));
+        assert!(!version_lt("1.4.4", (1, 4, 4)));
+        assert!(!version_lt("1.4.5", (1, 4, 4)));
+        assert!(!version_lt("2.0.0", (1, 4, 4)));
+        assert!(!version_lt("garbage", (1, 4, 4))); // fail-open
     }
 }
