@@ -700,12 +700,24 @@ fn ensure_index(gguf_path: &str, tier: u8) -> Result<(), String> {
         return Ok(());
     }
     log::info!("PoM: building WeightIndex from {gguf_path} (tier {tier})…");
-    let index = crate::pom::WeightIndex::build_from_gguf(gguf_path).map_err(|e| e.to_string())?;
+    let mut index = crate::pom::WeightIndex::build_from_gguf(gguf_path).map_err(|e| e.to_string())?;
     log::info!(
         "PoM: tier {tier} loaded — {} chunks, computed R_T = {} (must match the node's pinned root)",
         index.n_chunks,
         hex32(&index.r_t)
     );
+    // Opt-in solo block-race edge (mirror of pom_gpu's hook, upstream 951b2e6): hold the FULL Merkle
+    // tree in RAM so the post-hit proof build is a pure lookup (~0.5 ms) instead of the ~30-40 ms
+    // sparse recompute — at 10 BPS that latency measurably loses chain races. Costs ~2N*32 B RAM
+    // (~9.6 GB at tier-0), hence opt-in; pool miners don't need it, low-RAM rigs keep the sparse
+    // path. Built ONCE on the shared index (before set_index), so all cards share it. Byte-safe:
+    // build_dense self-checks its dense root against the pinned R_T.
+    if std::env::var("KERYX_RESIDENT_TREE").is_ok_and(|v| v == "1") {
+        let t0 = std::time::Instant::now();
+        log::info!("PoM: building RESIDENT Merkle tree (RAM) — proof build becomes lookup-time (~+{} MiB)…", (index.n_chunks * 64) / (1024 * 1024));
+        index.build_dense();
+        log::info!("PoM: resident tree ready in {:.1}s.", t0.elapsed().as_secs_f32());
+    }
     crate::pom::set_index(index, tier);
     Ok(())
 }
