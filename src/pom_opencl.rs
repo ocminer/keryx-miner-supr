@@ -360,11 +360,9 @@ fn is_shared_dev(device_id: usize) -> bool {
     SHARED_DEV.lock().unwrap().map_or(false, |d| d == device_id)
 }
 
-/// This card's PCI (bus, device, function) via CL_DEVICE_TOPOLOGY_AMD — matched against the
-/// engine's VK_EXT_pci_bus_info to identify the SAME physical card across the two APIs.
-#[cfg(unix)]
 /// AMD sysfs health sample (the NVML-free analog). Plain data — miner.rs maps it into the shared
 /// gpu_health::GpuHealth (that module is binary-side; pom_opencl is lib-side, so no direct ref).
+/// Cfg-unconditional: both the unix `amd_health` and the non-unix stub return `Option<AmdHealth>`.
 #[derive(Default, Clone)]
 pub struct AmdHealth {
     pub power_w: Option<f64>,
@@ -440,6 +438,9 @@ pub fn amd_health(idx: usize) -> Option<AmdHealth> {
 #[cfg(not(unix))]
 pub fn amd_health(_idx: usize) -> Option<AmdHealth> { None }
 
+/// This card's PCI (bus, device, function) via CL_DEVICE_TOPOLOGY_AMD — matched against the
+/// engine's VK_EXT_pci_bus_info to identify the SAME physical card across the two APIs.
+#[cfg(unix)]
 fn device_pci(device_id: usize) -> Option<(u32, u32, u32)> {
     const CL_DEVICE_TOPOLOGY_AMD: opencl3::types::cl_device_info = 0x4037;
     const CL_DEVICE_TOPOLOGY_TYPE_PCIE_AMD: u32 = 1;
