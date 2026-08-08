@@ -236,6 +236,26 @@ Names are the tier names without the `--` (`very-light`, `light`, `default`, `hi
 
 The miner blocks on model prefetch until every file in the chosen tier is local. Per-share OPoI `tag_fixed` MLP is baked into the binary; the LLM tier only affects optional AI-request task eligibility.
 
+## Tuning knobs (environment variables)
+
+All optional. The miner runs correctly with none of them set.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `KERYX_RESIDENT_TREE` | *(unset = off)* | `=1` holds the **full possession Merkle tree in RAM** so the per-block proof is built by lookup (~0.5 ms) instead of the default on-disk recompute (~30–70 ms). Only worth it for **solo** mining (a faster proof build releases your block sooner in a chain race); it does nothing useful for pool mining. **Costs a lot of RAM** — roughly `2 × N × 32 bytes` (about **9.6 GB at tier 0**, tens of GB at larger tiers) plus ~2 min extra startup. |
+| `KERYX_INFERENCE_GPU` | auto | Pin OPoI inference to a specific CUDA ordinal (see note in *Automatic per-card selection*). |
+
+### Do I need to disable `KERYX_RESIDENT_TREE`? (low-RAM / 8 GB rigs)
+
+**No — it is OFF by default.** It only turns on if you *explicitly* export `KERYX_RESIDENT_TREE=1`. If you never set it (the normal case), you are already on the low-memory path and there is nothing to change.
+
+To turn it **off** if you (or a flight sheet) set it:
+
+- **Linux / CLI:** `unset KERYX_RESIDENT_TREE` (or just don't export it). Setting it to anything other than `1` — e.g. `KERYX_RESIDENT_TREE=0` — also counts as off.
+- **HiveOS / mmpOS:** remove the `KERYX_RESIDENT_TREE=1` line from the miner's *Extra config / environment* field and restart the miner.
+
+On an 8 GB card/host, leave it off — the resident tree needs far more RAM than that and the frugal on-disk path is the right one for you.
+
 ## Roadmap
 
 1. Verify the `candle` LLM-inference path on CUDA 13.0 (the PoW miner already builds and runs against 13.0 via `cust 0.3`; only the optional inference backend still rides upstream's candle 0.8 pin).
