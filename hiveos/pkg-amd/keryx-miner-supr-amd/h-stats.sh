@@ -37,14 +37,23 @@ diffTime=`echo $((time_now-time_rep)) | tr -d '-'`
 # takes the value field (NF-1) and multiplies by the unit's khs factor. khash=1, Mhash=1e3,
 # Ghash=1e6, Thash=1e9; default Mhash if no unit token is present.
 to_khs() {
-        awk '{
-                rate = $(NF-1); m = 1000;
-                if      ($0 ~ /Thash/) m = 1000000000;
-                else if ($0 ~ /Ghash/) m = 1000000;
-                else if ($0 ~ /Mhash/) m = 1000;
-                else if ($0 ~ /khash/) m = 1;
-                printf "%.0f\n", rate * m;
-        }'
+	awk '{
+		# Anchor on the "<val> <U>hash/s" token so trailing text (health stats, the
+		# "eff X MH/s/W" figure the efficiency addon appends) never shifts the parse.
+		# Old code took $(NF-1), which the addon moved onto the efficiency number.
+		rate = 0; m = 1000;
+		for (i = 1; i <= NF; i++) {
+			if ($i ~ /hash\/s$/) {
+				rate = $(i-1);
+				if      ($i ~ /Thash/) m = 1000000000;
+				else if ($i ~ /Ghash/) m = 1000000;
+				else if ($i ~ /Mhash/) m = 1000;
+				else if ($i ~ /khash/) m = 1;
+				break;
+			}
+		}
+		printf "%.0f\n", rate * m;
+	}'
 }
 
 if [ "$diffTime" -lt "$maxDelay" ]; then
