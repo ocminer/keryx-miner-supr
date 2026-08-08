@@ -127,10 +127,15 @@ enum WorkerCommand {
 }
 
 /// One device's current hashrate (hashes/sec); `label` is e.g. "#0 (NVIDIA GeForce RTX 5090)".
+/// `health` is the NVML sample taken in the same reporting tick (None on non-NVIDIA rigs
+/// or when the CUDA↔NVML device mapping can't be verified); `efficiency_mhs_per_w` is
+/// hashrate/power from that same tick — the field users tune against.
 #[derive(Default, Clone)]
 pub struct DeviceRate {
     pub label: String,
     pub hashrate: f64,
+    pub health: Option<crate::gpu_health::GpuHealth>,
+    pub efficiency_mhs_per_w: Option<f64>,
 }
 
 /// Live hashrate snapshot, refreshed by the logger every LOG_RATE. Read by the stats API.
@@ -138,6 +143,10 @@ pub struct DeviceRate {
 pub struct MinerStats {
     pub total_hashrate: f64,
     pub devices: Vec<DeviceRate>,
+    /// Sum of NVML power across devices with a verified sample (watts); None if no device
+    /// reported. Basis for the rig-level efficiency figure.
+    pub total_power_w: Option<f64>,
+    pub total_efficiency_mhs_per_w: Option<f64>,
 }
 
 #[allow(dead_code)]
@@ -673,14 +682,52 @@ impl MinerManager {
                 challenge_active,
             );
             let mut devices = Vec::new();
+            let mut power_sum = 0.0f64;
+            let mut power_seen = false;
             for (device, rate) in &*hashes_by_worker.lock().unwrap() {
-                let r = Self::log_single_hashrate(rate, format!("Device {}:", device), "0 hash/s", duration, true, challenge_active);
-                devices.push(DeviceRate { label: device.clone(), hashrate: r });
+                // NVML sample in the same tick as the rate, so the printed/API efficiency
+                // pairs a hashrate with the power draw that produced it (field request:
+                // one line with temp/fan/power/clocks/vram + MH/s + MH/s/W).
+                let health = crate::gpu_health::ordinal_from_label(device)
+                    .and_then(|ord| crate::gpu_health::sample(ord, device));
+                let suffix = match &health {
+                    Some(h) => {
+                        if let Some(w) = h.power_w {
+                            power_sum += w;
+                            power_seen = true;
+                        }
+                        let frag = h.to_log_fragment();
+                        if frag.is_empty() { String::new() } else { format!(" | {}", frag) }
+                    }
+                    None => String::new(),
+                };
+                let r = Self::log_single_hashrate_with(
+                    rate,
+                    format!("Device {}:", device),
+                    "0 hash/s",
+                    duration,
+                    true,
+                    challenge_active,
+                    &suffix,
+                    health.as_ref().and_then(|h| h.power_w),
+                );
+                let eff = crate::gpu_health::efficiency_mhs_per_w(
+                    r,
+                    health.as_ref().and_then(|h| h.power_w),
+                );
+                devices.push(DeviceRate { label: device.clone(), hashrate: r, health, efficiency_mhs_per_w: eff });
+            }
+            let total_power_w = if power_seen { Some(power_sum) } else { None };
+            let total_eff = crate::gpu_health::efficiency_mhs_per_w(total, total_power_w);
+            if let (Some(w), Some(e)) = (total_power_w, total_eff) {
+                info!("Rig efficiency: {:.1} W total, {:.3} MH/s/W", w, e);
             }
             // Publish the snapshot for the stats API (hashrates are hashes/sec).
             if let Ok(mut s) = stats.lock() {
                 s.total_hashrate = total;
                 s.devices = devices;
+                s.total_power_w = total_power_w;
+                s.total_efficiency_mhs_per_w = total_eff;
             }
             last_instant = now;
         }
@@ -693,6 +740,23 @@ impl MinerManager {
         duration: f64,
         keep_prefix: bool,
         challenge_active: bool,
+    ) -> f64 {
+        Self::log_single_hashrate_with(counter, prefix, warn_message, duration, keep_prefix, challenge_active, "", None)
+    }
+
+    /// `log_single_hashrate` + an optional health suffix and power figure: prints
+    /// `<prefix> <rate> <unit> | <health> | eff <x.xxx> MH/s/W` on one line. The
+    /// stall-warning and OPoI-pause branches are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn log_single_hashrate_with(
+        counter: &Arc<AtomicU64>,
+        prefix: String,
+        warn_message: &str,
+        duration: f64,
+        keep_prefix: bool,
+        challenge_active: bool,
+        health_suffix: &str,
+        power_w: Option<f64>,
     ) -> f64 {
         let hashes = counter.swap(0, Ordering::AcqRel);
         let rate = (hashes as f64) / duration;
@@ -710,8 +774,11 @@ impl MinerManager {
                 };
             }
         } else {
-            let (rate, suffix) = Self::hash_suffix(rate);
-            info!("{} {:.2} {}", prefix, rate, suffix);
+            let (disp, unit) = Self::hash_suffix(rate);
+            match crate::gpu_health::efficiency_mhs_per_w(rate, power_w) {
+                Some(eff) => info!("{} {:.2} {}{} | eff {:.3} MH/s/W", prefix, disp, unit, health_suffix, eff),
+                None => info!("{} {:.2} {}{}", prefix, disp, unit, health_suffix),
+            }
         }
         rate
     }

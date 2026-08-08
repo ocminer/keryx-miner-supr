@@ -24,6 +24,7 @@ use crate::miner::MinerManager;
 use crate::target::Uint256;
 
 mod api;
+mod gpu_health;
 mod cli;
 mod client;
 mod escrow;

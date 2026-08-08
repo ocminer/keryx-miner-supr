@@ -46,14 +46,31 @@ fn dev_index(label: &str) -> Option<u64> {
 }
 
 fn generic_json(stats: &Arc<Mutex<MinerStats>>, version: &str, uptime: u64) -> String {
-    let (total, devices) = {
+    let (total, devices, total_power_w, total_eff) = {
         let s = stats.lock().unwrap();
-        (s.total_hashrate, s.devices.clone())
+        (s.total_hashrate, s.devices.clone(), s.total_power_w, s.total_efficiency_mhs_per_w)
     };
     let (acc, rej) = shares();
+    // Per-device health + efficiency (field request): everything the combined log line
+    // shows, machine-readable. Fields are null on rigs where NVML is unavailable or the
+    // device mapping could not be verified — consumers must treat them as optional.
     let devs: Vec<_> = devices
         .iter()
-        .map(|d| serde_json::json!({ "name": d.label, "hashrate_hs": d.hashrate }))
+        .map(|d| {
+            let h = d.health.as_ref();
+            serde_json::json!({
+                "name": d.label,
+                "hashrate_hs": d.hashrate,
+                "temp_c": h.and_then(|h| h.temp_c),
+                "fan_pct": h.and_then(|h| h.fan_pct),
+                "power_w": h.and_then(|h| h.power_w),
+                "core_mhz": h.and_then(|h| h.core_mhz),
+                "mem_mhz": h.and_then(|h| h.mem_mhz),
+                "vram_used_mb": h.and_then(|h| h.vram_used_mb),
+                "vram_total_mb": h.and_then(|h| h.vram_total_mb),
+                "efficiency_mhs_per_w": d.efficiency_mhs_per_w,
+            })
+        })
         .collect();
     serde_json::json!({
         "miner": MINER_NAME,
@@ -61,6 +78,8 @@ fn generic_json(stats: &Arc<Mutex<MinerStats>>, version: &str, uptime: u64) -> S
         "algo": "keryxhash",
         "uptime_s": uptime,
         "total_hashrate_hs": total,
+        "total_power_w": total_power_w,
+        "total_efficiency_mhs_per_w": total_eff,
         "devices": devs,
         "shares": { "accepted": acc, "rejected": rej },
     })
