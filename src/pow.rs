@@ -239,6 +239,9 @@ impl State {
         // we emit the v2 proof — every K chunk read + its Merkle path under R_T, no trace tree,
         // no Fiat-Shamir openings. Below the gate the legacy trace-tree proof. `to_wire_bytes`
         // keeps a pre-H4 proof byte-identical to the 7-field layout the not-yet-H4 node decodes.
+        // Proof-build latency is a solo block-race factor at 10 BPS (~30-40 ms sparse vs
+        // lookup-time with KERYX_RESIDENT_TREE=1) — log it at debug so the effect is measurable.
+        let proof_t0 = std::time::Instant::now();
         let proof = if self.daa_score >= pom::h4_activation_daa() {
             pom::build_proof_v2(
                 tier,
@@ -265,6 +268,7 @@ impl State {
                 h3,
             )
         };
+        log::debug!("PoM: proof built in {:.1} ms", proof_t0.elapsed().as_secs_f64() * 1e3);
         let bytes = proof.to_wire_bytes();
 
         let mut block_seed = (*self.block).clone();

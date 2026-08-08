@@ -651,6 +651,11 @@ pub struct WeightIndex {
     /// every per-GPU process AND across restarts). NOT deleted on drop — other live workers `pread`
     /// the same inode and the next restart reuses it. A PRIVATE/test tree is `persistent = false`.
     persistent: bool,
+    /// Optional in-RAM dense tree (all levels). When present, `merkle_path` is a pure lookup
+    /// instead of the sparse recompute — removes the ~30-40 ms proof-build latency after a hit,
+    /// which at 10 BPS is a real solo block-race edge (upstream 7a6e7a0). Costs ~2N*32 B of RAM
+    /// (~9.6 GB at tier-0's N=150M), so it is OPT-IN via KERYX_RESIDENT_TREE=1.
+    dense: Option<Vec<Vec<[u8; 32]>>>,
 }
 
 impl Drop for WeightIndex {
@@ -967,6 +972,7 @@ impl WeightIndex {
             checkpoints,
             total_levels,
             persistent,
+            dense: None,
         };
         Ok((idx, table_snapshot))
     }
@@ -1017,6 +1023,7 @@ impl WeightIndex {
             checkpoints,
             total_levels: meta.total_levels,
             persistent: true,
+            dense: None,
         })
     }
 
@@ -1121,10 +1128,41 @@ impl WeightIndex {
         fold_levels(&nodes, rounds)
     }
 
+    /// Build the in-RAM dense tree; afterwards `merkle_path` is a pure lookup. Reads every chunk
+    /// once (sequential, page-cache friendly). Ported from upstream 7a6e7a0.
+    pub fn build_dense(&mut self) {
+        if self.dense.is_some() {
+            return;
+        }
+        let mut levels: Vec<Vec<[u8; 32]>> = vec![(0..self.n_chunks).map(|i| blake(&self.read_chunk_bytes(i))).collect()];
+        while levels.last().unwrap().len() > 1 {
+            let cur = levels.last().unwrap();
+            let mut next = Vec::with_capacity(cur.len().div_ceil(2));
+            let mut i = 0;
+            while i < cur.len() {
+                let r = if i + 1 < cur.len() { cur[i + 1] } else { cur[i] };
+                next.push(hash_pair(&cur[i], &r));
+                i += 2;
+            }
+            levels.push(next);
+        }
+        self.dense = Some(levels);
+    }
+
     /// Inclusion path for chunk index `off`: stored siblings read from the checkpoint file, unstored
     /// intermediate levels recomputed on the fly from the nearest checkpoint / the GGUF leaves.
     /// Byte-identical to the dense full-tree path: an out-of-range sibling is the node itself.
     pub fn merkle_path(&self, off: u64) -> Vec<[u8; 32]> {
+        if let Some(dense) = &self.dense {
+            let mut path = Vec::with_capacity(dense.len().saturating_sub(1));
+            let mut idx = off as usize;
+            for level in &dense[..dense.len() - 1] {
+                let sib = idx ^ 1;
+                path.push(if sib < level.len() { level[sib] } else { level[idx] });
+                idx >>= 1;
+            }
+            return path;
+        }
         let total_levels = self.total_levels;
         let mut path = Vec::with_capacity(total_levels as usize);
         let mut idx: u64 = off;
@@ -1536,12 +1574,29 @@ mod tests {
             checkpoints,
             total_levels,
             persistent: false,
+            dense: None,
         }
     }
 
     /// BYTE-EXACT GATE (consensus): the sparse checkpoint-built root MUST equal the dense canonical
     /// root (`merkle_root_mini` over all leaves = what the node pins in POM_TIERS) for every N,
     /// including the non-power-of-two sizes whose short tails used to drop the hash(x,x) carries.
+    #[test]
+    fn dense_merkle_path_matches_sparse() {
+        for n in [64u64, 65, 100, 1000, 2000, 4096, 4968, 12345, 65536, 100000, 131072] {
+            let mut idx = synth_index(n);
+            let step = (n as usize / 37).max(1);
+            let offs: Vec<u64> = (0..n).step_by(step).collect();
+            let sparse: Vec<Vec<[u8; 32]>> = offs.iter().map(|&o| idx.merkle_path(o)).collect();
+            idx.build_dense();
+            for (k, &o) in offs.iter().enumerate() {
+                assert_eq!(idx.merkle_path(o), sparse[k], "path mismatch n={n} off={o}");
+            }
+            let dense = idx.dense.as_ref().unwrap();
+            assert_eq!(dense.last().unwrap()[0], idx.r_t, "dense root != r_t, n={n}");
+        }
+    }
+
     #[test]
     fn sparse_build_root_matches_dense_root() {
         for n in [64u64, 65, 100, 1000, 2000, 4096, 4968, 12345, 65536, 100000, 131072] {
@@ -1672,6 +1727,7 @@ mod tests {
             checkpoints,
             total_levels,
             persistent: false,
+            dense: None,
         };
 
         // Every chunk read by pread matches the canonical chunk, across all segments + padding.

@@ -791,7 +791,18 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             };
             info!("PoM: building host weight index (gpu{}) — this can take a while…", device_id);
             match crate::pom::WeightIndex::build_from_gguf(&gguf) {
-                Ok(idx) => {
+                Ok(mut idx) => {
+                    // Opt-in solo block-race edge (upstream 7a6e7a0): hold the FULL Merkle tree in
+                    // RAM so the post-hit proof build is a pure lookup instead of a ~30-40 ms
+                    // sparse recompute — at 10 BPS that latency measurably loses chain races.
+                    // Costs ~2N*32 B RAM (~9.6 GB at tier-0), hence opt-in; low-RAM rigs keep the
+                    // frugal sparse path. KERYX_RESIDENT_TREE=1 enables.
+                    if std::env::var("KERYX_RESIDENT_TREE").is_ok_and(|v| v == "1") {
+                        let t0 = std::time::Instant::now();
+                        info!("PoM[gpu{}]: building RESIDENT tree (RAM) — proof build becomes lookup-time…", device_id);
+                        idx.build_dense();
+                        info!("PoM[gpu{}]: resident tree ready in {:.1}s", device_id, t0.elapsed().as_secs_f32());
+                    }
                     info!("PoM[gpu{}]: host index ready — N={} chunks", device_id, idx.n_chunks);
                     if per_device { crate::pom::set_index_for(device_id, idx, tier); } else { crate::pom::set_index(idx, tier); }
                 }
