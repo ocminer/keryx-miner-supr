@@ -363,6 +363,83 @@ fn is_shared_dev(device_id: usize) -> bool {
 /// This card's PCI (bus, device, function) via CL_DEVICE_TOPOLOGY_AMD — matched against the
 /// engine's VK_EXT_pci_bus_info to identify the SAME physical card across the two APIs.
 #[cfg(unix)]
+/// AMD sysfs health sample (the NVML-free analog). Plain data — miner.rs maps it into the shared
+/// gpu_health::GpuHealth (that module is binary-side; pom_opencl is lib-side, so no direct ref).
+#[derive(Default, Clone)]
+pub struct AmdHealth {
+    pub power_w: Option<f64>,
+    pub temp_c: Option<u32>,
+    pub fan_pct: Option<u32>,
+    pub core_mhz: Option<u32>,
+    pub vram_used_mb: Option<u64>,
+    pub vram_total_mb: Option<u64>,
+}
+
+/// Per-GPU health for the efficiency stats on AMD (the NVML analog): power/temp/clocks/VRAM read
+/// from Linux sysfs (amdgpu hwmon), matched to OpenCL device `idx` by PCI address. `idx` is the
+/// plugin's "#N" — the Nth GPU device of the AMD ("Advanced Micro Devices, Inc.") OpenCL platform,
+/// mirroring plugins/opencl device selection so #N here == #N in the hashrate line. No rocm-smi /
+/// NVML dependency; every field is best-effort → None (so a rig without amdgpu sysfs just shows no
+/// efficiency, never a wrong number). Power is what the MH/s/W figure needs.
+#[cfg(unix)]
+pub fn amd_health(idx: usize) -> Option<AmdHealth> {
+    use opencl3::platform::get_platforms;
+    // Mirror the plugin's platform pick: first AMD-vendor platform with devices.
+    let plats = get_platforms().ok()?;
+    let amd = plats.into_iter().find(|p| {
+        p.vendor().map(|v| v == "Advanced Micro Devices, Inc.").unwrap_or(false)
+            && !p.get_devices(opencl3::device::CL_DEVICE_TYPE_GPU).unwrap_or_default().is_empty()
+    })?;
+    let devs = amd.get_devices(opencl3::device::CL_DEVICE_TYPE_GPU).ok()?;
+    let dev = *devs.get(idx)?;
+    let (b, d, f) = device_pci(dev as usize)?;
+    let want = format!("0000:{:02x}:{:02x}.{:x}", b, d, f);
+    // Find the DRM card whose PCI address matches, then read its hwmon + amdgpu sysfs nodes.
+    let read_u64 = |path: &std::path::Path| -> Option<u64> {
+        std::fs::read_to_string(path).ok()?.trim().parse::<u64>().ok()
+    };
+    for entry in std::fs::read_dir("/sys/class/drm").ok()? {
+        let card = entry.ok()?.path();
+        if !card.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with("card") && !n.contains('-')).unwrap_or(false) {
+            continue;
+        }
+        let devdir = card.join("device");
+        let pci = std::fs::canonicalize(&devdir).ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+        if pci.as_deref() != Some(want.as_str()) {
+            continue;
+        }
+        let mut h = AmdHealth::default();
+        // hwmon dir under the device (power/temp/fan)
+        if let Ok(hw) = std::fs::read_dir(devdir.join("hwmon")) {
+            if let Some(hwmon) = hw.filter_map(|e| e.ok()).map(|e| e.path()).next() {
+                // RDNA reports power1_average; Vega20/Instinct (MI50/MI60) report power1_input instead.
+                h.power_w = read_u64(&hwmon.join("power1_average"))
+                    .or_else(|| read_u64(&hwmon.join("power1_input")))
+                    .map(|uw| uw as f64 / 1_000_000.0);
+                h.temp_c = read_u64(&hwmon.join("temp1_input")).map(|mc| (mc / 1000) as u32);
+                if let (Some(cur), Some(max)) = (read_u64(&hwmon.join("pwm1")), Some(255u64)) {
+                    h.fan_pct = Some(((cur * 100) / max) as u32);
+                }
+            }
+        }
+        h.vram_used_mb = read_u64(&devdir.join("mem_info_vram_used")).map(|b| b / (1024 * 1024));
+        h.vram_total_mb = read_u64(&devdir.join("mem_info_vram_total")).map(|b| b / (1024 * 1024));
+        // Current core clock: the "*"-marked line in pp_dpm_sclk (e.g. "3: 2482Mhz *").
+        if let Ok(txt) = std::fs::read_to_string(devdir.join("pp_dpm_sclk")) {
+            for line in txt.lines().filter(|l| l.contains('*')) {
+                if let Some(mhz) = line.split_whitespace().find_map(|t| t.strip_suffix("Mhz").and_then(|n| n.parse::<u32>().ok())) {
+                    h.core_mhz = Some(mhz);
+                }
+            }
+        }
+        return Some(h);
+    }
+    None
+}
+#[cfg(not(unix))]
+pub fn amd_health(_idx: usize) -> Option<AmdHealth> { None }
+
 fn device_pci(device_id: usize) -> Option<(u32, u32, u32)> {
     const CL_DEVICE_TOPOLOGY_AMD: opencl3::types::cl_device_info = 0x4037;
     const CL_DEVICE_TOPOLOGY_TYPE_PCIE_AMD: u32 = 1;
