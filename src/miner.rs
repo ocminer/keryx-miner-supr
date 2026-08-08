@@ -688,8 +688,25 @@ impl MinerManager {
                 // NVML sample in the same tick as the rate, so the printed/API efficiency
                 // pairs a hashrate with the power draw that produced it (field request:
                 // one line with temp/fan/power/clocks/vram + MH/s + MH/s/W).
-                let health = crate::gpu_health::ordinal_from_label(device)
+                let mut health = crate::gpu_health::ordinal_from_label(device)
                     .and_then(|ord| crate::gpu_health::sample(ord, device));
+                // AMD has no NVML: read power/temp/clocks/VRAM from sysfs (amdgpu hwmon), matched
+                // to the plugin's "#N" device by PCI — so MH/s/W works on AMD rigs too (field
+                // request). Only when the NVML path produced nothing, and only on the AMD build.
+                #[cfg(all(feature = "pom-opencl", unix))]
+                if health.is_none() {
+                    if let Some(ord) = crate::gpu_health::ordinal_from_label(device) {
+                        health = keryx_miner::pom_opencl::amd_health(ord as usize).map(|a| crate::gpu_health::GpuHealth {
+                            temp_c: a.temp_c,
+                            fan_pct: a.fan_pct,
+                            power_w: a.power_w,
+                            core_mhz: a.core_mhz,
+                            mem_mhz: None,
+                            vram_used_mb: a.vram_used_mb,
+                            vram_total_mb: a.vram_total_mb,
+                        });
+                    }
+                }
                 let suffix = match &health {
                     Some(h) => {
                         if let Some(w) = h.power_w {
