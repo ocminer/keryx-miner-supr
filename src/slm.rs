@@ -168,6 +168,15 @@ pub fn gguf_path_for(spec: &ModelSpec) -> std::path::PathBuf {
 fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
     const MAX_ATTEMPTS: u32 = 240; // survives long gateway outages (~40 min of retries)
     const BACKOFF_SECS: u64 = 10;
+    // Mark the process as "downloading" for the whole fetch (incl. retries/resume) so the
+    // hashrate reporter shows "downloading model" instead of "workers stalled or crashed".
+    // RAII guard clears it on every exit path (success, error, early return).
+    DOWNLOADING.store(true, AtomicOrdering::Relaxed);
+    struct DlGuard;
+    impl Drop for DlGuard {
+        fn drop(&mut self) { DOWNLOADING.store(false, AtomicOrdering::Relaxed); }
+    }
+    let _dl = DlGuard;
     eprintln!("[keryx-miner] Downloading {} ...", url);
     let mut attempt = 0u32;
     loop {
@@ -1361,6 +1370,24 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// True while a model file is actively downloading via IPFS (set around the download in
+/// `ensure_gguf`). Lets the hashrate reporter say "downloading model" instead of the alarming
+/// "workers stalled or crashed" during the (potentially many-minute) first-run fetch.
+static DOWNLOADING: AtomicBool = AtomicBool::new(false);
+
+/// Whether a model download is in progress right now.
+pub fn is_downloading() -> bool {
+    DOWNLOADING.load(AtomicOrdering::Relaxed)
+}
+
+/// True when the miner is still in first-run PREPARATION — no model is fully staged yet
+/// (downloading, or waiting to). While this holds, a 0 h/s reading is EXPECTED, not a stall.
+/// Backend-agnostic (reads the shared `.ok`/download state); the CUDA index/resident-tree
+/// build window is reported separately via `pom_gpu::is_loading()`.
+pub fn mining_preparing() -> bool {
+    is_downloading() || loaded_model_ids().is_empty()
 }
 
 /// Return the model_ids of supported models that have fully-downloaded files (.ok flag present).

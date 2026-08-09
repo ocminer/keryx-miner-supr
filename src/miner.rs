@@ -673,13 +673,35 @@ impl MinerManager {
             let now = ticker.tick().await;
             let duration = (now - last_instant).as_secs_f64();
             let challenge_active = opoi_challenge_active.load(Ordering::Relaxed);
-            let total = Self::log_single_hashrate(
+            // First-run PREPARATION: a 0 h/s reading is EXPECTED while the model is downloading
+            // or the possession index / resident tree is being built (the latter can take minutes,
+            // esp. with --resident-tree). Report that plainly instead of "workers stalled or
+            // crashed", which alarms users who simply haven't finished the one-time model download.
+            let preparing = keryx_miner::slm::mining_preparing() || {
+                #[cfg(feature = "pom-cuda")] { keryx_miner::pom_gpu::is_loading() }
+                #[cfg(not(feature = "pom-cuda"))] { false }
+            };
+            let stall_or_prep: &str = if preparing {
+                if keryx_miner::slm::is_downloading() {
+                    "still downloading the model (one-time first-run setup) — mining starts automatically when done, this is NOT a stall"
+                } else if keryx_miner::slm::loaded_model_ids().is_empty() {
+                    "preparing models (staging/verifying files) — mining starts automatically when ready, this is NOT a stall"
+                } else {
+                    "building the possession index / resident tree — mining starts automatically when done, this is NOT a stall"
+                }
+            } else {
+                "Workers stalled or crashed. Considered reducing workload and check that your node is synced"
+            };
+            let total = Self::log_single_hashrate_with(
                 &hashes_tried,
                 "Current hashrate is".into(),
-                "Workers stalled or crashed. Considered reducing workload and check that your node is synced",
+                stall_or_prep,
                 duration,
                 false,
                 challenge_active,
+                "",
+                None,
+                preparing,
             );
             let mut devices = Vec::new();
             let mut power_sum = 0.0f64;
@@ -721,12 +743,13 @@ impl MinerManager {
                 let r = Self::log_single_hashrate_with(
                     rate,
                     format!("Device {}:", device),
-                    "0 hash/s",
+                    "0 hash/s (preparing)",
                     duration,
                     true,
                     challenge_active,
                     &suffix,
                     health.as_ref().and_then(|h| h.power_w),
+                    preparing,
                 );
                 let eff = crate::gpu_health::efficiency_mhs_per_w(
                     r,
@@ -758,7 +781,7 @@ impl MinerManager {
         keep_prefix: bool,
         challenge_active: bool,
     ) -> f64 {
-        Self::log_single_hashrate_with(counter, prefix, warn_message, duration, keep_prefix, challenge_active, "", None)
+        Self::log_single_hashrate_with(counter, prefix, warn_message, duration, keep_prefix, challenge_active, "", None, false)
     }
 
     /// `log_single_hashrate` + an optional health suffix and power figure: prints
@@ -774,6 +797,7 @@ impl MinerManager {
         challenge_active: bool,
         health_suffix: &str,
         power_w: Option<f64>,
+        preparing: bool,
     ) -> f64 {
         let hashes = counter.swap(0, Ordering::AcqRel);
         let rate = (hashes as f64) / duration;
@@ -784,6 +808,12 @@ impl MinerManager {
                 } else {
                     info!("OPoI challenge in progress — PoW paused, stand by");
                 }
+            } else if preparing {
+                // Expected during first-run model download / index build — informational, not a warning.
+                match keep_prefix {
+                    true => info!("{} {}", prefix, warn_message),
+                    false => info!("{}", warn_message),
+                };
             } else {
                 match keep_prefix {
                     true => warn!("{}{}", prefix, warn_message),
