@@ -796,8 +796,8 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                     // RAM so the post-hit proof build is a pure lookup instead of a ~30-40 ms
                     // sparse recompute — at 10 BPS that latency measurably loses chain races.
                     // Costs ~2N*32 B RAM (~9.6 GB at tier-0), hence opt-in; low-RAM rigs keep the
-                    // frugal sparse path. KERYX_RESIDENT_TREE=1 enables.
-                    if std::env::var("KERYX_RESIDENT_TREE").is_ok_and(|v| v == "1") {
+                    // frugal sparse path. Gated by --resident-tree / KERYX_RESIDENT_TREE=1 (resolved in main).
+                    if crate::pom::resident_tree_enabled() {
                         let t0 = std::time::Instant::now();
                         info!("PoM[gpu{}]: building RESIDENT tree (RAM) — proof build becomes lookup-time…", device_id);
                         idx.build_dense();

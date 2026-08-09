@@ -713,7 +713,7 @@ fn ensure_index(gguf_path: &str, tier: u8) -> Result<(), String> {
     // (~9.6 GB at tier-0), hence opt-in; pool miners don't need it, low-RAM rigs keep the sparse
     // path. Built ONCE on the shared index (before set_index), so all cards share it. Byte-safe:
     // build_dense self-checks its dense root against the pinned R_T.
-    if std::env::var("KERYX_RESIDENT_TREE").is_ok_and(|v| v == "1") {
+    if crate::pom::resident_tree_enabled() {
         let t0 = std::time::Instant::now();
         log::info!("PoM: building RESIDENT Merkle tree (RAM) — proof build becomes lookup-time (~+{} MiB)…", (index.n_chunks * 64) / (1024 * 1024));
         index.build_dense();

@@ -743,6 +743,22 @@ async fn run() -> Result<(), Error> {
     let _ = env_logger::builder().filter_level(opt.log_level()).parse_default_env().try_init();
     opt.process()?;
 
+    // Resolve the resident-tree switch ONCE (read by both the CUDA and OpenCL index builders).
+    // Off by default. --resident-tree or KERYX_RESIDENT_TREE=1 (back-compat) turns it on;
+    // --no-resident-tree forces it off and wins over everything (escape hatch for a stray env
+    // var in a flight sheet — the "I can't turn it off" complaint).
+    let resident_tree = if opt.no_resident_tree {
+        false
+    } else {
+        opt.resident_tree || std::env::var("KERYX_RESIDENT_TREE").is_ok_and(|v| v == "1")
+    };
+    keryx_miner::pom::set_resident_tree(resident_tree);
+    log::info!(
+        "PoM resident tree: {} ({})",
+        if resident_tree { "ON" } else { "off" },
+        if resident_tree { "lookup-time proof build, high RAM" } else { "frugal on-disk proof build" }
+    );
+
     // Clean shutdown: respond to SIGINT (Ctrl-C) and SIGTERM — the signals HiveOS / mmpOS / SMOS /
     // systemd send to STOP a miner. The GPU worker threads sit in long, uninterruptible CUDA calls
     // and can't be stopped cooperatively, so we exit the process directly and let the OS reclaim the
