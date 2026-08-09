@@ -110,6 +110,25 @@ pub struct Opt {
     pub recover_escrow: bool,
 
     #[clap(
+        long = "resident-tree",
+        help = "Hold the full possession Merkle tree in RAM so the per-block proof is built by \
+                lookup (~0.5 ms) instead of the default on-disk recompute (~30-70 ms). OFF by \
+                default. Only useful for SOLO mining (faster proof release wins chain races); \
+                useless for pool mining. Costs a lot of RAM (~9.6 GB at tier 0, tens of GB at \
+                larger tiers) — do NOT enable on low-RAM (e.g. 8 GB) rigs.",
+        help_heading = "Mining"
+    )]
+    pub resident_tree: bool,
+
+    #[clap(
+        long = "no-resident-tree",
+        help = "Force the resident tree OFF even if KERYX_RESIDENT_TREE=1 is set in the environment \
+                (e.g. left in a flight sheet). This is already the default; use it to guarantee off.",
+        help_heading = "Mining"
+    )]
+    pub no_resident_tree: bool,
+
+    #[clap(
         long = "recover-escrow-api",
         help = "Base URL of the Keryx API to use for escrow recovery",
         help_heading = "OPoI / Inference",

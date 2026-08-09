@@ -37,6 +37,22 @@ pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io
 }
 use std::sync::OnceLock;
 
+/// Resident-tree switch. Resolved ONCE at startup from the CLI (`--resident-tree` /
+/// `--no-resident-tree`) with `KERYX_RESIDENT_TREE` as a back-compat fallback, then read by
+/// both the CUDA (`pom_gpu`) and OpenCL (`pom_opencl`) index-build paths. OFF by default:
+/// building the full Merkle tree in RAM (~9.6 GB at tier 0) is only worth it for solo mining.
+static RESIDENT_TREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set the resident-tree switch (call once, from main after CLI parse).
+pub fn set_resident_tree(on: bool) {
+    RESIDENT_TREE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the in-RAM resident Merkle tree is enabled for this process.
+pub fn resident_tree_enabled() -> bool {
+    RESIDENT_TREE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub const CHUNK_WORDS: usize = 4; // 32 B chunk
 const SEED_SALT: u64 = 0x4B65727978500; // "KeryxP"
 
