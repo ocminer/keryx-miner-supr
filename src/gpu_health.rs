@@ -13,13 +13,22 @@
 //! a blind index lookup can attribute the wrong card's wattage — CUDA_DEVICE_ORDER=
 //! PCI_BUS_ID aligns them, but we refuse to rely on it silently).
 
+// NVML (`nvml-wrapper`) is a dependency only for cfg(not(target_os = "macos")) (see Cargo.toml —
+// there is no NVIDIA on Apple Silicon), so the NVML sampler is compiled out on macOS. Everything
+// below the sampler (GpuHealth, to_log_fragment, ordinal_from_label, efficiency_mhs_per_w) is
+// NVML-independent and shared by every backend, including the Metal build.
+#[cfg(not(target_os = "macos"))]
 use std::sync::OnceLock;
 
+#[cfg(not(target_os = "macos"))]
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
+#[cfg(not(target_os = "macos"))]
 use nvml_wrapper::Nvml;
 
+#[cfg(not(target_os = "macos"))]
 static NVML: OnceLock<Option<Nvml>> = OnceLock::new();
 
+#[cfg(not(target_os = "macos"))]
 fn nvml() -> Option<&'static Nvml> {
     NVML.get_or_init(|| Nvml::init().ok()).as_ref()
 }
@@ -69,6 +78,7 @@ impl GpuHealth {
 /// `expect_label` (the worker label, e.g. `#0 (NVIDIA RTX A4000)`). A name mismatch means
 /// the CUDA and NVML orderings differ on this rig — return `None` rather than attribute
 /// another card's power draw.
+#[cfg(not(target_os = "macos"))]
 pub fn sample(ordinal: u32, expect_label: &str) -> Option<GpuHealth> {
     let nvml = nvml()?;
     let dev = nvml.device_by_index(ordinal).ok()?;
@@ -86,6 +96,15 @@ pub fn sample(ordinal: u32, expect_label: &str) -> Option<GpuHealth> {
         vram_used_mb: mem.as_ref().map(|m| m.used / 1024 / 1024),
         vram_total_mb: mem.as_ref().map(|m| m.total / 1024 / 1024),
     })
+}
+
+/// macOS (Metal) has no NVML — the Apple GPU exposes no per-device power/clock telemetry through
+/// this path, so health sampling degrades to `None` and the reporter prints the hashrate-only
+/// line (identical to an AMD/CPU rig with no libnvidia-ml). Keeps the `miner.rs` call site
+/// backend-agnostic.
+#[cfg(target_os = "macos")]
+pub fn sample(_ordinal: u32, _expect_label: &str) -> Option<GpuHealth> {
+    None
 }
 
 /// Parse the CUDA ordinal out of a worker label like `#0 (NVIDIA RTX A4000)`.
