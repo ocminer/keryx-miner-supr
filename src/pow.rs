@@ -14,6 +14,7 @@ use crate::{
     Error, Hash,
 };
 use keryx_miner::pom::{self, WeightIndex};
+use keryx_miner::pom_v3;
 use keryx_miner::Worker;
 
 mod hasher;
@@ -229,6 +230,49 @@ impl State {
         // MUST-match-GPU-era rule as h5_1 (seed selection: h5_2 > h5_1 > h3 > base).
         let h5_2 = self.daa_score >= pom::h5_2_activation_daa();
         let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3, h5_1, h5_2);
+
+        // H6 (AUTO-SWITCH): at/after the pom_v3 gate the PoW IS the int8 matrix-state walk. The
+        // GPU grind (`pom_gpu::mine_v3`) found this candidate nonce; the witness is built host-side
+        // by re-walking the resident index (byte-exact `pom_v3::v3_walk`), so a GPU false-positive
+        // (unverified kernel) is caught here by the target re-check and dropped, never submitted.
+        // `final_state = fold64(roots[K])` and `pow_value = era_pow_fold(final_state)` are the
+        // header-stable H3 fold — the header carries `final_state` exactly like the v1/v2 eras.
+        if self.daa_score >= pom::pom_v3_activation_daa() {
+            let (states, snippets) = pom_v3::host_walk_via_index(seed, index).ok()?;
+            let v3 = pom_v3::build_proof_v3(tier, &pph, nonce, seed, &states, &snippets, index)
+                .map_err(|e| info!("PoM v3 proof build failed: {e}"))
+                .ok()?;
+            let final_state = pom_v3::fold64(&v3.roots[pom_v3::POM_V3_K]);
+            let pow_value = pom::pom_pow_value(final_state, &pph, h3);
+            if !pom::le_leq(&pow_value, &self.target.to_le_bytes()) {
+                return None; // GPU grind false-positive (or clock/target drift) — drop it.
+            }
+            if !pom_v3::verify_proof_v3(&pph, nonce, seed, &v3, &index.r_t, index.n_chunks) {
+                info!("PoM v3 proof discarded: pre-submit self-check failed");
+                return None;
+            }
+            let proof = pom::PomProof {
+                tier,
+                trace_root: [0u8; 32],
+                pow_value,
+                final_state,
+                initial_trace_path: vec![],
+                final_trace_path: vec![],
+                openings: vec![],
+                steps_v2: None,
+                v3: Some(v3),
+            };
+            let wire = proof.to_wire_bytes();
+            info!(
+                "PoM v3: H6 proof built + submitting (nonce {}, daa {}, tier {}, {} B)",
+                nonce,
+                self.daa_score,
+                tier,
+                wire.len()
+            );
+            return self.assemble_pom_block(nonce, final_state, wire);
+        }
+
         let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), walk_v2);
         if !pom::le_leq(&pom::pom_pow_value(final_state, &pph, h3), &self.target.to_le_bytes()) {
             return None;
@@ -269,8 +313,14 @@ impl State {
             )
         };
         log::debug!("PoM: proof built in {:.1} ms", proof_t0.elapsed().as_secs_f64() * 1e3);
-        let bytes = proof.to_wire_bytes();
+        self.assemble_pom_block(nonce, proof.final_state, proof.to_wire_bytes())
+    }
 
+    /// Stamp the winning `nonce`, `final_state` (header pin) and the borsh proof bytes into a clone
+    /// of the job's block seed (solo `FullBlock` sets the RpcBlock header + `pomProof`; pool
+    /// `PartialBlock` carries the nonce + proof bytes for `mining.submit` params[5]). Shared by the
+    /// v1/v2 and the H6 (v3) proof paths.
+    fn assemble_pom_block(&self, nonce: u64, final_state: u64, proof_bytes: Vec<u8>) -> Option<BlockSeed> {
         let mut block_seed = (*self.block).clone();
         match block_seed {
             BlockSeed::FullBlock(ref mut block) => {
@@ -280,12 +330,12 @@ impl State {
                 // checks `proof.final_state == header.pom_final_state` (body validation) and its
                 // block hash commits it post-gate. Pre-H3 pom_level_active is false so the node
                 // neither hashes nor checks it; setting it unconditionally is a harmless no-op then.
-                header.pom_final_state = proof.final_state;
-                block.pom_proof = bytes; // plain bytes field (empty = none on the wire)
+                header.pom_final_state = final_state;
+                block.pom_proof = proof_bytes; // plain bytes field (empty = none on the wire)
             }
             BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut pom_proof, .. } => {
                 *header_nonce = nonce;
-                *pom_proof = bytes; // stratum client hex-encodes this into mining.submit params[5]
+                *pom_proof = proof_bytes; // stratum client hex-encodes this into mining.submit params[5]
             }
         }
         Some(block_seed)

@@ -387,6 +387,83 @@ impl PomGpuMiner {
         Ok(if w == u64::MAX { None } else { Some(w) })
     }
 
+    /// H6 (PoM v3) grind: one CUDA block per nonce over `[start, start + batch)`. Byte-exact mirror
+    /// of `pom_v3::v3_walk` on the GPU. Returns the lowest winning nonce (`era_pow_fold(fold64(
+    /// roots[K])) <= target`), or None. The 64 KB tile lives in dynamic shared memory (opt-in
+    /// attribute, cc >= 7.0 / sm_75+; JITs onto sm_80 CMP-170HX and sm_120 5090 alike).
+    pub fn mine_v3(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, h5_1: bool, h5_2: bool) -> candle_core::Result<Option<u64>> {
+        let n_tiles = self.n_total_chunks / crate::pom_v3::POM_V3_TILE_CHUNKS;
+        if n_tiles == 0 {
+            return Err(candle_core::Error::Msg("PoM GPU: blob too small for the v3 walk".into()));
+        }
+        let p = crate::pom::pph_words_for_era(pre_pow_hash, h3);
+        let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
+        let t = words4(target_le);
+        let k = crate::pom_v3::POM_V3_K as u32;
+        let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
+        let cfg = LaunchConfig {
+            grid_dim: (batch as u32, 1, 1),
+            block_dim: (crate::pom_v3::POM_V3_D as u32, 1, 1),
+            shared_mem_bytes: crate::pom_v3::POM_V3_TILE_BYTES as u32,
+        };
+        let func = load_walk_func(&self.cuda, "pom_mine_v3")?;
+        func.func
+            .set_attribute(
+                candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                crate::pom_v3::POM_V3_TILE_BYTES as i32,
+            )
+            .map_err(candle_core::Error::wrap)?;
+        let mut b = func.builder();
+        b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
+            .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
+            .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+            .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
+            .arg(&start).arg(&batch).arg(&winner);
+        unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
+        self.stream.synchronize().map_err(candle_core::Error::wrap)?;
+        let w = self.stream.clone_dtoh(&winner).map_err(candle_core::Error::wrap)?[0];
+        Ok(if w == u64::MAX { None } else { Some(w) })
+    }
+
+    /// H6 (PoM v3) dump: re-walk ONE (winning) nonce, returning (states S_0..=S_K concatenated,
+    /// snippets, fold64(root_K)) for the host proof-build (`pom_v3::build_proof_v3`).
+    pub fn dump_v3(&self, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> candle_core::Result<(Vec<u8>, Vec<u8>, u64)> {
+        let n_tiles = self.n_total_chunks / crate::pom_v3::POM_V3_TILE_CHUNKS;
+        if n_tiles == 0 {
+            return Err(candle_core::Error::Msg("PoM GPU: blob too small for the v3 walk".into()));
+        }
+        let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
+        let k = crate::pom_v3::POM_V3_K;
+        let d = crate::pom_v3::POM_V3_D;
+        let states = self.stream.clone_htod(vec![0u8; (k + 1) * d * d].as_slice()).map_err(candle_core::Error::wrap)?;
+        let snippets = self.stream.clone_htod(vec![0u8; k * crate::pom_v3::POM_V3_SNIPPET_BYTES].as_slice()).map_err(candle_core::Error::wrap)?;
+        let final_state = self.stream.clone_htod(&[0u64]).map_err(candle_core::Error::wrap)?;
+        let k32 = k as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (d as u32, 1, 1),
+            shared_mem_bytes: crate::pom_v3::POM_V3_TILE_BYTES as u32,
+        };
+        let func = load_walk_func(&self.cuda, "pom_mine_v3_dump")?;
+        func.func
+            .set_attribute(
+                candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                crate::pom_v3::POM_V3_TILE_BYTES as i32,
+            )
+            .map_err(candle_core::Error::wrap)?;
+        let mut b = func.builder();
+        b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k32)
+            .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp).arg(&nonce)
+            .arg(&states).arg(&snippets).arg(&final_state);
+        unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
+        self.stream.synchronize().map_err(candle_core::Error::wrap)?;
+        Ok((
+            self.stream.clone_dtoh(&states).map_err(candle_core::Error::wrap)?,
+            self.stream.clone_dtoh(&snippets).map_err(candle_core::Error::wrap)?,
+            self.stream.clone_dtoh(&final_state).map_err(candle_core::Error::wrap)?[0],
+        ))
+    }
+
     /// Startup micro-benchmark: sweep candidate CUDA block sizes over the resident blob and pin the
     /// fastest into `self.block_dim`. Runs ONCE per device (guarded by the caller). Byte-exact —
     /// block size changes only occupancy/scheduling, never results — so it needs no re-validation.
@@ -649,6 +726,41 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
             None
         }
     }
+}
+
+/// Convenience: H6 (PoM v3) grind via the installed miner for a specific device. Same transient-
+/// fault teardown path as `mine`; block autotune is irrelevant here (v3 is one block per nonce).
+#[allow(clippy::too_many_arguments)]
+pub fn mine_v3(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, h5_1: bool, h5_2: bool) -> Option<u64> {
+    let miner = {
+        let g = miners().lock().ok()?;
+        g.get(&device_id)?.clone()
+    };
+    match miner.mine_v3(pre_pow_hash, timestamp, target_le, start, batch, h3, h5_1, h5_2) {
+        Ok(w) => w,
+        Err(e) => {
+            let msg = e.to_string();
+            if is_transient_gpu_runtime_fault(&msg) {
+                log::warn!("PoM[gpu{}]: TRANSIENT GPU FAULT during the v3 walk ({}) — rebuilding next cycle.", device_id, msg);
+                reset_stale_gpu_state(device_id);
+            } else {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    log::error!("PoM[gpu{}]: v3 walk failed with a NON-transient error ({}). Logged once.", device_id, msg);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Convenience: H6 (PoM v3) witness dump for the winning nonce via the installed miner.
+pub fn dump_v3(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Option<(Vec<u8>, Vec<u8>, u64)> {
+    let miner = {
+        let g = miners().lock().ok()?;
+        g.get(&device_id)?.clone()
+    };
+    miner.dump_v3(pre_pow_hash, timestamp, nonce, h3, h5_1, h5_2).ok()
 }
 
 /// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup.
@@ -983,5 +1095,112 @@ mod tests {
         assert!(!is_transient_gpu_runtime_fault("CUDA_ERROR_LAUNCH_TIMEOUT"));
         assert!(!is_transient_gpu_runtime_fault("CUDA_ERROR_INVALID_PTX"));
         assert!(!is_transient_gpu_runtime_fault("PoM GPU: model produced 0 chunks"));
+    }
+}
+
+#[cfg(test)]
+impl PomGpuMiner {
+    /// Test-only walk source: upload arbitrary chunk-aligned segments (no GGUF, no llama) so the
+    /// v3 kernel can be checked against the host reference over a synthetic blob.
+    pub(crate) fn load_test_segments(device_id: usize, segments: Vec<Vec<u8>>) -> candle_core::Result<Self> {
+        let device = Device::new_cuda(device_id)?;
+        let cuda = match &device {
+            Device::Cuda(c) => c.clone(),
+            _ => return Err(candle_core::Error::Msg("PoM GPU: not a CUDA device".into())),
+        };
+        let stream = cuda.cuda_stream();
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        let mut uploads: Vec<CudaSlice<u8>> = Vec::new();
+        let mut bases: Vec<u64> = Vec::new();
+        let mut prefix: Vec<u64> = vec![0];
+        for seg in &segments {
+            let chunks = (seg.len() / CHUNK_BYTES) as u64;
+            if chunks == 0 {
+                continue;
+            }
+            let dev = stream.clone_htod(seg.as_slice()).map_err(candle_core::Error::wrap)?;
+            bases.push(dev.device_ptr(&stream).0 as u64);
+            uploads.push(dev);
+            prefix.push(prefix.last().unwrap() + chunks);
+        }
+        let n_total_chunks = *prefix.last().unwrap();
+        let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
+        let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
+        let _ = load_walk_func(&cuda, "pom_mine")?;
+        Ok(Self {
+            cuda,
+            stream,
+            bases_dev,
+            prefix_dev,
+            t_count: bases.len() as u32,
+            n_total_chunks,
+            block_dim: AtomicU32::new(256),
+            use_ilp2: AtomicBool::new(false),
+            _tensors: Vec::new(),
+            _shared: Vec::new(),
+            _uploads: uploads,
+        })
+    }
+}
+
+/// GPU lockstep tests — need a CUDA card: `cargo test --release --features pom-cuda -- --ignored v3_kernel`.
+/// Ported from upstream 54f63c0; validates the v3 kernel byte-for-byte against `pom_v3::ref_walk`
+/// over the pinned `lockstep_blob`.
+#[cfg(test)]
+mod v3_kernel_tests {
+    use super::*;
+    use crate::pom_v3;
+
+    const PPH: [u8; 32] = [7u8; 32];
+    const TIMESTAMP: u64 = 0x11_2233_4455;
+
+    /// Chunk-aligned but NOT tile-aligned segment cuts — tiles straddle segment boundaries,
+    /// exercising the per-chunk gather.
+    fn split_blob(blob: &[u8]) -> Vec<Vec<u8>> {
+        let cuts = [999 * 32, 5000 * 32, blob.len()];
+        let mut segs = Vec::new();
+        let mut start = 0;
+        for &c in &cuts {
+            segs.push(blob[start..c].to_vec());
+            start = c;
+        }
+        segs
+    }
+
+    #[test]
+    #[ignore]
+    fn v3_kernel_matches_host_reference() {
+        let blob = pom_v3::lockstep_blob();
+        let miner = PomGpuMiner::load_test_segments(0, split_blob(&blob)).unwrap();
+        let nonce = 42u64;
+        // Era words identical (h3/h5_1/h5_2 all true) — the dump seed matches pom_block_seed below.
+        let (states, snippets, final_state) = miner.dump_v3(&PPH, TIMESTAMP, nonce, true, true, true).unwrap();
+
+        let seed = crate::pom::pom_block_seed(&PPH, TIMESTAMP, nonce, true, true, true);
+        let (ref_states, ref_snippets, _) = pom_v3::ref_walk(seed, &blob);
+        assert_eq!(snippets, ref_snippets, "GPU snippets differ from the host reference");
+        assert_eq!(states, ref_states, "GPU states differ from the host reference");
+
+        let d2 = pom_v3::POM_V3_D * pom_v3::POM_V3_D;
+        let root = pom_v3::v3_state_root(&ref_states[pom_v3::POM_V3_K * d2..]);
+        assert_eq!(final_state, pom_v3::fold64(&root), "GPU blake3 tree differs from the host");
+    }
+
+    #[test]
+    #[ignore]
+    fn v3_grind_end_to_end() {
+        let blob = pom_v3::lockstep_blob();
+        let miner = PomGpuMiner::load_test_segments(0, split_blob(&blob)).unwrap();
+        // Trivial target: every nonce wins, atomicMin returns the batch base.
+        let target = [0xFFu8; 32];
+        let found = miner.mine_v3(&PPH, TIMESTAMP, &target, 1000, 8, true, true, true).unwrap().unwrap();
+        assert_eq!(found, 1000);
+
+        let (states, snippets, final_state) = miner.dump_v3(&PPH, TIMESTAMP, found, true, true, true).unwrap();
+        let seed = crate::pom::pom_block_seed(&PPH, TIMESTAMP, found, true, true, true);
+        let index = crate::pom::index_from_ram(blob);
+        let proof = pom_v3::build_proof_v3(0, &PPH, found, seed, &states, &snippets, &index).unwrap();
+        assert_eq!(pom_v3::fold64(&proof.roots[pom_v3::POM_V3_K]), final_state);
+        assert!(pom_v3::verify_proof_v3(&PPH, found, seed, &proof, &index.r_t, index.n_chunks));
     }
 }

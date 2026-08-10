@@ -154,7 +154,7 @@ pub struct Opt {
     )]
     pub backup_pool: Vec<String>,
 
-    #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22211]")]
+    #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22210]")]
     port: Option<u16>,
 
     #[clap(
@@ -313,7 +313,7 @@ impl Opt {
     }
 
     fn port(&mut self) -> u16 {
-        *self.port.get_or_insert(if self.testnet { 22211 } else { 22110 })
+        *self.port.get_or_insert(if self.testnet { 22210 } else { 22110 })
     }
 
     pub fn log_level(&self) -> LevelFilter {
