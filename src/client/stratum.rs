@@ -162,6 +162,20 @@ static LAST_DAA_SCORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// the next job builds a real PoM proof instead of looping on rejects forever.
 static POOL_FORCED_POM: AtomicBool = AtomicBool::new(false);
 
+/// The keryx H6 pool embeds the block DAA in the wire jobId as `<rand8>_<daa>` (e.g.
+/// `32fc29f1_500000` → daa 500000). The plain `Short` `mining.notify` carries NO daa_score field, so
+/// this trailing suffix is the AUTHORITATIVE per-job DAA on that pool — it must reach the PoM path so
+/// the fork gates (H3/H4/H5/H6) and the seed/pow salts resolve exactly as the node does for the same
+/// block. Returns None when the jobId has no `_<digits>` suffix (older pools); the caller then falls
+/// back to the LAST_DAA_SCORE/POOL_FORCED_POM flooring.
+fn job_id_daa(job_id: &str) -> Option<u64> {
+    let (_, tail) = job_id.rsplit_once('_')?;
+    if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    tail.parse::<u64>().ok()
+}
+
 #[allow(dead_code)]
 pub struct StratumHandler {
     log_handler: JoinHandle<()>,
@@ -780,6 +794,46 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
+                            // Authoritative per-job DAA. The keryx H6 pool has no daa_score field in
+                            // the plain Short notify but embeds the DAA in the jobId as `<rand8>_<daa>`
+                            // (see job_id_daa). Parse it and use it directly so the PoM/v3 gates and the
+                            // seed/pow salts match the node byte-for-byte. Fall back to the historical
+                            // LAST_DAA_SCORE/POOL_FORCED_POM flooring only when the jobId carries no
+                            // numeric suffix (older Short-only pools).
+                            let daa_score = if let Some(daa) = job_id_daa(&id) {
+                                // Drive the OPoI lineup swap here (stratum is our job source), same as
+                                // the ShortV2/WithTask paths, and remember it for any later suffix-less job.
+                                keryx_miner::slm::advance_lineup_if_due(daa);
+                                LAST_DAA_SCORE.store(daa, std::sync::atomic::Ordering::Relaxed);
+                                daa
+                            } else {
+                                // Short stratum notify carries no daa_score; pin it to the
+                                // current salt era so the host generates the right matrix.
+                                // Post-relaunch the chain is on SALT v4. Inherit the last
+                                // real daa (from WithTask/ShortV2) so post-fork PoM still
+                                // activates on Short-only pools; floor at SALT-v4 era.
+                                let base = LAST_DAA_SCORE.load(std::sync::atomic::Ordering::Relaxed)
+                                    .max(crate::pow::heavy_hash::POW_SALT_V4_ACTIVATION_DAA);
+                                // If the pool told us the fork is active (POOL_FORCED_POM),
+                                // floor at the CURRENT frontier — activation + H2 tier AND
+                                // the H3 gate (level_activation_daa, salted folds). The old
+                                // floor stopped at H2: on a Short-only pool/proxy (no
+                                // daa_score on the wire) the miner then mined UNSALTED
+                                // pre-H3 folds forever, and every post-H3 verifier rejected
+                                // ~every share as "low difficulty". H3 (like H2) is a frozen
+                                // frontier the network is permanently past, so any pool
+                                // forcing PoM today is necessarily post-H3.
+                                if POOL_FORCED_POM.load(std::sync::atomic::Ordering::Relaxed) {
+                                    // 0.7.0 is the H4 binary: floor at the H4 frontier too, so a
+                                    // Short-only pool forcing PoM stamps the H4 tier and builds
+                                    // proof-v2 (h4 dominates H2/H3; env-override respected).
+                                    base.max(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA)
+                                        .max(keryx_miner::pom::level_activation_daa())
+                                        .max(keryx_miner::pom::h4_activation_daa())
+                                } else {
+                                    base
+                                }
+                            };
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
                             if keryx_miner::slm::loaded_model_ids().is_empty() {
@@ -794,34 +848,7 @@ impl StratumHandler {
                                     id,
                                     header_hash,
                                     timestamp,
-                                    // Short stratum notify carries no daa_score; pin it to the
-                                    // current salt era so the host generates the right matrix.
-                                    // Post-relaunch the chain is on SALT v4. Inherit the last
-                                    // real daa (from WithTask/ShortV2) so post-fork PoM still
-                                    // activates on Short-only pools; floor at SALT-v4 era.
-                                    daa_score: {
-                                        let base = LAST_DAA_SCORE.load(std::sync::atomic::Ordering::Relaxed)
-                                            .max(crate::pow::heavy_hash::POW_SALT_V4_ACTIVATION_DAA);
-                                        // If the pool told us the fork is active (POOL_FORCED_POM),
-                                        // floor at the CURRENT frontier — activation + H2 tier AND
-                                        // the H3 gate (level_activation_daa, salted folds). The old
-                                        // floor stopped at H2: on a Short-only pool/proxy (no
-                                        // daa_score on the wire) the miner then mined UNSALTED
-                                        // pre-H3 folds forever, and every post-H3 verifier rejected
-                                        // ~every share as "low difficulty". H3 (like H2) is a frozen
-                                        // frontier the network is permanently past, so any pool
-                                        // forcing PoM today is necessarily post-H3.
-                                        if POOL_FORCED_POM.load(std::sync::atomic::Ordering::Relaxed) {
-                                            // 0.7.0 is the H4 binary: floor at the H4 frontier too, so a
-                                            // Short-only pool forcing PoM stamps the H4 tier and builds
-                                            // proof-v2 (h4 dominates H2/H3; env-override respected).
-                                            base.max(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA)
-                                                .max(keryx_miner::pom::level_activation_daa())
-                                                .max(keryx_miner::pom::h4_activation_daa())
-                                        } else {
-                                            base
-                                        }
-                                    },
+                                    daa_score,
                                     nonce: 0,
                                     target: self.target_pool,
                                     nonce_mask: self.nonce_mask,

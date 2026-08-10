@@ -680,7 +680,8 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
         ModelFormat::GgufExaone4
         | ModelFormat::GgufGlm4
         | ModelFormat::GgufQwen35
-        | ModelFormat::GgufKimiLinear => {
+        | ModelFormat::GgufKimiLinear
+        | ModelFormat::GgufGemma4 => {
             anyhow::bail!(
                 "model '{}' ({}) is an H4 arch served only by the in-process llama.cpp engine \
                  (libkeryx-llama.so) — candle has no loader for it. Ensure the .so is present/loads.",
@@ -1359,6 +1360,7 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
             ModelFormat::Safetensors => ensure_safetensors(spec).map(|_| ()),
             ModelFormat::Gguf | ModelFormat::GgufQwen2 | ModelFormat::GgufQwen3 | ModelFormat::GgufGemma3
             | ModelFormat::GgufExaone4 | ModelFormat::GgufGlm4 | ModelFormat::GgufQwen35 | ModelFormat::GgufKimiLinear
+            | ModelFormat::GgufGemma4
                 => ensure_gguf(spec).map(|_| ()),
         };
         match result {

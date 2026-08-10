@@ -962,10 +962,19 @@ async fn run() -> Result<(), Error> {
     // --force-model contract: the forced model loads REGARDLESS of VRAM fit (power-user knob), so
     // the capability gate is skipped for it — otherwise filter_specs_by_vram silently drops the
     // forced spec and PoM never configures (the "--force-model ignored" bug class, issue #7).
-    // Stage the CURRENT-era lineup: H5 is live, so resolve at the H5 gate (tier-0 = Qwen3-8B). Using
-    // the H4 gate here wrongly staged `--very-light` as the retired EXAONE (h4 < h5). Higher tiers are
-    // unchanged across H5, so h5 gives the same models for them.
-    let specs_all = keryx_miner::models::specs_for(keryx_miner::pom::h5_activation_daa(), tier);
+    // Stage the CURRENT-era lineup. H5 is normally live, so resolve at the H5 gate (tier-0 =
+    // Qwen3-8B). Using the H4 gate here wrongly staged `--very-light` as the retired EXAONE (h4 <
+    // h5). Higher tiers are unchanged across H5, so h5 gives the same models for them. BUT once H6
+    // (PoM v3) is ARMED (`pom_v3_activation_daa() != u64::MAX` — testnet/staging or a scheduled
+    // mainnet fork) the mining tier-0 model becomes the H6 anchor (Qwen3.5-9B, whose R_T pins
+    // POM_TIERS_H6), so resolve at the H6 gate then — matching `Tier::pom_spec()`. Without this the
+    // miner stages+mines the H5 model on an H6 pool and every v3 proof fails possession.
+    let lineup_daa = if keryx_miner::pom::pom_v3_activation_daa() != u64::MAX {
+        keryx_miner::pom::pom_v3_activation_daa()
+    } else {
+        keryx_miner::pom::h5_activation_daa()
+    };
+    let specs_all = keryx_miner::models::specs_for(lineup_daa, tier);
     let specs_v2 = if tier_forced {
         info!("--force-model: VRAM capability gate skipped for the forced model — it will load regardless of fit (may OOM an undersized card).");
         specs_all
@@ -976,7 +985,7 @@ async fn run() -> Result<(), Error> {
     let pom_spec = specs_v2
         .iter()
         .copied()
-        .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id, keryx_miner::pom::h5_activation_daa()).is_some())
+        .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id, lineup_daa).is_some())
         .max_by_key(|s| s.min_vram_mb);
     keryx_miner::slm::set_v2_lineup(specs_v2);
     keryx_miner::slm::init_supported(specs_v2);
@@ -1019,7 +1028,7 @@ async fn run() -> Result<(), Error> {
     // with zero-dup VRAM sharing.
     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
     if let Some(spec) = pom_spec {
-        let tier_idx = keryx_miner::models::pom_tier_index(&spec.model_id, keryx_miner::pom::h5_activation_daa()).expect("pom_spec has a tier");
+        let tier_idx = keryx_miner::models::pom_tier_index(&spec.model_id, lineup_daa).expect("pom_spec has a tier");
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         // PoM PASSTHROUGH live test (KERYX_POM_PASSTHROUGH): build the HOST possession index in the
         // background so kHeavyHash shares can carry a PomProof (daemon stores it pre-fork). Heavy

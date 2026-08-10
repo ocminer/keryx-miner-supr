@@ -92,6 +92,11 @@ pub struct PomProof {
     /// H4 recompute-from-chunks walk record. `None` on every pre-H4 proof. MUST keep the exact
     /// field order/types of the node's `PomProof::steps_v2` (borsh wire format).
     pub steps_v2: Option<Vec<PomStep>>,
+    /// H6 matrix-walk witness. When present the legacy fields above are canonical placeholders
+    /// (`trace_root` zeroed, empty paths/openings, `steps_v2 = None`) except `tier` (mirrored),
+    /// `final_state` (= `pom_v3::fold64(roots[K])`) and `pow_value` (era pow fold of it).
+    /// Trailing field, same era-exact wire mechanism as `steps_v2` — mirror of the node's.
+    pub v3: Option<crate::pom_v3::PomProofV3>,
 }
 
 /// Exact pre-H4 layout of `PomProof` (no `steps_v2`) — mirror of the node's `PomProofPreH4`.
@@ -108,13 +113,74 @@ pub struct PomProofPreH4 {
     pub openings: Vec<PomOpening>,
 }
 
+/// Exact pre-H6 layout of `PomProof` (no `v3`) — mirror of the node's `PomProofPreV3`. A proof
+/// without the v3 extension MUST serialize through this so pre-H6 nodes keep accepting it
+/// byte-for-byte. See `PomProof::to_wire_bytes`.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct PomProofPreV3 {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<PomOpening>,
+    pub steps_v2: Option<Vec<PomStep>>,
+}
+
+impl From<PomProofPreV3> for PomProof {
+    fn from(p: PomProofPreV3) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: p.steps_v2,
+            v3: None,
+        }
+    }
+}
+
+impl From<PomProofPreH4> for PomProof {
+    fn from(p: PomProofPreH4) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: None,
+            v3: None,
+        }
+    }
+}
+
 impl PomProof {
-    /// Canonical wire (borsh) encoding, era-exact — mirror of the node's `to_wire_bytes`. A proof
-    /// without the v2 extension encodes byte-identically to the pre-H4 layout, so a not-yet-H4 node
-    /// (7-field decode) still accepts it. The submit path MUST use this, never `borsh::to_vec`.
+    /// Canonical wire (borsh) encoding, era-exact — mirror of the node's `to_wire_bytes`: a proof
+    /// without the v3 extension encodes byte-identically to the pre-H6 layout, and without the v2
+    /// extension to the pre-H4 layout. The submit path MUST use this, never `borsh::to_vec`.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        match &self.steps_v2 {
-            None => borsh::to_vec(&PomProofPreH4 {
+        if self.v3.is_some() {
+            borsh::to_vec(self).expect("PomProof borsh serialize")
+        } else if self.steps_v2.is_some() {
+            borsh::to_vec(&PomProofPreV3 {
+                tier: self.tier,
+                trace_root: self.trace_root,
+                pow_value: self.pow_value,
+                final_state: self.final_state,
+                initial_trace_path: self.initial_trace_path.clone(),
+                final_trace_path: self.final_trace_path.clone(),
+                openings: self.openings.clone(),
+                steps_v2: self.steps_v2.clone(),
+            })
+            .expect("PomProof borsh serialize")
+        } else {
+            borsh::to_vec(&PomProofPreH4 {
                 tier: self.tier,
                 trace_root: self.trace_root,
                 pow_value: self.pow_value,
@@ -123,9 +189,15 @@ impl PomProof {
                 final_trace_path: self.final_trace_path.clone(),
                 openings: self.openings.clone(),
             })
-            .expect("PomProof borsh serialize"),
-            Some(_) => borsh::to_vec(self).expect("PomProof borsh serialize"),
+            .expect("PomProof borsh serialize")
         }
+    }
+
+    /// Decode the canonical wire encoding, any era — mirror of the node's `from_wire_bytes`.
+    pub fn from_wire_bytes(bytes: &[u8]) -> std::io::Result<Self> {
+        borsh::from_slice::<PomProof>(bytes)
+            .or_else(|_| borsh::from_slice::<PomProofPreV3>(bytes).map(PomProof::from))
+            .or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
     }
 }
 
@@ -368,7 +440,7 @@ pub fn merkle_proof(leaves: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
     path
 }
 
-fn verify_merkle(leaf: [u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
+pub(crate) fn verify_merkle(leaf: [u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
     let mut acc = leaf;
     let mut idx = index;
     for sib in path {
@@ -500,6 +572,7 @@ where
         final_trace_path: merkle_proof(&trace_leaves, k as usize),
         openings,
         steps_v2: None,
+        v3: None,
     }
 }
 
@@ -544,6 +617,7 @@ where
         final_trace_path: vec![],
         openings: vec![],
         steps_v2: Some(steps),
+        v3: None,
     }
 }
 
@@ -1440,6 +1514,42 @@ pub fn h5_2_activation_daa() -> u64 {
 }
 static H5_2_ACTIVATION_DAA_CELL: OnceLock<u64> = OnceLock::new();
 
+/// H6 (matrix-state walk, PoM v3) activation DAA score. At/after this score — decided per job from
+/// the TEMPLATE's own `daa_score`, never wall clock or tip — the miner grinds the v3 walk on the GPU
+/// and builds `PomProofV3`; a pre-H6 (trace/steps_v2) proof verifies false at/after the gate and is
+/// rejected. MUST equal the node's `pom_v3_activation`: mainnet is unset (armed in a later release,
+/// `u64::MAX`), testnet 108_000. Overridable via `KERYX_POM_V3_ACTIVATION_DAA` for staging/crossing
+/// tests (e.g. set to 0 to force the H6 walk on regardless of daa_score). Read once.
+pub const POM_V3_ACTIVATION_DAA: u64 = u64::MAX;
+pub fn pom_v3_activation_daa() -> u64 {
+    *POM_V3_ACTIVATION_DAA_CELL.get_or_init(|| {
+        std::env::var("KERYX_POM_V3_ACTIVATION_DAA")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(POM_V3_ACTIVATION_DAA)
+    })
+}
+static POM_V3_ACTIVATION_DAA_CELL: OnceLock<u64> = OnceLock::new();
+
+/// AUTO-SWITCH: is this block at/after the H6 (PoM v3 matrix-walk) gate? Decided per job from the
+/// block's own `daa_score` so an already-running miner flips to the v3 walk + witness on the first
+/// post-gate job. Logs ONCE on first crossing.
+pub fn pom_v3_active(daa_score: u64) -> bool {
+    let active = daa_score >= pom_v3_activation_daa();
+    if active {
+        static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::info!(
+                "H6 hardfork ACTIVE (block DAA {} >= gate {}): PoM is now the int8 matrix-state walk \
+                 (v3). Building PomProofV3 witnesses.",
+                daa_score,
+                pom_v3_activation_daa()
+            );
+        }
+    }
+    active
+}
+
 /// Effective H4 activation DAA. Overridable via `KERYX_H4_ACTIVATION_DAA` for STAGING / pre-gate
 /// testing only (e.g. set to 0 to force H4 proof v2 + lineup on regardless of daa_score). Read once.
 pub fn h4_activation_daa() -> u64 {
@@ -1534,6 +1644,53 @@ pub fn active_index_for(device_id: u32) -> Option<&'static (WeightIndex, u8)> {
 /// Whether this device has its own per-device index installed (vs falling back to the global one).
 pub fn has_device_index(device_id: u32) -> bool {
     pom_indices().lock().map(|m| m.contains_key(&device_id)).unwrap_or(false)
+}
+
+/// Test-only WeightIndex over arbitrary RAM chunks (`data` = chunk-aligned canonical bytes) — real
+/// checkpoint tree + merkle paths, no GGUF. Shared by the pom.rs synth tests AND the pom_v3 mirror
+/// test (which pins the node's R_T + walk vectors over a synthetic blob).
+#[cfg(test)]
+pub(crate) fn index_from_ram(data: Vec<u8>) -> WeightIndex {
+    use std::sync::atomic::{AtomicU64, Ordering as O};
+    static UNIQ: AtomicU64 = AtomicU64::new(0);
+    let uid = UNIQ.fetch_add(1, O::Relaxed);
+    let tree_path = std::env::temp_dir().join(format!("keryx-pom-synth-{}-{}.bin", std::process::id(), uid));
+    let _ = std::fs::remove_file(&tree_path);
+
+    let n = (data.len() / 32) as u64;
+    let k = CHECKPOINT_INTERVAL;
+    let batch_size = 1u64 << k; // 64 for K=6
+
+    let mut writer = BufWriter::new(
+        OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tree_path).unwrap(),
+    );
+    let mut batch: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
+    for o in 0..n as usize {
+        batch.push(blake(&data[o * 32..o * 32 + 32]));
+        if batch.len() == batch_size as usize {
+            writer.write_all(&fold_levels(&batch, k)).unwrap();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        writer.write_all(&fold_levels(&batch, k)).unwrap();
+    }
+    writer.flush().unwrap();
+    drop(writer);
+
+    let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n).unwrap();
+    let tree_file = File::open(&tree_path).unwrap();
+    WeightIndex {
+        n_chunks: n,
+        r_t,
+        chunks: ChunkSource::Ram(data),
+        tree_file,
+        tree_path,
+        checkpoints,
+        total_levels,
+        persistent: false,
+        dense: None,
+    }
 }
 
 #[cfg(test)]
@@ -1650,9 +1807,10 @@ mod tests {
             assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, !walk_v2),
                 "walk_v2={walk_v2} proof must fail verification under the opposite era");
 
-            // borsh wire round-trips through to_wire_bytes (full struct for a v2 proof).
+            // Wire round-trip: a v2 proof now encodes through the pre-H6 (PreV3) layout for
+            // era-exactness, and decodes back through the fallback chain (`from_wire_bytes`).
             let bytes = proof.to_wire_bytes();
-            let back: PomProof = borsh::from_slice(&bytes).unwrap();
+            let back = PomProof::from_wire_bytes(&bytes).unwrap();
             assert!(verify_proof_v2(&back, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, walk_v2));
         }
         let _ = std::fs::remove_file(&idx.tree_path);

@@ -384,8 +384,12 @@ impl MinerManager {
                     // PoM possession mining (post-fork): grind the data-dependent walk on the GPU
                     // over the resident tier weights instead of kHeavyHash. On a winning nonce we
                     // build the proof (host) and submit; the legacy plugin path below is skipped.
+                    // Engage the PoM path when the block is at/after EITHER the base PoM activation
+                    // OR the H6 (PoM v3) gate. The v3 gate can be armed BELOW the base activation
+                    // (e.g. testnet pom_v3=5000 while base=37.78M), so gating on base alone would keep
+                    // running kHeavyHash on an H6 pool and never build a v3 proof.
                     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
-                    if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::activation_daa()) {
+                    if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::activation_daa() || s.daa_score >= keryx_miner::pom::pom_v3_activation_daa()) {
                         let (pph, time, target_le, daa) = {
                             let s = state.as_ref().unwrap();
                             let mut pph = [0u8; 32];
@@ -407,6 +411,18 @@ impl MinerManager {
                         // H5.2 salt at/after the gate (pow words stay H3). Host-side per
                         // pom_gpu::mine; kernel-agnostic. Selection: h5_2 > h5_1 > h3 > base.
                         let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
+                        // H6 (matrix-state walk): at/after the pom_v3 gate the GPU grinds the v3
+                        // kernel (one CUDA block per nonce, int8 D×D×K matmul) instead of the
+                        // possession walk. The host builds the witness in generate_block_if_pom
+                        // (host re-walk of the index). CUDA only; dormant on mainnet (gate u64::MAX).
+                        let v3 = daa >= keryx_miner::pom::pom_v3_activation_daa();
+                        // v3 grinds ~4.3 GMAC per nonce, so a full POM_BATCH of blocks is absurd —
+                        // grind a small slice per launch (env KERYX_POM_V3_BATCH overrides).
+                        let batch = if v3 {
+                            std::env::var("KERYX_POM_V3_BATCH").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0).unwrap_or(1 << 10)
+                        } else {
+                            POM_BATCH
+                        };
                         // NVIDIA (CUDA) + Apple Silicon (Metal): per-device PoM. Each GPU thread
                         // builds + walks its OWN device's blob (per-device MINERS map) so no-flag
                         // multi-GPU works without CUDA_VISIBLE_DEVICES. Device id = the worker's
@@ -436,7 +452,11 @@ impl MinerManager {
                                 }
                                 pom_driver::ensure_installed(wdid, daa);
                             }
-                            pom_driver::mine(wdid, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1, h5_2)
+                            if v3 {
+                                pom_driver::mine_v3(wdid, &pph, time, &target_le, pom_nonce, batch, h3, h5_1, h5_2)
+                            } else {
+                                pom_driver::mine(wdid, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2)
+                            }
                         };
                         // AMD: the thread is already bound to its card (bind_thread_device), so the
                         // deviceless OpenCL API is per-GPU via thread-local binding.
@@ -454,11 +474,11 @@ impl MinerManager {
                                 }
                                 let _ = pom_driver::ensure_installed();
                             }
-                            pom_driver::mine(&pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1, h5_2)
+                            pom_driver::mine(&pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2)
                         };
-                        pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
-                        hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
-                        worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                        pom_nonce = pom_nonce.wrapping_add(batch);
+                        hashes_tried.fetch_add(batch, Ordering::AcqRel);
+                        worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         if let Some(nonce) = found {
                             // NVIDIA/Apple: recompute the PoM tier per block (H2-boundary correct).
                             #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
