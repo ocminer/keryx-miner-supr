@@ -1242,6 +1242,24 @@ async fn run() -> Result<(), Error> {
         info!("--no-shared-inference: OPoI inference will run on this process's own --cuda-device GPU.");
         keryx_miner::slm::set_no_shared_inference(true);
     }
+    // Multi-GPU OPoI router policy (default: speed). Invalid values fall back to the env/default.
+    if let Some(p) = keryx_miner::slm::InferencePolicy::parse(&opt.inference_policy) {
+        keryx_miner::slm::set_inference_policy(p);
+        info!("OPoI inference routing policy: {:?}", p);
+    } else {
+        warn!("--inference-policy '{}' not recognized — using default (speed).", opt.inference_policy);
+    }
+    // Restrict which CUDA cards serve inference (others stay PoW-only). --no-shared-inference is the
+    // single-card special case: bind inference to this process's own walk GPU.
+    if opt.no_shared_inference {
+        keryx_miner::slm::set_inference_cards(vec![keryx_miner::slm::inference_gpu_ordinal()]);
+    } else if let Some(list) = opt.inference_cards.as_ref() {
+        let cards: Vec<usize> = list.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect();
+        if !cards.is_empty() {
+            info!("--inference-cards: OPoI inference restricted to CUDA ordinals {:?}; other cards are PoW-only.", cards);
+            keryx_miner::slm::set_inference_cards(cards);
+        }
+    }
     if opt.cpu_inference || keryx_miner::slm::cpu_inference_enabled() {
         info!("CPU inference mode — skipping the GPU/cuBLAS probe (OPoI inference runs on the CPU).");
     } else if cfg!(all(target_os = "macos", feature = "pom-metal")) {

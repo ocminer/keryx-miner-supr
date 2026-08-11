@@ -280,7 +280,7 @@ impl PomGpuMiner {
             _ => return Err(candle_core::Error::Msg("PoM GPU: not a CUDA device".into())),
         };
         let stream = cuda.cuda_stream();
-        let ts = crate::llama_engine::tensors()
+        let ts = crate::llama_engine::tensors_for(device_id)
             .ok_or_else(|| candle_core::Error::Msg("PoM GPU: llama engine tensors unavailable".into()))?;
         let mut bases: Vec<u64> = Vec::new();
         let mut prefix: Vec<u64> = vec![0];
@@ -798,6 +798,13 @@ pub fn device_model(device_id: u32) -> Option<([u8; 32], String)> {
     MINING_TIER.get().cloned()
 }
 
+/// Every per-card model assignment (model_id, gguf_path) — the distinct tiers a mixed rig serves
+/// across its cards. Used to build the declare-capabilities UNION so a smaller per-card tier that
+/// is NOT in the process-wide lineup is still declared servable. Empty on a uniform single-model rig.
+pub fn assigned_models() -> Vec<([u8; 32], String)> {
+    device_models().lock().map(|m| m.values().cloned().collect()).unwrap_or_default()
+}
+
 /// True if this device has its OWN model (mixed rig / --force-model) vs using the shared default.
 /// Decides whether it builds/uses a per-device possession index or the process-wide shared one.
 fn has_device_override(device_id: u32) -> bool {
@@ -960,7 +967,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     if use_llama {
         let host_n = crate::pom::active_index_for(device_id as u32).map(|t| t.0.n_chunks)
             .or_else(|| crate::pom::active_index().map(|(i, _)| i.n_chunks));
-        let llama_n = crate::llama_engine::tensors().map(|ts| {
+        let llama_n = crate::llama_engine::tensors_for(device_id as usize).map(|ts| {
             ts.iter().map(|(_, _, nbytes, _)| (*nbytes / CHUNK_BYTES) as u64).sum::<u64>()
         });
         if let (Some(hn), Some(ln)) = (host_n, llama_n) {
@@ -968,7 +975,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 info!(
                     "PoM[gpu{}]: llama-resident layout N={} != canonical N={} (llama repacks this model arch) — walking a raw canonical copy; inference for this model is unavailable.", device_id, ln, hn
                 );
-                crate::llama_engine::unload();
+                crate::llama_engine::unload_for_gpu(device_id as usize);
                 use_llama = false;
             }
         }
