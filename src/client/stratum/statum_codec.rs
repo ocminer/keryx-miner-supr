@@ -47,6 +47,15 @@ pub(crate) enum MiningNotify {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum MiningSubmit {
+    // 8-element (PoM + H6 UNSIGNED AiResponse, service-bond era): address, job_id, nonce, opoi_tag,
+    // ipfs_cid, pom_proof_hex, reqId, response_length (token count = answer.split_whitespace().count()).
+    // Sent at/after the PoM v3 gate when a CID (an answer) is present. The POOL — not the miner —
+    // builds the coinbase and therefore signs the V2 AiResponse with the POOL's escrow key over the
+    // exact 78 v1 bytes; `response_length` MUST be transmitted (not re-derived) because it is one of
+    // those signed bytes, and `reqId` echoes the dispatched request so the pool can match it. The
+    // trailing u32 makes this arity-8 shape distinct from any all-string tuple; listed first so
+    // untagged deserialization never mistakes it for the 6-element PoM submit.
+    MiningSubmitWithUnsignedResponse((String, String, String, String, String, String, String, u32)),
     // 6-element (PoM, post-fork): address, job_id, nonce, opoi_tag, ipfs_cid (or ""),
     // pom_proof_hex. Fixed slot layout — CID stays at params[4] even when empty so the
     // proof is always params[5]. See POM_STRATUM_RECIPE.md (pool side reconciled).
@@ -55,6 +64,39 @@ pub enum MiningSubmit {
     MiningSubmitWithCID((String, String, String, String, String)),
     MiningSubmitWithTag((String, String, String, String)), // address, job_id, nonce, opoi_tag
     MiningSubmitShort((String, String, String)),
+}
+
+/// Interactive chat inference request (pool → miner, `mining.inference_request`). Off-chain
+/// product path — NOT the consensus AiResponse flow: no tx, no escrow, text returned inline. The
+/// `params` value is this object directly (not wrapped in an array).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct InferenceRequestParams {
+    #[serde(rename = "reqId")]
+    pub req_id: String,
+    /// 64-hex tier model id the chat should be answered by.
+    pub model_id: String,
+    pub prompt: String,
+    pub max_tokens: usize,
+    #[serde(default)]
+    pub stream: bool,
+}
+
+/// Interactive chat inference result (miner → pool, `mining.inference_result`). On success:
+/// `{ reqId, ok:true, text, tokens, ms }`; on failure/timeout/unready-model: `{ reqId, ok:false,
+/// error }`. Optional fields are omitted when absent so both shapes serialize cleanly.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct InferenceResultParams {
+    #[serde(rename = "reqId")]
+    pub req_id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -104,6 +146,15 @@ pub(crate) enum StratumCommand {
     // response. The nonce is echoed back so the bridge can reject replayed/stale responses.
     #[serde(rename = "mining.challenge_response")]
     MiningChallengeResponse((String, String, String)),
+    // H6 interactive chat (protocol extension): pool → miner — off-chain, low-latency inference
+    // request. `params` is the object itself (reqId/model_id/prompt/max_tokens/stream). Separate
+    // from consensus AiResponse; the miner answers inline via `mining.inference_result`.
+    #[serde(rename = "mining.inference_request")]
+    MiningInferenceRequest(InferenceRequestParams),
+    // H6 interactive chat (protocol extension): miner → pool — the chat answer (text inline) or an
+    // error. `params` is the object itself (reqId/ok/text/tokens/ms | reqId/ok/error).
+    #[serde(rename = "mining.inference_result")]
+    MiningInferenceResult(InferenceResultParams),
     /*#[serde(rename = "mining.submit_hashrate")]
     MiningSubmitHashrate {
         params: (String, String),
@@ -215,5 +266,160 @@ impl Encoder<StratumLine> for NewLineJsonCodec {
 impl Default for NewLineJsonCodec {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H6 unsigned AiResponse submit: the wire must be exactly
+    /// [address, job_id, nonce, opoi_tag, ipfs_cid, pom_proof_hex, reqId, response_length]
+    /// with response_length as a JSON number, and must round-trip back to the same variant.
+    #[test]
+    fn unsigned_response_submit_roundtrip() {
+        let line = StratumLine {
+            id: Some(7),
+            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
+                MiningSubmit::MiningSubmitWithUnsignedResponse((
+                    "keryx:qaddr".to_string(),
+                    "job_500000".to_string(),
+                    "00000000deadbeef".to_string(),
+                    "opoitag".to_string(),
+                    "QmCidV0".to_string(),
+                    "aabbcc".to_string(),
+                    "req-42".to_string(),
+                    17u32,
+                )),
+            )),
+            jsonrpc: None,
+            error: None,
+        };
+
+        let json = serde_json::to_string(&line).unwrap();
+        // Exact wire shape: params is an 8-element array, reqId at [6], response_length (number) at [7].
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["method"], "mining.submit");
+        let params = v["params"].as_array().unwrap();
+        assert_eq!(params.len(), 8);
+        assert_eq!(params[0], "keryx:qaddr");
+        assert_eq!(params[4], "QmCidV0");
+        assert_eq!(params[5], "aabbcc");
+        assert_eq!(params[6], "req-42");
+        assert_eq!(params[7], 17); // JSON number, not string
+        assert!(params[7].is_u64());
+
+        // Round-trips back to the same variant with identical fields.
+        let back: StratumLine = serde_json::from_str(&json).unwrap();
+        match back.payload {
+            StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
+                MiningSubmit::MiningSubmitWithUnsignedResponse((addr, job, nonce, tag, cid, proof, rid, len)),
+            )) => {
+                assert_eq!(addr, "keryx:qaddr");
+                assert_eq!(job, "job_500000");
+                assert_eq!(nonce, "00000000deadbeef");
+                assert_eq!(tag, "opoitag");
+                assert_eq!(cid, "QmCidV0");
+                assert_eq!(proof, "aabbcc");
+                assert_eq!(rid, "req-42");
+                assert_eq!(len, 17u32);
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    /// The plain 6-element PoM submit must still decode as `MiningSubmitWithPom` (not mistaken for
+    /// the new 8-element unsigned-response shape).
+    #[test]
+    fn plain_pom_submit_still_decodes() {
+        let raw = r#"{"id":1,"method":"mining.submit","params":["addr","job","nonce","tag","","aabb"],"error":null}"#;
+        let line: StratumLine = serde_json::from_str(raw).unwrap();
+        match line.payload {
+            StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
+                MiningSubmit::MiningSubmitWithPom(_),
+            )) => {}
+            other => panic!("expected MiningSubmitWithPom, got {:?}", other),
+        }
+    }
+
+    /// `mining.inference_request` (pool → miner): params is the object itself; decodes the fields.
+    #[test]
+    fn inference_request_decode() {
+        let raw = r#"{"id":null,"method":"mining.inference_request","params":{"reqId":"c-1","model_id":"aa","prompt":"hi","max_tokens":128,"stream":false},"error":null}"#;
+        let line: StratumLine = serde_json::from_str(raw).unwrap();
+        match line.payload {
+            StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceRequest(p)) => {
+                assert_eq!(p.req_id, "c-1");
+                assert_eq!(p.model_id, "aa");
+                assert_eq!(p.prompt, "hi");
+                assert_eq!(p.max_tokens, 128);
+                assert!(!p.stream);
+            }
+            other => panic!("expected MiningInferenceRequest, got {:?}", other),
+        }
+    }
+
+    /// `mining.inference_result` (miner → pool): OK shape carries text/tokens/ms and no error;
+    /// error shape carries error and omits text/tokens/ms. Both round-trip.
+    #[test]
+    fn inference_result_roundtrip() {
+        // success
+        let ok = StratumLine {
+            id: None,
+            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceResult(
+                InferenceResultParams {
+                    req_id: "c-1".to_string(),
+                    ok: true,
+                    text: Some("hello world".to_string()),
+                    tokens: Some(2),
+                    ms: Some(42),
+                    error: None,
+                },
+            )),
+            jsonrpc: None,
+            error: None,
+        };
+        let json = serde_json::to_string(&ok).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["method"], "mining.inference_result");
+        assert_eq!(v["params"]["reqId"], "c-1");
+        assert_eq!(v["params"]["ok"], true);
+        assert_eq!(v["params"]["text"], "hello world");
+        assert_eq!(v["params"]["tokens"], 2);
+        assert_eq!(v["params"]["ms"], 42);
+        assert!(v["params"].get("error").is_none()); // omitted when None
+        let back: StratumLine = serde_json::from_str(&json).unwrap();
+        match back.payload {
+            StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceResult(p)) => {
+                assert!(p.ok);
+                assert_eq!(p.text.as_deref(), Some("hello world"));
+                assert_eq!(p.tokens, Some(2));
+                assert_eq!(p.ms, Some(42));
+                assert!(p.error.is_none());
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+
+        // failure
+        let err = StratumLine {
+            id: None,
+            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceResult(
+                InferenceResultParams {
+                    req_id: "c-2".to_string(),
+                    ok: false,
+                    text: None,
+                    tokens: None,
+                    ms: None,
+                    error: Some("model not ready".to_string()),
+                },
+            )),
+            jsonrpc: None,
+            error: None,
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["params"]["ok"], false);
+        assert_eq!(v["params"]["error"], "model not ready");
+        assert!(v["params"].get("text").is_none()); // omitted when None
     }
 }
