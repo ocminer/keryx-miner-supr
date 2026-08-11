@@ -239,8 +239,12 @@ pub struct StratumHandler {
     current_task_slot: Arc<Mutex<Option<CurrentTask>>>,
     /// Completed inferences: stable_id → base58 CIDv0 string (persists across block changes).
     inference_cache: InferenceCache,
-    /// True while a capability challenge inference is in flight — prevents duplicate spawns.
-    challenge_in_flight: Arc<AtomicBool>,
+    /// Count of OPoI inferences currently in flight ACROSS ALL CARDS. Per-card busy-ness is tracked
+    /// by the router (`slm::acquire_inference_card`); this counter only ref-counts the GLOBAL PoW
+    /// pause so PoW resumes exactly when the LAST inference finishes (concurrent inferences on
+    /// different cards each pause it; the first pauses, the last resumes). Replaces the former
+    /// single `challenge_in_flight` bool that rejected any second concurrent inference.
+    inference_inflight: Arc<std::sync::atomic::AtomicUsize>,
 
     /// Miner-telemetry (mining.hello/mining.telemetry, v0.7.0). Best-effort/non-fatal: starts true;
     /// flips false for the session if the pool rejects `mining.hello`/`mining.telemetry` with error
@@ -252,6 +256,23 @@ pub struct StratumHandler {
     telemetry_req_ids: HashSet<u32>,
     /// Process start, for the telemetry `uptime_s` field.
     start_time: std::time::Instant,
+}
+
+/// Ref-counted PoW-pause guard. On drop it decrements the in-flight-inference counter and, when it
+/// held the LAST one, clears the miner's OPoI flag so PoW resumes on the next `mining.notify`. Drop
+/// runs on normal completion AND on panic unwind inside the spawned blocking task, so a panicking
+/// inference can never leave PoW paused forever (nor leak the count). Construct it AFTER the
+/// `fetch_add` that decided whether this was the first (pausing) inference.
+struct PowPauseGuard {
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
+    miner_flag: Arc<AtomicBool>,
+}
+impl Drop for PowPauseGuard {
+    fn drop(&mut self) {
+        if self.inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.miner_flag.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -537,7 +558,7 @@ impl StratumHandler {
             ipfs_url,
             current_task_slot,
             inference_cache,
-            challenge_in_flight: Arc::new(AtomicBool::new(false)),
+            inference_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             telemetry_on: keryx_miner::telemetry::enabled(),
             telemetry_req_ids: HashSet::new(),
             start_time: std::time::Instant::now(),
@@ -557,6 +578,13 @@ impl StratumHandler {
 
         let handle = tokio::spawn(async move {
             let mut recv_stream = ReceiverStream::new(recv);
+            // H6 attach-once dedup: the last reqId whose unsigned AiResponse we already put on a
+            // share. At 10 BPS the job rolls over faster than a PoM share is found, so we can NOT
+            // gate the attach on `ct.job_id == job_id` (it would never match) — instead we attach
+            // the cached answer to the FIRST share found after inference completes, then skip it on
+            // every subsequent share for the same reqId so the pool gets it exactly once (it keeps
+            // re-dispatching until served, and stops once served).
+            let mut last_attached_req_id: Option<String> = None;
             while let Some(seed) = recv_stream.next().await {
                 let (nonce, job_id, pom_proof) = match seed {
                     BlockSeed::PartialBlock { nonce, id, pom_proof, .. } => (nonce, id, pom_proof),
@@ -569,12 +597,16 @@ impl StratumHandler {
 
                 let daa_now = LAST_DAA_SCORE.load(std::sync::atomic::Ordering::Relaxed);
 
-                // Phase 2: check inference cache for the current job's task, and capture the reqId the
-                // pool dispatched so it can be echoed back on the submit.
+                // Phase 2: check the inference cache for the CURRENT task's answer, and capture the
+                // reqId the pool dispatched so it can be echoed back on the submit. NOTE: we do NOT
+                // require `ct.job_id == job_id` — at 10 BPS the task-carrying job has already rolled
+                // over by the time a PoM share is found, so a job match would never hold and the
+                // answer would never attach. The cache key stays `ct.task.stable_id` (handle_ai_task
+                // copies reqId→stable_id), so we attach whenever the current task's answer is cached.
                 let (result_opt, req_id): (Option<InferenceResult>, Option<String>) = {
                     let task_guard = current_task_slot.lock().await;
                     if let Some(ref ct) = *task_guard {
-                        if ct.job_id == job_id && !ct.task.stable_id.is_empty() {
+                        if !ct.task.stable_id.is_empty() {
                             let cache_guard = inference_cache.lock().await;
                             let res = cache_guard.results.get(&ct.task.stable_id).cloned();
                             let rid = if ct.task.req_id.is_empty() { None } else { Some(ct.task.req_id.clone()) };
@@ -593,9 +625,13 @@ impl StratumHandler {
                 // the exact 78 v1 bytes, so `response_length` (the miner's token count) MUST travel
                 // on the wire, not be re-derived. Below the gate, or without a CID/reqId, fall
                 // through to the plain 6-slot PoM submit.
+                // Attach-once: skip if we already put THIS reqId's AiResponse on an earlier share.
                 let unsigned_response: Option<(String, u32)> =
                     match (&result_opt, &req_id) {
-                        (Some(res), Some(rid)) if daa_now >= keryx_miner::pom::pom_v3_activation_daa() => {
+                        (Some(res), Some(rid))
+                            if daa_now >= keryx_miner::pom::pom_v3_activation_daa()
+                                && last_attached_req_id.as_deref() != Some(rid.as_str()) =>
+                        {
                             Some((rid.clone(), res.response_length))
                         }
                         _ => None,
@@ -611,6 +647,8 @@ impl StratumHandler {
                         // H6 (unsigned): params[6]=reqId, params[7]=response_length. The POOL signs
                         // the V2 AiResponse with its own escrow key using EXACTLY this cid +
                         // response_length (the 78 v1 bytes) and matches it to reqId.
+                        // Mark this reqId attached so we don't re-emit it on every following share.
+                        last_attached_req_id = Some(rid.clone());
                         info!(
                             "PoM: submitting share with proof ({} B) + unsigned AiResponse (reqId={}, len={}) for job {}",
                             pom_proof.len(), rid, response_length, job_id
@@ -804,6 +842,13 @@ impl StratumHandler {
                                 }
                                 return miner.process_block(None).await;
                             }
+                            // The task arrives as a JSON object (locked contract); a legacy
+                            // double-encoded JSON string is unwrapped so handle_ai_task's
+                            // `from_str` sees the object either way.
+                            let task_json = match task_json {
+                                serde_json::Value::String(s) => s,
+                                other => other.to_string(),
+                            };
                             let inference_started =
                                 self.handle_ai_task(id.clone(), task_json, miner).await;
                             if inference_started {
@@ -1107,17 +1152,10 @@ impl StratumHandler {
     /// it has the requested model loaded and can produce inference output. The result is
     /// sent back as `mining.challenge_response` so the bridge can forward it to the node.
     async fn handle_challenge(&mut self, model_id_hex: String, nonce_hex: String, miner: &mut MinerManager) {
-        // Only one challenge in flight at a time — bridge will re-challenge if needed.
-        if self.challenge_in_flight.swap(true, Ordering::SeqCst) {
-            warn!("OPoI challenge: already in flight, dropping new challenge for model {:.8}", model_id_hex);
-            return;
-        }
-
         let model_id_bytes = match hex::decode(&model_id_hex) {
             Ok(b) if b.len() == 32 => b,
             _ => {
                 warn!("OPoI challenge: invalid model_id_hex '{}'", model_id_hex);
-                self.challenge_in_flight.store(false, Ordering::SeqCst);
                 return;
             }
         };
@@ -1126,32 +1164,47 @@ impl StratumHandler {
 
         if !keryx_miner::slm::is_model_ready(&model_id) {
             warn!("OPoI challenge: model {:.8} not ready — sending empty response", model_id_hex);
-            self.challenge_in_flight.store(false, Ordering::SeqCst);
             self.send_channel.send(make_challenge_response_line(&model_id_hex, &nonce_hex, "")).await.ok();
             return;
         }
 
-        // Pause PoW so the GPU is fully available for the challenge inference.
-        // In --cpu-inference mode the GPU is free, so keep hashing during the challenge.
+        // Route to the best FREE eligible card (per-card busy, not global). All eligible cards busy
+        // ⇒ drop this challenge (empty response); the bridge re-challenges later. The lease pins the
+        // card for the whole inference and auto-releases when the spawned task's closure ends.
+        let lease = match keryx_miner::slm::acquire_inference_card(&model_id, 30_000) {
+            Some(l) => l,
+            None => {
+                warn!("OPoI challenge: all eligible cards busy — dropping challenge for model {:.8}", model_id_hex);
+                self.send_channel.send(make_challenge_response_line(&model_id_hex, &nonce_hex, "")).await.ok();
+                return;
+            }
+        };
+        let gpu = lease.gpu();
+
+        // Pause PoW so the GPU is available for the challenge inference (ref-counted: the FIRST
+        // in-flight inference pauses, the LAST resumes). In --cpu-inference mode the GPU is free.
+        let cpu_inference = keryx_miner::slm::cpu_inference_enabled();
         let miner_flag = miner.opoi_challenge_flag();
-        if keryx_miner::slm::cpu_inference_enabled() {
+        let first = self.inference_inflight.fetch_add(1, Ordering::SeqCst) == 0;
+        if cpu_inference {
             info!("OPoI challenge: CPU inference — PoW continues — model={:.8} nonce={:.8}", model_id_hex, nonce_hex);
-        } else {
+        } else if first {
             miner_flag.store(true, Ordering::SeqCst);
             miner.process_block(None).await.ok();
-            info!("OPoI challenge: PoW suspended — model={:.8} nonce={:.8}", model_id_hex, nonce_hex);
+            info!("OPoI challenge: PoW suspended (GPU {}) — model={:.8} nonce={:.8}", gpu, model_id_hex, nonce_hex);
+        } else {
+            info!("OPoI challenge: concurrent on GPU {} — model={:.8} nonce={:.8}", gpu, model_id_hex, nonce_hex);
         }
 
         let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
         let send_channel = self.send_channel.clone();
-        let challenge_flag = Arc::clone(&self.challenge_in_flight);
+        let pause = PowPauseGuard { inflight: Arc::clone(&self.inference_inflight), miner_flag };
 
         tokio::task::spawn_blocking(move || {
-            let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, CHALLENGE_MAX_TOKENS);
+            let _pause = pause; // drop → PoW resumes when this is the last inference (panic-safe)
+            let _lease = lease; // drop → release this card for the next queued request
+            let result = keryx_miner::slm::load_and_run_inference_on(gpu, &model_id, &prompt, CHALLENGE_MAX_TOKENS);
             let text = result.unwrap_or_default();
-            // Clear both flags — PoW resumes on the next mining.notify from the bridge.
-            miner_flag.store(false, Ordering::SeqCst);
-            challenge_flag.store(false, Ordering::SeqCst);
             if text.is_empty() {
                 warn!("OPoI challenge: inference returned empty text for model {:.8}", model_id_hex);
             } else {
@@ -1195,40 +1248,48 @@ impl StratumHandler {
             return;
         }
 
-        // Guard against concurrent GPU inference (a mining challenge or AiTask may hold the GPU).
-        if self.challenge_in_flight.swap(true, Ordering::SeqCst) {
-            warn!("chat[{}]: GPU inference already in flight — rejecting", req_id);
-            self.send_channel
-                .send(make_inference_result_err(&req_id, "busy"))
-                .await
-                .ok();
-            return;
-        }
+        // Per-card busy guard: route to the best FREE eligible card, waiting up to the request's
+        // deadline for one to free. Only reply "busy" when NO eligible card frees in time — a
+        // second concurrent request on a DIFFERENT card is allowed. The lease pins the card.
+        let lease = match keryx_miner::slm::acquire_inference_card(&model_id, req.deadline_ms) {
+            Some(l) => l,
+            None => {
+                warn!("chat[{}]: all eligible cards busy through deadline — replying busy", req_id);
+                self.send_channel
+                    .send(make_inference_result_err(&req_id, "busy"))
+                    .await
+                    .ok();
+                return;
+            }
+        };
+        let gpu = lease.gpu();
 
-        // Pause PoW so the GPU is free for the chat inference (same pattern as handle_challenge).
-        // In --cpu-inference mode the GPU is free, so keep hashing.
+        // Pause PoW (ref-counted: first inference pauses, last resumes). --cpu-inference keeps hashing.
+        let cpu_inference = keryx_miner::slm::cpu_inference_enabled();
         let miner_flag = miner.opoi_challenge_flag();
-        if keryx_miner::slm::cpu_inference_enabled() {
+        let first = self.inference_inflight.fetch_add(1, Ordering::SeqCst) == 0;
+        if cpu_inference {
             info!("chat[{}]: CPU inference — PoW continues — model={:.8}", req_id, req.model_id);
-        } else {
+        } else if first {
             miner_flag.store(true, Ordering::SeqCst);
             miner.process_block(None).await.ok();
-            info!("chat[{}]: PoW suspended — model={:.8}", req_id, req.model_id);
+            info!("chat[{}]: PoW suspended (GPU {}) — model={:.8}", req_id, gpu, req.model_id);
+        } else {
+            info!("chat[{}]: concurrent on GPU {} — model={:.8}", req_id, gpu, req.model_id);
         }
 
         let prompt = req.prompt.clone();
         let max_tokens = req.max_tokens;
         let send_channel = self.send_channel.clone();
-        let challenge_flag = Arc::clone(&self.challenge_in_flight);
+        let pause = PowPauseGuard { inflight: Arc::clone(&self.inference_inflight), miner_flag };
         let model_hex = req.model_id.clone();
 
         tokio::task::spawn_blocking(move || {
+            let _pause = pause; // PoW resumes when the last inference drops this (panic-safe)
+            let _lease = lease; // releases the leased card on drop
             let started = std::time::Instant::now();
-            let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens);
+            let result = keryx_miner::slm::load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens);
             let ms = started.elapsed().as_millis() as u32;
-            // Clear both flags — PoW resumes on the next mining.notify from the pool.
-            miner_flag.store(false, Ordering::SeqCst);
-            challenge_flag.store(false, Ordering::SeqCst);
             let line = match result {
                 Some(text) if !text.is_empty() => {
                     let tokens = text.split_whitespace().count() as u32;
@@ -1298,20 +1359,29 @@ impl StratumHandler {
             return false;
         }
 
-        // Guard against two concurrent inferences (challenge may already hold the GPU).
-        if self.challenge_in_flight.swap(true, Ordering::SeqCst) {
-            warn!("OPoI AiTask [{}]: inference already in flight, skipping", task.stable_id);
-            return false;
-        }
+        // Per-card busy guard: route to the best FREE eligible card, waiting up to the task's
+        // deadline. Skip only when NO eligible card frees in time (a concurrent AiTask on another
+        // card is allowed). The lease pins the card for the whole inference + IPFS upload.
+        let lease = match keryx_miner::slm::acquire_inference_card(&model_id, task.deadline_ms) {
+            Some(l) => l,
+            None => {
+                warn!("OPoI AiTask [{}]: all eligible cards busy through deadline — skipping", task.stable_id);
+                return false;
+            }
+        };
+        let gpu = lease.gpu();
 
-        // Pause PoW — running kHeavyHash and SLM inference simultaneously crashes the GPU.
-        // In --cpu-inference mode the GPU is free, so keep hashing during inference.
+        // Pause PoW — running the PoW walk and SLM inference on the SAME card simultaneously crashes
+        // the GPU. Ref-counted: first inference pauses, last resumes. --cpu-inference keeps hashing.
         let cpu_inference = keryx_miner::slm::cpu_inference_enabled();
         let miner_flag = miner.opoi_challenge_flag();
-        if !cpu_inference {
+        let first = self.inference_inflight.fetch_add(1, Ordering::SeqCst) == 0;
+        if !cpu_inference && first {
             miner_flag.store(true, Ordering::SeqCst);
             miner.process_block(None).await.ok();
-            info!("OPoI AiTask [{}]: PoW suspended for GPU inference", task.stable_id);
+            info!("OPoI AiTask [{}]: PoW suspended for GPU {} inference", task.stable_id, gpu);
+        } else if !cpu_inference {
+            info!("OPoI AiTask [{}]: concurrent inference on GPU {}", task.stable_id, gpu);
         } else {
             info!("OPoI AiTask [{}]: CPU inference — PoW continues", task.stable_id);
         }
@@ -1326,13 +1396,12 @@ impl StratumHandler {
         let max_tokens = task.max_tokens;
         let ipfs_url = self.ipfs_url.clone();
         let cache_ref = Arc::clone(&self.inference_cache);
-        let challenge_flag = Arc::clone(&self.challenge_in_flight);
+        let pause = PowPauseGuard { inflight: Arc::clone(&self.inference_inflight), miner_flag };
 
         tokio::task::spawn_blocking(move || {
-            run_inference_and_upload(model_id, prompt, max_tokens, ipfs_url, stable_id, cache_ref);
-            // Clear both flags — PoW resumes on the next mining.notify from the bridge.
-            miner_flag.store(false, Ordering::SeqCst);
-            challenge_flag.store(false, Ordering::SeqCst);
+            let _pause = pause; // PoW resumes when the last inference drops this (panic-safe)
+            let _lease = lease; // releases the leased card on drop
+            run_inference_and_upload(gpu, model_id, prompt, max_tokens, ipfs_url, stable_id, cache_ref);
         });
 
         // GPU mode: PoW was paused, caller must not feed a new block (returns true).
@@ -1353,6 +1422,7 @@ impl Drop for StratumHandler {
 /// Runs SLM inference, uploads the result to IPFS, then stores the CID in the cache.
 /// Called from `spawn_blocking` — must not call async functions.
 fn run_inference_and_upload(
+    gpu: usize,
     model_id: [u8; 32],
     prompt: String,
     max_tokens: usize,
@@ -1360,7 +1430,7 @@ fn run_inference_and_upload(
     stable_id: String,
     cache: InferenceCache,
 ) {
-    let result_opt = do_inference_and_upload(&model_id, &prompt, max_tokens, &ipfs_url, &stable_id);
+    let result_opt = do_inference_and_upload(gpu, &model_id, &prompt, max_tokens, &ipfs_url, &stable_id);
     let mut guard = cache.blocking_lock();
     guard.in_progress.remove(&stable_id);
     if let Some(result) = result_opt {
@@ -1416,14 +1486,15 @@ fn make_challenge_response_line(model_id_hex: &str, nonce_hex: &str, result: &st
 }
 
 fn do_inference_and_upload(
+    gpu: usize,
     model_id: &[u8; 32],
     prompt: &str,
     max_tokens: usize,
     ipfs_url: &str,
     stable_id: &str,
 ) -> Option<InferenceResult> {
-    info!("OPoI [{}]: starting SLM inference (max_tokens={})", stable_id, max_tokens);
-    let text = keryx_miner::slm::load_and_run_inference(model_id, prompt, max_tokens)?;
+    info!("OPoI [{}]: starting SLM inference (max_tokens={}, GPU {})", stable_id, max_tokens, gpu);
+    let text = keryx_miner::slm::load_and_run_inference_on(gpu, model_id, prompt, max_tokens)?;
     if text.is_empty() {
         warn!("OPoI [{}]: inference returned empty text — skipping IPFS upload", stable_id);
         return None;

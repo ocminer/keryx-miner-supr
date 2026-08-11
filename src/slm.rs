@@ -17,7 +17,7 @@ use crate::quantized_llama_split::ModelWeights as SplitWeights;
 use crate::quantized_qwen3_split::ModelWeights as Qwen3SplitWeights;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokenizers::Tokenizer;
 
 use crate::models::{ModelFormat, ModelSpec};
@@ -1138,6 +1138,285 @@ pub fn set_no_shared_inference(v: bool) {
     NO_SHARED_INFERENCE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
+// ── Multi-GPU OPoI inference router ───────────────────────────────────────────
+//
+// On a multi-GPU rig, each inference request is routed to the best-capacity FREE card that can
+// serve the requested model; concurrent requests run on DIFFERENT cards (same-card requests
+// serialize). A request is NEVER migrated once its card is leased ("don't criss-cross"). If every
+// eligible card is busy the caller waits up to the request's deadline for one to free, then reports
+// busy (not a hard reject). Single-GPU / no-CUDA rigs collapse to the one card — behavior unchanged.
+
+/// Policy used to rank the FREE, eligible cards. Default `Speed`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InferencePolicy {
+    /// Highest measured tokens/sec first (measured on the first real generation per card, cached).
+    Speed,
+    /// Card serving the highest max-tier (largest resident model) first.
+    Reward,
+    /// Highest free VRAM (nvidia-smi memory.free) first.
+    Memory,
+    /// Lowest current PoW hashrate first — minimizes the mining opportunity cost of the pause.
+    PowMin,
+}
+
+impl InferencePolicy {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "speed" => Some(Self::Speed),
+            "reward" => Some(Self::Reward),
+            "memory" | "mem" => Some(Self::Memory),
+            "pow-min" | "powmin" | "pow" => Some(Self::PowMin),
+            _ => None,
+        }
+    }
+}
+
+static INFERENCE_POLICY: OnceLock<InferencePolicy> = OnceLock::new();
+
+/// Set the inference routing policy (CLI `--inference-policy`). Env `KERYX_INFERENCE_POLICY` and
+/// then `Speed` are the fallbacks when this is never called.
+pub fn set_inference_policy(p: InferencePolicy) {
+    let _ = INFERENCE_POLICY.set(p);
+}
+
+/// The active routing policy: CLI (if set) → `KERYX_INFERENCE_POLICY` → `Speed`.
+pub fn inference_policy() -> InferencePolicy {
+    if let Some(p) = INFERENCE_POLICY.get() {
+        return *p;
+    }
+    std::env::var("KERYX_INFERENCE_POLICY")
+        .ok()
+        .and_then(|s| InferencePolicy::parse(&s))
+        .unwrap_or(InferencePolicy::Speed)
+}
+
+/// CUDA ordinals allowed to serve inference (CLI `--inference-cards` / env `KERYX_INFERENCE_CARDS`).
+/// Empty ⇒ every walk card. Cards not in the set stay PoW-only.
+static INFERENCE_CARDS: OnceLock<Vec<usize>> = OnceLock::new();
+
+pub fn set_inference_cards(cards: Vec<usize>) {
+    let _ = INFERENCE_CARDS.set(cards);
+}
+
+fn inference_cards_restrict() -> Vec<usize> {
+    if let Some(v) = INFERENCE_CARDS.get() {
+        return v.clone();
+    }
+    std::env::var("KERYX_INFERENCE_CARDS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Per-card inference busy flags (keyed by CUDA ordinal). A set flag ⇒ that card is mid-generation.
+fn card_busy() -> &'static Mutex<std::collections::HashMap<usize, bool>> {
+    static B: OnceLock<Mutex<std::collections::HashMap<usize, bool>>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn try_claim_card(gpu: usize) -> bool {
+    let mut g = match card_busy().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    let slot = g.entry(gpu).or_insert(false);
+    if *slot { false } else { *slot = true; true }
+}
+
+fn release_card(gpu: usize) {
+    let mut g = match card_busy().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    g.insert(gpu, false);
+}
+
+fn card_is_free(gpu: usize) -> bool {
+    let g = match card_busy().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    !g.get(&gpu).copied().unwrap_or(false)
+}
+
+/// RAII lease of ONE inference card. While held, the card is claimed for a single generation;
+/// dropping it (normal return, `?`, or a panic unwind inside `catch_unwind`) releases the card so
+/// the next queued request can use it. A request is NEVER migrated to another card once leased.
+pub struct InferenceLease {
+    gpu: usize,
+}
+impl InferenceLease {
+    pub fn gpu(&self) -> usize { self.gpu }
+}
+impl Drop for InferenceLease {
+    fn drop(&mut self) { release_card(self.gpu); }
+}
+
+/// Measured tokens/sec per card — populated on the first real generation on each card
+/// (`record_card_toks`), so the `Speed` policy ranks on a MEASURED number rather than a synthetic
+/// probe ("measure, don't proxy"). Until a card has a measurement it ranks by the total-VRAM proxy.
+fn card_toks() -> &'static Mutex<std::collections::HashMap<usize, f64>> {
+    static T: OnceLock<Mutex<std::collections::HashMap<usize, f64>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn record_card_toks(gpu: usize, toks_per_s: f64) {
+    if toks_per_s.is_finite() && toks_per_s > 0.0 {
+        if let Ok(mut g) = card_toks().lock() { g.insert(gpu, toks_per_s); }
+    }
+}
+
+fn card_toks_get(gpu: usize) -> Option<f64> {
+    card_toks().lock().ok().and_then(|g| g.get(&gpu).copied())
+}
+
+/// Optional per-card PoW hashrate feed for the `PowMin` policy (H/s). The mining loop MAY call this;
+/// when a card has no reported value the policy falls back to the total-VRAM proxy (PoM is
+/// bandwidth-bound, so smaller cards ≈ lower hashrate ≈ cheapest to pause).
+static CARD_HASHRATE: OnceLock<Mutex<std::collections::HashMap<usize, f64>>> = OnceLock::new();
+fn card_hashrate() -> &'static Mutex<std::collections::HashMap<usize, f64>> {
+    CARD_HASHRATE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+pub fn report_card_hashrate(gpu: usize, h_per_s: f64) {
+    if let Ok(mut g) = card_hashrate().lock() { g.insert(gpu, h_per_s); }
+}
+fn card_hashrate_get(gpu: usize) -> Option<f64> {
+    card_hashrate().lock().ok().and_then(|g| g.get(&gpu).copied())
+}
+
+/// nvidia-smi `memory.total` / `memory.free` (MiB) keyed by CUDA ordinal (line order == PCI_BUS_ID
+/// order, the ordinal the miner uses — see `biggest_cuda_gpu`). Empty on any failure.
+fn gpu_mem_mib(query: &str) -> std::collections::HashMap<usize, u64> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(o) = std::process::Command::new("nvidia-smi")
+        .args([&format!("--query-gpu={}", query), "--format=csv,noheader,nounits"])
+        .output()
+    else { return out };
+    if !o.status.success() { return out; }
+    for (i, line) in String::from_utf8_lossy(&o.stdout).lines().enumerate() {
+        if let Ok(v) = line.trim().parse::<u64>() {
+            out.insert(i, v);
+        }
+    }
+    out
+}
+
+/// On-disk GGUF size (bytes) of the model assigned to `gpu`, used as the `Reward` tier-magnitude
+/// proxy (bigger resident model = higher tier = higher subsidy). 0 when unknown.
+#[cfg(feature = "pom-cuda")]
+fn card_assigned_model_bytes(gpu: usize) -> u64 {
+    let Some((_mid, gguf)) = crate::pom_gpu::device_model(gpu as u32) else { return 0 };
+    std::fs::metadata(&gguf).map(|m| m.len()).unwrap_or(0)
+}
+
+/// CUDA ordinals eligible to serve `model_id`, restricted by `--inference-cards`. Preference:
+///   1. Walk cards whose ASSIGNED tier == `model_id` (zero-dup reuse — the model is already this
+///      card's mining tier, so inference needs no extra copy beyond pausing that card's walk).
+///   2. If none match by assignment (e.g. a chat request for a tier no card mines), ALL allowed
+///      walk cards (the model is a declared tier; inference evicts that card's walk anyway — this
+///      is the "fits free VRAM" fallback in practice).
+/// Single-GPU / no-CUDA collapses to `[inference_gpu_ordinal()]` so behavior is unchanged.
+fn eligible_cards(model_id: &[u8; 32]) -> Vec<usize> {
+    #[cfg(feature = "pom-cuda")]
+    {
+        let restrict = inference_cards_restrict();
+        let allowed = |g: usize| restrict.is_empty() || restrict.contains(&g);
+        let cards: Vec<usize> = crate::pom_gpu::walk_devices()
+            .into_iter()
+            .map(|d| d as usize)
+            .filter(|g| allowed(*g))
+            .collect();
+        if cards.is_empty() {
+            // Walk not installed yet (inference before the first PoM job), or every walk card
+            // filtered out — fall back to the legacy single-card choice (respecting the restrict
+            // set if it names a card).
+            let d = inference_gpu_ordinal();
+            return if allowed(d) { vec![d] } else { cards };
+        }
+        let matched: Vec<usize> = cards
+            .iter()
+            .copied()
+            .filter(|g| {
+                crate::pom_gpu::device_model(*g as u32).map_or(false, |(mid, _)| &mid == model_id)
+            })
+            .collect();
+        if !matched.is_empty() {
+            return matched;
+        }
+        cards
+    }
+    #[cfg(not(feature = "pom-cuda"))]
+    {
+        let _ = model_id;
+        vec![inference_gpu_ordinal()]
+    }
+}
+
+/// Rank `cards` best-first under `policy`. Ties resolve to the lowest ordinal (stable). Called on
+/// every router poll iteration, so it shells out to `nvidia-smi` ONLY when the policy (or a missing
+/// measurement) actually needs it — the default `Speed` path with cached tok/s never does.
+fn rank_cards(mut cards: Vec<usize>, policy: InferencePolicy) -> Vec<usize> {
+    // `memory.total` proxy is needed when a Speed/PowMin card lacks a measurement, or for Reward on
+    // non-CUDA. `memory.free` is needed only for the Memory policy. Query each at most once, lazily.
+    let need_total = match policy {
+        InferencePolicy::Memory => false,
+        InferencePolicy::Speed => cards.iter().any(|g| card_toks_get(*g).is_none()),
+        InferencePolicy::PowMin => cards.iter().any(|g| card_hashrate_get(*g).is_none()),
+        InferencePolicy::Reward => cfg!(not(feature = "pom-cuda")),
+    };
+    let total = if need_total { gpu_mem_mib("memory.total") } else { std::collections::HashMap::new() };
+    let free = if matches!(policy, InferencePolicy::Memory) { gpu_mem_mib("memory.free") } else { std::collections::HashMap::new() };
+    // f64 sort key; higher == preferred. We negate for "lowest first" policies.
+    let key = |g: usize| -> f64 {
+        match policy {
+            InferencePolicy::Speed => card_toks_get(g)
+                .unwrap_or_else(|| total.get(&g).copied().unwrap_or(0) as f64 / 1.0e6),
+            InferencePolicy::Memory => free.get(&g).copied().unwrap_or(0) as f64,
+            #[cfg(feature = "pom-cuda")]
+            InferencePolicy::Reward => card_assigned_model_bytes(g) as f64,
+            #[cfg(not(feature = "pom-cuda"))]
+            InferencePolicy::Reward => total.get(&g).copied().unwrap_or(0) as f64,
+            InferencePolicy::PowMin => {
+                // Lowest hashrate preferred ⇒ negate. Fallback proxy: lowest total VRAM.
+                let h = card_hashrate_get(g)
+                    .unwrap_or_else(|| total.get(&g).copied().unwrap_or(0) as f64);
+                -h
+            }
+        }
+    };
+    cards.sort_by(|&a, &b| {
+        key(b)
+            .partial_cmp(&key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    cards
+}
+
+/// The card this request WOULD be routed to right now (best-ranked, free, eligible) — non-claiming.
+/// `None` when every eligible card is currently busy. Replaces `inference_gpu_ordinal()` for
+/// request routing; the latter stays the single-card / no-shared default and the ultimate fallback.
+pub fn pick_inference_device(model_id: &[u8; 32]) -> Option<usize> {
+    let free: Vec<usize> = eligible_cards(model_id).into_iter().filter(|g| card_is_free(*g)).collect();
+    rank_cards(free, inference_policy()).into_iter().next()
+}
+
+/// Claim the best FREE eligible card for `model_id`, waiting up to `deadline_ms` for one to free if
+/// all are busy. Returns a lease (card claimed, auto-released on drop) or `None` on deadline (caller
+/// reports busy — NOT a hard reject). The request is pinned to the leased card for its whole life.
+pub fn acquire_inference_card(model_id: &[u8; 32], deadline_ms: u64) -> Option<InferenceLease> {
+    let policy = inference_policy();
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(if deadline_ms == 0 { 30_000 } else { deadline_ms });
+    loop {
+        let eligible = eligible_cards(model_id);
+        if eligible.is_empty() {
+            return None;
+        }
+        let free: Vec<usize> = eligible.iter().copied().filter(|g| card_is_free(*g)).collect();
+        for gpu in rank_cards(free, policy) {
+            if try_claim_card(gpu) {
+                return Some(InferenceLease { gpu });
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// CUDA ordinal to place OPoI inference on.
 ///
 /// The tricky case is MANY per-GPU processes (one `--cuda-device N` process per card, each a
@@ -1392,13 +1671,29 @@ pub fn mining_preparing() -> bool {
     is_downloading() || loaded_model_ids().is_empty()
 }
 
-/// Return the model_ids of supported models that have fully-downloaded files (.ok flag present).
+/// The UNION of model_ids this rig can serve = every supported-lineup model with fully-downloaded
+/// files (`.ok`), PLUS every per-card assigned tier on a mixed rig (a smaller per-card model that is
+/// NOT in the process-wide lineup is still servable on the card that mines it). This drives
+/// declare_capabilities, so the pool routes every tier at least one card can serve — no under- or
+/// over-declaration on a mixed rig.
 pub fn loaded_model_ids() -> Vec<[u8; 32]> {
     let specs = *SUPPORTED_SPECS.read().unwrap();
-    specs.iter()
+    let mut ids: Vec<[u8; 32]> = specs.iter()
         .filter(|s| model_dir(s).join(".ok").exists())
         .map(|s| s.model_id)
-        .collect()
+        .collect();
+    // Per-card assignments (mixed rig / --force-model): add any assigned tier whose GGUF is staged
+    // (its dir's `.ok` present) and not already listed. pom-cuda only — the map is empty elsewhere.
+    #[cfg(feature = "pom-cuda")]
+    for (mid, gguf) in crate::pom_gpu::assigned_models() {
+        let ready = std::path::Path::new(&gguf)
+            .parent()
+            .map_or(false, |d| d.join(".ok").exists());
+        if ready && !ids.contains(&mid) {
+            ids.push(mid);
+        }
+    }
+    ids
 }
 
 /// True when a specific model spec's files are fully downloaded on disk (`.ok` sentinel present).
@@ -1415,9 +1710,25 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     model_dir(spec).join(".ok").exists()
 }
 
-/// Load the requested model on demand (evicting a cached different model if needed),
-/// then run inference. Blocking — call from `spawn_blocking`.
+/// Load the requested model on demand (evicting a cached different model if needed), then run
+/// inference. Blocking — call from `spawn_blocking`. Routes to the best FREE eligible card via the
+/// policy router (single-GPU / no-CUDA collapses to the one card). Callers that need to reply "busy"
+/// or pause PoW BEFORE dispatch should instead `acquire_inference_card(..)` themselves and call
+/// `load_and_run_inference_on(lease.gpu(), ..)` (see the stratum handlers).
 pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
+    // Default deadline for callers that don't pass one (grpc solo path, capability challenge):
+    // wait up to 30s for a free card, else give up (None → skipped, no hard reject upstream).
+    let lease = acquire_inference_card(model_id, 30_000)?;
+    load_and_run_inference_on(lease.gpu(), model_id, prompt, max_tokens)
+    // lease drops here → card released on every exit path.
+}
+
+/// As `load_and_run_inference`, but runs on the caller-leased CUDA card `gpu` (no migration). The
+/// in-process llama.cpp engine branch is card-aware (its own resident model per card + per-card
+/// generate); the candle/vk fallbacks remain the single-card dormant path.
+pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
+    let _ = gpu; // the leased card is used by the in-process llama branch (CUDA/Metal); the
+                 // vk/candle fallbacks below are single-card by design and ignore it.
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
 
@@ -1434,11 +1745,27 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
         all(feature = "pom-cuda", not(feature = "pom-opencl")),
         all(target_os = "macos", feature = "pom-metal"),
     ))]
-    if crate::llama_engine::available() {
-        if let Some(text) = crate::llama_engine::generate(prompt, max_tokens) {
-            return Some(text);
+    {
+        let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
+        // If this card doesn't already host the requested model, free ITS walk (per-card — other
+        // cards keep mining) so the inference model fits, then load it on this card. When the model
+        // is ALREADY resident here (the zero-dup mining tier) this is a no-op: no uninstall, no
+        // reload — byte-identical to the pre-router single-card path.
+        if !crate::llama_engine::active_for(&gguf, gpu) {
+            crate::pom_gpu::uninstall(gpu as u32);
+            crate::llama_engine::ensure_loaded_on(&gguf, gpu);
         }
-        log::warn!("SlmEngine: in-process llama generate failed — trying the next engine.");
+        if crate::llama_engine::available_on(gpu) {
+            let t0 = std::time::Instant::now();
+            if let Some(text) = crate::llama_engine::generate_on(gpu, prompt, max_tokens) {
+                let secs = t0.elapsed().as_secs_f64();
+                if secs > 0.0 {
+                    record_card_toks(gpu, text.split_whitespace().count() as f64 / secs);
+                }
+                return Some(text);
+            }
+            log::warn!("SlmEngine: in-process llama generate failed on GPU {} — trying the next engine.", gpu);
+        }
     }
 
     // AMD (pom-opencl) in-process engine: the zero-dup host of the walk's model — its inference

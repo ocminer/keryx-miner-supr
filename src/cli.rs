@@ -79,6 +79,27 @@ pub struct Opt {
     pub no_shared_inference: bool,
 
     #[clap(
+        long = "inference-policy",
+        help = "Multi-GPU OPoI routing policy — how the miner ranks free eligible cards when a rig \
+                has more than one GPU: speed (default; highest measured tokens/sec first), reward \
+                (card serving the highest tier first), memory (most free VRAM first), pow-min \
+                (lowest current PoW hashrate first, minimizing mining opportunity cost). \
+                Env: KERYX_INFERENCE_POLICY.",
+        help_heading = "OPoI / Inference",
+        default_value = "speed"
+    )]
+    pub inference_policy: String,
+
+    #[clap(
+        long = "inference-cards",
+        help = "Restrict OPoI inference to these CUDA device ordinals (comma-separated, e.g. 0,1); \
+                cards not listed stay PoW-only. Empty/unset = every walk card may serve inference. \
+                Env: KERYX_INFERENCE_CARDS.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub inference_cards: Option<String>,
+
+    #[clap(
         long = "ipfs-url",
         help = "IPFS Kubo API URL for uploading inference results",
         help_heading = "OPoI / Inference",

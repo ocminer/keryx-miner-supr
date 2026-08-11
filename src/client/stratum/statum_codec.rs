@@ -37,8 +37,12 @@ pub(crate) struct StratumError(pub(crate) ErrorCode, pub(crate) String, #[serde(
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub(crate) enum MiningNotify {
-    // 5-element: job_id, header_hash, timestamp, daa_score, task_json (AiRequest payload)
-    MiningNotifyWithTask((String, [u64; 4], u64, u64, String)),
+    // 5-element: job_id, header_hash, timestamp, daa_score, task (AiRequest payload).
+    // The pool sends the task as a JSON OBJECT directly (the locked H6 contract), so this is a
+    // `Value`; a legacy double-encoded JSON string still deserializes as `Value::String` and is
+    // unwrapped at the call site. Typing this as `String` (the old assumption) made the whole
+    // `mining.notify` line fail untagged deserialization when the pool sent an object.
+    MiningNotifyWithTask((String, [u64; 4], u64, u64, Value)),
     MiningNotifyShortV2((String, [u64; 4], u64, u64)),
     MiningNotifyShort((String, [u64; 4], u64)),
     MiningNotifyLong((String, String, String, String, Vec<String>, String, String, String, bool)),
@@ -79,6 +83,10 @@ pub(crate) struct InferenceRequestParams {
     pub max_tokens: usize,
     #[serde(default)]
     pub stream: bool,
+    /// Wall-clock budget the pool allots for routing this chat to a free card (ms). 0/absent ⇒ the
+    /// router's default (30s). If every eligible card stays busy past it, the miner replies busy.
+    #[serde(default)]
+    pub deadline_ms: u64,
 }
 
 /// Interactive chat inference result (miner → pool, `mining.inference_result`). On success:

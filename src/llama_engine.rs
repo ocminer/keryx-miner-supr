@@ -10,8 +10,9 @@
 //! user-facing OPoI text. The walk kernel, the host possession index, proofs and `tag_fixed` are
 //! untouched; `ensure_installed_inner`'s N-guard cross-checks the gather against the host index.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use nix::libc;
 
@@ -36,9 +37,93 @@ struct Engine {
 // The wrapper serializes generation internally; tensor info is read-only after load.
 unsafe impl Send for Engine {}
 
-fn engine() -> &'static Mutex<Option<Engine>> {
-    static E: OnceLock<Mutex<Option<Engine>>> = OnceLock::new();
-    E.get_or_init(|| Mutex::new(None))
+/// One per-GPU engine slot. Its own `Mutex` serializes generation ON THAT CARD while letting a
+/// DIFFERENT card's slot run concurrently (the whole point of the multi-GPU inference pool): the
+/// caller clones the `Arc<EngineSlot>` out of `POOL` (a brief lock), releases `POOL`, then locks
+/// only this slot for the duration of the generate. `Engine: Send` ⇒ `Mutex<Option<Engine>>: Sync`
+/// ⇒ `Arc<EngineSlot>: Send + Sync`, so a slot can be handed to `spawn_blocking`.
+struct EngineSlot {
+    inner: Mutex<Option<Engine>>,
+}
+
+/// The per-GPU engine pool. `POOL[gpu]` (a slot Arc) hosts at most one llama.cpp model on CUDA
+/// ordinal `gpu`. Each GPU is an independent slot so concurrent inference runs on different cards
+/// and a model swap / free on one card never touches another card's resident tensors (the zero-dup
+/// PoM walk gathers over those — see `ensure_loaded_on`'s safety note). Replaces the former single
+/// `Mutex<Option<Engine>>` singleton; the legacy `ensure_loaded/generate/tensors/…` calls are thin
+/// shims over this map so existing call sites and the walk sharing keep compiling.
+fn pool() -> &'static Mutex<HashMap<usize, Arc<EngineSlot>>> {
+    static P: OnceLock<Mutex<HashMap<usize, Arc<EngineSlot>>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get (or create) the slot for `gpu`. Only the map lock is held here — never a slot's `inner`
+/// lock — so this never blocks on an in-flight generation.
+fn slot_for(gpu: usize) -> Arc<EngineSlot> {
+    let mut g = match pool().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.entry(gpu)
+        .or_insert_with(|| Arc::new(EngineSlot { inner: Mutex::new(None) }))
+        .clone()
+}
+
+/// Snapshot of the currently-populated GPU ordinals (a slot may exist but be empty; only ordinals
+/// whose slot holds a live engine are returned).
+fn loaded_gpus() -> Vec<usize> {
+    let slots: Vec<(usize, Arc<EngineSlot>)> = match pool().lock() {
+        Ok(g) => g.iter().map(|(k, v)| (*k, v.clone())).collect(),
+        Err(_) => return Vec::new(),
+    };
+    slots
+        .into_iter()
+        .filter(|(_, s)| s.inner.lock().map(|g| g.is_some()).unwrap_or(false))
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// Actually dlopen the .so, resolve symbols, load the model for (gguf, gpu). Returns the Engine or
+/// None (caller falls back). Factored out of `ensure_loaded_on` so the load happens while the
+/// target slot's lock is held (per-card serialization) without duplicating the FFI plumbing.
+fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
+    let so = so_path()?;
+    let cso = CString::new(so.to_string_lossy().as_bytes()).ok()?;
+    unsafe {
+        let lib = libc::dlopen(cso.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        if lib.is_null() {
+            let err = libc::dlerror();
+            let msg = if err.is_null() { "?".into() } else { CStr::from_ptr(err).to_string_lossy().into_owned() };
+            log::warn!("llama engine: dlopen({}) failed: {} — candle fallback stays active.", so.display(), msg);
+            return None;
+        }
+        let (Some(abi), Some(load), Some(count), Some(info), Some(gen), Some(free)) = (
+            sym::<AbiFn>(lib, "keryx_llama_abi"),
+            sym::<LoadFn>(lib, "keryx_llama_load"),
+            sym::<CountFn>(lib, "keryx_llama_tensor_count"),
+            sym::<InfoFn>(lib, "keryx_llama_tensor_info"),
+            sym::<GenFn>(lib, "keryx_llama_generate"),
+            sym::<FreeFn>(lib, "keryx_llama_free"),
+        ) else {
+            log::warn!("llama engine: {} is missing symbols — candle fallback stays active.", so.display());
+            return None;
+        };
+        let got = abi();
+        if got != ABI {
+            log::warn!("llama engine: {} ABI {} != expected {} — candle fallback stays active.", so.display(), got, ABI);
+            return None;
+        }
+        let cg = CString::new(gguf).ok()?;
+        log::info!("llama engine: loading {} on GPU {} via {} (in-process, zero-dup)…", gguf, gpu, so.display());
+        let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
+        let model = load(cg.as_ptr(), gpu as c_int, n_ctx);
+        if model.is_null() {
+            log::warn!("llama engine: model load failed on GPU {} (VRAM? arch?) — candle fallback stays active.", gpu);
+            return None;
+        }
+        log::info!("llama engine: ✓ active on GPU {} — llama.cpp hosts the model + serves OPoI inference (candle dormant).", gpu);
+        Some(Engine { model, count, info, generate: gen, free, gpu, gguf: gguf.to_string() })
+    }
 }
 
 /// The stock `libkeryx-llama.so` bakes in AVX/AVX2/FMA/F16C/BMI2 with no runtime dispatch
@@ -125,89 +210,62 @@ unsafe fn sym<T: Copy>(lib: *mut c_void, name: &str) -> Option<T> {
     Some(std::mem::transmute_copy::<*mut c_void, T>(&p))
 }
 
-/// Load the .so + the model once (idempotent, blocking — a model load takes seconds). Returns
-/// whether the engine is active for `gguf` on `gpu`. Safe to call from multiple threads.
-pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
-    let mut g = match engine().lock() {
+/// Load the .so + the model for `gpu` (idempotent, blocking — a model load takes seconds) WITHOUT
+/// evicting any OTHER GPU's engine. Returns whether the engine is active for `gguf` on `gpu`. Safe
+/// to call from multiple threads and concurrently for different GPUs.
+///
+/// Per-GPU slot safety: because each GPU has its OWN slot, this can ONLY ever free-and-reload the
+/// engine that lives on `gpu` itself (a same-card model swap — the caller reaches here from
+/// `ensure_installed_inner` with THIS card's walk already uninstalled). A different card's resident
+/// tensors are unreachable from here, so the former "different GPU must not steal the engine"
+/// device-use-after-free hazard (upstream Keryx-Labs/keryx-miner@278098b) is now structurally
+/// impossible rather than guarded by an early-return.
+pub fn ensure_loaded_on(gguf: &str, gpu: usize) -> bool {
+    let slot = slot_for(gpu);
+    let mut g = match slot.inner.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
     if let Some(e) = g.as_ref() {
-        if e.gguf == gguf && e.gpu == gpu {
-            return true;
+        if e.gguf == gguf {
+            return true; // already resident on this card (gpu matches by construction)
         }
-        // Only a SAME-GPU model swap may free-and-reload: the caller reaches here from
-        // `ensure_installed_inner` with its own walk uninstalled. A different GPU must not
-        // steal the engine — the hosting GPU's zero-dup walk still gathers over these
-        // resident tensors, so freeing them here would be a device use-after-free (and the
-        // two GPUs would thrash full model loads stealing the singleton back and forth).
-        // (upstream Keryx-Labs/keryx-miner@278098b)
-        if e.gpu != gpu {
-            return false;
-        }
+        // Same-card model swap: free this card's old model before loading the new one.
         if let Some(e) = g.take() {
             unsafe { (e.free)(e.model) };
         }
     }
-    let Some(so) = so_path() else { return false };
-    let cso = match CString::new(so.to_string_lossy().as_bytes()) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    unsafe {
-        let lib = libc::dlopen(cso.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-        if lib.is_null() {
-            let err = libc::dlerror();
-            let msg = if err.is_null() { "?".into() } else { CStr::from_ptr(err).to_string_lossy().into_owned() };
-            log::warn!("llama engine: dlopen({}) failed: {} — candle fallback stays active.", so.display(), msg);
-            return false;
+    match load_engine(gguf, gpu) {
+        Some(e) => {
+            *g = Some(e);
+            true
         }
-        let (Some(abi), Some(load), Some(count), Some(info), Some(gen), Some(free)) = (
-            sym::<AbiFn>(lib, "keryx_llama_abi"),
-            sym::<LoadFn>(lib, "keryx_llama_load"),
-            sym::<CountFn>(lib, "keryx_llama_tensor_count"),
-            sym::<InfoFn>(lib, "keryx_llama_tensor_info"),
-            sym::<GenFn>(lib, "keryx_llama_generate"),
-            sym::<FreeFn>(lib, "keryx_llama_free"),
-        ) else {
-            log::warn!("llama engine: {} is missing symbols — candle fallback stays active.", so.display());
-            return false;
-        };
-        let got = abi();
-        if got != ABI {
-            log::warn!("llama engine: {} ABI {} != expected {} — candle fallback stays active.", so.display(), got, ABI);
-            return false;
-        }
-        let cg = match CString::new(gguf) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        log::info!("llama engine: loading {} on GPU {} via {} (in-process, zero-dup)…", gguf, gpu, so.display());
-        let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
-        let model = load(cg.as_ptr(), gpu as c_int, n_ctx);
-        if model.is_null() {
-            log::warn!("llama engine: model load failed (VRAM? arch?) — candle fallback stays active.");
-            return false;
-        }
-        *g = Some(Engine { model, count, info, generate: gen, free, gpu, gguf: gguf.to_string() });
-        log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves OPoI inference (candle dormant).");
-        true
+        None => false,
     }
+}
+
+/// Legacy shim: load `gguf` on `gpu`. Identical to `ensure_loaded_on` (kept so the walk-sharing
+/// call sites in `pom_gpu` and the startup warmers in `main` compile unchanged).
+pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
+    ensure_loaded_on(gguf, gpu)
 }
 
 /// Engine active for exactly this (gguf, gpu)?
 pub fn active_for(gguf: &str, gpu: usize) -> bool {
-    match engine().lock() {
-        Ok(g) => g.as_ref().map_or(false, |e| e.gguf == gguf && e.gpu == gpu),
-        Err(_) => false,
-    }
+    let slot = slot_for(gpu);
+    let g = match slot.inner.lock() { Ok(g) => g, Err(_) => return false };
+    g.as_ref().map_or(false, |e| e.gguf == gguf)
 }
 
+/// Any GPU currently hosting a llama engine?
 pub fn available() -> bool {
-    match engine().lock() {
-        Ok(g) => g.is_some(),
-        Err(_) => false,
-    }
+    !loaded_gpus().is_empty()
+}
+
+/// Is a llama engine resident on this specific card?
+pub fn available_on(gpu: usize) -> bool {
+    let slot = slot_for(gpu);
+    slot.inner.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
 /// Free the resident model and disable the engine (available() -> false). Used when llama's
@@ -215,31 +273,35 @@ pub fn available() -> bool {
 /// (e.g. llama repacks Gemma's tied embeddings) — the walk must gather the canonical GGUF bytes,
 /// so we free llama's VRAM and let the caller fall back to candle for BOTH walk and inference.
 pub fn unload() {
-    if let Ok(mut g) = engine().lock() {
+    let slots: Vec<Arc<EngineSlot>> = match pool().lock() {
+        Ok(g) => g.values().cloned().collect(),
+        Err(p) => p.into_inner().values().cloned().collect(),
+    };
+    for slot in slots {
+        let mut g = match slot.inner.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         if let Some(e) = g.take() {
             unsafe { (e.free)(e.model) };
         }
     }
 }
 
-/// Free the resident model and disable the engine only if the given GPU currently hosts it.
-/// This is used for stale-GPU recovery after a transient fault on that specific device — a
-/// GPU that does NOT host the engine must not be able to free another card's resident model.
-/// (upstream Keryx-Labs/keryx-miner@278098b)
+/// Free the resident model and disable the engine only for the given GPU. Used both for stale-GPU
+/// recovery after a transient fault on that specific device and for the per-card inference model
+/// swap — a GPU that does NOT host the engine must not be able to free another card's resident
+/// model. Per-GPU slots make this scope-exact by construction. (upstream Keryx-Labs/keryx-miner@278098b)
 pub fn unload_for_gpu(gpu: usize) {
-    if let Ok(mut g) = engine().lock() {
-        if g.as_ref().is_some_and(|e| e.gpu != gpu) {
-            return;
-        }
-        if let Some(e) = g.take() {
-            unsafe { (e.free)(e.model) };
-        }
+    let slot = slot_for(gpu);
+    let mut g = match slot.inner.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    if let Some(e) = g.take() {
+        unsafe { (e.free)(e.model) };
     }
 }
 
-/// Resident tensors in CANONICAL (name-sorted) order: (name, data_ptr, nbytes, is_device).
-pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> {
-    let g = engine().lock().ok()?;
+/// Resident tensors of the engine on `gpu` in CANONICAL (name-sorted) order:
+/// (name, data_ptr, nbytes, is_device). The zero-dup PoM walk on `gpu` gathers over these.
+pub fn tensors_for(gpu: usize) -> Option<Vec<(String, u64, usize, bool)>> {
+    let slot = slot_for(gpu);
+    let g = slot.inner.lock().ok()?;
     let e = g.as_ref()?;
     let n = unsafe { (e.count)(e.model) };
     let mut out = Vec::with_capacity(n);
@@ -258,9 +320,18 @@ pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> {
     Some(out)
 }
 
-/// Generate OPoI text via the in-process engine. None on any failure (caller falls back).
-pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
-    let g = engine().lock().ok()?;
+/// Legacy shim: tensors of the single/first resident engine (used only where exactly one card
+/// hosts a model). Prefer `tensors_for(gpu)`.
+pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> {
+    let gpu = loaded_gpus().into_iter().next()?;
+    tensors_for(gpu)
+}
+
+/// Generate OPoI text on `gpu`'s engine. Serialized per-card (one generation per card at a time);
+/// different cards run concurrently. None on any failure (caller falls back).
+pub fn generate_on(gpu: usize, prompt: &str, max_tokens: usize) -> Option<String> {
+    let slot = slot_for(gpu);
+    let g = match slot.inner.lock() { Ok(g) => g, Err(p) => p.into_inner() };
     let e = g.as_ref()?;
     let cp = CString::new(prompt).ok()?;
     let mut buf = vec![0u8; 64 * 1024];
@@ -270,4 +341,10 @@ pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
     }
     buf.truncate(n as usize);
     String::from_utf8(buf).ok()
+}
+
+/// Legacy shim: generate on the single/first resident engine. Prefer `generate_on(gpu, …)`.
+pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
+    let gpu = loaded_gpus().into_iter().next()?;
+    generate_on(gpu, prompt, max_tokens)
 }
