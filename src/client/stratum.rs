@@ -12,7 +12,8 @@ mod statum_codec;
 
 use crate::client::stratum::statum_codec::{ErrorCode, MiningNotify, MiningSubmit, NewLineJsonCodecError, StratumLine};
 use crate::client::stratum::statum_codec::{
-    MiningSubscribe, SetExtranonce, StratumCommand, StratumError, StratumLinePayload, StratumResult,
+    InferenceRequestParams, InferenceResultParams, MiningSubscribe, SetExtranonce, StratumCommand, StratumError,
+    StratumLinePayload, StratumResult,
 };
 use crate::client::Client;
 use crate::pow::BlockSeed;
@@ -47,6 +48,12 @@ const CHALLENGE_MAX_TOKENS: usize = 128;
 struct AiTask {
     #[serde(default)]
     stable_id: String,
+    /// H6 pool request id — echoed back verbatim in `mining.submit` so the pool can match the
+    /// unsigned AiResponse to the request it dispatched. When the pool omits `stable_id` (the H6
+    /// wire), this doubles as the inference-cache dedup key (see `handle_ai_task`).
+    #[serde(default, rename = "reqId")]
+    req_id: String,
+    #[serde(alias = "model_id")]
     model_id_hex: String,
     prompt: String,
     max_tokens: usize,
@@ -54,6 +61,15 @@ struct AiTask {
     inference_reward: u64,
     #[serde(default)]
     request_hash: String,
+    /// H6 service-bond era: the AiResponse `challenge_window_end`. The POOL owns this on the pool
+    /// path (it builds and signs the coinbase), so the miner does NOT choose it here — it is parsed
+    /// only for completeness/telemetry. (On the SOLO grpc path the miner still derives daa+1000.)
+    #[serde(default)]
+    challenge_window_end: u64,
+    /// H6: wall-clock budget the pool allots for the answer. Parsed for completeness; the miner
+    /// does not currently enforce a hard deadline on the (uninterruptible) GPU inference.
+    #[serde(default)]
+    deadline_ms: u64,
 }
 
 /// Task attached to the current mining job, cleared on each new `mining.notify`.
@@ -65,9 +81,20 @@ struct CurrentTask {
 /// Shared inference result cache — persists across block changes so that if the
 /// same AiRequest is included in multiple consecutive job templates the miner can
 /// immediately submit with a CID once inference completed for the first occurrence.
+/// A completed inference result: the base58 CID for the share submit plus the raw multihash
+/// bytes and token count needed to reconstruct (and sign) the 78-byte v1 AiResponse message.
+#[derive(Clone)]
+struct InferenceResult {
+    /// base58 CIDv0 string returned by IPFS — goes on the wire as the share's CID param.
+    cid_b58: String,
+    /// Token/word count — the `response_length` transmitted on the unsigned submit (the pool signs
+    /// the V2 AiResponse over exactly this value, so it must be sent, not re-derived pool-side).
+    response_length: u32,
+}
+
 struct InferenceCacheInner {
-    /// stable_id → base58 CIDv0 string returned by IPFS after upload.
-    results: HashMap<String, String>,
+    /// stable_id → completed inference result (CID + fields for the V2 responder signature).
+    results: HashMap<String, InferenceResult>,
     /// stable_ids currently being inferred (guards against duplicate spawn_blocking calls).
     in_progress: HashSet<String>,
 }
@@ -476,6 +503,9 @@ impl StratumHandler {
             results: HashMap::new(),
             in_progress: HashSet::new(),
         }));
+        // H6 pool path: the POOL builds the coinbase and therefore signs the V2 AiResponse with its
+        // OWN escrow key — the miner transmits the UNSIGNED answer (reqId + response_length) and no
+        // longer holds a responder signer here. (Solo/grpc self-signing lives in grpc.rs.)
         let (block_channel, block_handle) = Self::create_block_channel(
             send_channel.clone(),
             miner_address.clone(),
@@ -537,49 +567,95 @@ impl StratumHandler {
                 let nonce_hex = format!("{:016x}", nonce);
                 let opoi_tag = keryx_inference::tag_fixed(nonce);
 
-                // Phase 2: check inference cache for the current job's task
-                let cid_opt = {
+                let daa_now = LAST_DAA_SCORE.load(std::sync::atomic::Ordering::Relaxed);
+
+                // Phase 2: check inference cache for the current job's task, and capture the reqId the
+                // pool dispatched so it can be echoed back on the submit.
+                let (result_opt, req_id): (Option<InferenceResult>, Option<String>) = {
                     let task_guard = current_task_slot.lock().await;
                     if let Some(ref ct) = *task_guard {
                         if ct.job_id == job_id && !ct.task.stable_id.is_empty() {
                             let cache_guard = inference_cache.lock().await;
-                            cache_guard.results.get(&ct.task.stable_id).cloned()
+                            let res = cache_guard.results.get(&ct.task.stable_id).cloned();
+                            let rid = if ct.task.req_id.is_empty() { None } else { Some(ct.task.req_id.clone()) };
+                            (res, rid)
                         } else {
-                            None
+                            (None, None)
                         }
                     } else {
-                        None
+                        (None, None)
                     }
                 };
+
+                // H6 service-bond era (pool path): at/after the PoM v3 gate, when an answer (CID)
+                // exists AND the pool gave us a reqId, transmit the UNSIGNED answer data. The POOL —
+                // which builds the coinbase — signs the V2 AiResponse with its own escrow key over
+                // the exact 78 v1 bytes, so `response_length` (the miner's token count) MUST travel
+                // on the wire, not be re-derived. Below the gate, or without a CID/reqId, fall
+                // through to the plain 6-slot PoM submit.
+                let unsigned_response: Option<(String, u32)> =
+                    match (&result_opt, &req_id) {
+                        (Some(res), Some(rid)) if daa_now >= keryx_miner::pom::pom_v3_activation_daa() => {
+                            Some((rid.clone(), res.response_length))
+                        }
+                        _ => None,
+                    };
 
                 let line = if !pom_proof.is_empty() {
                     // PoM (post-fork): fixed 6-slot submit — proof always at params[5], CID-or-empty
                     // at params[4]. Matches POM_STRATUM_RECIPE.md (pool relays params[5] → RpcBlock
                     // .pomProof; it does not verify). hex is lowercase per hex::encode.
                     let proof_hex = hex::encode(&pom_proof);
-                    let cid = cid_opt.unwrap_or_default();
-                    info!(
-                        "PoM: submitting share with proof ({} B, {} hex chars) for job {}",
-                        pom_proof.len(),
-                        proof_hex.len(),
-                        job_id
-                    );
-                    StratumLine {
-                        id: Some(msg_id),
-                        payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
-                            MiningSubmit::MiningSubmitWithPom((
-                                miner_address.clone(),
-                                job_id,
-                                nonce_hex,
-                                opoi_tag,
-                                cid,
-                                proof_hex,
+                    let cid = result_opt.as_ref().map(|r| r.cid_b58.clone()).unwrap_or_default();
+                    if let Some((rid, response_length)) = unsigned_response {
+                        // H6 (unsigned): params[6]=reqId, params[7]=response_length. The POOL signs
+                        // the V2 AiResponse with its own escrow key using EXACTLY this cid +
+                        // response_length (the 78 v1 bytes) and matches it to reqId.
+                        info!(
+                            "PoM: submitting share with proof ({} B) + unsigned AiResponse (reqId={}, len={}) for job {}",
+                            pom_proof.len(), rid, response_length, job_id
+                        );
+                        StratumLine {
+                            id: Some(msg_id),
+                            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
+                                MiningSubmit::MiningSubmitWithUnsignedResponse((
+                                    miner_address.clone(),
+                                    job_id,
+                                    nonce_hex,
+                                    opoi_tag,
+                                    cid,
+                                    proof_hex,
+                                    rid,
+                                    response_length,
+                                )),
                             )),
-                        )),
-                        jsonrpc: None,
-                        error: None,
+                            jsonrpc: None,
+                            error: None,
+                        }
+                    } else {
+                        info!(
+                            "PoM: submitting share with proof ({} B, {} hex chars) for job {}",
+                            pom_proof.len(),
+                            proof_hex.len(),
+                            job_id
+                        );
+                        StratumLine {
+                            id: Some(msg_id),
+                            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
+                                MiningSubmit::MiningSubmitWithPom((
+                                    miner_address.clone(),
+                                    job_id,
+                                    nonce_hex,
+                                    opoi_tag,
+                                    cid,
+                                    proof_hex,
+                                )),
+                            )),
+                            jsonrpc: None,
+                            error: None,
+                        }
                     }
-                } else if let Some(cid) = cid_opt {
+                } else if let Some(cid) = result_opt.map(|r| r.cid_b58) {
                     info!("OPoI Phase 2: submitting share with CID for job {}", job_id);
                     StratumLine {
                         id: Some(msg_id),
@@ -862,6 +938,12 @@ impl StratumHandler {
                             self.handle_challenge(model_id_hex, nonce_hex, miner).await;
                             Ok(())
                         }
+                        // H6 interactive chat (off-chain product path): run inference on the GPU
+                        // (pausing PoW like the challenge path) and reply inline. No tx/escrow.
+                        StratumCommand::MiningInferenceRequest(req) => {
+                            self.handle_inference_request(req, miner).await;
+                            Ok(())
+                        }
                         _ => Err(format!("Unexpected stratum message: {:?}", msg).into()),
                     },
                     _ => Err(format!("Inconsistent stratum message: {:?}", msg).into()),
@@ -1082,12 +1164,94 @@ impl StratumHandler {
         });
     }
 
+    /// H6 interactive chat (`mining.inference_request` → `mining.inference_result`). Off-chain,
+    /// low-latency product path: NO tx, NO escrow, NO consensus. Runs SLM inference on the GPU
+    /// (reusing the challenge path's GPU-pause pattern) and returns the answer text INLINE. When no
+    /// request is pending this is never entered, so PoW is untouched. On an unready model, empty
+    /// output, or any failure it replies `{ reqId, ok:false, error }`.
+    async fn handle_inference_request(&mut self, req: InferenceRequestParams, miner: &mut MinerManager) {
+        let req_id = req.req_id.clone();
+
+        // Validate the model_id (64 hex → 32 bytes) and that it is a declared/ready tier.
+        let model_id_bytes = match hex::decode(&req.model_id) {
+            Ok(b) if b.len() == 32 => b,
+            _ => {
+                warn!("chat[{}]: invalid model_id '{}'", req_id, req.model_id);
+                self.send_channel
+                    .send(make_inference_result_err(&req_id, "invalid model_id"))
+                    .await
+                    .ok();
+                return;
+            }
+        };
+        let mut model_id = [0u8; 32];
+        model_id.copy_from_slice(&model_id_bytes);
+        if !keryx_miner::slm::loaded_model_ids().iter().any(|m| m == &model_id) {
+            warn!("chat[{}]: model {:.8} not ready", req_id, req.model_id);
+            self.send_channel
+                .send(make_inference_result_err(&req_id, "model not ready"))
+                .await
+                .ok();
+            return;
+        }
+
+        // Guard against concurrent GPU inference (a mining challenge or AiTask may hold the GPU).
+        if self.challenge_in_flight.swap(true, Ordering::SeqCst) {
+            warn!("chat[{}]: GPU inference already in flight — rejecting", req_id);
+            self.send_channel
+                .send(make_inference_result_err(&req_id, "busy"))
+                .await
+                .ok();
+            return;
+        }
+
+        // Pause PoW so the GPU is free for the chat inference (same pattern as handle_challenge).
+        // In --cpu-inference mode the GPU is free, so keep hashing.
+        let miner_flag = miner.opoi_challenge_flag();
+        if keryx_miner::slm::cpu_inference_enabled() {
+            info!("chat[{}]: CPU inference — PoW continues — model={:.8}", req_id, req.model_id);
+        } else {
+            miner_flag.store(true, Ordering::SeqCst);
+            miner.process_block(None).await.ok();
+            info!("chat[{}]: PoW suspended — model={:.8}", req_id, req.model_id);
+        }
+
+        let prompt = req.prompt.clone();
+        let max_tokens = req.max_tokens;
+        let send_channel = self.send_channel.clone();
+        let challenge_flag = Arc::clone(&self.challenge_in_flight);
+        let model_hex = req.model_id.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens);
+            let ms = started.elapsed().as_millis() as u32;
+            // Clear both flags — PoW resumes on the next mining.notify from the pool.
+            miner_flag.store(false, Ordering::SeqCst);
+            challenge_flag.store(false, Ordering::SeqCst);
+            let line = match result {
+                Some(text) if !text.is_empty() => {
+                    let tokens = text.split_whitespace().count() as u32;
+                    info!("chat[{}]: done model={:.8} ({} tokens, {} ms) — PoW resumes on next notify", req_id, model_hex, tokens, ms);
+                    make_inference_result_ok(&req_id, text, tokens, ms)
+                }
+                _ => {
+                    warn!("chat[{}]: inference produced no output", req_id);
+                    make_inference_result_err(&req_id, "inference failed")
+                }
+            };
+            if send_channel.blocking_send(line).is_err() {
+                warn!("chat[{}]: send_channel closed, could not deliver result", req_id);
+            }
+        });
+    }
+
     /// Parse the task JSON from a `MiningNotifyWithTask`, store it in `current_task_slot`,
     /// Handles an AiTask dispatched by the bridge. Returns `true` if inference was launched
     /// and PoW has been paused — the caller must NOT call `process_block(Some(...))` in that
     /// case; PoW resumes automatically on the next `mining.notify` after inference completes.
     async fn handle_ai_task(&mut self, job_id: String, task_json: String, miner: &mut MinerManager) -> bool {
-        let task: AiTask = match serde_json::from_str(&task_json) {
+        let mut task: AiTask = match serde_json::from_str(&task_json) {
             Ok(t) => t,
             Err(e) => {
                 warn!("OPoI: failed to parse task JSON from bridge: {}", e);
@@ -1096,10 +1260,17 @@ impl StratumHandler {
             }
         };
 
+        // H6 wire: the pool identifies a request by `reqId` and may omit the legacy `stable_id`.
+        // Use reqId as the inference-cache dedup key (and the create_block_channel lookup key) when
+        // stable_id is absent, so inference still runs and the answer reaches the submit.
+        if task.stable_id.is_empty() {
+            task.stable_id = task.req_id.clone();
+        }
+
         // Store task for this job so create_block_channel can look up the CID.
         *self.current_task_slot.lock().await = Some(CurrentTask { job_id, task: task.clone() });
 
-        // Skip inference if stable_id is missing (malformed task) or already done/running.
+        // Skip inference if there is no key (neither stable_id nor reqId) or it's already done/running.
         if task.stable_id.is_empty() {
             return false;
         }
@@ -1189,11 +1360,45 @@ fn run_inference_and_upload(
     stable_id: String,
     cache: InferenceCache,
 ) {
-    let cid_opt = do_inference_and_upload(&model_id, &prompt, max_tokens, &ipfs_url, &stable_id);
+    let result_opt = do_inference_and_upload(&model_id, &prompt, max_tokens, &ipfs_url, &stable_id);
     let mut guard = cache.blocking_lock();
     guard.in_progress.remove(&stable_id);
-    if let Some(cid) = cid_opt {
-        guard.results.insert(stable_id, cid);
+    if let Some(result) = result_opt {
+        guard.results.insert(stable_id, result);
+    }
+}
+
+/// Build a successful `mining.inference_result` line (text returned inline).
+fn make_inference_result_ok(req_id: &str, text: String, tokens: u32, ms: u32) -> StratumLine {
+    StratumLine {
+        id: None,
+        payload: StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceResult(InferenceResultParams {
+            req_id: req_id.to_string(),
+            ok: true,
+            text: Some(text),
+            tokens: Some(tokens),
+            ms: Some(ms),
+            error: None,
+        })),
+        jsonrpc: None,
+        error: None,
+    }
+}
+
+/// Build a failed `mining.inference_result` line.
+fn make_inference_result_err(req_id: &str, error: &str) -> StratumLine {
+    StratumLine {
+        id: None,
+        payload: StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceResult(InferenceResultParams {
+            req_id: req_id.to_string(),
+            ok: false,
+            text: None,
+            tokens: None,
+            ms: None,
+            error: Some(error.to_string()),
+        })),
+        jsonrpc: None,
+        error: None,
     }
 }
 
@@ -1216,19 +1421,22 @@ fn do_inference_and_upload(
     max_tokens: usize,
     ipfs_url: &str,
     stable_id: &str,
-) -> Option<String> {
+) -> Option<InferenceResult> {
     info!("OPoI [{}]: starting SLM inference (max_tokens={})", stable_id, max_tokens);
     let text = keryx_miner::slm::load_and_run_inference(model_id, prompt, max_tokens)?;
     if text.is_empty() {
         warn!("OPoI [{}]: inference returned empty text — skipping IPFS upload", stable_id);
         return None;
     }
+    // Token count mirrors the solo grpc path's `result.split_whitespace().count()` — this is the
+    // `response_length` the V2 responder signature covers, so the pool must commit the same value.
+    let response_length = text.split_whitespace().count() as u32;
     match crate::ipfs::upload(&text, ipfs_url) {
         Ok(cid_bytes) => {
             // Convert raw 34-byte multihash to base58 CIDv0 string via AiResponsePayload helper.
-            let cid = keryx_inference::AiResponsePayload::new([0u8; 32], 0, cid_bytes, 0).cid_v0();
-            info!("OPoI [{}]: inference complete, IPFS CID={}", stable_id, cid);
-            Some(cid)
+            let cid_b58 = keryx_inference::AiResponsePayload::new([0u8; 32], 0, cid_bytes, 0).cid_v0();
+            info!("OPoI [{}]: inference complete, IPFS CID={}", stable_id, cid_b58);
+            Some(InferenceResult { cid_b58, response_length })
         }
         Err(e) => {
             warn!("OPoI [{}]: IPFS upload failed: {}", stable_id, e);
