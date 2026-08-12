@@ -328,6 +328,15 @@ impl MinerManager {
                 let mut nonces = vec![0u64; 1];
 
                 let mut state = None;
+                // AMD PoM: cap on proof-builds running concurrently on detached threads (the async
+                // overlap that keeps the card grinding while the CPU re-walks the winner). One winner
+                // per batch means ~1-2 in flight normally; the cap only guards a pathological
+                // low-difficulty burst from spawning unbounded threads (excess winners are dropped —
+                // the grind found more than the CPU can prove, which is fine).
+                #[cfg(feature = "pom-opencl")]
+                let inflight_proofs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                #[cfg(feature = "pom-opencl")]
+                const MAX_INFLIGHT_PROOFS: usize = 6;
                 // PoM (post-fork): nonce cursor + per-launch batch. The kernel grinds the whole
                 // batch before returning, so blocks/sec is capped at hashrate / POM_BATCH.
                 //
@@ -501,10 +510,9 @@ impl MinerManager {
                                     s.generate_block_if_pom(nonce, idx, tier)
                                 })
                             });
-                            #[cfg(feature = "pom-opencl")]
-                            let built = state.as_ref().and_then(|s| {
-                                keryx_miner::pom::active_index().and_then(|(idx, tier)| s.generate_block_if_pom(nonce, idx, *tier))
-                            });
+                            // NVIDIA/Apple keep the synchronous submit (candle's per-device driver is
+                            // not structured for the AMD detached-thread overlap).
+                            #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                             if let Some(block_seed) = built {
                                 match send_channel.blocking_send(block_seed.clone()) {
                                     Ok(()) => block_seed.report_block(),
@@ -512,6 +520,36 @@ impl MinerManager {
                                 }
                                 if let BlockSeed::FullBlock(_) = block_seed {
                                     state = None;
+                                }
+                            }
+                            // AMD: OVERLAP the ~300 ms host proof re-walk with GPU grinding. The card
+                            // just finished a batch and would otherwise idle (dropping its boost
+                            // clock) while the CPU re-walks the winner to build the witness. Instead
+                            // clone the (cheap, Arc-backed) block template and build+submit the proof
+                            // on a detached thread; the worker loops straight back into the next grind.
+                            // The host re-walk re-checks the target, so a kernel false-positive is
+                            // dropped there — never submitted.
+                            #[cfg(feature = "pom-opencl")]
+                            if let Some(s) = state.as_ref() {
+                                if let Some((_idx, tier)) = keryx_miner::pom::active_index() {
+                                    if inflight_proofs.load(Ordering::Acquire) < MAX_INFLIGHT_PROOFS {
+                                        inflight_proofs.fetch_add(1, Ordering::AcqRel);
+                                        let s_clone = s.clone();
+                                        let tier = *tier;
+                                        let tx = send_channel.clone();
+                                        let counter = std::sync::Arc::clone(&inflight_proofs);
+                                        std::thread::spawn(move || {
+                                            if let Some((idx, _)) = keryx_miner::pom::active_index() {
+                                                if let Some(block_seed) = s_clone.generate_block_if_pom(nonce, idx, tier) {
+                                                    match tx.blocking_send(block_seed.clone()) {
+                                                        Ok(()) => block_seed.report_block(),
+                                                        Err(e) => warn!("Could not submit PoM block — pool connection dropped ({}); reconnecting", e),
+                                                    }
+                                                }
+                                            }
+                                            counter.fetch_sub(1, Ordering::AcqRel);
+                                        });
+                                    }
                                 }
                             }
                         }
