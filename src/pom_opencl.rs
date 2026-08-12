@@ -133,12 +133,29 @@ impl PomMiner {
         // the compiler strength-reduces it to its exact multiply-high sequence (byte-exact — the
         // compiler's own constant-division transform). Falls back to the arg if the build with the
         // define fails for any reason.
-        let opts = format!("-D POM_NC={}UL", n_chunks);
+        // RDNA3+/CDNA (gfx11/gfx12) have the native `v_dot4_i32_i8` (dot9-insts): -D USE_AMD_DOT4
+        // routes the v3 int8 matmul (the walk's hot loop) through `__builtin_amdgcn_sudot4` — 1
+        // instruction instead of the 4-mul scalar unpack, byte-identical result. Older AMD (GCN/
+        // Polaris/Vega/RDNA1/2) and Windows Adrenalin (which can reject the builtin) keep the scalar
+        // path; if the dot4 build fails for any reason we retry without the define.
+        let dev_name = device.name().unwrap_or_default();
+        let want_dot4 = std::env::var("KERYX_NO_AMD_DOT4").is_err()
+            && (dev_name.contains("gfx11") || dev_name.contains("gfx12"));
+        let base = format!("-D POM_NC={}UL", n_chunks);
+        let opts = if want_dot4 { format!("{base} -D USE_AMD_DOT4=1") } else { base.clone() };
         let program = match Program::create_and_build_from_source(&context, POM_SRC, &opts) {
-            Ok(p) => p,
+            Ok(p) => {
+                if want_dot4 {
+                    log::info!("PoM: v3 int8 matmul using native v_dot4_i32_i8 (RDNA3+ hardware dot) on {dev_name}.");
+                }
+                p
+            }
             Err(e) => {
-                log::warn!("PoM: JIT with baked chunk-count failed ({e}) — rebuilding with the runtime divisor.");
-                Program::create_and_build_from_source(&context, POM_SRC, "")?
+                log::warn!("PoM: JIT with {opts:?} failed ({e}) — retrying without the dot4/baked-count defines.");
+                match Program::create_and_build_from_source(&context, POM_SRC, &base) {
+                    Ok(p) => p,
+                    Err(_) => Program::create_and_build_from_source(&context, POM_SRC, "")?,
+                }
             }
         };
         let kernel = Kernel::create(&program, "pom_mine").map_err(|e| e.to_string())?;
