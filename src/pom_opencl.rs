@@ -74,21 +74,20 @@ fn dispatch_raw(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulon
     Some(if w[0] != u64::MAX { Some(w[0]) } else { None })
 }
 
-/// H6 PoM v3 dispatch: ONE work-group per nonce, `local`=256 work-items (one per state row x).
-/// The whole tier blob is a SINGLE contiguous cl_mem reinterpreted as `uint*` (chunk idx ->
-/// blob32[idx*8]); a 64 KB `__local` tile is set via set_arg_local_buffer. `n_nonces` == number
-/// of work-groups. Blocks until complete. Same return convention as dispatch_raw.
+/// H6 PoM v3: ENQUEUE one sub-dispatch (no finish/read). ONE work-group per nonce, local=256 (one
+/// per state row x). The whole tier blob is a SINGLE contiguous cl_mem reinterpreted as `uint*`; the
+/// tile is read straight from it (VRAM/L2), so LDS holds only the 12 KB Merkle scratch. `n_nonces` ==
+/// number of work-groups. The kernel does an atomic-min into `winner`, so many sub-dispatches sharing
+/// one winner buffer accumulate the global-min nonce — mine_v3 enqueues the whole batch back-to-back
+/// then finishes ONCE, keeping the GPU continuously fed (no per-sub-dispatch stall that lets the clock
+/// sag) instead of the old enqueue→finish→read per 128 nonces.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_raw_v3(queue: &CommandQueue, kernel: &Kernel, blob: &Buffer<cl_ulong>, winner: &mut Buffer<cl_ulong>,
-                   n_tiles: u64, k: u32, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4],
-                   base: u64, n_nonces: u64) -> Option<Option<u64>> {
-    const V3_LOCAL: usize = 256;                 // one work-item per state row (D=256)
-    // The tile is read straight from the resident blob (VRAM/L2), not staged into LDS — this ~1.6x's
-    // throughput by freeing LDS for occupancy. LDS now only holds the final Merkle-tree scratch:
-    // 256 leaves × 8 u32 (2048) + the 128-hash ping-pong region (1024) = 3072 u32 = 12 KB.
-    const V3_MERKLE_LDS_BYTES: usize = 3072 * 4;
-    queue.enqueue_write_buffer(winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
-    let global = (n_nonces * V3_LOCAL as u64) as usize;   // n_nonces work-groups × 256 items
+fn enqueue_v3(queue: &CommandQueue, kernel: &Kernel, blob: &Buffer<cl_ulong>, winner: &Buffer<cl_ulong>,
+              n_tiles: u64, k: u32, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4],
+              base: u64, n_nonces: u64) -> Option<()> {
+    const V3_LOCAL: usize = 256;
+    const V3_MERKLE_LDS_BYTES: usize = 3072 * 4;   // 256 leaves×8 + 128-hash ping-pong = 12 KB
+    let global = (n_nonces * V3_LOCAL as u64) as usize;
     ExecuteKernel::new(kernel)
         .set_arg(blob)
         .set_arg(&n_tiles)
@@ -104,10 +103,7 @@ fn dispatch_raw_v3(queue: &CommandQueue, kernel: &Kernel, blob: &Buffer<cl_ulong
         .set_local_work_size(V3_LOCAL)
         .enqueue_nd_range(queue)
         .ok()?;
-    queue.finish().ok()?;
-    let mut w = [u64::MAX];
-    queue.enqueue_read_buffer(winner, CL_BLOCKING, 0, &mut w, &[]).ok()?;
-    Some(if w[0] != u64::MAX { Some(w[0]) } else { None })
+    Some(())
 }
 
 /// Staging window for the VRAM upload: 2^22 chunks × 32 B = 128 MiB. The blob is streamed
@@ -361,19 +357,23 @@ impl PomMiner {
             return None;
         }
         let k = POM_V3_K as u32;
+        // Reset the shared winner, enqueue the WHOLE batch back-to-back (each sub-dispatch stays
+        // under the Windows TDR limit but there is NO finish between them, so the GPU never drains
+        // its queue mid-batch — the boost clock stays pinned), then finish + read once. The kernel's
+        // atomic-min makes the single winner buffer hold the batch's lowest winning nonce.
+        self.queue.enqueue_write_buffer(&mut self.winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
         let mut done: u64 = 0;
         while done < batch {
             let sub = (batch - done).min(V3_SUB_DISPATCH_NONCES);
             let base = nonce_base.wrapping_add(done);
-            match dispatch_raw_v3(&self.queue, &self.kernel_v3, &self.weights[0], &mut self.winner,
-                                  n_tiles, k, pph, seed, time, target, base, sub) {
-                None => return None,
-                Some(Some(w)) => return Some(w),
-                Some(None) => {}
-            }
+            enqueue_v3(&self.queue, &self.kernel_v3, &self.weights[0], &self.winner,
+                       n_tiles, k, pph, seed, time, target, base, sub)?;
             done += sub;
         }
-        None
+        self.queue.finish().ok()?;
+        let mut w = [u64::MAX];
+        self.queue.enqueue_read_buffer(&self.winner, CL_BLOCKING, 0, &mut w, &[]).ok()?;
+        if w[0] != u64::MAX { Some(w[0]) } else { None }
     }
 }
 
