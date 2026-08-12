@@ -1676,10 +1676,36 @@ pub fn mining_preparing() -> bool {
 /// NOT in the process-wide lineup is still servable on the card that mines it). This drives
 /// declare_capabilities, so the pool routes every tier at least one card can serve — no under- or
 /// over-declaration on a mixed rig.
+/// Models whose files are on disk but which this miner cannot currently serve (upstream 0795e92).
+fn unavailable_models() -> &'static RwLock<std::collections::HashSet<[u8; 32]>> {
+    static MODELS: OnceLock<RwLock<std::collections::HashSet<[u8; 32]>>> = OnceLock::new();
+    MODELS.get_or_init(|| RwLock::new(std::collections::HashSet::new()))
+}
+
+/// Withdraw a model from `ai:cap`: the files are on disk but this miner cannot serve it right now
+/// (upstream 0795e92). Announcing it anyway earns assigned requests it cannot answer, hence
+/// service-bond strikes. Idempotent — only the transition logs.
+pub fn mark_model_unavailable(model_id: &[u8; 32], reason: &str) {
+    if unavailable_models().write().unwrap().insert(*model_id) {
+        log::warn!("SlmEngine: model {:.8} withdrawn from ai:cap ({})", hex::encode(model_id), reason);
+    }
+}
+
+/// Re-announce a model after it serves again (upstream 0795e92).
+pub fn mark_model_available(model_id: &[u8; 32], reason: &str) {
+    if unavailable_models().write().unwrap().remove(model_id) {
+        log::info!("SlmEngine: model {:.8} back in ai:cap ({})", hex::encode(model_id), reason);
+    }
+}
+
+fn model_is_unavailable(model_id: &[u8; 32]) -> bool {
+    unavailable_models().read().unwrap().contains(model_id)
+}
+
 pub fn loaded_model_ids() -> Vec<[u8; 32]> {
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let mut ids: Vec<[u8; 32]> = specs.iter()
-        .filter(|s| model_dir(s).join(".ok").exists())
+        .filter(|s| model_dir(s).join(".ok").exists() && !model_is_unavailable(&s.model_id))
         .map(|s| s.model_id)
         .collect();
     // Per-card assignments (mixed rig / --force-model): add any assigned tier whose GGUF is staged
@@ -1689,7 +1715,7 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]> {
         let ready = std::path::Path::new(&gguf)
             .parent()
             .map_or(false, |d| d.join(".ok").exists());
-        if ready && !ids.contains(&mid) {
+        if ready && !ids.contains(&mid) && !model_is_unavailable(&mid) {
             ids.push(mid);
         }
     }
@@ -1703,11 +1729,12 @@ pub fn spec_files_ready(spec: &ModelSpec) -> bool {
     model_dir(spec).join(".ok").exists()
 }
 
-/// True only when the model is supported and its files are completely downloaded.
+/// True only when the model is supported, its files are completely downloaded, and it is not
+/// currently withdrawn from `ai:cap` (upstream 0795e92).
 pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else { return false; };
-    model_dir(spec).join(".ok").exists()
+    model_dir(spec).join(".ok").exists() && !model_is_unavailable(model_id)
 }
 
 /// Load the requested model on demand (evicting a cached different model if needed), then run
@@ -1762,9 +1789,15 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                 if secs > 0.0 {
                     record_card_toks(gpu, text.split_whitespace().count() as f64 / secs);
                 }
+                // Upstream 0795e92: a successful generation re-announces the model in ai:cap.
+                mark_model_available(model_id, "generation_success");
                 return Some(text);
             }
             log::warn!("SlmEngine: in-process llama generate failed on GPU {} — trying the next engine.", gpu);
+        } else {
+            // Upstream 0795e92: this card is the only one that can serve the model and its engine
+            // failed to come up — withdraw it from ai:cap so the pool stops routing us requests.
+            mark_model_unavailable(model_id, "llama_load_failed");
         }
     }
 
@@ -1908,5 +1941,40 @@ pub fn pom_shared(
         ModelInner::QuantizedSplit(m) => Some((e.device.clone(), m.pom_quant_tensors())),
         ModelInner::QuantizedGemma3Split(m) => Some((e.device.clone(), m.pom_quant_tensors())),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod withdrawal_tests {
+    use super::*;
+
+    #[test]
+    fn withdrawn_models_are_hidden_until_they_recover() {
+        let model_id = [0xa7u8; 32];
+        assert!(!model_is_unavailable(&model_id));
+
+        mark_model_unavailable(&model_id, "test_failure");
+        assert!(model_is_unavailable(&model_id));
+        assert!(!is_model_ready(&model_id));
+        assert!(!loaded_model_ids().contains(&model_id));
+
+        mark_model_available(&model_id, "test_recovery");
+        assert!(!model_is_unavailable(&model_id));
+    }
+
+    #[test]
+    fn withdrawal_is_idempotent_per_model() {
+        let model_id = [0xb3u8; 32];
+        mark_model_unavailable(&model_id, "first");
+        mark_model_unavailable(&model_id, "second");
+        assert!(model_is_unavailable(&model_id));
+
+        mark_model_available(&model_id, "recovered");
+        mark_model_available(&model_id, "recovered_again");
+        assert!(!model_is_unavailable(&model_id));
+
+        let other = [0xc1u8; 32];
+        mark_model_unavailable(&model_id, "again");
+        assert!(!model_is_unavailable(&other));
     }
 }
