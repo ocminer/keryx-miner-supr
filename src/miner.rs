@@ -416,6 +416,11 @@ impl MinerManager {
                         // possession walk. The host builds the witness in generate_block_if_pom
                         // (host re-walk of the index). CUDA only; dormant on mainnet (gate u64::MAX).
                         let v3 = daa >= keryx_miner::pom::pom_v3_activation_daa();
+                        // AMD: at the v3 gate keep each card on its OpenCL blob (pom_mine_v3) rather
+                        // than the zero-dup Vulkan v2 walk shader (wrong for H6). No-op pre-fork / on
+                        // non-OpenCL builds.
+                        #[cfg(feature = "pom-opencl")]
+                        if v3 { pom_driver::set_v3_mode(true); }
                         // v3 grinds ~4.3 GMAC per nonce, so a full POM_BATCH of blocks is absurd —
                         // grind a small slice per launch (env KERYX_POM_V3_BATCH overrides).
                         let batch = if v3 {
@@ -474,7 +479,15 @@ impl MinerManager {
                                 }
                                 let _ = pom_driver::ensure_installed();
                             }
-                            pom_driver::mine(&pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2)
+                            // H6: at/after the pom_v3 gate the AMD GPU grinds the int8 matrix-state
+                            // walk (pom_mine_v3 OpenCL kernel, one work-group per nonce). The host
+                            // rebuilds the witness in generate_block_if_pom (byte-exact CPU re-walk),
+                            // so a kernel false-positive is dropped, not submitted.
+                            if v3 {
+                                pom_driver::mine_v3(&pph, time, &target_le, pom_nonce, batch, h3, h5_1, h5_2)
+                            } else {
+                                pom_driver::mine(&pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2)
+                            }
                         };
                         pom_nonce = pom_nonce.wrapping_add(batch);
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);
