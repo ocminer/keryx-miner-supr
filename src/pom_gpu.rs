@@ -592,8 +592,22 @@ pub fn install(device_id: u32, m: PomGpuMiner) {
 /// entry untouched. Pulled out as a tiny generic helper (over the map's value type) purely so
 /// this scoping behavior is unit-testable without a real, CUDA-backed `PomGpuMiner` — production
 /// always calls it through `uninstall` against `HashMap<u32, Arc<PomGpuMiner>>`.
-fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) {
-    map.remove(&device_id);
+fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) -> Option<T> {
+    map.remove(&device_id)
+}
+
+/// Block until `item` is the only remaining handle, or the deadline passes; returns whether the
+/// wait succeeded. Upstream aa29fd2 — drains an in-flight walk that cloned the miner Arc before we
+/// let the caller free the tensors that walk reads.
+fn wait_for_sole_owner<T>(item: &Arc<T>, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while Arc::strong_count(item) > 1 {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    true
 }
 
 /// Drop the GPU miner for `device_id` only, releasing its hold on that device's mining-model VRAM
@@ -610,8 +624,20 @@ fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) {
 /// gather index (`ensure_installed_inner`'s own doc comment calls this reload "Heavy") even though
 /// nothing about them changed.
 pub fn uninstall(device_id: u32) {
-    if let Ok(mut g) = miners().lock() {
-        remove_device_entry(&mut g, device_id);
+    let removed = match miners().lock() {
+        Ok(mut g) => remove_device_entry(&mut g, device_id),
+        Err(_) => None,
+    };
+    // BARRIER before the caller frees any VRAM this miner walks over (upstream aa29fd2): a mining
+    // thread clones the handle out of the map and launches OUTSIDE the map lock, so removing the
+    // entry does not stop an in-flight walk. Its launch synchronizes before it drops its handle, so
+    // waiting for the last handle to drop is enough. Freeing under a live walk raises a sticky
+    // CUDA_ERROR_ILLEGAL_ADDRESS that poisons the device's context for every user of it, inference
+    // included.
+    if let Some(miner) = removed {
+        if !wait_for_sole_owner(&miner, std::time::Duration::from_secs(30)) {
+            log::error!("PoM[gpu{}]: a walk still holds the miner after 30s — releasing anyway", device_id);
+        }
     }
 }
 
@@ -957,7 +983,32 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // tensors and candle hosts nothing. ensure_loaded is idempotent/cheap when already active and
     // self-disables (returns false) when no .so is present — then the candle paths below apply.
     let inference_gpu = crate::slm::inference_gpu_ordinal();
-    let mut use_llama = device_id as usize == inference_gpu && crate::llama_engine::ensure_loaded(&gguf, inference_gpu);
+    let mut use_llama = false;
+    if device_id as usize == inference_gpu {
+        use_llama = crate::llama_engine::ensure_loaded(&gguf, inference_gpu);
+        // Upstream 0795e92: only this GPU can serve the model — no engine here means no inference
+        // anywhere, so reflect that in ai:cap instead of announcing a model we cannot answer for.
+        match use_llama {
+            true => crate::slm::mark_model_available(&model_id, "llama_engine_loaded"),
+            false => crate::slm::mark_model_unavailable(&model_id, "llama_engine_load_failed"),
+        }
+    }
+    // OWNERSHIP GATE (upstream aa29fd2): the walk dereferences llama's tensor pointers on THIS
+    // device. If llama placed them on another card, the launch hits unmapped memory and raises a
+    // sticky CUDA_ERROR_ILLEGAL_ADDRESS that poisons the primary context for every user of the
+    // device, llama included — the card then loops on rebuilds until the process restarts.
+    // (Scoped `unload_for_gpu` here, vs upstream's singleton `unload`, to match our per-GPU pool.)
+    if use_llama {
+        if let Some((name, owner)) = crate::llama_engine::foreign_device_tensor(device_id as usize) {
+            log::warn!(
+                "PoM[gpu{}]: llama placed '{}' on device {} — walking a raw canonical copy; inference for this model is unavailable.",
+                device_id, name, owner
+            );
+            crate::llama_engine::unload_for_gpu(device_id as usize);
+            use_llama = false;
+            crate::slm::mark_model_unavailable(&model_id, "llama_wrong_device");
+        }
+    }
     // BYTE-COMPAT GATE: llama.cpp repacks some architectures on load (e.g. Gemma-3 materialises a
     // separate output.weight from its tied embeddings), so its resident chunk count differs from
     // the canonical GGUF the walk MUST gather and R_T pins. When that happens the zero-dup walk is
@@ -977,6 +1028,8 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 );
                 crate::llama_engine::unload_for_gpu(device_id as usize);
                 use_llama = false;
+                // Upstream 0795e92: this model's llama layout can't be served here — withdraw it.
+                crate::slm::mark_model_unavailable(&model_id, "llama_layout_incompatible");
             }
         }
     }
@@ -1055,6 +1108,46 @@ mod tests {
         assert_eq!(map.get(&1), Some(&"gpu1-miner"));
         assert_eq!(map.get(&2), Some(&"gpu2-miner"));
         assert_eq!(map.len(), 2);
+    }
+
+    // Upstream aa29fd2: the drain barrier in `uninstall`.
+    #[test]
+    fn barrier_waits_for_the_last_walk_to_release_the_miner() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let miner = Arc::new("gpu0-miner");
+        let held = Arc::clone(&miner);
+        let (tx, rx) = mpsc::channel();
+        let walker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(held);
+            let _ = tx.send(());
+        });
+
+        assert!(wait_for_sole_owner(&miner, Duration::from_secs(5)), "must wait, not give up");
+        assert_eq!(Arc::strong_count(&miner), 1);
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        walker.join().unwrap();
+    }
+
+    #[test]
+    fn barrier_gives_up_after_the_deadline_rather_than_hanging() {
+        use std::time::Duration;
+
+        let miner = Arc::new("gpu0-miner");
+        let _stuck = Arc::clone(&miner);
+
+        assert!(!wait_for_sole_owner(&miner, Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn remove_device_entry_hands_back_the_removed_miner() {
+        let mut map: HashMap<u32, &str> = HashMap::new();
+        map.insert(0, "gpu0-miner");
+
+        assert_eq!(remove_device_entry(&mut map, 0), Some("gpu0-miner"));
+        assert_eq!(remove_device_entry(&mut map, 0), None);
     }
 
     #[test]

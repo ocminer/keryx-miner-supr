@@ -100,6 +100,24 @@ bool keryx_llama_tensor_info(KeryxLlama* h, size_t i, const char** name, void** 
     return true;
 }
 
+// CUDA ordinal owning tensor i's bytes, or -1 (host memory, unified memory, unknown, or a context
+// in error). The possession walk gathers over these pointers, so it must launch on this device —
+// the Rust side (foreign_device_tensor) uses this to detect a wrong-device placement before the
+// walk dereferences unmapped memory. Optional symbol (miner looks it up soft). Upstream aa29fd2.
+int keryx_llama_tensor_device(KeryxLlama* h, size_t i) {
+#ifdef __APPLE__
+    (void)h; (void)i;
+    return -1;
+#else
+    if (!h || i >= h->names.size()) return -1;
+    const ggml_tensor* t = h->model->get_tensor(h->names[i].c_str());
+    if (!t || !t->data) return -1;
+    cudaPointerAttributes attr{};
+    if (cudaPointerGetAttributes(&attr, t->data) != cudaSuccess) return -1;
+    return attr.type == cudaMemoryTypeDevice ? attr.device : -1;
+#endif
+}
+
 // Generate up to max_tokens; writes UTF-8 into out (cap bytes, NUL-terminated). Returns written
 // length, or -1 on error. Serialized — one generation at a time (OPoI challenges are rare).
 int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
