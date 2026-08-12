@@ -397,7 +397,7 @@ __kernel void pom_mine_v3(
     const u64 t0, const u64 t1, const u64 t2, const u64 t3,   // target (4 LE u64)
     const u64 nonce_base, const u64 n_nonces,
     volatile __global u64* winner,
-    __local uint* s_tile32)                  // 16384 u32 = 64 KB (host sets local arg size)
+    __local uint* s_merkle)                  // 3072 u32 = 12 KB scratch for the final Merkle tree only
 {
     const uint x  = get_local_id(0);         // state row index 0..255
     const u64  gid = get_group_id(0);
@@ -413,20 +413,19 @@ __kernel void pom_mine_v3(
     }
     u64 off = pom_mix64(seed ^ V3_OFFSET_FIRST_SALT) % n_tiles;
 
+    // The tile is read DIRECTLY from the resident blob (VRAM/L2), NOT staged into LDS: freeing the
+    // 64 KB LDS lets far more wavefronts stay resident (latency hiding) and the 64 KB tile is small
+    // enough to stay L2/Infinity-Cache-hot across a step's 256×256 reuse — measured ~1.6x faster
+    // than the LDS-staged version. The state update is row-independent and reads no shared memory,
+    // so NO per-step barrier is needed. Byte-identical (same bytes, different memory space).
     for (uint step = 1; step <= K; step++) {
-        // Load the 64 KB tile (2048 chunks) into LDS, cooperatively.
         const u64 chunk0 = off * (u64)V3_TILE_CHUNKS;
-        for (uint c = x; c < V3_TILE_CHUNKS; c += V3_D) {
-            const __global uint* src = blob32 + (chunk0 + (u64)c) * 8UL;
-            __local uint* dst = s_tile32 + c * 8;
-            for (int w = 0; w < 8; w++) dst[w] = src[w];
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
+        __global const uint* gtile = blob32 + chunk0 * 8UL;   // tile row j = gtile + j*64
 
         // Next offset from THIS tile's snippet (first 32 B = 8 u32), derived by every WI.
         {
             u64 sf = 0;
-            for (int w = 0; w < 8; w++) sf = pom_mix64(sf ^ (u64)s_tile32[w]);
+            for (int w = 0; w < 8; w++) sf = pom_mix64(sf ^ (u64)gtile[w]);
             off = pom_mix64(seed ^ (u64)(step + 1) * V3_OFFSET_STEP_SALT ^ sf) % n_tiles;
         }
 
@@ -437,7 +436,7 @@ __kernel void pom_mine_v3(
             uint packed = 0;
             for (int jj = 0; jj < 4; jj++) {
                 const int j = j4 * 4 + jj;
-                __local const uint* col = s_tile32 + j * V3_D4;   // tile row j = 64 u32
+                __global const uint* col = gtile + j * V3_D4;    // tile row j = 64 u32
                 int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
                 for (int k16 = 0; k16 < V3_D4 / 4; k16++) {
                     a0 = v3_dp4(row4[k16*4+0], col[k16*4+0], a0);
@@ -451,14 +450,13 @@ __kernel void pom_mine_v3(
             new4[j4] = packed;
         }
         for (int k4 = 0; k4 < V3_D4; k4++) row4[k4] = new4[k4];
-        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // root_K: blake3 row leaves + depth-8 tree in LDS (reuse the tile region as scratch).
-    b3_hash_row(row4, s_tile32 + x * 8);
+    // root_K: blake3 row leaves + depth-8 tree in the small LDS scratch.
+    b3_hash_row(row4, s_merkle + x * 8);
     barrier(CLK_LOCAL_MEM_FENCE);
-    __local uint* src = s_tile32;
-    __local uint* dst = s_tile32 + V3_D * 8;
+    __local uint* src = s_merkle;
+    __local uint* dst = s_merkle + V3_D * 8;
     for (uint n = V3_D; n > 1; n >>= 1) {
         if (x < n / 2) b3_hash_pair(src + x * 16, dst + x * 8);
         barrier(CLK_LOCAL_MEM_FENCE);

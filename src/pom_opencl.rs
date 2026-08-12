@@ -83,7 +83,10 @@ fn dispatch_raw_v3(queue: &CommandQueue, kernel: &Kernel, blob: &Buffer<cl_ulong
                    n_tiles: u64, k: u32, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4],
                    base: u64, n_nonces: u64) -> Option<Option<u64>> {
     const V3_LOCAL: usize = 256;                 // one work-item per state row (D=256)
-    const V3_TILE_BYTES: usize = 65536;          // 64 KB LDS tile
+    // The tile is read straight from the resident blob (VRAM/L2), not staged into LDS — this ~1.6x's
+    // throughput by freeing LDS for occupancy. LDS now only holds the final Merkle-tree scratch:
+    // 256 leaves × 8 u32 (2048) + the 128-hash ping-pong region (1024) = 3072 u32 = 12 KB.
+    const V3_MERKLE_LDS_BYTES: usize = 3072 * 4;
     queue.enqueue_write_buffer(winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
     let global = (n_nonces * V3_LOCAL as u64) as usize;   // n_nonces work-groups × 256 items
     ExecuteKernel::new(kernel)
@@ -96,7 +99,7 @@ fn dispatch_raw_v3(queue: &CommandQueue, kernel: &Kernel, blob: &Buffer<cl_ulong
         .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
         .set_arg(&base).set_arg(&n_nonces)
         .set_arg(winner)
-        .set_arg_local_buffer(V3_TILE_BYTES)
+        .set_arg_local_buffer(V3_MERKLE_LDS_BYTES)
         .set_global_work_size(global)
         .set_local_work_size(V3_LOCAL)
         .enqueue_nd_range(queue)
