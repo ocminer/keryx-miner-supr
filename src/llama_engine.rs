@@ -22,6 +22,9 @@ type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
 type InfoFn = unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
 type FreeFn = unsafe extern "C" fn(*mut c_void);
+// CUDA ordinal owning tensor i's bytes, or -1 (host/unified/unknown). Upstream aa29fd2 — optional
+// symbol (absent on older .so builds → the ownership gate below degrades to a no-op).
+type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
 
 const ABI: c_int = 2;
 
@@ -31,6 +34,8 @@ struct Engine {
     info: InfoFn,
     generate: GenFn,
     free: FreeFn,
+    /// Optional: absent on older `libkeryx-llama.so` builds (looked up soft, gate no-ops if None).
+    tensor_device: Option<TensorDeviceFn>,
     gpu: usize,
     gguf: String,
 }
@@ -113,6 +118,8 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             log::warn!("llama engine: {} ABI {} != expected {} — candle fallback stays active.", so.display(), got, ABI);
             return None;
         }
+        // Optional (upstream aa29fd2): older .so builds lack it — the ownership gate then no-ops.
+        let tensor_device = sym::<TensorDeviceFn>(lib, "keryx_llama_tensor_device");
         let cg = CString::new(gguf).ok()?;
         log::info!("llama engine: loading {} on GPU {} via {} (in-process, zero-dup)…", gguf, gpu, so.display());
         let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
@@ -122,7 +129,7 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             return None;
         }
         log::info!("llama engine: ✓ active on GPU {} — llama.cpp hosts the model + serves OPoI inference (candle dormant).", gpu);
-        Some(Engine { model, count, info, generate: gen, free, gpu, gguf: gguf.to_string() })
+        Some(Engine { model, count, info, generate: gen, free, tensor_device, gpu, gguf: gguf.to_string() })
     }
 }
 
@@ -325,6 +332,38 @@ pub fn tensors_for(gpu: usize) -> Option<Vec<(String, u64, usize, bool)>> {
 pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> {
     let gpu = loaded_gpus().into_iter().next()?;
     tensors_for(gpu)
+}
+
+/// First resident tensor of the engine on `expected_gpu` whose bytes do NOT live on that device,
+/// as (name, owning ordinal). `None` = all device tensors are on `expected_gpu` (or the .so lacks
+/// `keryx_llama_tensor_device`, or no engine is loaded — the gate then does nothing).
+///
+/// Upstream aa29fd2: the possession walk on `expected_gpu` gathers straight over these pointers;
+/// launching the kernel on a device that does not own them dereferences unmapped memory, which
+/// raises a sticky CUDA_ERROR_ILLEGAL_ADDRESS and poisons that card's whole primary context —
+/// inference included. Adapted to our per-GPU slot pool (upstream reads the singleton engine).
+pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
+    let slot = slot_for(expected_gpu);
+    let g = slot.inner.lock().ok()?;
+    let e = g.as_ref()?;
+    let tensor_device = e.tensor_device?;
+    let n = unsafe { (e.count)(e.model) };
+    for i in 0..n {
+        let mut name: *const c_char = std::ptr::null();
+        let mut data: *mut c_void = std::ptr::null_mut();
+        let mut nbytes: usize = 0;
+        let mut is_dev: c_int = 0;
+        let ok = unsafe { (e.info)(e.model, i, &mut name, &mut data, &mut nbytes, &mut is_dev) };
+        if !ok || name.is_null() || data.is_null() || is_dev == 0 {
+            continue;
+        }
+        let owner = unsafe { tensor_device(e.model, i) };
+        if owner >= 0 && owner as usize != expected_gpu {
+            let nm = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
+            return Some((nm, owner));
+        }
+    }
+    None
 }
 
 /// Generate OPoI text on `gpu`'s engine. Serialized per-card (one generation per card at a time);
