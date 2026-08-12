@@ -137,15 +137,27 @@ impl PomMiner {
         // instruction instead of the 4-mul scalar unpack, byte-identical result. Older AMD (GCN/
         // Polaris/Vega/RDNA1/2) and Windows Adrenalin (which can reject the builtin) keep the scalar
         // path; if the dot4 build fails for any reason we retry without the define.
+        // Native int8 dot: RDNA3+/gfx11-12 use `sudot4` (dot9-insts); GCN/CDNA gfx906/908/90a (Vega20
+        // MI50, MI100, MI200) use the older `sdot4` (dot1-insts). Both are byte-identical to the scalar
+        // unpack; everything else (Polaris/RDNA1-2/Windows Adrenalin) keeps scalar. KERYX_NO_AMD_DOT4
+        // forces scalar; if the hardware-dot build fails for any reason we retry without the define.
         let dev_name = device.name().unwrap_or_default();
-        let want_dot4 = std::env::var("KERYX_NO_AMD_DOT4").is_err()
-            && (dev_name.contains("gfx11") || dev_name.contains("gfx12"));
+        let allow_dot = std::env::var("KERYX_NO_AMD_DOT4").is_err();
+        let dot_def = if !allow_dot {
+            None
+        } else if dev_name.contains("gfx11") || dev_name.contains("gfx12") {
+            Some(("sudot4 (RDNA3+ dot9-insts)", "-D USE_AMD_DOT4=1"))
+        } else if dev_name.contains("gfx906") || dev_name.contains("gfx908") || dev_name.contains("gfx90a") {
+            Some(("sdot4 (GCN/CDNA dot1-insts)", "-D USE_AMD_SDOT4=1"))
+        } else {
+            None
+        };
         let base = format!("-D POM_NC={}UL", n_chunks);
-        let opts = if want_dot4 { format!("{base} -D USE_AMD_DOT4=1") } else { base.clone() };
+        let opts = match dot_def { Some((_, d)) => format!("{base} {d}"), None => base.clone() };
         let program = match Program::create_and_build_from_source(&context, POM_SRC, &opts) {
             Ok(p) => {
-                if want_dot4 {
-                    log::info!("PoM: v3 int8 matmul using native v_dot4_i32_i8 (RDNA3+ hardware dot) on {dev_name}.");
+                if let Some((desc, _)) = dot_def {
+                    log::info!("PoM: v3 int8 matmul using native v_dot4_i32_i8 ({desc}) on {dev_name}.");
                 }
                 p
             }
