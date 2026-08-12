@@ -306,8 +306,10 @@ __kernel void pom_mine_ilp4(
 // driver only enables it on gfx11/gfx12 (dot9-insts); every other device keeps the scalar unpack
 // (identical result), and the plain rebuild-without-defines fallback covers a JIT that rejects it.
 inline int v3_dp4(uint a, uint b, int acc) {
-#ifdef USE_AMD_DOT4
-    return __builtin_amdgcn_sudot4(true, (int)a, true, (int)b, acc, false);
+#if defined(USE_AMD_DOT4)
+    return __builtin_amdgcn_sudot4(true, (int)a, true, (int)b, acc, false);   // RDNA3+/gfx11-12 (dot9-insts)
+#elif defined(USE_AMD_SDOT4)
+    return __builtin_amdgcn_sdot4((int)a, (int)b, acc, false);                // GCN/CDNA gfx906/908/90a (dot1-insts, e.g. MI50)
 #else
     acc += (int)((char)(a       & 0xff)) * (int)((char)(b       & 0xff));
     acc += (int)((char)((a >> 8) & 0xff)) * (int)((char)((b >> 8) & 0xff));
