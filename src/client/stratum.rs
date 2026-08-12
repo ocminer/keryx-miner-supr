@@ -256,6 +256,12 @@ pub struct StratumHandler {
     telemetry_req_ids: HashSet<u32>,
     /// Process start, for the telemetry `uptime_s` field.
     start_time: std::time::Instant,
+    /// The last model-id set announced to the pool via `mining.declare_capabilities`. Declare is
+    /// re-sent whenever `loaded_model_ids()` differs from this (a model finishing its load, or
+    /// `--tier auto` swapping in a bigger model), so the pool ALWAYS knows what a rig serves the
+    /// moment it can serve it. Empty until the first successful declare. Fixes the race where a rig
+    /// authorized before its model was ready declared `models:[]` and never re-announced.
+    declared_model_ids: Vec<String>,
 }
 
 /// Ref-counted PoW-pause guard. On drop it decrements the in-flight-inference counter and, when it
@@ -309,24 +315,11 @@ impl Client for StratumHandler {
             })
             .await?;
 
-        // Declare loaded SLM models so the bridge can challenge with the right model.
-        let model_ids: Vec<String> = keryx_miner::slm::loaded_model_ids()
-            .into_iter()
-            .map(|id| hex::encode(id))
-            .collect();
-        if !model_ids.is_empty() {
-            info!("OPoI: declaring {} model(s) to pool bridge", model_ids.len());
-            self.send_channel
-                .send(StratumLine {
-                    id: None,
-                    payload: StratumLinePayload::StratumCommand(
-                        StratumCommand::MiningDeclareCapabilities(model_ids),
-                    ),
-                    jsonrpc: None,
-                    error: None,
-                })
-                .await?;
-        }
+        // Declare loaded SLM models so the bridge can challenge with the right model. If no model is
+        // ready yet (still loading/streaming into VRAM at authorize time), this is a no-op here and
+        // the declare is re-attempted on every `mining.notify` — so the pool learns what this rig
+        // serves the instant the model is ready, not just if it happened to be ready at authorize.
+        self.declare_capabilities_if_changed().await?;
 
         // Miner telemetry (v0.7.0): STATIC rig identity, sent ONCE. Best-effort & non-fatal — if the
         // pool doesn't support it, it replies error 20 (handled in handle_message → telemetry_on=false
@@ -456,6 +449,45 @@ impl Client for StratumHandler {
 }
 
 impl StratumHandler {
+    /// Announce the currently-ready SLM models to the pool via `mining.declare_capabilities`, but
+    /// ONLY when the ready set has changed since the last announcement. Called at authorize AND on
+    /// every `mining.notify` — so the moment a model finishes loading (or `--tier auto` swaps in a
+    /// bigger one) the pool is told, without spamming an identical declaration each job. The pool
+    /// MUST know what a rig serves as soon as it can serve it: a rig that authorized before its
+    /// model was ready used to declare `models:[]` once and never correct it. Best-effort/non-fatal.
+    async fn declare_capabilities_if_changed(&mut self) -> Result<(), Error> {
+        let model_ids: Vec<String> = keryx_miner::slm::loaded_model_ids()
+            .into_iter()
+            .map(hex::encode)
+            .collect();
+        if model_ids == self.declared_model_ids {
+            return Ok(()); // no change — don't re-spam the pool
+        }
+        // Only announce a non-empty set (an empty declare tells the pool nothing useful and would
+        // churn while a model is still loading). Once we HAVE declared, a later drop to empty is
+        // left as-is until a real model is ready again.
+        if model_ids.is_empty() {
+            return Ok(());
+        }
+        info!(
+            "OPoI: declaring {} model(s) to pool bridge ({})",
+            model_ids.len(),
+            model_ids.iter().map(|m| &m[..8.min(m.len())]).collect::<Vec<_>>().join(",")
+        );
+        self.send_channel
+            .send(StratumLine {
+                id: None,
+                payload: StratumLinePayload::StratumCommand(StratumCommand::MiningDeclareCapabilities(
+                    model_ids.clone(),
+                )),
+                jsonrpc: None,
+                error: None,
+            })
+            .await?;
+        self.declared_model_ids = model_ids;
+        Ok(())
+    }
+
     pub async fn connect(
         address: String,
         miner_address: String,
@@ -562,6 +594,7 @@ impl StratumHandler {
             telemetry_on: keryx_miner::telemetry::enabled(),
             telemetry_req_ids: HashSet::new(),
             start_time: std::time::Instant::now(),
+            declared_model_ids: Vec::new(),
         }))
     }
 
@@ -842,6 +875,9 @@ impl StratumHandler {
                                 }
                                 return miner.process_block(None).await;
                             }
+                            // Models are ready and we are about to mine — make sure the pool knows
+                            // which models this rig serves (re-declares only if the set changed).
+                            self.declare_capabilities_if_changed().await?;
                             // The task arrives as a JSON object (locked contract); a legacy
                             // double-encoded JSON string is unwrapped so handle_ai_task's
                             // `from_str` sees the object either way.
@@ -894,6 +930,8 @@ impl StratumHandler {
                                 }
                                 return miner.process_block(None).await;
                             }
+                            // Models ready + about to mine — keep the pool's view of served models current.
+                            self.declare_capabilities_if_changed().await?;
                             // No AiRequest in this job — clear the task slot.
                             *self.current_task_slot.lock().await = None;
                             miner
@@ -963,6 +1001,8 @@ impl StratumHandler {
                                 }
                                 return miner.process_block(None).await;
                             }
+                            // Models ready + about to mine — keep the pool's view of served models current.
+                            self.declare_capabilities_if_changed().await?;
                             *self.current_task_slot.lock().await = None;
                             miner
                                 .process_block(Some(PartialBlock {
