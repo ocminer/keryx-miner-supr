@@ -299,12 +299,22 @@ __kernel void pom_mine_ilp4(
 #define V3_OFFSET_STEP_SALT  0xD4C194F3ADB3B1C7UL
 
 // signed int8×int8 dot of 4 packed bytes (byte-exact with CUDA __dp4a.s32).
+// USE_AMD_DOT4: RDNA3+/CDNA native `v_dot4_i32_i8` (__builtin_amdgcn_sudot4, signed×signed, no
+// saturation) — 1 instruction vs the 4-mul unpack, so the matmul (the walk's hot loop) runs several
+// times faster. Byte-EXACT with the scalar path: signed int8 terms can't overflow i32 (max per
+// accumulator over the 64 dp4 calls ≈ 4.2M ≪ 2^31), so clamp=false wraparound never triggers. The
+// driver only enables it on gfx11/gfx12 (dot9-insts); every other device keeps the scalar unpack
+// (identical result), and the plain rebuild-without-defines fallback covers a JIT that rejects it.
 inline int v3_dp4(uint a, uint b, int acc) {
+#ifdef USE_AMD_DOT4
+    return __builtin_amdgcn_sudot4(true, (int)a, true, (int)b, acc, false);
+#else
     acc += (int)((char)(a       & 0xff)) * (int)((char)(b       & 0xff));
     acc += (int)((char)((a >> 8) & 0xff)) * (int)((char)((b >> 8) & 0xff));
     acc += (int)((char)((a >>16) & 0xff)) * (int)((char)((b >>16) & 0xff));
     acc += (int)((char)((a >>24) & 0xff)) * (int)((char)((b >>24) & 0xff));
     return acc;
+#endif
 }
 
 // v3_rho8 (pom_v3.rs rho8): finalizer -> low byte.
