@@ -21,6 +21,9 @@ include = [
 ]
 
 [dependencies]
+# Cached-tree authentication (upstream e69461d): SHA-256 the possession tree + atomic sidecar write.
+sha2 = "0.10"
+tempfile = "3"
 tonic = "0.8"
 tokio = { version = "1.17", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
 prost = "0.11"

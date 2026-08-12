@@ -623,7 +623,7 @@ fn model_plus_blob_fits(device_id: usize, blob_bytes: u64) -> bool {
         .lock()
         .unwrap()
         .as_ref()
-        .and_then(|(path, _)| std::fs::metadata(path).ok().map(|m| m.len()))
+        .and_then(|(_, path, _)| std::fs::metadata(path).ok().map(|m| m.len()))
         .unwrap_or(6 << 30); // unknown → assume a big model (conservative: prefer unloading)
     let Ok(total) = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id).global_mem_size() else {
         return false;
@@ -809,12 +809,13 @@ pub fn gpu0_global_mem_mb() -> Option<u64> {
 
 /// Registered mining tier (GGUF path, tier index). Set once at startup via set_mining_tier;
 /// the first PoM-active job lazily builds the index + GPU residency via ensure_installed.
-static TIER: Mutex<Option<(String, u8)>> = Mutex::new(None);
+static TIER: Mutex<Option<([u8; 32], String, u8)>> = Mutex::new(None);
 
-/// Register the tier to mine (GGUF path on disk, POM_TIERS index). Cheap — no I/O. The heavy
-/// load_tier (build the Merkle tree + upload the blob) runs lazily on the first PoM-active job.
-pub fn set_mining_tier(gguf_path: String, tier: u8) {
-    *TIER.lock().unwrap() = Some((gguf_path, tier));
+/// Register the tier to mine (model id, GGUF path on disk, POM_TIERS index). Cheap — no I/O. The
+/// heavy load_tier (build the Merkle tree + upload the blob) runs lazily on the first PoM-active job.
+/// `model_id` binds the cached `pom-tree.bin` sidecar to this model (upstream e69461d).
+pub fn set_mining_tier(model_id: [u8; 32], gguf_path: String, tier: u8) {
+    *TIER.lock().unwrap() = Some((model_id, gguf_path, tier));
 }
 
 /// Serializes the one-time tier build so concurrent first-time callers (the PoM loop runs one
@@ -826,12 +827,12 @@ static BUILD_LOCK: Mutex<()> = Mutex::new(());
 /// Build the shared proof-side WeightIndex from a GGUF, once. Idempotent — returns immediately
 /// if it already exists. Caller must hold BUILD_LOCK. This is the heavy, card-independent work
 /// (CPU/disk); the per-card VRAM upload streams from this index in install_resident().
-fn ensure_index(gguf_path: &str, tier: u8) -> Result<(), String> {
+fn ensure_index(model_id: [u8; 32], gguf_path: &str, tier: u8) -> Result<(), String> {
     if crate::pom::active_index().is_some() {
         return Ok(());
     }
     log::info!("PoM: building WeightIndex from {gguf_path} (tier {tier})…");
-    let mut index = crate::pom::WeightIndex::build_from_gguf(gguf_path).map_err(|e| e.to_string())?;
+    let mut index = crate::pom::WeightIndex::build_from_gguf(gguf_path, model_id).map_err(|e| e.to_string())?;
     log::info!(
         "PoM: tier {tier} loaded — {} chunks, computed R_T = {} (must match the node's pinned root)",
         index.n_chunks,
@@ -883,7 +884,7 @@ pub fn ensure_installed() {
         }
     }
     let tier = TIER.lock().unwrap().clone();
-    let (path, t) = match tier {
+    let (model_id, path, t) = match tier {
         Some(pt) => pt,
         None => {
             log::warn!("PoM: no mining tier registered (set_mining_tier not called).");
@@ -898,7 +899,7 @@ pub fn ensure_installed() {
         // startup (issue #9). Concurrent streams cost ~one disk pass total — the page cache
         // serves the followers.
         let _build = BUILD_LOCK.lock().unwrap();
-        if let Err(e) = ensure_index(&path, t) {
+        if let Err(e) = ensure_index(model_id, &path, t) {
             log::warn!("PoM: tier build failed ({path}): {e} — is the model GGUF downloaded?");
             return;
         }
@@ -988,7 +989,9 @@ pub fn mine_v3(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64,
 /// resident on the FIRST OpenCL GPU. The multi-GPU production path uses ensure_installed (one
 /// resident copy per card); this single-device form backs the tests + any non-bound caller.
 pub fn load_tier(gguf_path: &str, tier: u8) -> Result<(), String> {
-    ensure_index(gguf_path, tier)?;
+    // Non-bound/test entry: no model id at hand, so the cache is bound to the zero id and any
+    // production (set_mining_tier) tree for a real model is treated as foreign and rebuilt.
+    ensure_index([0u8; 32], gguf_path, tier)?;
     let id = opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU)
         .map_err(|e| e.to_string())?
         .first()

@@ -1037,9 +1037,10 @@ async fn run() -> Result<(), Error> {
         if keryx_miner::pom::passthrough_enabled() {
             warn!("PoM: PASSTHROUGH mode (KERYX_POM_PASSTHROUGH) — kHeavyHash shares will carry a PomProof for the pre-fork wire test.");
             let gpath_pt = gpath.clone();
+            let model_id_pt = spec.model_id;
             std::thread::spawn(move || {
                 info!("PoM passthrough: building host possession index for proof attachment…");
-                match keryx_miner::pom::WeightIndex::build_from_gguf(&gpath_pt) {
+                match keryx_miner::pom::WeightIndex::build_from_gguf(&gpath_pt, model_id_pt) {
                     Ok(idx) => {
                         info!("PoM passthrough: index ready — N={} chunks; shares now carry a proof.", idx.n_chunks);
                         keryx_miner::pom::set_index(idx, tier_idx);
@@ -1165,7 +1166,7 @@ async fn run() -> Result<(), Error> {
             });
         }
         #[cfg(feature = "pom-opencl")]
-        keryx_miner::pom_opencl::set_mining_tier(gpath, tier_idx);
+        keryx_miner::pom_opencl::set_mining_tier(spec.model_id, gpath, tier_idx);
         #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
         {
             // Force the single-device split loader so the mining tier exposes its quant tensors
