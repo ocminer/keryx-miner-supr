@@ -107,14 +107,34 @@ int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char
     std::lock_guard<std::mutex> g(h->gen_lock);
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
 
-    std::vector<llama_token> toks(strlen(prompt) + 16);
-    int n = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt), toks.data(), (int32_t)toks.size(), true, true);
+    // Apply the model's chat template so the model sees a proper USER turn and stops at the end of
+    // ITS reply. Without this the raw prompt is treated as free text: the small tier-0 models never
+    // reach a turn boundary, so they hallucinate a whole fake "user:/assistant:" conversation and
+    // ramble until max_tokens (the EOG check below never fires because the model doesn't think it
+    // finished a turn). With the template the model emits its end-of-turn token (e.g. <|im_end|>),
+    // which IS an EOG token → clean stop. Falls back to the raw prompt if the GGUF has no template.
+    std::string formatted;
+    if (const char* tmpl = llama_model_chat_template(h->model, nullptr)) {
+        llama_chat_message msg{ "user", prompt };
+        int need = llama_chat_apply_template(tmpl, &msg, 1, /*add_ass=*/true, nullptr, 0);
+        if (need > 0) {
+            formatted.resize((size_t)need);
+            int wrote = llama_chat_apply_template(tmpl, &msg, 1, true, &formatted[0], need);
+            if (wrote > 0) formatted.resize((size_t)wrote); else formatted.clear();
+        }
+    }
+    const char* infer = formatted.empty() ? prompt : formatted.c_str();
+    const int infer_len = (int)strlen(infer);
+
+    std::vector<llama_token> toks(infer_len + 16);
+    int n = llama_tokenize(vocab, infer, infer_len, toks.data(), (int32_t)toks.size(), true, true);
     if (n < 0) return -1;
     toks.resize(n);
 
     llama_memory_clear(llama_get_memory(h->ctx), true);
     llama_batch batch = llama_batch_get_one(toks.data(), (int32_t)toks.size());
     int written = 0;
+    std::string acc; // mirrors `out` for cross-piece stop-string scanning
     for (int i = 0; i < max_tokens; i++) {
         if (llama_decode(h->ctx, batch) != 0) break;
         llama_token tok = llama_sampler_sample(h->smpl, h->ctx, -1);
@@ -125,6 +145,17 @@ int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char
         if (written + pn >= cap - 1) break;
         memcpy(out + written, piece, pn);
         written += pn;
+        // Fallback for models that write the turn-end marker as PLAIN TEXT (multi-token, not an
+        // atomic EOG token) and roll into a hallucinated next turn — cut at the first such marker so
+        // the answer ends cleanly even when EOG never fires. Only unambiguous chat template markers
+        // (never valid answer content), so this can't truncate a legitimate reply.
+        acc.append(piece, (size_t)pn);
+        static const char* const STOPS[] = {
+            "<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|end_of_text|>", "<|endoftext|>",
+        };
+        size_t cut = std::string::npos;
+        for (const char* s : STOPS) { size_t p = acc.find(s); if (p < cut) cut = p; }
+        if (cut != std::string::npos) { written = (int)cut; break; }
         batch = llama_batch_get_one(&tok, 1);
     }
     out[written] = 0;
