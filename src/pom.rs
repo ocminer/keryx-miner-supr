@@ -762,21 +762,30 @@ impl Drop for WeightIndex {
 #[derive(BorshSerialize, BorshDeserialize)]
 struct PomTreeMeta {
     version: u32,
+    /// The model this tree was built from (upstream e69461d). On reuse we require this to equal the
+    /// model the miner is currently serving, so a tree built for a DIFFERENT tier/model — e.g. a
+    /// stale or poisoned `pom-tree.bin` served over a SHARED NFS mount — is rebuilt, never trusted.
+    model_id: [u8; 32],
     /// GGUF length + mtime — if either differs from the live file, the cache is stale → rebuild.
     gguf_len: u64,
     gguf_mtime: i64,
     n_chunks: u64,
     r_t: [u8; 32],
     total_levels: u32,
+    /// SHA-256 of the ENTIRE `pom-tree.bin` bytes (upstream e69461d). Reuse verifies the whole tree,
+    /// not just the root, so a corrupted/tampered checkpoint level (correct root, wrong interior) is
+    /// caught before we mine on it. Full-file hash = one sequential read of the tree at startup.
+    tree_sha256: [u8; 32],
     /// Flattened `ChunkSource::Gguf` table: (first-chunk index, gguf byte offset) pairs.
     table: Vec<u64>,
     /// Flattened sparse `checkpoints`: (level, byte offset, node count) triples.
     checkpoints: Vec<u64>,
 }
 
-/// v2 = sparse checkpoint tree (was v1 = dense all-levels tree). Bumping this invalidates every
-/// legacy dense `pom-tree.bin` → it is rebuilt as a tiny sparse tree (and the huge old file deleted).
-const POM_TREE_CACHE_VERSION: u32 = 2;
+/// v2 = sparse checkpoint tree (was v1 = dense all-levels tree). v3 (upstream e69461d) adds
+/// model-id binding + full-tree SHA-256 to the sidecar — bumping invalidates every legacy
+/// unauthenticated `pom-tree.bin`/`.meta` so it is rebuilt with the authenticated sidecar.
+const POM_TREE_CACHE_VERSION: u32 = 3;
 
 /// A build lock older than this with no published tree is treated as abandoned (a crashed builder).
 const POM_TREE_LOCK_STALE_SECS: u64 = 90 * 60;
@@ -799,13 +808,17 @@ fn pom_tree_lock_is_stale(lock_path: &std::path::Path) -> bool {
 }
 
 /// Write the meta sentinel (atomically, via a temp + rename) AFTER the tree is fully on disk.
+/// `model_id` binds the sidecar to the model the tree was built from (upstream e69461d); the
+/// full-tree SHA-256 is computed here over the just-published `idx.tree_path`.
 fn write_pom_tree_meta(
     meta_path: &std::path::Path,
     gguf_path: &str,
+    model_id: [u8; 32],
     idx: &WeightIndex,
     table: &[(u64, u64)],
 ) -> std::io::Result<()> {
     let gm = std::fs::metadata(gguf_path)?;
+    let tree_sha256 = crate::integrity::sha256_file(&idx.tree_path, |_, _| {})?;
     let mut tflat = Vec::with_capacity(table.len() * 2);
     for &(a, b) in table {
         tflat.push(a);
@@ -819,11 +832,13 @@ fn write_pom_tree_meta(
     }
     let meta = PomTreeMeta {
         version: POM_TREE_CACHE_VERSION,
+        model_id,
         gguf_len: gm.len(),
         gguf_mtime: pom_tree_mtime_secs(&gm),
         n_chunks: idx.n_chunks,
         r_t: idx.r_t,
         total_levels: idx.total_levels,
+        tree_sha256,
         table: tflat,
         checkpoints: cflat,
     };
@@ -885,7 +900,7 @@ impl WeightIndex {
     /// Build from a GGUF on disk (CPU dtoh of each tensor). The bytes are candle's exact quantized
     /// bytes — the same the miner serves in VRAM and the builder pinned in `R_T`. The Merkle tree
     /// is streamed to a temp file next to the GGUF (disk, never tmpfs) so big tiers don't OOM.
-    pub fn build_from_gguf(path: &str) -> candle_core::Result<Self> {
+    pub fn build_from_gguf(path: &str, model_id: [u8; 32]) -> candle_core::Result<Self> {
         let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
         let cache_path = dir.join("pom-tree.bin");
         let meta_path = dir.join("pom-tree.meta");
@@ -897,7 +912,7 @@ impl WeightIndex {
         // previous run). Reuse it read-only — ONE physical copy shared via the OS page cache across
         // all GPUs, and NO rebuild on restart. (Was: pom-tree-<PID>.bin = one identical copy + a full
         // rebuild PER process PER restart → N× host RAM, which OOM'd the 4th GPU under WSL's cap.)
-        if let Some(idx) = Self::reuse_cached_tree(&cache_path, &meta_path, path) {
+        if let Some(idx) = Self::reuse_cached_tree(&cache_path, &meta_path, path, model_id) {
             log::info!("PoM: reusing cached possession tree {} — shared across GPUs, no rebuild.", cache_path.display());
             return Ok(idx);
         }
@@ -909,7 +924,7 @@ impl WeightIndex {
         use std::time::{Duration, Instant};
         let deadline = Instant::now() + Duration::from_secs(POM_TREE_LOCK_STALE_SECS);
         loop {
-            if let Some(idx) = Self::reuse_cached_tree(&cache_path, &meta_path, path) {
+            if let Some(idx) = Self::reuse_cached_tree(&cache_path, &meta_path, path, model_id) {
                 log::info!("PoM: cached possession tree became available — reusing (no rebuild).");
                 return Ok(idx);
             }
@@ -922,7 +937,7 @@ impl WeightIndex {
                         Ok((mut idx, table)) => match std::fs::rename(&tmp, &cache_path) {
                             Ok(()) => {
                                 idx.tree_path = cache_path.clone();
-                                if let Err(e) = write_pom_tree_meta(&meta_path, path, &idx, &table) {
+                                if let Err(e) = write_pom_tree_meta(&meta_path, path, model_id, &idx, &table) {
                                     log::warn!("PoM: tree built but meta sidecar write failed ({e}); other GPUs will rebuild.");
                                 }
                                 Ok(idx)
@@ -1070,10 +1085,17 @@ impl WeightIndex {
     /// Reconstruct a byte-identical `WeightIndex` from an existing shared cache + meta sidecar, or
     /// `None` if the cache is absent/stale/corrupt (→ caller rebuilds). Validated FOUR ways: cache
     /// version, GGUF length+mtime, tree-file size, and the on-disk root hash == the meta's `r_t`.
-    fn reuse_cached_tree(cache_path: &std::path::Path, meta_path: &std::path::Path, gguf_path: &str) -> Option<Self> {
+    fn reuse_cached_tree(cache_path: &std::path::Path, meta_path: &std::path::Path, gguf_path: &str, expected_model_id: [u8; 32]) -> Option<Self> {
         let bytes = std::fs::read(meta_path).ok()?;
         let meta = PomTreeMeta::try_from_slice(&bytes).ok()?;
         if meta.version != POM_TREE_CACHE_VERSION {
+            return None;
+        }
+        // Upstream e69461d: the sidecar must name the SAME model we are serving. Over a shared NFS
+        // mount a `pom-tree.bin` built for another tier (or swapped in) would otherwise be trusted
+        // solely on gguf len/mtime; the model-id binding rebuilds instead.
+        if meta.model_id != expected_model_id {
+            log::warn!("PoM: cached tree was built for a different model — rebuilding.");
             return None;
         }
         let gm = std::fs::metadata(gguf_path).ok()?;
@@ -1102,6 +1124,20 @@ impl WeightIndex {
         read_exact_at(&tree_file, &mut root_hash, root.offset).ok()?;
         if root_hash != meta.r_t {
             return None; // integrity mismatch — never mine on a corrupt tree
+        }
+        // Upstream e69461d: authenticate the ENTIRE tree, not just the root — a tampered interior
+        // checkpoint level (valid root, wrong nodes) would otherwise produce bad Merkle paths. One
+        // sequential read of the tree at startup; over NFS this also detects a torn/partial mirror.
+        match crate::integrity::sha256_file(cache_path, |_, _| {}) {
+            Ok(digest) if digest == meta.tree_sha256 => {}
+            Ok(_) => {
+                log::warn!("PoM: cached tree SHA-256 mismatch — rebuilding.");
+                return None;
+            }
+            Err(e) => {
+                log::warn!("PoM: could not hash cached tree ({e}) — rebuilding.");
+                return None;
+            }
         }
         let gguf = File::open(gguf_path).ok()?;
         Some(WeightIndex {
@@ -1971,7 +2007,7 @@ mod tests {
             eprintln!("skip: GGUF not found at {path}");
             return;
         }
-        let idx = WeightIndex::build_from_gguf(path).expect("build index from real GGUF");
+        let idx = WeightIndex::build_from_gguf(path, [0u8; 32]).expect("build index from real GGUF");
         eprintln!("real model index: N={} chunks", idx.n_chunks);
         let (k, t) = (POM_WALK_STEPS, POM_OPENINGS);
         let pph = [3u8; 32];
@@ -2044,7 +2080,7 @@ mod tests {
     #[ignore = "needs Gemma-3-4B GGUF on disk"]
     fn weight_index_matches_pinned_gemma() {
         let path = std::env::var("KERYX_GEMMA_GGUF").unwrap_or_else(|_| "/home/slash/KERYX-KRX/claude/keryx-miner/target/release/models/Gemma-3-4B/model.gguf".to_string());
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index");
         assert_eq!(idx.n_chunks, 77_604_776, "chunk count must match pinned GEMMA_3_4B_POM_CHUNKS");
         let pinned: [u8; 32] = [
             0x84, 0x6c, 0xaa, 0x40, 0x0c, 0xf0, 0x14, 0x13, 0x21, 0x18, 0x49, 0x5d, 0x22, 0xe4, 0xbf, 0xa2,
@@ -2068,7 +2104,7 @@ mod tests {
     #[ignore = "needs Gemma-3-4B GGUF on disk"]
     fn h3_end_to_end_real_model() {
         let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index");
         assert_eq!(idx.n_chunks, 77_604_776);
         let pph = blake(b"h3-real-gemma-end-to-end");
         let ts = 1_700_000_000u64;
@@ -2089,7 +2125,7 @@ mod tests {
     #[ignore = "needs Gemma-3-4B GGUF on disk; emits /tmp/POM_SAMPLE_submit.json"]
     fn emit_canonical_pom_sample() {
         let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index");
         assert_eq!(idx.n_chunks, 77_604_776);
         let pph: [u8; 32] = [
             0x4d, 0x27, 0xef, 0x7d, 0x41, 0xb8, 0x1e, 0xd8, 0xf8, 0xef, 0xe0, 0xca, 0x6f, 0xf2, 0xa7, 0x7a,
@@ -2117,7 +2153,7 @@ mod tests {
     #[cfg(all(feature = "pom-opencl", unix))]
     fn gpu_real_tier_end_to_end_llama_vk() {
         let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index");
         assert_eq!(idx.n_chunks, 77_604_776, "Gemma-3-4B tier N must be 77,604,776");
         let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         assert!(crate::llama_engine_vk::ensure_loaded(&path, gpu), "engine load failed (.so present? VRAM?)");
@@ -2164,7 +2200,7 @@ mod tests {
     #[cfg(all(feature = "pom-opencl", unix))]
     fn gpu_walk_v2_opencl_matches_cpu() {
         let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index");
         let pph = blake(b"gpu-real-e2e"); // same pph/target as gpu_real_tier_end_to_end (v1 winner = 9559)
         let time = 1_700_000_000u64;
         let mut target = [0xffu8; 32];
@@ -2199,7 +2235,7 @@ mod tests {
     #[cfg(all(feature = "pom-opencl", unix))]
     fn gpu_walk_v2_llama_vk_matches_cpu() {
         let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index");
         let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         assert!(crate::llama_engine_vk::ensure_loaded(&path, gpu), "engine load failed (.so present? VRAM?)");
         assert!(crate::llama_engine_vk::pom_ready(), "engine walk not ready");
@@ -2235,7 +2271,7 @@ mod tests {
     #[cfg(all(feature = "pom-opencl", unix))]
     fn gpu_h5_1_seed_opencl_matches_cpu() {
         let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index");
         let pph = blake(b"gpu-real-e2e");
         let time = 1_700_000_000u64;
         let mut target = [0xffu8; 32];
@@ -2289,7 +2325,7 @@ mod tests {
     #[cfg(all(feature = "pom-opencl", unix))]
     fn gpu_h5_1_seed_llama_vk_matches_cpu() {
         let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index");
         let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         assert!(crate::llama_engine_vk::ensure_loaded(&path, gpu), "engine load failed (.so present? vk_abi 5?)");
         assert!(crate::llama_engine_vk::pom_ready(), "engine walk not ready");
@@ -2326,7 +2362,7 @@ mod tests {
     #[cfg(all(feature = "pom-opencl", unix))]
     fn gpu_h5_2_seed_opencl_matches_cpu() {
         let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index");
         let pph = blake(b"gpu-real-e2e");
         let time = 1_700_000_000u64;
         let mut target = [0xffu8; 32];
@@ -2359,7 +2395,7 @@ mod tests {
     #[cfg(all(feature = "pom-opencl", unix))]
     fn gpu_h5_2_seed_llama_vk_matches_cpu() {
         let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index");
         let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         assert!(crate::llama_engine_vk::ensure_loaded(&path, gpu), "engine load failed (.so present? vk_abi 5?)");
         assert!(crate::llama_engine_vk::pom_ready(), "engine walk not ready");
@@ -2496,7 +2532,7 @@ mod tests {
     fn gpu_real_tier_end_to_end_cuda() {
         let path = std::env::var("KERYX_GEMMA_GGUF").expect("set KERYX_GEMMA_GGUF");
         // Proof side: WeightIndex from the GGUF (canonical chunks + Merkle root).
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index");
         let pinned_rt: [u8; 32] = [
             0x84, 0x6c, 0xaa, 0x40, 0x0c, 0xf0, 0x14, 0x13, 0x21, 0x18, 0x49, 0x5d, 0x22, 0xe4,
             0xbf, 0xa2, 0x42, 0x45, 0x4e, 0xac, 0x0d, 0x83, 0x5c, 0x3f, 0x8e, 0x63, 0x47, 0xd0,
@@ -2542,7 +2578,7 @@ mod tests {
     #[cfg(feature = "pom-cuda")]
     fn gpu_real_tier_qwen3_cuda() {
         let path = std::env::var("KERYX_QWEN3_GGUF").expect("set KERYX_QWEN3_GGUF");
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index");
         // Node-pinned tier-2 (Qwen3-32B) invariants.
         let pinned_rt: [u8; 32] = [
             0xe2, 0xaa, 0x66, 0x59, 0xaa, 0xb4, 0x38, 0x7e, 0xb5, 0xfd, 0x79, 0x40, 0x9c, 0x0a,
@@ -2732,7 +2768,7 @@ mod tests {
     fn emit_h4_v2_proof() {
         let path = std::env::var("KERYX_H4_GGUF").expect("set KERYX_H4_GGUF to the H4 model.gguf");
         let tier: u8 = std::env::var("KERYX_H4_TIER").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let idx = WeightIndex::build_from_gguf(&path).expect("build index from H4 GGUF");
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).expect("build index from H4 GGUF");
 
         // Synthetic-but-deterministic header inputs (NOT a real chain header). H4 era → H3 salt ON.
         let h3 = true;

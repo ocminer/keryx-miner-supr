@@ -3,6 +3,7 @@ use libloading::{Library, Symbol};
 
 pub mod gguf;
 pub mod inference;
+pub mod integrity;
 pub mod models;
 pub mod slm;
 /// Stratum miner-telemetry (mining.hello / mining.telemetry) — display/ops only, best-effort.

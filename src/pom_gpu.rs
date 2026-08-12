@@ -909,7 +909,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 None => return false,
             };
             info!("PoM: building host weight index (gpu{}) — this can take a while…", device_id);
-            match crate::pom::WeightIndex::build_from_gguf(&gguf) {
+            match crate::pom::WeightIndex::build_from_gguf(&gguf, model_id) {
                 Ok(mut idx) => {
                     // Opt-in solo block-race edge (upstream 7a6e7a0): hold the FULL Merkle tree in
                     // RAM so the post-hit proof build is a pure lookup instead of a ~30-40 ms

@@ -612,7 +612,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 None => return false,
             };
             info!("PoM Metal: building shared host weight index (gpu{}) — this can take a while…", device_id);
-            match crate::pom::WeightIndex::build_from_gguf(gguf) {
+            match crate::pom::WeightIndex::build_from_gguf(gguf, *model_id) {
                 Ok(idx) => {
                     info!("PoM Metal: shared host index ready — N={} chunks", idx.n_chunks);
                     crate::pom::set_index(idx, tier);
@@ -742,7 +742,7 @@ mod tests {
 
         // Build the host WeightIndex (reuses pom-tree.bin next to the GGUF if present).
         eprintln!("building host WeightIndex from {gguf} (may reuse pom-tree.bin)…");
-        let idx = pom::WeightIndex::build_from_gguf(&gguf).expect("host index");
+        let idx = pom::WeightIndex::build_from_gguf(&gguf, [0u8; 32]).expect("host index");
         eprintln!("host index: N = {} chunks", idx.n_chunks);
 
         // Production loader — packs raw GGUF bytes into ONE MTLBuffer, no candle Metal touch.
