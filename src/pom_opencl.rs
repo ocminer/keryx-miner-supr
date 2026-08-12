@@ -21,6 +21,8 @@ pub struct PomMiner {
     _context: Arc<Context>,
     queue: CommandQueue,
     kernel: Kernel,
+    /// H6 PoM v3 matrix-state walk kernel (one work-group per nonce). Grinds the int8 D×D×K matmul.
+    kernel_v3: Kernel,
     weights: Vec<Buffer<cl_ulong>>,
     slab_shift: u32,
     winner: Buffer<cl_ulong>,
@@ -72,6 +74,39 @@ fn dispatch_raw(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulon
     Some(if w[0] != u64::MAX { Some(w[0]) } else { None })
 }
 
+/// H6 PoM v3 dispatch: ONE work-group per nonce, `local`=256 work-items (one per state row x).
+/// The whole tier blob is a SINGLE contiguous cl_mem reinterpreted as `uint*` (chunk idx ->
+/// blob32[idx*8]); a 64 KB `__local` tile is set via set_arg_local_buffer. `n_nonces` == number
+/// of work-groups. Blocks until complete. Same return convention as dispatch_raw.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_raw_v3(queue: &CommandQueue, kernel: &Kernel, blob: &Buffer<cl_ulong>, winner: &mut Buffer<cl_ulong>,
+                   n_tiles: u64, k: u32, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4],
+                   base: u64, n_nonces: u64) -> Option<Option<u64>> {
+    const V3_LOCAL: usize = 256;                 // one work-item per state row (D=256)
+    const V3_TILE_BYTES: usize = 65536;          // 64 KB LDS tile
+    queue.enqueue_write_buffer(winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
+    let global = (n_nonces * V3_LOCAL as u64) as usize;   // n_nonces work-groups × 256 items
+    ExecuteKernel::new(kernel)
+        .set_arg(blob)
+        .set_arg(&n_tiles)
+        .set_arg(&k)
+        .set_arg(&pph[0]).set_arg(&pph[1]).set_arg(&pph[2]).set_arg(&pph[3])
+        .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
+        .set_arg(&time)
+        .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
+        .set_arg(&base).set_arg(&n_nonces)
+        .set_arg(winner)
+        .set_arg_local_buffer(V3_TILE_BYTES)
+        .set_global_work_size(global)
+        .set_local_work_size(V3_LOCAL)
+        .enqueue_nd_range(queue)
+        .ok()?;
+    queue.finish().ok()?;
+    let mut w = [u64::MAX];
+    queue.enqueue_read_buffer(winner, CL_BLOCKING, 0, &mut w, &[]).ok()?;
+    Some(if w[0] != u64::MAX { Some(w[0]) } else { None })
+}
+
 /// Staging window for the VRAM upload: 2^22 chunks × 32 B = 128 MiB. The blob is streamed
 /// GGUF → window → cl_mem, so no full host copy of the tier ever exists (the old design cached
 /// the whole blob in system RAM — ~2.5 GB for Gemma, ~28 GB for the 70B tier). Cards stream
@@ -109,6 +144,7 @@ impl PomMiner {
         let kernel = Kernel::create(&program, "pom_mine").map_err(|e| e.to_string())?;
         let kernel_ilp2 = Kernel::create(&program, "pom_mine_ilp2").map_err(|e| e.to_string())?;
         let kernel_ilp4 = Kernel::create(&program, "pom_mine_ilp4").map_err(|e| e.to_string())?;
+        let kernel_v3 = Kernel::create(&program, "pom_mine_v3").map_err(|e| e.to_string())?;
         // worker.rs pattern: a context ref that outlives the borrow checker (Arc kept in struct).
         let cref = unsafe { Arc::as_ptr(&context).as_ref().unwrap() };
         // The whole tier blob lives in ONE cl_mem. AMD caps a single allocation at
@@ -230,7 +266,7 @@ impl PomMiner {
             best_name, best_ilp, best_local, best_rate / 1e6,
             if pin_ilp.is_some() || pin_local.is_some() { " [env-pinned]" } else { "" },
         );
-        Ok(Self { _context: context, queue, kernel: chosen, weights, slab_shift, winner, n_chunks, ilp: best_ilp, local: best_local })
+        Ok(Self { _context: context, queue, kernel: chosen, kernel_v3, weights, slab_shift, winner, n_chunks, ilp: best_ilp, local: best_local })
     }
 
     /// Create + stream the blob as ceil(n_chunks / 2^shift) buffers (shift>=63 = one buffer).
@@ -287,7 +323,46 @@ impl PomMiner {
         }
         None
     }
+
+    /// H6 (PoM v3): grind `batch` nonces from `nonce_base` through the int8 matrix-state walk on
+    /// the resident blob. One work-group per nonce; sub-dispatched to keep any single NDRange short
+    /// (each v3 nonce is a 256×256×256 int8 GEMM × 256 steps — heavy). Returns the lowest winning
+    /// nonce (host re-walks it byte-exact to build the witness), or None. Requires a single-slab
+    /// blob (n_tiles addresses one contiguous buffer); big-VRAM RDNA cards (the H6 target) always
+    /// stream one slab.
+    pub fn mine_v3(&mut self, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64) -> Option<u64> {
+        if self.weights.len() != 1 {
+            log::error!("PoM v3: blob is {} slabs — the v3 kernel needs one contiguous buffer; this card can't do the H6 walk.", self.weights.len());
+            return None;
+        }
+        let n_tiles = self.n_chunks / POM_V3_TILE_CHUNKS;
+        if n_tiles == 0 {
+            log::error!("PoM v3: blob too small ({} chunks < one 2048-chunk tile).", self.n_chunks);
+            return None;
+        }
+        let k = POM_V3_K as u32;
+        let mut done: u64 = 0;
+        while done < batch {
+            let sub = (batch - done).min(V3_SUB_DISPATCH_NONCES);
+            let base = nonce_base.wrapping_add(done);
+            match dispatch_raw_v3(&self.queue, &self.kernel_v3, &self.weights[0], &mut self.winner,
+                                  n_tiles, k, pph, seed, time, target, base, sub) {
+                None => return None,
+                Some(Some(w)) => return Some(w),
+                Some(None) => {}
+            }
+            done += sub;
+        }
+        None
+    }
 }
+
+/// PoM v3 walk constants (mirror src/pom_v3.rs — the byte-exact host reference).
+const POM_V3_TILE_CHUNKS: u64 = 2048;   // 64 KB tile / 32 B chunk
+const POM_V3_K: usize = 256;            // walk steps
+/// Work-groups (= nonces) per v3 NDRange. Each nonce is a heavy int8 GEMM chain; keep a dispatch
+/// short so a slow card doesn't trip the Windows TDR (~2 s). 128 groups ≈ sub-second even at kh/s.
+const V3_SUB_DISPATCH_NONCES: u64 = 128;
 
 // ============================================================================
 // Module interface mirroring upstream `pom_gpu` (candle-CUDA) so miner.rs calls
@@ -358,6 +433,23 @@ static DEDICATED_DEV: Mutex<Option<usize>> = Mutex::new(None);
 
 fn is_shared_dev(device_id: usize) -> bool {
     SHARED_DEV.lock().unwrap().map_or(false, |d| d == device_id)
+}
+
+/// Set once the miner reaches the H6 (PoM v3) gate. In v3 the walk is the OpenCL `pom_mine_v3`
+/// kernel over the card's OWN resident blob — the zero-dup Vulkan walk shader is the pre-H6 v2
+/// walk, so a v3 card must NOT claim zero-dup (it would route to the wrong shader and never install
+/// the OpenCL blob mine_v3 needs). On the 24 GB H6 target the engine (for OPoI inference) and the
+/// blob (for the walk) coexist. Cleared/left false pre-fork.
+static V3_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called by the miner when it enters the PoM v3 (H6) era so the AMD driver keeps each card on its
+/// OpenCL blob (mine_v3) instead of the zero-dup Vulkan v2 walk. Idempotent.
+pub fn set_v3_mode(on: bool) {
+    V3_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn v3_mode() -> bool {
+    V3_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// AMD sysfs health sample (the NVML-free analog). Plain data — miner.rs maps it into the shared
@@ -511,6 +603,12 @@ fn model_plus_blob_fits(device_id: usize, blob_bytes: u64) -> bool {
 fn try_claim_shared(device_id: usize) -> bool {
     if is_shared_dev(device_id) {
         return true;
+    }
+    // H6 (PoM v3): the walk is the OpenCL pom_mine_v3 kernel over this card's own blob. The zero-dup
+    // Vulkan walk is the pre-H6 v2 shader, so never claim zero-dup in v3 — install the OpenCL blob
+    // (the engine can still host the model on this card for OPoI inference; both fit on 24 GB).
+    if v3_mode() {
+        return false;
     }
     if SHARED_DEV.lock().unwrap().is_some() || !crate::llama_engine_vk::pom_ready() {
         return false;
@@ -838,6 +936,22 @@ pub fn mine(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, ba
     g.mine(p, s, time, t, nonce_base, batch, walk_v2)
 }
 
+/// H6 (PoM v3) grind on THIS thread's bound GPU: the int8 matrix-state walk on the resident blob.
+/// Mirrors `mine()`'s host-side era word selection (POW words `p` from `pph_words_for_era`, SEED
+/// words `s` from `seed_pph_words_for_era`), then dispatches the `pom_mine_v3` kernel. Returns the
+/// lowest winning nonce; the caller rebuilds the witness host-side (byte-exact CPU re-walk), so a
+/// kernel false-positive is silently dropped, never submitted. v3 always runs on the card's own
+/// OpenCL blob (never the zero-dup Vulkan walk — that shader is the pre-H6 v2 walk).
+pub fn mine_v3(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64, h3: bool, h5_1: bool, h5_2: bool) -> Option<u64> {
+    let id = target_dev()?;
+    let p = crate::pom::pph_words_for_era(pph, h3);
+    let s = crate::pom::seed_pph_words_for_era(pph, h3, h5_1, h5_2);
+    let t = words(target_le);
+    let miner = miner_for(id)?;
+    let mut g = miner.lock().unwrap();
+    g.mine_v3(p, s, time, t, nonce_base, batch)
+}
+
 /// Build the resident tier from a GGUF (shared proof WeightIndex, streamed to VRAM) and make it
 /// resident on the FIRST OpenCL GPU. The multi-GPU production path uses ensure_installed (one
 /// resident copy per card); this single-device form backs the tests + any non-bound caller.
@@ -855,4 +969,76 @@ fn hex32(b: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for x in b { s.push_str(&format!("{x:02x}")); }
     s
+}
+
+#[cfg(test)]
+mod v3_byte_exact {
+    //! Byte-exact GPU-vs-CPU check for the H6 (PoM v3) walk. Builds a synthetic possession blob,
+    //! grinds a handful of nonces on a REAL OpenCL GPU via `pom_mine_v3`, and asserts the winner
+    //! matches the CPU host reference (`pom_v3::host_walk_via_index` + `pom_pow_value`). Consensus
+    //! is byte-exact, so any divergence is a kernel bug. Needs an AMD OpenCL GPU (skips if none).
+    use super::*;
+    use crate::pom_v3;
+
+    // CPU reference pow-value (256-bit LE) for one nonce over `index`, era flags all false.
+    fn cpu_pow(index: &crate::pom::WeightIndex, pph: &[u8; 32], time: u64, nonce: u64) -> [u8; 32] {
+        let seed = crate::pom::pom_block_seed(pph, time, nonce, false, false, false);
+        let (states, _snips) = pom_v3::host_walk_via_index(seed, index).unwrap();
+        let d2 = 256 * 256;
+        let sk = &states[256 * d2..257 * d2]; // S_K (final state)
+        let root = pom_v3::v3_state_root(sk);
+        let fin = pom_v3::fold64(&root);
+        crate::pom::pom_pow_value(fin, pph, false)
+    }
+
+    #[test]
+    fn gpu_v3_matches_cpu_reference() {
+        // First AMD OpenCL GPU, or skip (CI without a GPU).
+        let dev_ids = match opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU) {
+            Ok(v) if !v.is_empty() => v,
+            _ => { eprintln!("no OpenCL GPU — skipping v3 byte-exact test"); return; }
+        };
+        let dev = opencl3::device::Device::new(dev_ids[0]);
+        eprintln!("v3 byte-exact on: {}", dev.name().unwrap_or_default());
+
+        // Synthetic 4-tile blob (8192 chunks). Varied signed bytes to exercise the int8 dot.
+        let n_chunks: u64 = 4 * POM_V3_TILE_CHUNKS;
+        let mut data = vec![0u8; (n_chunks * 32) as usize];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(131).wrapping_add(i / 7).wrapping_add(17)) as u8;
+        }
+        let index = crate::pom::index_from_ram(data);
+
+        let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(23).wrapping_add(5));
+        let time: u64 = 0x0123_4567_89AB_CDEF;
+        const NN: u64 = 4; // host walk is ~4.3 GMAC/nonce — keep it small (run with --release)
+
+        // CPU: find the argmin pow over 0..NN; target = that min → only the argmin passes.
+        let mut best = ([0xFFu8; 32], u64::MAX);
+        for nonce in 0..NN {
+            let pv = cpu_pow(&index, &pph, time, nonce);
+            // LE compare (least-significant word first).
+            let le_le = |a: &[u8; 32], b: &[u8; 32]| {
+                for k in (0..4).rev() {
+                    let (wa, wb) = (
+                        u64::from_le_bytes(a[k * 8..k * 8 + 8].try_into().unwrap()),
+                        u64::from_le_bytes(b[k * 8..k * 8 + 8].try_into().unwrap()),
+                    );
+                    if wa != wb { return wa < wb; }
+                }
+                true
+            };
+            if best.1 == u64::MAX || le_le(&pv, &best.0) { best = (pv, nonce); }
+        }
+        let (target, w_cpu) = best;
+        eprintln!("cpu argmin nonce = {w_cpu}");
+
+        // GPU: grind 0..NN with target = the argmin's pow. Expect it to return w_cpu.
+        let mut miner = PomMiner::new(dev, &index, n_chunks).expect("PomMiner::new");
+        let p = crate::pom::pph_words_for_era(&pph, false);
+        let s = crate::pom::seed_pph_words_for_era(&pph, false, false, false);
+        let t = words(&target);
+        let got = miner.mine_v3(p, s, time, t, 0, NN);
+        assert_eq!(got, Some(w_cpu), "GPU v3 winner must match the CPU reference argmin");
+    }
 }

@@ -284,3 +284,187 @@ __kernel void pom_mine_ilp4(
     if (idx2 != i0) { pom_pow_fold(st2, p0, p1, p2, p3, pv); if (pom_le_leq(pv, t0, t1, t2, t3)) pom_submit(winner, n2); }
     if (idx3 != i0) { pom_pow_fold(st3, p0, p1, p2, p3, pv); if (pom_le_leq(pv, t0, t1, t2, t3)) pom_submit(winner, n3); }
 }
+
+// ============================ PoM v3 (H6 matrix-state walk) ============================
+// Byte-exact OpenCL mirror of src/pom_v3.rs / src/pom_mine.cu (CUDA pom_mine_v3). One WORK-GROUP
+// per nonce; local_size = 256 = D; work-item x owns state row x (256 int8 = 64 packed uint). The
+// 64 KB tile lives in __local (LDS). Blob = single contiguous uint buffer (chunk idx = 8 u32 at
+// blob32[idx*8]). Consensus-critical: MUST match the host walk / node verifier bit-for-bit.
+
+#define V3_D    256
+#define V3_D4   64          // D/4 (packed uints per row)
+#define V3_TILE_CHUNKS 2048
+#define V3_S0_ROW_SALT       0x6B61F28F3CC48744UL
+#define V3_OFFSET_FIRST_SALT 0x3F1F886D659E316AUL
+#define V3_OFFSET_STEP_SALT  0xD4C194F3ADB3B1C7UL
+
+// signed int8×int8 dot of 4 packed bytes (byte-exact with CUDA __dp4a.s32).
+inline int v3_dp4(uint a, uint b, int acc) {
+    acc += (int)((char)(a       & 0xff)) * (int)((char)(b       & 0xff));
+    acc += (int)((char)((a >> 8) & 0xff)) * (int)((char)((b >> 8) & 0xff));
+    acc += (int)((char)((a >>16) & 0xff)) * (int)((char)((b >>16) & 0xff));
+    acc += (int)((char)((a >>24) & 0xff)) * (int)((char)((b >>24) & 0xff));
+    return acc;
+}
+
+// v3_rho8 (pom_v3.rs rho8): finalizer -> low byte.
+inline uint v3_rho8(int acc, uint tweak) {
+    uint z = (uint)acc ^ tweak;
+    z *= 0x9E3779B9u; z ^= z >> 16;
+    z *= 0x85EBCA6Bu; z ^= z >> 13;
+    return z & 0xffu;
+}
+
+// ---- blake3 (single-chunk path: inputs <= 1024 B, counter 0) ----
+__constant uint B3_IV[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u };
+__constant uchar B3_SCHED[7][16] = {
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},
+    {2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8},
+    {3,4,10,12,13,2,7,14,6,5,9,0,11,15,8,1},
+    {10,7,12,9,14,3,13,15,4,0,11,2,5,8,1,6},
+    {12,13,9,11,15,10,14,8,7,2,5,3,0,1,6,4},
+    {9,14,11,5,8,12,15,1,13,3,0,10,2,6,4,7},
+    {11,15,5,0,1,9,8,6,14,10,2,12,3,4,7,13} };
+#define B3_CHUNK_START 1u
+#define B3_CHUNK_END   2u
+#define B3_ROOT        8u
+inline uint b3_rotr(uint x, int n) { return (x >> n) | (x << (32 - n)); }
+inline void b3_g(uint* v, int a, int b, int c, int d, uint mx, uint my) {
+    v[a] += v[b] + mx; v[d] = b3_rotr(v[d] ^ v[a], 16);
+    v[c] += v[d];      v[b] = b3_rotr(v[b] ^ v[c], 12);
+    v[a] += v[b] + my; v[d] = b3_rotr(v[d] ^ v[a], 8);
+    v[c] += v[d];      v[b] = b3_rotr(v[b] ^ v[c], 7);
+}
+inline void b3_compress(uint cv[8], const uint m[16], uint block_len, uint flags) {
+    uint v[16];
+    for (int i = 0; i < 8; i++) v[i] = cv[i];
+    v[8]=B3_IV[0]; v[9]=B3_IV[1]; v[10]=B3_IV[2]; v[11]=B3_IV[3];
+    v[12]=0; v[13]=0; v[14]=block_len; v[15]=flags;
+    for (int r = 0; r < 7; r++) {
+        __constant uchar* s = B3_SCHED[r];
+        b3_g(v,0,4,8,12,  m[s[0]],  m[s[1]]);
+        b3_g(v,1,5,9,13,  m[s[2]],  m[s[3]]);
+        b3_g(v,2,6,10,14, m[s[4]],  m[s[5]]);
+        b3_g(v,3,7,11,15, m[s[6]],  m[s[7]]);
+        b3_g(v,0,5,10,15, m[s[8]],  m[s[9]]);
+        b3_g(v,1,6,11,12, m[s[10]], m[s[11]]);
+        b3_g(v,2,7,8,13,  m[s[12]], m[s[13]]);
+        b3_g(v,3,4,9,14,  m[s[14]], m[s[15]]);
+    }
+    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[i + 8];
+}
+// blake3 of one 256 B state row (64 packed words, PRIVATE) -> 8 words in LDS.
+inline void b3_hash_row(const uint row[64], __local uint* out) {
+    uint cv[8];
+    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+    for (int b = 0; b < 4; b++) {
+        uint flags = (b == 0 ? B3_CHUNK_START : 0u) | (b == 3 ? (B3_CHUNK_END | B3_ROOT) : 0u);
+        b3_compress(cv, row + b * 16, 64, flags);
+    }
+    for (int i = 0; i < 8; i++) out[i] = cv[i];
+}
+// blake3 of a 64 B concat (two child hashes, both in LDS) -> 8 words in LDS. The message is
+// staged into a PRIVATE buffer first because b3_compress takes a __private message pointer.
+inline void b3_hash_pair(__local const uint* m, __local uint* out) {
+    uint mp[16];
+    for (int i = 0; i < 16; i++) mp[i] = m[i];
+    uint cv[8];
+    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+    b3_compress(cv, mp, 64, B3_CHUNK_START | B3_CHUNK_END | B3_ROOT);
+    for (int i = 0; i < 8; i++) out[i] = cv[i];
+}
+
+// v3 grind: 1 work-group per nonce, local_size = 256. Winner = lowest nonce whose pow<=target.
+__kernel void pom_mine_v3(
+    __global const uint* restrict blob32,   // whole tier blob as u32 (chunk idx -> blob32[idx*8])
+    const u64 n_tiles,                       // n_chunks / 2048
+    const uint K,                            // 256
+    const u64 p0, const u64 p1, const u64 p2, const u64 p3,   // POW-fold pph words
+    const u64 s0, const u64 s1, const u64 s2, const u64 s3,   // SEED-fold pph words
+    const u64 time_,
+    const u64 t0, const u64 t1, const u64 t2, const u64 t3,   // target (4 LE u64)
+    const u64 nonce_base, const u64 n_nonces,
+    volatile __global u64* winner,
+    __local uint* s_tile32)                  // 16384 u32 = 64 KB (host sets local arg size)
+{
+    const uint x  = get_local_id(0);         // state row index 0..255
+    const u64  gid = get_group_id(0);
+    if (gid >= n_nonces) return;
+    const u64 nonce = nonce_base + gid;
+    const u64 seed  = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+
+    // S_0 row x: mix64 keystream.
+    uint row4[V3_D4];
+    {
+        u64 h = pom_mix64(seed ^ (V3_S0_ROW_SALT + (u64)x));
+        for (int k4 = 0; k4 < V3_D4; k4++) { h = pom_mix64(h); row4[k4] = (uint)h; }
+    }
+    u64 off = pom_mix64(seed ^ V3_OFFSET_FIRST_SALT) % n_tiles;
+
+    for (uint step = 1; step <= K; step++) {
+        // Load the 64 KB tile (2048 chunks) into LDS, cooperatively.
+        const u64 chunk0 = off * (u64)V3_TILE_CHUNKS;
+        for (uint c = x; c < V3_TILE_CHUNKS; c += V3_D) {
+            const __global uint* src = blob32 + (chunk0 + (u64)c) * 8UL;
+            __local uint* dst = s_tile32 + c * 8;
+            for (int w = 0; w < 8; w++) dst[w] = src[w];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // Next offset from THIS tile's snippet (first 32 B = 8 u32), derived by every WI.
+        {
+            u64 sf = 0;
+            for (int w = 0; w < 8; w++) sf = pom_mix64(sf ^ (u64)s_tile32[w]);
+            off = pom_mix64(seed ^ (u64)(step + 1) * V3_OFFSET_STEP_SALT ^ sf) % n_tiles;
+        }
+
+        // next[x][j] = rho8(dot_i8(row_x, col_j), tweak(step,x,j)), packed 4 bytes/uint.
+        const uint step_tweak = step * 0x9E3779B9u + x * 0xC2B2AE35u;
+        uint new4[V3_D4];
+        for (int j4 = 0; j4 < V3_D4; j4++) {
+            uint packed = 0;
+            for (int jj = 0; jj < 4; jj++) {
+                const int j = j4 * 4 + jj;
+                __local const uint* col = s_tile32 + j * V3_D4;   // tile row j = 64 u32
+                int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+                for (int k16 = 0; k16 < V3_D4 / 4; k16++) {
+                    a0 = v3_dp4(row4[k16*4+0], col[k16*4+0], a0);
+                    a1 = v3_dp4(row4[k16*4+1], col[k16*4+1], a1);
+                    a2 = v3_dp4(row4[k16*4+2], col[k16*4+2], a2);
+                    a3 = v3_dp4(row4[k16*4+3], col[k16*4+3], a3);
+                }
+                packed |= v3_rho8((a0 + a1) + (a2 + a3),
+                                  step_tweak + (uint)j * 0x85EBCA6Bu) << (8 * jj);
+            }
+            new4[j4] = packed;
+        }
+        for (int k4 = 0; k4 < V3_D4; k4++) row4[k4] = new4[k4];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // root_K: blake3 row leaves + depth-8 tree in LDS (reuse the tile region as scratch).
+    b3_hash_row(row4, s_tile32 + x * 8);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __local uint* src = s_tile32;
+    __local uint* dst = s_tile32 + V3_D * 8;
+    for (uint n = V3_D; n > 1; n >>= 1) {
+        if (x < n / 2) b3_hash_pair(src + x * 16, dst + x * 8);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        __local uint* tmp = src; src = dst; dst = tmp;
+    }
+    if (x == 0) {
+        const u64 fin = (u64)src[0] | ((u64)src[1] << 32);
+        u64 pv[4];
+        pom_pow_fold(fin, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) {
+            u64 old = *winner;
+            while (nonce < old) {
+                u64 prev = atom_cmpxchg(winner, old, nonce);
+                if (prev == old) break;
+                old = prev;
+            }
+        }
+    }
+}
