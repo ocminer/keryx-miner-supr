@@ -79,6 +79,14 @@ pub struct KeryxdHandler {
     /// Auto-claim module: present when an escrow private key is available.
     escrow_watcher: Option<crate::escrow::EscrowWatcher>,
 
+    /// 128-char hex delegation cert embedded as `/esig:<cert>`, binding the escrow key above to
+    /// the payout address. Mandatory from H6 — a block without it is invalid.
+    escrow_cert: Option<String>,
+
+    /// Service-ledger identity of the payout address (the node's `miner_key`), the key strikes,
+    /// burns and suspensions are reported against.
+    service_identity: Option<String>,
+
     /// Block hashes queued for boot-time escrow-state validation, drained in slices of
     /// VALIDATION_WINDOW so thousands of GetBlock requests never saturate the HTTP/2
     /// flow-control window (each consumed answer sends the next queued request).
@@ -155,6 +163,7 @@ impl KeryxdHandler {
         block_template_ctr: Option<Arc<AtomicU16>>,
         escrow_privkey: Option<String>,
         escrow_state_file: String,
+        escrow_cert: Option<String>,
         ipfs_url: String,
     ) -> Result<Box<Self>, Error>
     where
@@ -178,6 +187,14 @@ impl KeryxdHandler {
                 }
             }
             None => (None, None),
+        };
+
+        let service_identity = match crate::escrow::service_identity_hex(&miner_address) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                log::warn!("Cannot derive the service identity of the payout address: {}", e);
+                None
+            }
         };
 
         let mut client = RpcClient::connect(address).await?;
@@ -210,6 +227,8 @@ impl KeryxdHandler {
             ipfs_url,
             escrow_pubkey,
             escrow_watcher,
+            escrow_cert,
+            service_identity,
             validation_queue: VecDeque::new(),
             last_pending_escrow: None,
             last_strike_poll: std::time::Instant::now() - std::time::Duration::from_secs(55),
@@ -266,6 +285,12 @@ impl KeryxdHandler {
             .as_deref()
             .map(|pk| format!("/escrow:{}", pk))
             .unwrap_or_default();
+        // Delegation cert binding that escrow key to the payout address. From H6 the node rejects
+        // a block whose coinbase carries no valid pair.
+        let esig_part = self.escrow_cert
+            .as_deref()
+            .map(|cert| format!("/esig:{}", cert))
+            .unwrap_or_default();
         // Announce loaded model capabilities so the node can enforce model_id matching.
         let cap_part = {
             let ids = keryx_miner::slm::loaded_model_ids();
@@ -276,7 +301,8 @@ impl KeryxdHandler {
                 format!("/ai:cap:{}", hex_ids.join(","))
             }
         };
-        let extra_data = format!("{}{}/{}/ai:v1:{}{}", EXTRA_DATA, escrow_part, nonce_hex, opoi_tag, cap_part);
+        let extra_data =
+            format!("{}{}{}/{}/ai:v1:{}{}", EXTRA_DATA, escrow_part, esig_part, nonce_hex, opoi_tag, cap_part);
         // Harvest a pending challenge response if the inference task just finished.
         let inference_result = match self.challenge_inference_rx.take() {
             Some((challenge_str, mut rx)) => match rx.try_recv() {
@@ -560,9 +586,9 @@ impl KeryxdHandler {
     }
 
     /// Logs this miner's service-bond standing when it changes: strike count, burns awaiting
-    /// finality and production suspensions, matched by escrow pubkey.
+    /// finality and production suspensions, matched by payout-address identity.
     fn report_service_strikes(&mut self, resp: &crate::proto::GetServiceStrikesResponseMessage) {
-        let Some(me) = self.escrow_pubkey.as_deref() else { return };
+        let Some(me) = self.service_identity.as_deref() else { return };
         let strike = resp.strikes.iter().find(|s| s.miner.eq_ignore_ascii_case(me));
         let suspension = resp.suspended.iter().find(|s| s.miner.eq_ignore_ascii_case(me));
         let burns: Vec<_> = resp.pending_burns.iter().filter(|b| b.miner.eq_ignore_ascii_case(me)).collect();
