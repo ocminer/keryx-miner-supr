@@ -24,6 +24,9 @@ docker run --rm \
   -w /src \
   -e DEBIAN_FRONTEND=noninteractive \
   "$IMAGE" bash -euo pipefail -c '
+    # archive.ubuntu.com resolves to IPv6-only inside the container but there is no IPv6
+    # route -> apt-get update fetches nothing -> "Unable to locate package". Force apt IPv4.
+    echo "Acquire::ForceIPv4 \"true\";" > /etc/apt/apt.conf.d/99force-ipv4
     apt-get update -qq
     apt-get install -y -qq curl ca-certificates build-essential pkg-config \
         protobuf-compiler cmake libssl-dev ocl-icd-opencl-dev >/dev/null
