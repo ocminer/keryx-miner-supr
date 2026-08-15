@@ -1553,10 +1553,12 @@ static H5_2_ACTIVATION_DAA_CELL: OnceLock<u64> = OnceLock::new();
 /// H6 (matrix-state walk, PoM v3) activation DAA score. At/after this score — decided per job from
 /// the TEMPLATE's own `daa_score`, never wall clock or tip — the miner grinds the v3 walk on the GPU
 /// and builds `PomProofV3`; a pre-H6 (trace/steps_v2) proof verifies false at/after the gate and is
-/// rejected. MUST equal the node's `pom_v3_activation`: mainnet is unset (armed in a later release,
-/// `u64::MAX`), testnet 108_000. Overridable via `KERYX_POM_V3_ACTIVATION_DAA` for staging/crossing
-/// tests (e.g. set to 0 to force the H6 walk on regardless of daa_score). Read once.
-pub const POM_V3_ACTIVATION_DAA: u64 = u64::MAX;
+/// rejected. MUST equal the node's `pom_v3_activation`: mainnet DAA 77_203_262 (armed 2026-08-14,
+/// upstream a295508), testnet 1000. Overridable via `KERYX_POM_V3_ACTIVATION_DAA` for staging/crossing
+/// tests (set to 0 to force the H6 walk on regardless of daa_score; set to 1000 for testnet). Read once.
+/// NOTE: a finite (!= u64::MAX) value is the codebase-wide "H6 armed" sentinel that enables H6-lineup
+/// model staging (models::h6_staged / staging_daa / main.rs). Testnet default is provided via env.
+pub const POM_V3_ACTIVATION_DAA: u64 = 77_203_262;
 pub fn pom_v3_activation_daa() -> u64 {
     *POM_V3_ACTIVATION_DAA_CELL.get_or_init(|| {
         std::env::var("KERYX_POM_V3_ACTIVATION_DAA")

@@ -943,6 +943,8 @@ mod benches {
                     pruning_point: "be4c415d378f9113fabd3c09fcc84ddb6a00f900c87cb6a1186993ddc3014e2d".to_string(),
                     blue_score: 1164419,
                     pom_final_state: 0,
+                    service_state_hash: String::new(),
+                    pom_tier: 0,
                 }),
                 transactions: vec![],
                 verbose_data: None,

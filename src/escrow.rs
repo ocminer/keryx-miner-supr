@@ -18,8 +18,11 @@ use crate::proto::{
 };
 
 const CHALLENGE_WINDOW_BLOCKS: u64 = 36_000;
-/// CSV lock the node applies to coinbase escrow outputs from the H6 gate on.
-const SERVICE_BOND_CSV_WINDOW_BLOCKS: u64 = 504_000;
+/// CSV lock the node applies to coinbase escrow outputs from the H6 gate on. MUST equal the node's
+/// `SERVICE_BOND_CSV_WINDOW_BLOCKS` — the script (and so the output this miner recognizes as its own
+/// reclaimable bond) derives from it. 792_000 = 0x0c15c0 (upstream 8070e15/ebe157e, H6 arming wave).
+/// SOLO-only path: pool coinbases pay the pool, which claims its own escrow.
+const SERVICE_BOND_CSV_WINDOW_BLOCKS: u64 = 792_000;
 const CLAIM_FEE_SOMPI: u64 = 30_000_000;
 const NATIVE_SUBNETWORK: &str = "0000000000000000000000000000000000000000";
 
@@ -1358,9 +1361,240 @@ fn decode_address(addr: &str) -> Result<(u16, [u8; 32]), String> {
     Ok((version, spk))
 }
 
+// ── Escrow delegation cert ────────────────────────────────────────────────────
+
+/// Mirror of the node's `ESCROW_DELEGATION_DOMAIN`.
+const ESCROW_DELEGATION_DOMAIN: &[u8] = b"KeryxEscrowDelegationV1";
+
+fn escrow_delegation_message(escrow_pubkey: &[u8; 32]) -> [u8; 32] {
+    let mut h = Blake2bParams::new().hash_length(32).to_state();
+    h.update(ESCROW_DELEGATION_DOMAIN);
+    h.update(escrow_pubkey);
+    finalize32(h)
+}
+
+/// Service-ledger identity of a payout address — mirror of the node's `miner_key(spk)`:
+/// blake2b-256 keyed "TransactionHash" over `[version_le(2), p2pk_script]`. This is what the
+/// node reports strikes, burns and suspensions against; the escrow key is only the hot key.
+pub fn service_identity_hex(payout_address: &str) -> Result<String, String> {
+    let (version, payout_key) = decode_address(payout_address)?;
+    if version != 0 {
+        return Err(format!("Payout address version {} has no service identity (schnorr P2PK only)", version));
+    }
+    let mut h = Blake2bParams::new().hash_length(32).key(b"TransactionHash").to_state();
+    h.update(&version.to_le_bytes());
+    h.update(&build_p2pk_script(&payout_key));
+    Ok(hex::encode(finalize32(h)))
+}
+
+/// Verifies a delegation cert exactly the way the node does before accepting a block: schnorr
+/// over the domain-hashed escrow key, by the x-only key of the payout address.
+pub fn verify_escrow_cert(payout_address: &str, escrow_pubkey_hex: &str, cert_hex: &str) -> Result<(), String> {
+    let (version, payout_key) = decode_address(payout_address)?;
+    if version != 0 {
+        return Err(format!("Payout address version {} cannot carry a delegation (schnorr P2PK only)", version));
+    }
+    let mut escrow_pubkey = [0u8; 32];
+    hex::decode_to_slice(escrow_pubkey_hex, &mut escrow_pubkey)
+        .map_err(|e| format!("Invalid escrow pubkey hex: {}", e))?;
+    let mut sig_bytes = [0u8; 64];
+    hex::decode_to_slice(cert_hex, &mut sig_bytes).map_err(|e| format!("Invalid cert hex: {}", e))?;
+
+    let payout_key =
+        secp256k1::XOnlyPublicKey::from_slice(&payout_key).map_err(|e| format!("Invalid payout address key: {}", e))?;
+    let sig =
+        secp256k1::schnorr::Signature::from_slice(&sig_bytes).map_err(|e| format!("Invalid cert signature: {}", e))?;
+    let msg = secp256k1::Message::from_digest_slice(&escrow_delegation_message(&escrow_pubkey)).unwrap();
+    secp256k1::Secp256k1::verification_only()
+        .verify_schnorr(&sig, &msg, &payout_key)
+        .map_err(|_| "Cert does not match this payout address and escrow key".to_string())
+}
+
+const ADDRESS_CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+const ADDRESS_GENERATORS: [u64; 5] = [0x98f2_bc8e_61, 0x79b7_6d99_e2, 0xf33e_5fb3_c4, 0xae2e_abe2_a8, 0x1e4f_43e4_70];
+
+fn address_polymod(values: &[u8]) -> u64 {
+    let mut c: u64 = 1;
+    for &d in values {
+        let c0 = c >> 35;
+        c = ((c & 0x07_ffff_ffff) << 5) ^ d as u64;
+        for (i, g) in ADDRESS_GENERATORS.iter().enumerate() {
+            if c0 & (1 << i) != 0 {
+                c ^= g;
+            }
+        }
+    }
+    c ^ 1
+}
+
+/// Encode a schnorr x-only key into its version-0 Keryx address — the inverse of
+/// [`decode_address`]. A wrong checksum here would print an address that swallows rewards, so it
+/// is pinned against known pairs in the tests.
+pub fn encode_address(prefix: &str, pubkey: &[u8; 32]) -> String {
+    let mut data5: Vec<u8> = Vec::with_capacity(53);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for b in std::iter::once(0u8).chain(pubkey.iter().copied()) {
+        acc = (acc << 8) | b as u32;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            data5.push(((acc >> bits) & 0x1f) as u8);
+        }
+    }
+    if bits > 0 {
+        data5.push(((acc << (5 - bits)) & 0x1f) as u8);
+    }
+
+    let mut values: Vec<u8> = prefix.bytes().map(|c| c & 0x1f).collect();
+    values.push(0);
+    values.extend_from_slice(&data5);
+    values.extend_from_slice(&[0u8; 8]);
+    let checksum = address_polymod(&values);
+
+    let mut out = String::with_capacity(prefix.len() + 1 + data5.len() + 8);
+    out.push_str(prefix);
+    out.push(':');
+    out.extend(data5.iter().map(|&d| ADDRESS_CHARSET[d as usize] as char));
+    out.extend((0..8).map(|i| ADDRESS_CHARSET[((checksum >> (5 * (7 - i))) & 0x1f) as usize] as char));
+    out
+}
+
+/// This escrow key's own payout address — mining to it needs no wallet round-trip, since the
+/// miner then holds the payout key and can sign its own delegation.
+pub fn escrow_key_address(privkey_hex: &str, prefix: &str) -> Result<String, String> {
+    let mut pubkey = [0u8; 32];
+    hex::decode_to_slice(pubkey_hex_from_privkey(privkey_hex)?, &mut pubkey)
+        .map_err(|e| format!("Invalid escrow pubkey hex: {}", e))?;
+    Ok(encode_address(prefix, &pubkey))
+}
+
+/// Signs the delegation cert when the payout address IS this escrow key's own address — the only
+/// case where the payout key is on this machine. `None` otherwise: a cold payout address must be
+/// signed by the wallet that holds it.
+pub fn self_sign_cert(privkey_hex: &str, payout_address: &str) -> Option<String> {
+    let (version, payout_key) = decode_address(payout_address).ok()?;
+    let privkey_bytes = hex::decode(privkey_hex).ok()?;
+    let secp = secp256k1::Secp256k1::new();
+    let sk = secp256k1::SecretKey::from_slice(&privkey_bytes).ok()?;
+    let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+    let (xonly, _) = kp.x_only_public_key();
+    let pubkey: [u8; 32] = xonly.serialize();
+    if version != 0 || payout_key != pubkey {
+        return None;
+    }
+    let msg = secp256k1::Message::from_digest_slice(&escrow_delegation_message(&pubkey)).ok()?;
+    Some(hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &kp).as_ref()))
+}
+
+/// Loads the delegation cert and verifies it against the payout address and escrow key before
+/// returning it. Never hands back a cert the node would reject.
+pub fn load_cert(path: &str, payout_address: &str, escrow_pubkey_hex: &str) -> Result<String, String> {
+    let raw = fs::read_to_string(path).map_err(|e| format!("Cannot read escrow delegation cert '{}': {}", path, e))?;
+    let cert = raw.trim().to_ascii_lowercase();
+    if cert.len() != 128 {
+        return Err(format!("Escrow delegation cert '{}' must be 128 hex chars, found {}", path, cert.len()));
+    }
+    verify_escrow_cert(payout_address, escrow_pubkey_hex, &cert)?;
+    Ok(cert)
+}
+
+/// Persist a verified delegation cert to `path` so later starts load it without `--escrow-cert`.
+/// Idempotent: writes only when the file is missing or holds a different value. Returns whether it
+/// wrote. The cert is public (a signature over pubkey↔address), so the file needs no special mode.
+pub fn save_cert(path: &str, cert_hex: &str) -> std::io::Result<bool> {
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing.trim().eq_ignore_ascii_case(cert_hex) {
+            return Ok(false);
+        }
+    }
+    fs::write(path, cert_hex)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Payout address of the private key `0x11..11`, used as a payout key below.
+    const TEST_PAYOUT_ADDRESS: &str = "keryx:qp8n2k7uklxq4aegau7vawtptkgxsja4kt99lpv6krctwpq8tpc65uyeddvzr";
+
+    /// The service identity must equal the node's `miner_key(spk)`. The expected value is derived
+    /// independently of this code: blake2b-256 keyed "TransactionHash" over
+    /// `[version_le(2), 0x20 || key || 0xac]`.
+    #[test]
+    fn service_identity_matches_the_node_miner_key() {
+        assert_eq!(
+            service_identity_hex("keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte").unwrap(),
+            "cb79bef02d429e0fc8bb2335bf43d9d0df4f5bd6a25a39747d700b173e766e20"
+        );
+        assert!(service_identity_hex("not-an-address").is_err());
+    }
+
+    /// The encoder is the inverse of `decode_address` and must agree with the network's own
+    /// encoding — a wrong checksum prints an address that silently swallows rewards. Pinned on
+    /// two independent pairs, including the address of the private key `0x11..11`.
+    #[test]
+    fn address_encoding_roundtrips_known_pairs() {
+        let pairs = [
+            (
+                "cc1c720419a4645d2de6f06da860755b7cc665b90016226a7249f6fd69295ca3",
+                "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
+            ),
+            (
+                "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+                TEST_PAYOUT_ADDRESS,
+            ),
+        ];
+        for (key_hex, address) in pairs {
+            let mut key = [0u8; 32];
+            hex::decode_to_slice(key_hex, &mut key).unwrap();
+            assert_eq!(encode_address("keryx", &key), address);
+            // And back: the decoder must recover exactly what was encoded.
+            assert_eq!(decode_address(address).unwrap(), (0u16, key));
+        }
+    }
+
+    /// The miner signs its own delegation only when the payout address is its escrow key's.
+    #[test]
+    fn self_signing_is_limited_to_the_escrow_key_address() {
+        let privkey = "1111111111111111111111111111111111111111111111111111111111111111";
+        let own = escrow_key_address(privkey, "keryx").unwrap();
+        assert_eq!(own, TEST_PAYOUT_ADDRESS);
+
+        let cert = self_sign_cert(privkey, &own).expect("own address must self-sign");
+        let escrow_pubkey = pubkey_hex_from_privkey(privkey).unwrap();
+        assert!(verify_escrow_cert(&own, &escrow_pubkey, &cert).is_ok());
+
+        // Any other payout address: the miner does not hold that key, so it must refuse.
+        assert!(self_sign_cert(
+            privkey,
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte"
+        )
+        .is_none());
+    }
+
+    /// A cert only verifies against the exact payout address and escrow key it was signed for.
+    #[test]
+    fn escrow_cert_binds_payout_address_and_escrow_key() {
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let escrow_pubkey = [0x22u8; 32];
+        let msg = secp256k1::Message::from_digest_slice(&escrow_delegation_message(&escrow_pubkey)).unwrap();
+        let cert = hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &kp).as_ref());
+
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &hex::encode(escrow_pubkey), &cert).is_ok());
+        // Another escrow key: the delegation message differs.
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &hex::encode([0x33u8; 32]), &cert).is_err());
+        // Another payout address: not the signer.
+        assert!(verify_escrow_cert(
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
+            &hex::encode(escrow_pubkey),
+            &cert
+        )
+        .is_err());
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &hex::encode(escrow_pubkey), "dead").is_err());
+    }
 
     /// The responder signature must verify exactly the way the node's `verified_responder`
     /// does: schnorr over blake2b-256("KeryxServiceResponderV1" || v1 payload bytes) with the
@@ -1411,7 +1645,7 @@ mod tests {
         let bonded = build_escrow_script(&pk, SERVICE_BOND_CSV_WINDOW_BLOCKS);
 
         assert_eq!(&legacy[..3], &[0x02, 0xa0, 0x8c]); // 36_000 = 0x8ca0
-        assert_eq!(&bonded[..4], &[0x03, 0xc0, 0xb0, 0x07]); // 504_000 = 0x07b0c0
+        assert_eq!(&bonded[..4], &[0x03, 0xc0, 0x15, 0x0c]); // 792_000 = 0x0c15c0
 
         assert_eq!(legacy[3], OP_CSV);
         assert_eq!(bonded[4], OP_CSV);

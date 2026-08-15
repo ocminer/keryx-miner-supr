@@ -548,6 +548,7 @@ async fn get_client(
     block_template_ctr: Arc<AtomicU16>,
     escrow_privkey: Option<String>,
     escrow_state_file: String,
+    escrow_cert: Option<String>,
     ipfs_url: String,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
@@ -569,6 +570,7 @@ async fn get_client(
             Some(block_template_ctr.clone()),
             escrow_privkey,
             escrow_state_file,
+            escrow_cert,
             ipfs_url,
         )
         .await?)
@@ -583,6 +585,7 @@ async fn client_main(
     block_template_ctr: Arc<AtomicU16>,
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
+    escrow_cert: Option<String>,
 ) -> Result<(), Error> {
     // IPFS/kubo setup runs in the BACKGROUND (fire-and-forget) — it's only for optional inference-
     // reward uploads and must never gate mining. Previously this was `.await`ed, so a slow kubo
@@ -598,6 +601,7 @@ async fn client_main(
         block_template_ctr.clone(),
         escrow_privkey,
         opt.escrow_state_file.clone(),
+        escrow_cert,
         opt.ipfs_url.clone(),
     )
     .await?;
@@ -882,6 +886,70 @@ async fn run() -> Result<(), Error> {
             error!("Failed to load/generate OPoI escrow key: {}", e);
             return Err(e.into());
         }
+    };
+
+    // Escrow delegation cert: binds the escrow key to the payout address. From H6 a coinbase
+    // without a valid pair is an invalid block, so a bad cert fails here instead of producing
+    // rejected blocks.
+    // NOTE: upstream gates the hard-error on `keryx_miner::models::h6_staged()`; our tree has no
+    // such helper, so the equivalent `pom_v3_activation_daa() != u64::MAX` is inlined here.
+    let escrow_cert: Option<String> = match (&escrow_privkey, opt.mining_address.as_deref()) {
+        (Some(privkey), Some(address)) => {
+            let escrow_pubkey_hex = escrow::pubkey_hex_from_privkey(privkey)?;
+            let prefix = address.split(':').next().unwrap_or("keryx");
+            let own_address = escrow::escrow_key_address(privkey, prefix)?;
+            // Resolution order: an explicitly supplied cert wins; otherwise the miner signs its
+            // own when the payout address is its escrow key's (nothing to set up); otherwise the
+            // file, which is the path for a payout address whose key lives in a wallet.
+            let supplied = opt.escrow_cert.as_deref().map(|c| {
+                let cert = c.trim().to_ascii_lowercase();
+                escrow::verify_escrow_cert(address, &escrow_pubkey_hex, &cert).map(|()| cert)
+            });
+            let resolved = match supplied {
+                Some(Ok(cert)) => {
+                    info!("Escrow delegation cert taken from --escrow-cert.");
+                    // Persist it so the operator does not re-pass the flag every start (signed once).
+                    match escrow::save_cert(&opt.escrow_cert_file, &cert) {
+                        Ok(true) => info!(
+                            "Escrow delegation cert saved to '{}' — future starts need no --escrow-cert.",
+                            opt.escrow_cert_file
+                        ),
+                        Ok(false) => {}
+                        Err(e) => warn!("Could not persist escrow cert to '{}': {} (running this session anyway).", opt.escrow_cert_file, e),
+                    }
+                    Ok(cert)
+                }
+                Some(Err(e)) => Err(e),
+                None => match escrow::self_sign_cert(privkey, address) {
+                    Some(cert) => {
+                        info!("Payout address is this miner's escrow key — delegation signed locally, nothing to set up.");
+                        Ok(cert)
+                    }
+                    None => escrow::load_cert(&opt.escrow_cert_file, address, &escrow_pubkey_hex).map(|cert| {
+                        info!("Escrow delegation cert loaded from '{}'.", opt.escrow_cert_file);
+                        cert
+                    }),
+                },
+            };
+            match resolved {
+                Ok(cert) => Some(cert),
+                Err(e) => {
+                    if keryx_miner::pom::pom_v3_activation_daa() != u64::MAX {
+                        error!("{}", e);
+                        error!("Two ways to fix it, pick one:");
+                        error!("  1. Mine to this miner's own address — nothing else to do: {}", own_address);
+                        error!("  2. Keep your payout address and authorise this miner from the wallet holding it:");
+                        error!("       keryx-cli delegate-escrow {} {}", escrow_pubkey_hex, address);
+                        error!("     then pass the 128-hex output as --escrow-cert, or save it to '{}'.", opt.escrow_cert_file);
+                        return Err(e.into());
+                    }
+                    warn!("No usable escrow delegation cert ({}) — it becomes mandatory at H6.", e);
+                    warn!("Mining to {} would need no cert at all.", own_address);
+                    None
+                }
+            }
+        }
+        _ => None,
     };
 
     // Phase-3 OPoI: load inference models before mining starts.
@@ -1486,7 +1554,7 @@ async fn run() -> Result<(), Error> {
         if pools.len() > 1 {
             info!("Mining pool target: pool[{}] {}", target, pool_address);
         }
-        match client_main(&opt, pool_address, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone()).await {
+        match client_main(&opt, pool_address, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone(), escrow_cert.clone()).await {
             Ok(_) => info!("Client closed gracefully"),
             Err(e) => error!("Client closed with error {:?}", e),
         }
