@@ -122,8 +122,16 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
         let tensor_device = sym::<TensorDeviceFn>(lib, "keryx_llama_tensor_device");
         let cg = CString::new(gguf).ok()?;
         log::info!("llama engine: loading {} on GPU {} via {} (in-process, zero-dup)…", gguf, gpu, so.display());
-        let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
-        let model = load(cg.as_ptr(), gpu as c_int, n_ctx);
+        let configured_ctx = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse::<c_int>().ok());
+        let n_ctx: c_int = configured_ctx.unwrap_or(4096);
+        let mut model = load(cg.as_ptr(), gpu as c_int, n_ctx);
+        if model.is_null() && configured_ctx.is_none() && n_ctx > 1024 {
+            // Context-alloc retry (upstream Keryx-Labs/keryx-miner 9e6dc8d4, adapted): a card too
+            // tight for the default 4096-token context can still host the model with a smaller one.
+            // Retry once at 1024 before giving up (skipped when the user pinned KERYX_LLAMA_CTX).
+            log::warn!("llama engine: {}-token context did not fit on GPU {} — retrying with 1024 tokens.", n_ctx, gpu);
+            model = load(cg.as_ptr(), gpu as c_int, 1024);
+        }
         if model.is_null() {
             log::warn!("llama engine: model load failed on GPU {} (VRAM? arch?) — candle fallback stays active.", gpu);
             return None;
