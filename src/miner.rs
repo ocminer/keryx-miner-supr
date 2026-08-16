@@ -431,7 +431,9 @@ impl MinerManager {
                         #[cfg(feature = "pom-opencl")]
                         if v3 { pom_driver::set_v3_mode(true); }
                         // v3 grinds ~4.3 GMAC per nonce, so a full POM_BATCH of blocks is absurd —
-                        // grind a small slice per launch (env KERYX_POM_V3_BATCH overrides).
+                        // grind a small slice per launch (env KERYX_POM_V3_BATCH overrides). AMD sub-
+                        // dispatches this at v3_sub_dispatch_nonces() work-groups (default 1024) to fill
+                        // the GPU; 2^10 = one saturating dispatch per launch on a big card.
                         let batch = if v3 {
                             std::env::var("KERYX_POM_V3_BATCH").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0).unwrap_or(1 << 10)
                         } else {

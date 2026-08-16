@@ -438,13 +438,17 @@ __kernel void pom_mine_v3(
             uint packed = 0;
             for (int jj = 0; jj < 4; jj++) {
                 const int j = j4 * 4 + jj;
-                __global const uint* col = gtile + j * V3_D4;    // tile row j = 64 u32
+                // 128-bit (uint4) tile loads — one load instruction per 4 u32 instead of 4 scalar
+                // loads. Measured ~+3-8% on RDNA3 (RX 7900 XTX); no change on gfx1102/gfx906 (already
+                // coalesced there). Byte-exact: same 16 int8 lanes fed to the same v3_dp4 order.
+                __global const uint4* col4 = (__global const uint4*)(gtile + j * V3_D4); // tile row j = 16 u128
                 int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
                 for (int k16 = 0; k16 < V3_D4 / 4; k16++) {
-                    a0 = v3_dp4(row4[k16*4+0], col[k16*4+0], a0);
-                    a1 = v3_dp4(row4[k16*4+1], col[k16*4+1], a1);
-                    a2 = v3_dp4(row4[k16*4+2], col[k16*4+2], a2);
-                    a3 = v3_dp4(row4[k16*4+3], col[k16*4+3], a3);
+                    uint4 c = col4[k16];
+                    a0 = v3_dp4(row4[k16*4+0], c.x, a0);
+                    a1 = v3_dp4(row4[k16*4+1], c.y, a1);
+                    a2 = v3_dp4(row4[k16*4+2], c.z, a2);
+                    a3 = v3_dp4(row4[k16*4+3], c.w, a3);
                 }
                 packed |= v3_rho8((a0 + a1) + (a2 + a3),
                                   step_tweak + (uint)j * 0x85EBCA6Bu) << (8 * jj);
