@@ -658,6 +658,22 @@ pub fn is_loading() -> bool {
     LOADING.load(Ordering::Relaxed) > 0
 }
 
+/// Hard inference gate (ported from upstream Keryx-Labs/keryx-miner d35f85fc, adapted to our
+/// per-GPU pool). Raised before an OPoI model swap frees a card's walk, lowered once the swap is
+/// done. While raised, `mine()` returns immediately so the worker starts no NEW walk batch — that
+/// lets `uninstall()`'s `wait_for_sole_owner` barrier see the last handle drop and free VRAM
+/// cleanly, instead of timing out and freeing under a live walk (the CUDA_ERROR_ILLEGAL_ADDRESS
+/// "inference while the model is loading" crash on mixed rigs).
+static INFERENCE_PAUSED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_inference_paused(paused: bool) {
+    INFERENCE_PAUSED.store(paused, Ordering::Release);
+}
+
+pub fn inference_paused() -> bool {
+    INFERENCE_PAUSED.load(Ordering::Acquire)
+}
+
 /// Transient GPU runtime fault classifier (upstream Keryx-Labs/keryx-miner@278098b): the
 /// ILLEGAL_ADDRESS class — a kernel dereferenced garbage (driver hiccup, ECC blip, a stale
 /// gather pointer after an inference eviction race). The faulting CUDA context is poisoned but
@@ -706,6 +722,11 @@ fn take_injected_fault(device_id: u32) -> bool {
 
 /// Convenience: search a nonce batch via the installed miner for a specific device.
 pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool) -> Option<u64> {
+    // Hard inference gate: while an OPoI model swap is draining this process's walks, start no new
+    // batch — lets uninstall()'s barrier free VRAM without racing a live walk.
+    if inference_paused() {
+        return None;
+    }
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()

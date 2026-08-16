@@ -1788,6 +1788,15 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
         // is ALREADY resident here (the zero-dup mining tier) this is a no-op: no uninstall, no
         // reload — byte-identical to the pre-router single-card path.
         if !crate::llama_engine::active_for(&gguf, gpu) {
+            // Hard inference gate (upstream d35f85fc, adapted): pause + drain this process's PoM
+            // walks so uninstall() frees the card's walk WITHOUT racing a live batch, then reload
+            // the inference model and resume. A guard clears the pause on every exit (incl. panic).
+            struct PauseGuard;
+            impl Drop for PauseGuard {
+                fn drop(&mut self) { crate::pom_gpu::set_inference_paused(false); }
+            }
+            crate::pom_gpu::set_inference_paused(true);
+            let _resume = PauseGuard;
             crate::pom_gpu::uninstall(gpu as u32);
             crate::llama_engine::ensure_loaded_on(&gguf, gpu);
         }
