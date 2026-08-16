@@ -48,13 +48,16 @@ static WALK_MODULES: OnceLock<Mutex<HashMap<usize, Arc<CudaModule>>>> = OnceLock
 
 fn walk_load_err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(format!(
-        "PoM walk kernel failed to load ({e}). This build's walk PTX targets {PTX_ARCH}, and PTX \
-         only JIT-compiles onto {PTX_ARCH}-or-newer GPUs — on an older card the driver returns \
-         CUDA_ERROR_INVALID_PTX. Use the build line that matches your GPU: LEGACY = sm_70+ \
-         (Volta/V100, CMP 100-210, Turing and newer), PASCAL = sm_60/61 (GTX 10-series), \
-         MODERN = sm_75+ with driver 575+. If you built from source: CUDA 13.x cannot compile \
-         for Volta or Pascal — use a CUDA 12.x toolkit and set POM_CUDA_ARCH=compute_70 (Volta) \
-         or compute_60 (Pascal), plus CUDA_COMPUTE_CAP to match."
+        "PoM walk kernel failed to load ({e}). TWO distinct causes: \
+         (1) CUDA_ERROR_INVALID_PTX / 'no kernel image available' = your GPU is OLDER than this \
+         build's arch ({PTX_ARCH}) — the PTX/cubin can't run on it. \
+         (2) CUDA_ERROR_UNSUPPORTED_PTX_VERSION ('unsupported toolchain') = your NVIDIA DRIVER is \
+         too OLD for this build's PTX toolchain — UPDATE THE DRIVER (MODERN needs 575+), it is NOT \
+         a GPU-arch problem. \
+         Pick the build line for your GPU: LEGACY = sm_70+ (Volta/V100, CMP 100-210, Turing+), \
+         PASCAL = sm_60/61 (GTX 10-series), MODERN = sm_75+ with driver 575+. If you built from \
+         source: CUDA 13.x cannot compile for Volta or Pascal — use a CUDA 12.x toolkit and set \
+         POM_CUDA_ARCH=compute_70 (Volta) or compute_60 (Pascal), plus CUDA_COMPUTE_CAP to match."
     ))
 }
 
