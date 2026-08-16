@@ -893,7 +893,17 @@ async fn run() -> Result<(), Error> {
     // rejected blocks.
     // NOTE: upstream gates the hard-error on `keryx_miner::models::h6_staged()`; our tree has no
     // such helper, so the equivalent `pom_v3_activation_daa() != u64::MAX` is inlined here.
-    let escrow_cert: Option<String> = match (&escrow_privkey, opt.mining_address.as_deref()) {
+    // The escrow delegation cert is consumed ONLY by the solo (grpc) mining path — the pool
+    // (stratum) path builds and signs the coinbase itself and never uses the cert. So require/
+    // resolve it only when a configured pool is solo (grpc); pool mining skips it entirely.
+    // (Previously this hard-errored at startup for pool miners once H6 was active.)
+    let solo_mining = std::iter::once(&opt.keryxd_address)
+        .chain(opt.backup_pool.iter())
+        .any(|a| !a.starts_with("stratum+tcp://"));
+    let escrow_cert: Option<String> = if !solo_mining {
+        info!("Pool (stratum) mining — escrow delegation cert not required (the pool signs the coinbase).");
+        None
+    } else { match (&escrow_privkey, opt.mining_address.as_deref()) {
         (Some(privkey), Some(address)) => {
             let escrow_pubkey_hex = escrow::pubkey_hex_from_privkey(privkey)?;
             let prefix = address.split(':').next().unwrap_or("keryx");
@@ -950,7 +960,7 @@ async fn run() -> Result<(), Error> {
             }
         }
         _ => None,
-    };
+    } };
 
     // Phase-3 OPoI: load inference models before mining starts.
     //   (no flag)    → AUTO: largest PoM tier that fits this GPU's VRAM (per-process)
