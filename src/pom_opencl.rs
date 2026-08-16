@@ -374,9 +374,10 @@ impl PomMiner {
         // its queue mid-batch — the boost clock stays pinned), then finish + read once. The kernel's
         // atomic-min makes the single winner buffer hold the batch's lowest winning nonce.
         self.queue.enqueue_write_buffer(&mut self.winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
+        let sub_dispatch = v3_sub_dispatch_nonces();
         let mut done: u64 = 0;
         while done < batch {
-            let sub = (batch - done).min(V3_SUB_DISPATCH_NONCES);
+            let sub = (batch - done).min(sub_dispatch);
             let base = nonce_base.wrapping_add(done);
             enqueue_v3(&self.queue, &self.kernel_v3, &self.weights[0], &self.winner,
                        n_tiles, k, pph, seed, time, target, base, sub)?;
@@ -392,9 +393,18 @@ impl PomMiner {
 /// PoM v3 walk constants (mirror src/pom_v3.rs — the byte-exact host reference).
 const POM_V3_TILE_CHUNKS: u64 = 2048;   // 64 KB tile / 32 B chunk
 const POM_V3_K: usize = 256;            // walk steps
-/// Work-groups (= nonces) per v3 NDRange. Each nonce is a heavy int8 GEMM chain; keep a dispatch
-/// short so a slow card doesn't trip the Windows TDR (~2 s). 128 groups ≈ sub-second even at kh/s.
-const V3_SUB_DISPATCH_NONCES: u64 = 128;
+/// Work-groups (= nonces) per v3 NDRange. This is ONE work-group per nonce, so it's also the number
+/// of work-groups the GPU sees per dispatch — it MUST be large enough to fill all the CUs and give
+/// the scheduler enough waves to hide the per-step cold-tile latency. 128 (the old value) barely
+/// covered a 96-CU card (measured 1.94 vs 3.85 knonce/s at 1024 on an RX 7900 XTX — a ~2x loss from
+/// underfilling + the in-order queue draining between tiny dispatches). 1024 saturates big cards and,
+/// at ~1-4 knonce/s, each dispatch is still ~0.25-1 s — safely under the Windows TDR (~2 s) even on
+/// the slowest supported card. Override for a specific card via KERYX_POM_V3_SUB_DISPATCH.
+fn v3_sub_dispatch_nonces() -> u64 {
+    std::env::var("KERYX_POM_V3_SUB_DISPATCH").ok()
+        .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0)
+        .unwrap_or(1024)
+}
 
 // ============================================================================
 // Module interface mirroring upstream `pom_gpu` (candle-CUDA) so miner.rs calls

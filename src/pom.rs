@@ -2214,7 +2214,7 @@ mod tests {
         };
         let devs = opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU).expect("cl devices");
         crate::pom_opencl::bind_thread_device(devs[0] as usize);
-        crate::pom_opencl::set_mining_tier(path, 1);
+        crate::pom_opencl::set_mining_tier([0u8; 32], path, 1);
         crate::pom_opencl::ensure_installed();
         let mut base = 0u64;
         let mut nonce = None;
@@ -2286,7 +2286,7 @@ mod tests {
         };
         let devs = opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU).expect("cl devices");
         crate::pom_opencl::bind_thread_device(devs[0] as usize);
-        crate::pom_opencl::set_mining_tier(path, 1);
+        crate::pom_opencl::set_mining_tier([0u8; 32], path, 1);
         crate::pom_opencl::ensure_installed();
         let mut base = 0u64;
         let mut nonce = None;
@@ -2376,7 +2376,7 @@ mod tests {
         };
         let devs = opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU).expect("cl devices");
         crate::pom_opencl::bind_thread_device(devs[0] as usize);
-        crate::pom_opencl::set_mining_tier(path, 1);
+        crate::pom_opencl::set_mining_tier([0u8; 32], path, 1);
         crate::pom_opencl::ensure_installed();
         let mut base = 0u64;
         let mut nonce = None;
@@ -2437,7 +2437,7 @@ mod tests {
         let name = opencl3::device::Device::new(devs[di]).name().unwrap_or_default();
         eprintln!("opencl walk bench on device {di} ({name})");
         crate::pom_opencl::bind_thread_device(id);
-        crate::pom_opencl::set_mining_tier(path, 1);
+        crate::pom_opencl::set_mining_tier([0u8; 32], path, 1);
         crate::pom_opencl::ensure_installed();
         let pph = blake(b"bench-llama-vk");
         let target = [0u8; 32]; // impossible target -> full grind
