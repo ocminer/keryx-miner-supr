@@ -60,12 +60,17 @@ pub mod llama_engine;
 #[cfg(all(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")), not(unix)))]
 pub mod llama_engine {
     pub fn ensure_loaded(_gguf: &str, _gpu: usize) -> bool { false }
+    pub fn ensure_loaded_on(_gguf: &str, _gpu: usize) -> bool { false }
     pub fn active_for(_gguf: &str, _gpu: usize) -> bool { false }
     pub fn available() -> bool { false }
+    pub fn available_on(_gpu: usize) -> bool { false }
     pub fn unload() {}
     pub fn unload_for_gpu(_gpu: usize) {}
     pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> { None }
+    pub fn tensors_for(_gpu: usize) -> Option<Vec<(String, u64, usize, bool)>> { None }
+    pub fn foreign_device_tensor(_expected_gpu: usize) -> Option<(String, i32)> { None }
     pub fn generate(_prompt: &str, _max_tokens: usize) -> Option<String> { None }
+    pub fn generate_on(_gpu: usize, _prompt: &str, _max_tokens: usize) -> Option<String> { None }
 }
 // PoM GPU driver aliased to `pom_gpu` per platform so main.rs/miner.rs/slm.rs stay backend-agnostic:
 // NVIDIA CUDA on Linux/Windows, Apple-Silicon Metal on macOS. Mutually exclusive by construction
