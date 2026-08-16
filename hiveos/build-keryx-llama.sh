@@ -44,7 +44,7 @@ docker run --rm --network host \
   -e KCUDA="$KCUDA" -e ARCHS="$ARCHS" -e JOBS="$JOBS" -e SIMD_FLAGS="$SIMD_FLAGS" -e OUTNAME="$OUTNAME" \
   keryx-build:offline bash -euo pipefail -c '
     if [ ! -x /tmp/cmk/bin/cmake ]; then
-      curl -sL https://github.com/Kitware/CMake/releases/download/v3.28.6/cmake-3.28.6-linux-x86_64.tar.gz \
+      curl -4 -sL https://github.com/Kitware/CMake/releases/download/v3.28.6/cmake-3.28.6-linux-x86_64.tar.gz \
         | tar xz -C /tmp && mv /tmp/cmake-3.28.6-linux-x86_64 /tmp/cmk
     fi
     export PATH=/tmp/cmk/bin:$KCUDA/bin:$PATH CUDA_HOME=$KCUDA
