@@ -1759,6 +1759,15 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
 
+    // Race guard: never attempt inference (or a card model-swap that uninstalls the walk) for a
+    // model whose GGUF is not fully on disk yet. The initial background prefetch may still be
+    // downloading/loading it; serving now would uninstall+reload mid-prefetch. Drop the request —
+    // the pool re-challenges once the model is ready (loaded_model_ids / ai:cap track readiness).
+    if !crate::gguf::is_complete_file(&gguf_path_for(spec)) {
+        log::warn!("OPoI: model '{}' not fully staged yet — skipping inference (avoids a load race); will serve once ready.", spec.name);
+        return None;
+    }
+
     // Prefer a running llama.cpp llama-server: AMD always (candle has no AMD-GPU backend; Vulkan
     // server), NVIDIA when a CUDA llama-server is bundled/env-pointed (Phase 1 of candle-
     // independence — llama.cpp tracks new GGUF archs faster than candle). The OPoI text is
