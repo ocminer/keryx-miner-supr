@@ -37,26 +37,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cc::Build::new().flag("-c").file("src/keccakf1600_x86-64-osx.s").compile("libkeccak.a");
     }
 
-    // PoM CUDA: compile the gather kernel to PTX (JIT'd by the driver at runtime, so a virtual
-    // compute_75 arch runs on every Turing+ card — RTX 20xx/30xx/40xx/50xx, A100, H100). The
-    // candle-CUDA pom_gpu driver does include_str!(OUT_DIR/pom_mine.ptx). Use a CUDA 12.x nvcc
-    // (PATH/CUDA_PATH) to match candle 0.8's cudarc — NOT the CUDA 13 toolkit.
+    // PoM CUDA walk image. TWO shapes, selected below:
+    //  - MODERN (default): ship the prebuilt NATIVE-SASS fatbin `cuda/pom_mine.fatbin` (sm_75;80;86;
+    //    89;90;120 + compute_75 PTX fallback). Native sm_120 SASS means the walk runs DIRECTLY on
+    //    Blackwell (5070Ti/5080/5090) with NO driver JIT. The old path shipped only compute_75 PTX;
+    //    on Windows the driver's JIT of that to sm_120 was ~5x slower than upstream's native fatbin
+    //    ("limited on power"). The fatbin is prebuilt with CUDA 12.9 and committed, so even a build
+    //    toolkit that predates sm_120 (Windows CI = CUDA 12.5) still ships native Blackwell SASS.
+    //  - LEGACY/PASCAL (POM_CUDA_ARCH set, e.g. compute_70/compute_60): compile PTX from source with
+    //    the build's nvcc, as before (those old cards aren't the Blackwell-JIT case). Also the dev
+    //    fallback when the committed fatbin is absent.
     if env::var("CARGO_FEATURE_POM_CUDA").is_ok() {
         let out = env::var("OUT_DIR").unwrap();
-        let ptx = format!("{}/pom_mine.ptx", out);
+        let image = format!("{}/pom_mine.image", out); // the shipped walk image (fatbin or ptx)
         println!("cargo:rerun-if-changed=src/pom_mine.cu");
+        println!("cargo:rerun-if-changed=cuda/pom_mine.fatbin");
         println!("cargo:rerun-if-env-changed=POM_CUDA_ARCH");
-        let nvcc = env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
-        let arch = env::var("POM_CUDA_ARCH").unwrap_or_else(|_| "compute_75".to_string());
-        // Baked into the binary so the runtime can say WHICH arch the walk PTX targets when the
-        // module load fails on an older GPU (PTX only JITs forward → CUDA_ERROR_INVALID_PTX).
-        println!("cargo:rustc-env=POM_PTX_ARCH={}", arch.replace("compute_", "sm_"));
-        let status = std::process::Command::new(&nvcc)
-            .args(["-ptx", &format!("-arch={}", arch), "-o", &ptx, "src/pom_mine.cu"])
-            .status()
-            .expect("pom-cuda: failed to run nvcc (CUDA toolkit required)");
-        if !status.success() {
-            panic!("pom-cuda: nvcc -ptx src/pom_mine.cu failed");
+        let arch_override = env::var("POM_CUDA_ARCH").ok();
+        let committed_fatbin = "cuda/pom_mine.fatbin";
+        // Ship the native-SASS fatbin ONLY where the driver's PTX→sm_120 JIT is bad: WINDOWS.
+        // Measured on a 5080: Linux JITs compute_75 PTX to ~7.5 kh/s, but WINDOWS JITs the SAME PTX
+        // to only ~1.2 kh/s ("limited on power"); native sm_120 SASS runs ~6.8 kh/s regardless of OS.
+        // So Windows uses the fatbin (1.2 → ~6.8, matches/beats upstream) while Linux keeps the PTX
+        // path (native SASS is ~9% SLOWER than Linux's good JIT — no fleet regression). Override with
+        // POM_WALK_IMAGE=fatbin|ptx. Legacy/pascal (POM_CUDA_ARCH set) always use PTX (old cards, no
+        // Blackwell-JIT issue, and the fatbin has no sm_60/70).
+        let want_fatbin = match env::var("POM_WALK_IMAGE").ok().as_deref() {
+            Some("fatbin") => true,
+            Some("ptx") => false,
+            _ => env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows"),
+        };
+
+        if arch_override.is_none() && want_fatbin && std::path::Path::new(committed_fatbin).exists() {
+            // MODERN: ship the native-SASS fatbin as-is (no nvcc needed at build time).
+            std::fs::copy(committed_fatbin, &image)
+                .unwrap_or_else(|e| panic!("pom-cuda: copy {committed_fatbin} -> {image}: {e}"));
+            println!("cargo:rustc-env=POM_WALK_IMAGE_KIND=fatbin");
+            println!("cargo:rustc-env=POM_PTX_ARCH=sm_75..120-native"); // for the load-error message
+        } else {
+            // LEGACY/PASCAL or no committed fatbin: compile PTX from source, JIT'd at runtime.
+            let nvcc = env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
+            let arch = arch_override.unwrap_or_else(|| "compute_75".to_string());
+            println!("cargo:rustc-env=POM_PTX_ARCH={}", arch.replace("compute_", "sm_"));
+            let status = std::process::Command::new(&nvcc)
+                .args(["-ptx", &format!("-arch={}", arch), "-o", &image, "src/pom_mine.cu"])
+                .status()
+                .expect("pom-cuda: failed to run nvcc (CUDA toolkit required)");
+            if !status.success() {
+                panic!("pom-cuda: nvcc -ptx src/pom_mine.cu failed");
+            }
+            println!("cargo:rustc-env=POM_WALK_IMAGE_KIND=ptx");
         }
     }
     Ok(())
