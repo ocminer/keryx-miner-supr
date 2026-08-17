@@ -21,11 +21,44 @@ use candle_core::cuda_backend::cudarc::driver::{
 use candle_core::quantized::{gguf_file, QTensor};
 use candle_core::{CudaDevice, Device};
 
-const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine.ptx"));
-/// The arch the walk PTX was compiled for (build.rs bakes POM_CUDA_ARCH in) — modern=sm_75,
-/// legacy=sm_70, pascal=sm_60. Used to explain arch-mismatch load failures.
+/// The walk kernel image, embedded at build time (build.rs). Either a native-SASS FATBIN
+/// (sm_75..120 + compute_75 PTX fallback — modern; runs on Blackwell with NO driver JIT) or
+/// compute_XX PTX text (legacy/pascal). `POM_WALK_IMAGE_KIND` says which.
+const WALK_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_mine.image"));
+const WALK_IMAGE_KIND: &str = env!("POM_WALK_IMAGE_KIND"); // "fatbin" | "ptx"
+/// The arch the walk image targets (build.rs bakes it in) — "sm_75..120-native" for the modern
+/// fatbin, or sm_70/sm_60 for legacy/pascal PTX. Used to explain arch-mismatch load failures.
 const PTX_ARCH: &str = env!("POM_PTX_ARCH");
 const CHUNK_BYTES: usize = 32;
+
+/// Build the cudarc module image for `load_module`. cudarc 0.17 can only construct `Ptx` from a PTX
+/// string or a FILE path (the raw-bytes variant is crate-private), and `cuModuleLoad`/`LoadData`
+/// auto-detect fatbin/cubin/ptx — so for the fatbin we materialize the embedded bytes to a temp file
+/// ONCE and load it by path. This is what makes the walk run native sm_120 SASS instead of JIT'd PTX
+/// (the Windows compute_75-PTX-JIT was ~5x slower than the native fatbin — "limited on power").
+fn walk_image() -> candle_core::Result<candle_core::cuda_backend::cudarc::nvrtc::Ptx> {
+    use candle_core::cuda_backend::cudarc::nvrtc::Ptx;
+    if WALK_IMAGE_KIND == "fatbin" {
+        static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+        let p = if let Some(p) = PATH.get() {
+            p.clone()
+        } else {
+            // Name the temp file by image length so a new build never reuses a stale fatbin.
+            let p = std::env::temp_dir().join(format!("keryx-pom-walk-{}.fatbin", WALK_IMAGE.len()));
+            if !p.exists() {
+                std::fs::write(&p, WALK_IMAGE)
+                    .map_err(|e| candle_core::Error::Msg(format!("write walk fatbin {}: {e}", p.display())))?;
+            }
+            let _ = PATH.set(p.clone());
+            p
+        };
+        Ok(Ptx::from_file(p))
+    } else {
+        let src = std::str::from_utf8(WALK_IMAGE)
+            .map_err(|e| candle_core::Error::Msg(format!("walk PTX image is not UTF-8: {e}")))?;
+        Ok(Ptx::from_src(src))
+    }
+}
 
 /// The walk kernel bound to its device's stream. Mirrors the `CudaFunc` wrapper the vendored
 /// candle-core used to export: stock candle 0.9 keeps that type in a private module
@@ -72,7 +105,7 @@ fn load_walk_func(cuda: &CudaDevice, name: &str) -> candle_core::Result<WalkFunc
         match cache.get(&ctx.ordinal()) {
             Some(m) => m.clone(),
             None => {
-                let m = ctx.load_module(PTX.into()).map_err(walk_load_err)?;
+                let m = ctx.load_module(walk_image()?).map_err(walk_load_err)?;
                 cache.insert(ctx.ordinal(), m.clone());
                 m
             }
