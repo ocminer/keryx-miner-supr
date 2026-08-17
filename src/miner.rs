@@ -434,8 +434,17 @@ impl MinerManager {
                         // grind a small slice per launch (env KERYX_POM_V3_BATCH overrides). AMD sub-
                         // dispatches this at v3_sub_dispatch_nonces() work-groups (default 1024) to fill
                         // the GPU; 2^10 = one saturating dispatch per launch on a big card.
+                        // AMD default 2^11: the RDNA3 2-rows/item kernel runs 128-thread groups
+                        // (4 waves/nonce instead of 8), so it needs twice the nonces in flight to
+                        // keep the same wave count for latency hiding (measured: 2r at batch 1024
+                        // is flat vs 1-row; at 2048 it holds its +4-6%). Harmless for the 1-row
+                        // cards (a 2048 batch is still <1 s per call at MI50 rates).
+                        #[cfg(feature = "pom-opencl")]
+                        const V3_BATCH_DEFAULT: u64 = 1 << 11;
+                        #[cfg(not(feature = "pom-opencl"))]
+                        const V3_BATCH_DEFAULT: u64 = 1 << 10;
                         let batch = if v3 {
-                            std::env::var("KERYX_POM_V3_BATCH").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0).unwrap_or(1 << 10)
+                            std::env::var("KERYX_POM_V3_BATCH").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0).unwrap_or(V3_BATCH_DEFAULT)
                         } else {
                             POM_BATCH
                         };
