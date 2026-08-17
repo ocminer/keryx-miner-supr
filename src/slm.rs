@@ -762,14 +762,12 @@ fn load_engine_with_fallback(spec: &'static ModelSpec) -> Result<SlmEngine> {
 
     match try_load_engine(spec, device) {
         Ok(engine) => Ok(engine),
-        Err(reason) if on_gpu => {
-            // GPU load failed (CUDA or Metal) → fall back to CPU instead of crashing.
+        Err(reason) if on_gpu && cpu_inference_allowed() => {
+            // GPU load failed AND the operator opted into CPU fallback (--enable-cpu-inference /
+            // --cpu-inference) → degrade to CPU instead of withdrawing.
             log::warn!(
                 "⚠️ GPU inference FAILED to load on this device ({reason}) — falling back to CPU \
-                 inference (MUCH slower). The PoW walk still runs on the GPU. NVIDIA: (1) update the \
-                 driver to R525+; (2) ensure the CUDA 12 runtime libs are present (bundled in the \
-                 release); (3) Pascal/1080Ti must use CPU inference. Apple Silicon: candle-metal may \
-                 not yet support this model's quantization — the walk stays on Metal, inference on CPU."
+                 inference (MUCH slower; you enabled it). The PoW walk still runs on the GPU."
             );
             set_cpu_inference(true);
             let cpu = Device::Cpu;
@@ -783,6 +781,20 @@ fn load_engine_with_fallback(spec: &'static ModelSpec) -> Result<SlmEngine> {
                 );
                 engine
             })
+        }
+        Err(reason) if on_gpu => {
+            // GPU load failed and CPU fallback is DISABLED (the default). Do NOT waste cycles on
+            // glacial CPU inference — surface a clear, actionable error; the caller withdraws the
+            // model from OPoI. The real fix is a working in-process llama.cpp engine on the GPU.
+            Err(anyhow!(
+                "GPU inference could not load '{}' ({}). CPU fallback is OFF by default — the model \
+                 is withdrawn from OPoI rather than run on the CPU (far too slow to be useful). \
+                 Fix: ensure the in-process llama.cpp engine is present and loads next to the miner \
+                 — Linux: libkeryx-llama.so; Windows: keryx-llama.dll — together with the bundled \
+                 CUDA runtime libs, and a driver new enough for the build (modern R575+, legacy \
+                 R535+). To force CPU anyway, pass --enable-cpu-inference.",
+                spec.name, reason
+            ))
         }
         Err(reason) => {
             // Already on CPU (explicit --cpu-inference / AMD / prior fallback) — nothing left to
@@ -1160,6 +1172,27 @@ pub fn set_cpu_inference(on: bool) {
         // load_engine/ensure_loaded re-resolves the device via inference_device().
         evict_engine();
     }
+}
+
+/// Whether CPU inference is ALLOWED as a fallback (default: NO). Off unless the operator passes
+/// `--enable-cpu-inference` (or `--cpu-inference`, which forces CPU from the start). When off, a GPU
+/// that cannot load inference withdraws the model from OPoI instead of degrading to useless,
+/// glacially-slow CPU inference — see `load_engine_with_fallback`. Forced on for the AMD/OpenCL
+/// build (candle 0.9 has no AMD-GPU backend, so CPU is the only path there).
+static CPU_INFERENCE_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+/// True when CPU inference may be used (opt-in via `--enable-cpu-inference`/`--cpu-inference`, or
+/// always on the AMD/OpenCL build). Gates the automatic GPU→CPU fallback.
+pub fn cpu_inference_allowed() -> bool {
+    #[cfg(feature = "pom-opencl")]
+    { true }
+    #[cfg(not(feature = "pom-opencl"))]
+    { CPU_INFERENCE_ALLOWED.load(AtomicOrdering::Relaxed) }
+}
+
+/// Permit CPU inference (set from the CLI when `--enable-cpu-inference` or `--cpu-inference` is given).
+pub fn set_cpu_inference_allowed(on: bool) {
+    CPU_INFERENCE_ALLOWED.store(on, AtomicOrdering::Relaxed);
 }
 
 /// `--no-shared-inference`: force OPoI inference onto THIS process's own walk GPU instead of the

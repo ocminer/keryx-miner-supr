@@ -66,10 +66,17 @@ pub struct Opt {
 
     #[clap(
         long = "cpu-inference",
-        help = "Run OPoI inference on the CPU instead of the GPU — frees the GPU for hashing and avoids weak-fp16 GPUs (e.g. GTX 1060). Pairs well with --light.",
+        help = "Run OPoI inference on the CPU instead of the GPU — frees the GPU for hashing and avoids weak-fp16 GPUs (e.g. GTX 1060). Pairs well with --light. (Implies --enable-cpu-inference.)",
         help_heading = "OPoI / Inference"
     )]
     pub cpu_inference: bool,
+
+    #[clap(
+        long = "enable-cpu-inference",
+        help = "Allow OPoI inference to FALL BACK to the CPU when GPU inference cannot load (OFF by default). CPU inference is very slow and rarely worthwhile; without this flag a card that cannot run GPU inference withdraws from OPoI instead of doing futile CPU work. NVIDIA/Windows: the fix for 'GPU inference failed' is to ship keryx-llama.dll + the CUDA runtime DLLs next to the miner, NOT this flag.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub enable_cpu_inference: bool,
 
     #[clap(
         long = "no-shared-inference",

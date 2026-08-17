@@ -14,7 +14,12 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use nix::libc;
+// Cross-platform dynamic loader: `libloading` maps to dlopen on unix and LoadLibrary on Windows, so
+// the in-process llama.cpp engine works on every platform the miner ships on (previously this module
+// used raw libc::dlopen and was stubbed out on Windows — the reason Windows NVIDIA rigs could not
+// serve H4/H6 models and fell through to CPU). The library handle is opened ONCE into a process
+// global that lives forever; the resolved fn pointers are copied out and stay valid for the run.
+use libloading::Library;
 
 type AbiFn = unsafe extern "C" fn() -> c_int;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
@@ -92,36 +97,28 @@ fn loaded_gpus() -> Vec<usize> {
 /// None (caller falls back). Factored out of `ensure_loaded_on` so the load happens while the
 /// target slot's lock is held (per-card serialization) without duplicating the FFI plumbing.
 fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
-    let so = so_path()?;
-    let cso = CString::new(so.to_string_lossy().as_bytes()).ok()?;
+    let lib = engine_lib()?;
     unsafe {
-        let lib = libc::dlopen(cso.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-        if lib.is_null() {
-            let err = libc::dlerror();
-            let msg = if err.is_null() { "?".into() } else { CStr::from_ptr(err).to_string_lossy().into_owned() };
-            log::warn!("llama engine: dlopen({}) failed: {} — candle fallback stays active.", so.display(), msg);
-            return None;
-        }
         let (Some(abi), Some(load), Some(count), Some(info), Some(gen), Some(free)) = (
-            sym::<AbiFn>(lib, "keryx_llama_abi"),
-            sym::<LoadFn>(lib, "keryx_llama_load"),
-            sym::<CountFn>(lib, "keryx_llama_tensor_count"),
-            sym::<InfoFn>(lib, "keryx_llama_tensor_info"),
-            sym::<GenFn>(lib, "keryx_llama_generate"),
-            sym::<FreeFn>(lib, "keryx_llama_free"),
+            sym::<AbiFn>(lib, b"keryx_llama_abi\0"),
+            sym::<LoadFn>(lib, b"keryx_llama_load\0"),
+            sym::<CountFn>(lib, b"keryx_llama_tensor_count\0"),
+            sym::<InfoFn>(lib, b"keryx_llama_tensor_info\0"),
+            sym::<GenFn>(lib, b"keryx_llama_generate\0"),
+            sym::<FreeFn>(lib, b"keryx_llama_free\0"),
         ) else {
-            log::warn!("llama engine: {} is missing symbols — candle fallback stays active.", so.display());
+            log::warn!("llama engine: shared library is missing required symbols — inference engine unavailable.");
             return None;
         };
         let got = abi();
         if got != ABI {
-            log::warn!("llama engine: {} ABI {} != expected {} — candle fallback stays active.", so.display(), got, ABI);
+            log::warn!("llama engine: shared library ABI {} != expected {} — inference engine unavailable.", got, ABI);
             return None;
         }
-        // Optional (upstream aa29fd2): older .so builds lack it — the ownership gate then no-ops.
-        let tensor_device = sym::<TensorDeviceFn>(lib, "keryx_llama_tensor_device");
+        // Optional (upstream aa29fd2): older builds lack it — the ownership gate then no-ops.
+        let tensor_device = sym::<TensorDeviceFn>(lib, b"keryx_llama_tensor_device\0");
         let cg = CString::new(gguf).ok()?;
-        log::info!("llama engine: loading {} on GPU {} via {} (in-process, zero-dup)…", gguf, gpu, so.display());
+        log::info!("llama engine: loading {} on GPU {} (in-process, zero-dup)…", gguf, gpu);
         let configured_ctx = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse::<c_int>().ok());
         let n_ctx: c_int = configured_ctx.unwrap_or(4096);
         let mut model = load(cg.as_ptr(), gpu as c_int, n_ctx);
@@ -133,10 +130,10 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             model = load(cg.as_ptr(), gpu as c_int, 1024);
         }
         if model.is_null() {
-            log::warn!("llama engine: model load failed on GPU {} (VRAM? arch?) — candle fallback stays active.", gpu);
+            log::warn!("llama engine: model load failed on GPU {} (VRAM? arch? driver?) — OPoI inference unavailable on this card.", gpu);
             return None;
         }
-        log::info!("llama engine: ✓ active on GPU {} — llama.cpp hosts the model + serves OPoI inference (candle dormant).", gpu);
+        log::info!("llama engine: ✓ active on GPU {} — llama.cpp hosts the model + serves OPoI inference in-process.", gpu);
         Some(Engine { model, count, info, generate: gen, free, tensor_device, gpu, gguf: gguf.to_string() })
     }
 }
@@ -181,6 +178,9 @@ fn so_path() -> Option<std::path::PathBuf> {
     let want_noavx = !simd_ok
         || std::env::var("KERYX_LLAMA_FORCE_NOAVX").map_or(false, |v| v == "1");
     if want_noavx {
+        #[cfg(target_os = "windows")]
+        let p = dir.join("keryx-llama-noavx.dll");
+        #[cfg(not(target_os = "windows"))]
         let p = dir.join("libkeryx-llama-noavx.so");
         if p.exists() {
             log::info!(
@@ -200,7 +200,9 @@ fn so_path() -> Option<std::path::PathBuf> {
     // repackage the Linux .so alongside the macOS binary during cross-arch testing.
     #[cfg(target_os = "macos")]
     let candidates: [&str; 2] = ["libkeryx-llama.dylib", "libkeryx-llama.so"];
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    let candidates: [&str; 1] = ["keryx-llama.dll"];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let candidates: [&str; 1] = ["libkeryx-llama.so"];
     for name in candidates {
         let p = dir.join(name);
@@ -215,14 +217,35 @@ fn so_path() -> Option<std::path::PathBuf> {
     None
 }
 
-unsafe fn sym<T: Copy>(lib: *mut c_void, name: &str) -> Option<T> {
-    let c = CString::new(name).ok()?;
-    let p = libc::dlsym(lib, c.as_ptr());
-    if p.is_null() {
-        return None;
-    }
-    // fn-pointer types are pointer-sized; read the address as T.
-    Some(std::mem::transmute_copy::<*mut c_void, T>(&p))
+/// Open the llama.cpp shared library ONCE for the process and keep it resident forever. `libloading`
+/// picks the right OS primitive (dlopen / LoadLibrary), so this works on Linux, macOS AND Windows.
+/// The handle is never dropped (never dlclose/FreeLibrary'd), so fn pointers copied out via `sym`
+/// stay valid for the whole run — matching the old leak-the-dlopen-handle behavior.
+fn engine_lib() -> Option<&'static Library> {
+    static LIB: OnceLock<Option<Library>> = OnceLock::new();
+    LIB.get_or_init(|| {
+        let so = so_path()?;
+        // SAFETY: loading a trusted, self-shipped library next to our own binary; no init routine
+        // of it runs Rust code. Any load error (missing dep DLL, arch mismatch) is caught below.
+        match unsafe { Library::new(&so) } {
+            Ok(l) => {
+                log::info!("llama engine: loaded {} (in-process llama.cpp engine).", so.display());
+                Some(l)
+            }
+            Err(e) => {
+                log::warn!("llama engine: failed to load {}: {} — OPoI inference engine unavailable.", so.display(), e);
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Resolve a nul-terminated symbol name to a fn pointer. `T` must be an `extern "C"` fn-pointer type.
+/// The returned pointer is valid for the process lifetime because `lib` is the never-unloaded global
+/// from `engine_lib()`.
+unsafe fn sym<T: Copy>(lib: &'static Library, name: &[u8]) -> Option<T> {
+    lib.get::<T>(name).ok().map(|s| *s)
 }
 
 /// Load the .so + the model for `gpu` (idempotent, blocking — a model load takes seconds) WITHOUT

@@ -1,0 +1,13 @@
+; MSVC module-definition file: exports the keryx-llama C ABI from keryx-llama.dll on Windows.
+; On Linux/macOS the same symbols are exported by default (extern "C" + default visibility), so
+; this file is Windows-only and keeps keryx_llama.cpp itself byte-identical across platforms.
+; Keep in lockstep with the extern "C" block in keryx_llama.cpp (ABI 2).
+LIBRARY keryx-llama
+EXPORTS
+    keryx_llama_abi
+    keryx_llama_load
+    keryx_llama_tensor_count
+    keryx_llama_tensor_info
+    keryx_llama_tensor_device
+    keryx_llama_generate
+    keryx_llama_free
