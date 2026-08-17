@@ -391,7 +391,10 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     // file hiding behind a stale `.ok` (the "watchdog corrupts mid-download models" class). The
     // FULL content is still verified downstream when the PoM possession index recomputes the tier
     // root R_T, so a wrong drop fails there loudly rather than mining garbage.
-    let gguf_ready = crate::gguf::is_complete_file(&gguf);
+    // Explain the on-disk file's status up front so a hand-placed drop that gets rejected says WHY
+    // (absent / not a GGUF / truncated) instead of vanishing into a silent "staging/verifying" loop.
+    let gguf_reject = crate::gguf::completeness_reason(&gguf);
+    let gguf_ready = gguf_reject.is_none();
     if gguf_ready && (!need_tok || tok.exists()) {
         if ok_flag.exists() {
             log::debug!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
@@ -404,6 +407,22 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
             );
         }
         return Ok((tok, gguf));
+    }
+
+    // Not adoptable — name the exact expected path + the specific reason, at WARN so it surfaces in
+    // a normal (non-debug) log. This is the diagnostic an operator needs when a manually-copied
+    // model never becomes "ready".
+    if let Some(reason) = &gguf_reject {
+        log::warn!(
+            "SlmEngine: model '{}' NOT ready — expected GGUF at {}: {}. \
+             (Path must be exactly <model-dir>/{}/model.gguf.)",
+            spec.name, gguf.display(), reason, spec.dir_name
+        );
+    } else if need_tok && !tok.exists() {
+        log::warn!(
+            "SlmEngine: model '{}' GGUF is complete at {} but tokenizer.json is missing — will fetch it.",
+            spec.name, gguf.display()
+        );
     }
 
     std::fs::create_dir_all(&dir)?;
@@ -1740,6 +1759,28 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]> {
 /// `--tier auto` selection, before the lineup is staged via `init_supported`.
 pub fn spec_files_ready(spec: &ModelSpec) -> bool {
     model_dir(spec).join(".ok").exists()
+}
+
+/// One human-readable status line per supported-lineup model: the exact GGUF path the miner expects
+/// and whether it's ready, or the specific reason it isn't (absent / not a GGUF / truncated / no .ok
+/// yet). Drives the periodic diagnostic the miner prints while stuck in "preparing models
+/// (staging/verifying files)", so a manually-copied model that never becomes ready explains itself
+/// instead of looping silently. Empty when the lineup hasn't been installed yet.
+pub fn staging_diagnostics() -> Vec<String> {
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    specs.iter().map(|s| {
+        let dir = model_dir(s);
+        let gguf = dir.join("model.gguf");
+        let ok = dir.join(".ok").exists();
+        match crate::gguf::completeness_reason(&gguf) {
+            None if ok => format!("  '{}': READY ({})", s.name, gguf.display()),
+            None => format!(
+                "  '{}': GGUF complete but not yet adopted at {} (miner will write .ok on next staging pass)",
+                s.name, gguf.display()
+            ),
+            Some(reason) => format!("  '{}': NOT ready — {} [{}]", s.name, gguf.display(), reason),
+        }
+    }).collect()
 }
 
 /// True only when the model is supported, its files are completely downloaded, and it is not

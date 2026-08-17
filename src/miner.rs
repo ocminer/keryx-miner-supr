@@ -751,6 +751,9 @@ impl MinerManager {
         let mut ticker = tokio::time::interval(LOG_RATE);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_instant = ticker.tick().await;
+        // Rate-limit the per-model staging diagnostic so a stuck "preparing" box prints the WHY
+        // (expected path + reason each model was rejected) roughly once a minute, not every tick.
+        let mut prep_diag_ticks: u32 = 0;
         loop {
             let now = ticker.tick().await;
             let duration = (now - last_instant).as_secs_f64();
@@ -767,6 +770,19 @@ impl MinerManager {
                 if keryx_miner::slm::is_downloading() {
                     "still downloading the model (one-time first-run setup) — mining starts automatically when done, this is NOT a stall"
                 } else if keryx_miner::slm::loaded_model_ids().is_empty() {
+                    // Stuck with no model ready and nothing downloading — the common "manually
+                    // pasted a model.gguf but it never goes ready" case. Surface the exact expected
+                    // path + per-model reason (~once/min) so the loop stops being a silent spinner.
+                    if prep_diag_ticks % 6 == 0 {
+                        let diags = keryx_miner::slm::staging_diagnostics();
+                        if diags.is_empty() {
+                            warn!("model staging: no model lineup installed yet (waiting for chain tip / tier selection).");
+                        } else {
+                            warn!("model staging status (no model is ready yet — mining is suspended until one is):");
+                            for line in diags { warn!("{}", line); }
+                        }
+                    }
+                    prep_diag_ticks = prep_diag_ticks.wrapping_add(1);
                     "preparing models (staging/verifying files) — mining starts automatically when ready, this is NOT a stall"
                 } else {
                     "building the possession index / resident tree — mining starts automatically when done, this is NOT a stall"
