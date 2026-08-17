@@ -524,7 +524,12 @@ impl MinerManager {
                             // NVIDIA/Apple keep the synchronous submit (candle's per-device driver is
                             // not structured for the AMD detached-thread overlap).
                             #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
-                            if let Some(block_seed) = built {
+                            if let Some(mut block_seed) = built {
+                                // Tag the share with the GPU that found it so pool accept/reject is
+                                // attributed per-card (the A: / R: columns).
+                                if let crate::pow::BlockSeed::PartialBlock { device_id, .. } = &mut block_seed {
+                                    *device_id = wdid;
+                                }
                                 match send_channel.blocking_send(block_seed.clone()) {
                                     Ok(()) => block_seed.report_block(),
                                     Err(e) => warn!("Could not submit PoM block — pool connection dropped ({}); reconnecting", e),
@@ -827,7 +832,7 @@ impl MinerManager {
                         });
                     }
                 }
-                let suffix = match &health {
+                let mut suffix = match &health {
                     Some(h) => {
                         if let Some(w) = h.power_w {
                             power_sum += w;
@@ -838,6 +843,12 @@ impl MinerManager {
                     }
                     None => String::new(),
                 };
+                // Per-GPU accepted/rejected shares (field request): a card showing hashrate but
+                // `A: 0` is producing phantom hashrate (unstable OC) and never landing a real share.
+                if let Some(ord) = crate::gpu_health::ordinal_from_label(device) {
+                    let (acc, rej) = crate::pow::device_share_counts(ord as u32);
+                    suffix.push_str(&format!(" | A: {} / R: {}", acc, rej));
+                }
                 let r = Self::log_single_hashrate_with(
                     rate,
                     format!("Device {}:", device),

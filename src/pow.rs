@@ -38,7 +38,37 @@ pub enum BlockSeed {
         /// PoM (post-fork): borsh-encoded possession proof for this share. Empty pre-fork /
         /// legacy kHeavyHash. The stratum client hex-encodes it into `mining.submit` params[5].
         pom_proof: Vec<u8>,
+        /// The GPU (device ordinal) that FOUND this share. Set by the worker before submit (default
+        /// 0 in job templates), threaded to `shares_pending` so pool accept/reject is attributed
+        /// per-GPU for the per-card `A: / R:` diagnostic (catches phantom-hashrate/OC instability).
+        device_id: u32,
     },
+}
+
+// ── Per-GPU accepted/rejected share counters ─────────────────────────────────
+// Updated by the stratum accept/reject handler (via the device_id carried on each submitted share)
+// and read by the miner's per-GPU stats line. A card that shows hashrate but never accepts a share
+// (phantom hashrate from an unstable overclock) is then visible as `A: 0`.
+static PER_DEVICE_SHARES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, (u64, u64)>>> =
+    std::sync::OnceLock::new();
+
+fn per_device_shares() -> &'static std::sync::Mutex<std::collections::HashMap<u32, (u64, u64)>> {
+    PER_DEVICE_SHARES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record a pool-ACCEPTED share for `device_id`.
+pub fn record_share_accepted(device_id: u32) {
+    if let Ok(mut m) = per_device_shares().lock() { m.entry(device_id).or_default().0 += 1; }
+}
+
+/// Record a pool-REJECTED share (low-diff / stale / duplicate / invalid) for `device_id`.
+pub fn record_share_rejected(device_id: u32) {
+    if let Ok(mut m) = per_device_shares().lock() { m.entry(device_id).or_default().1 += 1; }
+}
+
+/// `(accepted, rejected)` share counts for `device_id` (both 0 if it never submitted).
+pub fn device_share_counts(device_id: u32) -> (u64, u64) {
+    per_device_shares().lock().ok().and_then(|m| m.get(&device_id).copied()).unwrap_or((0, 0))
 }
 
 impl BlockSeed {
