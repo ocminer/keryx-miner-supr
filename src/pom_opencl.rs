@@ -23,6 +23,8 @@ pub struct PomMiner {
     kernel: Kernel,
     /// H6 PoM v3 matrix-state walk kernel (one work-group per nonce). Grinds the int8 D×D×K matmul.
     kernel_v3: Kernel,
+    /// Work-group size for the chosen v3 kernel flavor: 128 (2-rows/item, RDNA3+) or 256 (1-row).
+    v3_local: usize,
     weights: Vec<Buffer<cl_ulong>>,
     slab_shift: u32,
     winner: Buffer<cl_ulong>,
@@ -82,12 +84,12 @@ fn dispatch_raw(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulon
 /// then finishes ONCE, keeping the GPU continuously fed (no per-sub-dispatch stall that lets the clock
 /// sag) instead of the old enqueue→finish→read per 128 nonces.
 #[allow(clippy::too_many_arguments)]
-fn enqueue_v3(queue: &CommandQueue, kernel: &Kernel, blob: &Buffer<cl_ulong>, winner: &Buffer<cl_ulong>,
+fn enqueue_v3(queue: &CommandQueue, kernel: &Kernel, blob: &Buffer<cl_ulong>, winner: &Buffer<cl_ulong>, v3_local: usize,
               n_tiles: u64, k: u32, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4],
               base: u64, n_nonces: u64) -> Option<()> {
-    const V3_LOCAL: usize = 256;
+    // local size comes from the chosen kernel flavor (128 = 2-rows/item on RDNA3+, 256 = 1-row).
     const V3_MERKLE_LDS_BYTES: usize = 3072 * 4;   // 256 leaves×8 + 128-hash ping-pong = 12 KB
-    let global = (n_nonces * V3_LOCAL as u64) as usize;
+    let global = (n_nonces * v3_local as u64) as usize;
     ExecuteKernel::new(kernel)
         .set_arg(blob)
         .set_arg(&n_tiles)
@@ -100,7 +102,7 @@ fn enqueue_v3(queue: &CommandQueue, kernel: &Kernel, blob: &Buffer<cl_ulong>, wi
         .set_arg(winner)
         .set_arg_local_buffer(V3_MERKLE_LDS_BYTES)
         .set_global_work_size(global)
-        .set_local_work_size(V3_LOCAL)
+        .set_local_work_size(v3_local)
         .enqueue_nd_range(queue)
         .ok()?;
     Some(())
@@ -172,7 +174,19 @@ impl PomMiner {
         let kernel = Kernel::create(&program, "pom_mine").map_err(|e| e.to_string())?;
         let kernel_ilp2 = Kernel::create(&program, "pom_mine_ilp2").map_err(|e| e.to_string())?;
         let kernel_ilp4 = Kernel::create(&program, "pom_mine_ilp4").map_err(|e| e.to_string())?;
-        let kernel_v3 = Kernel::create(&program, "pom_mine_v3").map_err(|e| e.to_string())?;
+        // v3 kernel flavor: BIG RDNA3 (gfx1100/gfx1101 — Navi31/32) uses the 2-rows-per-work-item variant (128-thread
+        // groups, each 128-bit column load feeds 8 int8 dots — measured +5-7% on an RX 7900 XTX,
+        // it is issue-bound at ~92% of its pure-dot ceiling). Everything else keeps the 1-row
+        // 256-thread layout: on GCN wave64 (MI50) the 2-row register pressure HALVES occupancy
+        // (measured -21%), and small RDNA3 (gfx1102) measured -4%. KERYX_POM_V3_2R=0/1 overrides.
+        let use_2r = match std::env::var("KERYX_POM_V3_2R").ok().as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => dev_name.contains("gfx1100") || dev_name.contains("gfx1101"),
+        };
+        let (v3_name, v3_local) = if use_2r { ("pom_mine_v3_2r", 128usize) } else { ("pom_mine_v3", 256usize) };
+        let kernel_v3 = Kernel::create(&program, v3_name).map_err(|e| e.to_string())?;
+        log::info!("PoM: v3 walk kernel = {v3_name} (local {v3_local}) on {dev_name}.");
         // worker.rs pattern: a context ref that outlives the borrow checker (Arc kept in struct).
         let cref = unsafe { Arc::as_ptr(&context).as_ref().unwrap() };
         // The whole tier blob lives in ONE cl_mem. AMD caps a single allocation at
@@ -294,7 +308,7 @@ impl PomMiner {
             best_name, best_ilp, best_local, best_rate / 1e6,
             if pin_ilp.is_some() || pin_local.is_some() { " [env-pinned]" } else { "" },
         );
-        Ok(Self { _context: context, queue, kernel: chosen, kernel_v3, weights, slab_shift, winner, n_chunks, ilp: best_ilp, local: best_local })
+        Ok(Self { _context: context, queue, kernel: chosen, kernel_v3, v3_local, weights, slab_shift, winner, n_chunks, ilp: best_ilp, local: best_local })
     }
 
     /// Create + stream the blob as ceil(n_chunks / 2^shift) buffers (shift>=63 = one buffer).
@@ -379,7 +393,7 @@ impl PomMiner {
         while done < batch {
             let sub = (batch - done).min(sub_dispatch);
             let base = nonce_base.wrapping_add(done);
-            enqueue_v3(&self.queue, &self.kernel_v3, &self.weights[0], &self.winner,
+            enqueue_v3(&self.queue, &self.kernel_v3, &self.weights[0], &self.winner, self.v3_local,
                        n_tiles, k, pph, seed, time, target, base, sub)?;
             done += sub;
         }

@@ -482,3 +482,114 @@ __kernel void pom_mine_v3(
         }
     }
 }
+// v3 grind (RDNA3+ variant): 1 work-group per nonce, local_size = 128 — each work-item owns TWO state rows (x and
+// x+128), so every 128-bit column load feeds EIGHT int8 dots instead of four. The kernel is
+// issue-bound (measured: pure-dot ceiling 5.67 vs full 5.20 knonce/s on an RX 7900 XTX), so
+// halving the load/addressing overhead per dot is worth ~+5-7%. V3_UNROLL on every loop that
+// indexes the row arrays keeps them in VGPRs (a single dynamically-indexed access would demote
+// the whole array to scratch). Winner = lowest nonce whose pow<=target.
+#define V3_UNROLL __attribute__((opencl_unroll_hint))
+__kernel __attribute__((reqd_work_group_size(128, 1, 1))) void pom_mine_v3_2r(
+    __global const uint* restrict blob32,   // whole tier blob as u32 (chunk idx -> blob32[idx*8])
+    const u64 n_tiles,                       // n_chunks / 2048
+    const uint K,                            // 256
+    const u64 p0, const u64 p1, const u64 p2, const u64 p3,   // POW-fold pph words
+    const u64 s0, const u64 s1, const u64 s2, const u64 s3,   // SEED-fold pph words
+    const u64 time_,
+    const u64 t0, const u64 t1, const u64 t2, const u64 t3,   // target (4 LE u64)
+    const u64 nonce_base, const u64 n_nonces,
+    volatile __global u64* winner,
+    __local uint* s_merkle)                  // 3072 u32 = 12 KB scratch for the final Merkle tree only
+{
+    const uint x  = get_local_id(0);         // this work-item's FIRST state row (0..127); second = x+128
+    const u64  gid = get_group_id(0);
+    if (gid >= n_nonces) return;
+    const u64 nonce = nonce_base + gid;
+    const u64 seed  = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+
+    // S_0 rows x and x+128: mix64 keystream (identical bytes to the 1-row/thread layout).
+    uint rowA[V3_D4], rowB[V3_D4];
+    {
+        u64 h = pom_mix64(seed ^ (V3_S0_ROW_SALT + (u64)x));
+        V3_UNROLL for (int k4 = 0; k4 < V3_D4; k4++) { h = pom_mix64(h); rowA[k4] = (uint)h; }
+    }
+    {
+        u64 h = pom_mix64(seed ^ (V3_S0_ROW_SALT + (u64)(x + 128)));
+        V3_UNROLL for (int k4 = 0; k4 < V3_D4; k4++) { h = pom_mix64(h); rowB[k4] = (uint)h; }
+    }
+    u64 off = pom_mix64(seed ^ V3_OFFSET_FIRST_SALT) % n_tiles;
+
+    // The tile is read DIRECTLY from the resident blob (VRAM/L2), NOT staged into LDS: freeing the
+    // 64 KB LDS lets far more wavefronts stay resident (latency hiding) and the 64 KB tile is small
+    // enough to stay L2/Infinity-Cache-hot across a step's 256×256 reuse — measured ~1.6x faster
+    // than the LDS-staged version. The state update is row-independent and reads no shared memory,
+    // so NO per-step barrier is needed. Byte-identical (same bytes, different memory space).
+    for (uint step = 1; step <= K; step++) {
+        const u64 chunk0 = off * (u64)V3_TILE_CHUNKS;
+        __global const uint* gtile = blob32 + chunk0 * 8UL;   // tile row j = gtile + j*64
+
+        // Next offset from THIS tile's snippet (first 32 B = 8 u32), derived by every WI.
+        {
+            u64 sf = 0;
+            for (int w = 0; w < 8; w++) sf = pom_mix64(sf ^ (u64)gtile[w]);
+            off = pom_mix64(seed ^ (u64)(step + 1) * V3_OFFSET_STEP_SALT ^ sf) % n_tiles;
+        }
+
+        // next[x][j] = rho8(dot_i8(row_x, col_j), tweak(step,x,j)), packed 4 bytes/uint.
+        // One 128-bit column load feeds 4 dots for row x AND 4 for row x+128 — the loads and
+        // addressing amortize over twice the useful work. Byte-exact: identical dot order per row.
+        const uint twA = step * 0x9E3779B9u + x * 0xC2B2AE35u;
+        const uint twB = step * 0x9E3779B9u + (x + 128u) * 0xC2B2AE35u;
+        uint newA[V3_D4], newB[V3_D4];
+        for (int j4 = 0; j4 < V3_D4; j4++) {
+            uint pkA = 0, pkB = 0;
+            V3_UNROLL for (int jj = 0; jj < 4; jj++) {
+                const int j = j4 * 4 + jj;
+                __global const uint4* col4 = (__global const uint4*)(gtile + j * V3_D4); // tile row j = 16 u128
+                int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+                int b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+                V3_UNROLL for (int k16 = 0; k16 < V3_D4 / 4; k16++) {
+                    uint4 c = col4[k16];
+                    a0 = v3_dp4(rowA[k16*4+0], c.x, a0);
+                    a1 = v3_dp4(rowA[k16*4+1], c.y, a1);
+                    a2 = v3_dp4(rowA[k16*4+2], c.z, a2);
+                    a3 = v3_dp4(rowA[k16*4+3], c.w, a3);
+                    b0 = v3_dp4(rowB[k16*4+0], c.x, b0);
+                    b1 = v3_dp4(rowB[k16*4+1], c.y, b1);
+                    b2 = v3_dp4(rowB[k16*4+2], c.z, b2);
+                    b3 = v3_dp4(rowB[k16*4+3], c.w, b3);
+                }
+                pkA |= v3_rho8((a0 + a1) + (a2 + a3), twA + (uint)j * 0x85EBCA6Bu) << (8 * jj);
+                pkB |= v3_rho8((b0 + b1) + (b2 + b3), twB + (uint)j * 0x85EBCA6Bu) << (8 * jj);
+            }
+            newA[j4] = pkA;
+            newB[j4] = pkB;
+        }
+        V3_UNROLL for (int k4 = 0; k4 < V3_D4; k4++) { rowA[k4] = newA[k4]; rowB[k4] = newB[k4]; }
+    }
+
+    // root_K: blake3 row leaves + depth-8 tree in the small LDS scratch (this thread owns 2 leaves).
+    b3_hash_row(rowA, s_merkle + x * 8);
+    b3_hash_row(rowB, s_merkle + (x + 128) * 8);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __local uint* src = s_merkle;
+    __local uint* dst = s_merkle + V3_D * 8;
+    for (uint n = V3_D; n > 1; n >>= 1) {
+        if (x < n / 2) b3_hash_pair(src + x * 16, dst + x * 8);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        __local uint* tmp = src; src = dst; dst = tmp;
+    }
+    if (x == 0) {
+        const u64 fin = (u64)src[0] | ((u64)src[1] << 32);
+        u64 pv[4];
+        pom_pow_fold(fin, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) {
+            u64 old = *winner;
+            while (nonce < old) {
+                u64 prev = atom_cmpxchg(winner, old, nonce);
+                if (prev == old) break;
+                old = prev;
+            }
+        }
+    }
+}
