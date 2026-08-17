@@ -519,7 +519,10 @@ fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier, 
     for (dev, vram) in &vrams {
         let (tier, is_forced) = match forced.get(*dev as usize).copied().flatten() {
             Some(t) => {
-                info!("GPU {}: --force-model → {} (forced; card has {} MiB).", dev, t.pom_model_name(), vram);
+                // --force-model means FORCE: honor the operator's choice with NO VRAM check. If it
+                // does not fit the card it will OOM — that is the user's explicit call. (Only AUTO
+                // selection below is VRAM-aware.)
+                info!("GPU {}: --force-model → {} (forced, no VRAM check; card has {} MiB).", dev, t.pom_model_name(), vram);
                 (t, true)
             }
             None => {
@@ -1255,6 +1258,11 @@ async fn run() -> Result<(), Error> {
             // without a per-device override use it. On a UNIFORM rig no overrides are set below, so
             // this is byte-identical to the previous single-model path.
             keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
+            // Record which cards are --force-model-pinned so the OOM auto-demotion never overrides an
+            // explicit forced choice (forced = load exactly this, no VRAM check).
+            for (dev, _t, is_forced) in &device_tiers {
+                if *is_forced { keryx_miner::pom_gpu::set_device_forced(*dev); }
+            }
             // Per-card overrides: cards whose best-fit (or --force-model) differs from the primary
             // get their OWN model, and those distinct smaller models are prefetched too.
             let mut extra: Vec<&'static keryx_miner::models::ModelSpec> = Vec::new();

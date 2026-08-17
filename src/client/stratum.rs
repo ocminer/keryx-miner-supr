@@ -456,7 +456,9 @@ impl StratumHandler {
     /// MUST know what a rig serves as soon as it can serve it: a rig that authorized before its
     /// model was ready used to declare `models:[]` once and never correct it. Best-effort/non-fatal.
     async fn declare_capabilities_if_changed(&mut self) -> Result<(), Error> {
-        let model_ids: Vec<String> = keryx_miner::slm::loaded_model_ids()
+        // Declare only PROVEN-serveable models (passed the inference self-test / answered live), never
+        // aspirationally: the pool must not route us a request for a tier we cannot actually serve.
+        let model_ids: Vec<String> = keryx_miner::slm::serveable_model_ids()
             .into_iter()
             .map(hex::encode)
             .collect();

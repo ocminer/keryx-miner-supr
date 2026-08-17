@@ -1718,6 +1718,117 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
     Ok(())
 }
 
+// ── OPoI serveability self-test ──────────────────────────────────────────────
+// The network's whole point is serving inference. Mining a tier we CANNOT serve exposes the pool to
+// inference strikes, and declaring one we cannot serve is dishonest. So a model must PROVE it can
+// generate on THIS rig before we announce or mine its tier: we run one tiny real generation and gate
+// declaration + mining on it. The result is cached (pass or fail) so the probe runs once per model
+// bring-up, not every mining cycle. A transient GPU fault reset clears the entry so it re-probes.
+const SELF_TEST_MAX_TOKENS: usize = 8;
+
+fn self_test_state() -> &'static RwLock<std::collections::HashMap<[u8; 32], bool>> {
+    static S: OnceLock<RwLock<std::collections::HashMap<[u8; 32], bool>>> = OnceLock::new();
+    S.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+/// True once `model_id` PASSED its inference self-test on this rig and has not since been withdrawn.
+/// This is the gate for both declaring the model to the pool and mining its tier.
+pub fn model_serveable(model_id: &[u8; 32]) -> bool {
+    let passed = self_test_state().read().map(|m| m.get(model_id).copied() == Some(true)).unwrap_or(false);
+    passed && !model_is_unavailable(model_id)
+}
+
+/// Whether a self-test has already been attempted (pass or fail) for `model_id`.
+pub fn self_test_attempted(model_id: &[u8; 32]) -> bool {
+    self_test_state().read().map(|m| m.contains_key(model_id)).unwrap_or(false)
+}
+
+/// Record that `model_id` is proven serveable (self-test passed, OR a real OPoI generation just
+/// succeeded — a live answer is the strongest possible proof). Idempotent.
+pub fn record_serveable(model_id: &[u8; 32]) {
+    if let Ok(mut m) = self_test_state().write() { m.insert(*model_id, true); }
+}
+
+/// The honest declare set: staged models that have PROVEN they can serve inference on this rig.
+/// `declare_capabilities` announces THIS (not raw `loaded_model_ids`), so the pool never routes us a
+/// request for a tier we cannot answer — and we never mine a tier we cannot serve (the walk install
+/// gates on the same `model_serveable`).
+///
+/// The self-test gate is wired in the CUDA walk bring-up (`pom_gpu::ensure_installed_inner`). The
+/// AMD/OpenCL (CPU/vk inference) and macOS/Metal builds don't run it yet, so they keep the prior
+/// declaration semantics — gating them here would stop them declaring anything.
+pub fn serveable_model_ids() -> Vec<[u8; 32]> {
+    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    { loaded_model_ids().into_iter().filter(|m| model_serveable(m)).collect() }
+    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+    { loaded_model_ids() }
+}
+
+/// Forget a model's self-test result so it re-probes (used after a transient GPU-fault reset that
+/// rebuilds the card's engine — the prior pass no longer necessarily holds).
+pub fn clear_self_test(model_id: &[u8; 32]) {
+    if let Ok(mut m) = self_test_state().write() { m.remove(model_id); }
+}
+
+/// Run ONE tiny inference on `gpu` to prove `model_id` can actually serve OPoI before we declare or
+/// mine its tier. Caches the outcome. PASS → `mark_model_available` (declarable + mineable); FAIL →
+/// `mark_model_unavailable` (withdrawn from ai:cap; the mining gate then refuses to grind a tier we
+/// cannot serve). Budgeted by nature: a warm short generation is ~1-2 s; a model that needs far
+/// longer would miss the on-chain service window anyway, so slow/empty == not serveable.
+pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
+    if let Ok(m) = self_test_state().read() {
+        if let Some(&passed) = m.get(model_id) {
+            return passed && !model_is_unavailable(model_id);
+        }
+    }
+    let name = {
+        let specs = *SUPPORTED_SPECS.read().unwrap();
+        specs.iter().find(|s| &s.model_id == model_id).map(|s| s.name).unwrap_or("?")
+    };
+    log::info!(
+        "OPoI self-test: probing '{}' on GPU {} — a model must prove it can generate before we \
+         declare/mine its tier (the network exists to serve inference).", name, gpu
+    );
+    let t0 = std::time::Instant::now();
+    let out = load_and_run_inference_on(gpu, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS);
+    let secs = t0.elapsed().as_secs_f64();
+    let passed = matches!(&out, Some(t) if !t.trim().is_empty());
+    if let Ok(mut m) = self_test_state().write() { m.insert(*model_id, passed); }
+    if passed {
+        mark_model_available(model_id, "inference_self_test_passed");
+        log::info!("OPoI self-test: '{}' PASSED in {:.1}s — serveable; its tier will be declared + mined.", name, secs);
+    } else {
+        mark_model_unavailable(model_id, "inference_self_test_failed");
+        log::warn!(
+            "OPoI self-test: '{}' FAILED after {:.1}s (no/empty output) — NOT serveable. Withdrawing it \
+             from ai:cap and NOT mining this tier (mining a tier we cannot serve would strike the pool). \
+             Cause is above: GPU inference could not load/run — usually the card lacks VRAM for this \
+             model, an old driver, or a missing CUDA runtime / keryx-llama engine next to the miner.",
+            name, secs
+        );
+    }
+    passed
+}
+
+/// VRAM headroom (MiB) required ON TOP of a smaller tier's `min_vram_mb` when demoting a card that
+/// OOMed — the walk gather + inference context need room beyond the raw weight budget.
+const DEMOTE_VRAM_HEADROOM_MB: u64 = 2_000;
+
+/// The largest supported model STRICTLY smaller (by `min_vram_mb`) than `current`, whose files are
+/// staged (`.ok`) and whose budget + headroom fits `vram_mb`. Used to demote a card that OOMed on a
+/// too-big tier to one that actually fits, so it mines/serves SOMETHING instead of looping on OOM.
+/// `None` when nothing smaller is both ready and fits — the caller then halts that card with guidance.
+pub fn next_smaller_ready_spec(current: &[u8; 32], vram_mb: u64) -> Option<&'static ModelSpec> {
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    let cur_budget = specs.iter().find(|s| &s.model_id == current).map(|s| s.min_vram_mb)?;
+    specs.iter()
+        .copied()
+        .filter(|s| s.min_vram_mb < cur_budget)
+        .filter(|s| spec_files_ready(s))
+        .filter(|s| s.min_vram_mb + DEMOTE_VRAM_HEADROOM_MB <= vram_mb)
+        .max_by_key(|s| s.min_vram_mb)
+}
+
 /// True while a model file is actively downloading via IPFS (set around the download in
 /// `ensure_gguf`). Lets the hashrate reporter say "downloading model" instead of the alarming
 /// "workers stalled or crashed" during the (potentially many-minute) first-run fetch.
@@ -1896,6 +2007,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                 }
                 // Upstream 0795e92: a successful generation re-announces the model in ai:cap.
                 mark_model_available(model_id, "generation_success");
+                record_serveable(model_id); // a live answer is proof this rig can serve the tier
                 return Some(strip_think_tags(&text));
             }
             log::warn!("SlmEngine: in-process llama generate failed on GPU {} — trying the next engine.", gpu);

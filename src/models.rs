@@ -201,9 +201,12 @@ pub const GEMMA_4_12B_ABLITERATED: ModelSpec = ModelSpec {
     tokenizer_cid: "",
     config_cid: "",
     weight_cids: &["QmSDVicqRDwitecBaPitHsAePLUEamgL4KfrBWYHVWQyx9"],
+    // 20 GB, not 12-13: the PoM walk gather + the inference context/KV need real headroom beyond the
+    // raw weights, and a 16 GB card (5070Ti/5080) OOMs the walk build for this 12B model. Requiring
+    // ~20 GB keeps auto-tier off 16 GB cards (they run t0/t1 9B) and onto 24 GB+ cards that fit.
     dir_name: "Gemma-4-12B-abliterated",
     // ~9.8 GB Q6_K weights + ~2 GB KV/workspace → 16 GB card (fills the 12→24 GB gap).
-    min_vram_mb: 16_000,
+    min_vram_mb: 20_000,
 };
 
 pub const GEMMA_3_4B: ModelSpec = ModelSpec {
