@@ -838,6 +838,23 @@ pub fn set_device_model(device_id: u32, model_id: [u8; 32], gguf_path: String) {
     }
 }
 
+/// Devices whose model was pinned by `--force-model`. A forced device is NEVER auto-demoted on an
+/// OOM — `--force-model` means "load exactly this, no VRAM check", so we honor it even if it OOMs.
+fn forced_devices() -> &'static Mutex<std::collections::HashSet<u32>> {
+    static F: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    F.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Mark `device_id` as `--force-model`-pinned (set from the CLI). Suppresses OOM auto-demotion.
+pub fn set_device_forced(device_id: u32) {
+    if let Ok(mut f) = forced_devices().lock() { f.insert(device_id); }
+}
+
+/// Whether this device's model was pinned via `--force-model`.
+pub fn is_device_forced(device_id: u32) -> bool {
+    forced_devices().lock().map(|f| f.contains(&device_id)).unwrap_or(false)
+}
+
 /// The model this device mines: its per-device override if set, else the process-wide default.
 pub fn device_model(device_id: u32) -> Option<([u8; 32], String)> {
     if let Ok(m) = device_models().lock() {
@@ -1057,6 +1074,23 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             }
         }
     }
+    // SERVEABILITY GATE — the network exists to serve inference, so we NEVER mine a tier we cannot
+    // serve (mining it would expose the pool to inference strikes). The serving GPU hosts EVERY model
+    // (it swaps on demand), so we prove THIS device's model by a one-time inference self-test THERE,
+    // whichever card mines the tier — this covers mixed rigs (e.g. a 3070 mining Qwen while the big
+    // card serves GLM). The result is cached per model, so only the first card per model generates; a
+    // model that fails is withdrawn from ai:cap and NOT mined on any card. (`inference_gpu` above.)
+    if !crate::slm::run_inference_self_test(&model_id, inference_gpu) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            info!(
+                "PoM[gpu{}]: model not proven serveable (inference self-test failed on the serving \
+                 GPU) — NOT mining this tier (we do not mine a tier we cannot serve).",
+                device_id
+            );
+        }
+        return false;
+    }
     // Non-inference GPUs (and byte-gate failures) walk a standalone raw upload of the canonical
     // GGUF bytes (`load_raw`) — candle-free, so it works for the H4 llama-only archs
     // (Qwen3.5-hybrid-SSM / GLM-4 / EXAONE-4 / Kimi-Linear-MoE) that candle cannot load at all.
@@ -1100,6 +1134,56 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                     e_msg
                 );
                 reset_stale_gpu_state(device_id);
+                return false;
+            }
+            // OUT_OF_MEMORY: this tier is simply too big for THIS card. Do not loop on it forever
+            // (the "device miner build failed: OUT_OF_MEMORY" spin). Withdraw it and DEMOTE this card
+            // to the largest staged tier that actually fits, so it mines/serves something instead of
+            // nothing; if nothing smaller is staged/fits, halt this card with clear guidance.
+            // (operator: make sure a model that fits VRAM is loaded.)
+            let low = e_msg.to_ascii_lowercase();
+            if low.contains("out of memory") || low.contains("out_of_memory") {
+                let vram_mb = query_all_gpus_vram().into_iter()
+                    .find(|(d, _)| *d == device_id).map(|(_, m)| m).unwrap_or(0);
+                // --force-model: honor the user's explicit choice — no VRAM check, no demotion.
+                if is_device_forced(device_id) {
+                    static WARNED_FORCED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED_FORCED.swap(true, Ordering::Relaxed) {
+                        log::error!(
+                            "PoM[gpu{}]: FORCED model OOMed on {} MB VRAM (device miner build: out of \
+                             memory). --force-model is honored WITHOUT a VRAM check — choose a smaller \
+                             --force-model or a card with more VRAM. Not demoting (forced).",
+                            device_id, vram_mb
+                        );
+                    }
+                    return false;
+                }
+                crate::slm::mark_model_unavailable(&model_id, "walk_build_oom");
+                crate::slm::clear_self_test(&model_id);
+                match crate::slm::next_smaller_ready_spec(&model_id, vram_mb) {
+                    Some(smaller) => {
+                        log::warn!(
+                            "PoM[gpu{}]: model walk OOMed on {} MB VRAM — too big for this card. \
+                             DEMOTING to '{}' ({} MB budget) and rebuilding. For a specific tier use \
+                             --force-model, or use a card with more VRAM.",
+                            device_id, vram_mb, smaller.name, smaller.min_vram_mb
+                        );
+                        let gguf = crate::slm::gguf_path_for(smaller).to_string_lossy().into_owned();
+                        set_device_model(device_id, smaller.model_id, gguf);
+                    }
+                    None => {
+                        static WARNED_HALT: AtomicBool = AtomicBool::new(false);
+                        if !WARNED_HALT.swap(true, Ordering::Relaxed) {
+                            log::error!(
+                                "PoM[gpu{}]: model walk OOMed on {} MB VRAM and NO smaller staged tier \
+                                 fits — this card cannot mine any available tier. Download a lighter \
+                                 model (t0 Qwen3.5-9B / t1 GLM-4-9B) or use a card with more VRAM. \
+                                 Mining is halted for this device until a fitting model is available.",
+                                device_id, vram_mb
+                            );
+                        }
+                    }
+                }
                 return false;
             }
             log::error!("PoM[gpu{}]: device miner build failed: {}", device_id, e);
