@@ -62,6 +62,18 @@ KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     // observed loops are whole sentences (~25 tokens each), far beyond the classic 64-token
     // window; 1.10 is the battle-tested llama.cpp default. (Upstream 76047d9.)
     llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    // DRY (Don't Repeat Yourself) ahead of the flat penalty: the 256-window repeat penalty scores
+    // single tokens and cannot see a whole clause repeating with different filler between copies —
+    // the exact loop the 9B Q4 models fall into. DRY matches the longest suffix that already
+    // appeared and penalizes its continuation, so a re-emerging sentence gets choked at token ~3
+    // instead of running to completion. Params are the llama.cpp/text-gen-webui defaults
+    // (multiplier 0.8, base 1.75, allowed-length 2, whole-context window -1); the seq breakers stop
+    // matches from spanning sentence/quote boundaries. (Ported from upstream Keryx-Labs f8d6ba4b.)
+    static const char* dry_breakers[] = { "\n", ":", "\"", "*" };
+    llama_sampler_chain_add(smpl, llama_sampler_init_dry(
+        llama_model_get_vocab(model), llama_model_n_ctx_train(model),
+        0.8f, 1.75f, 2, -1, dry_breakers,
+        sizeof(dry_breakers) / sizeof(dry_breakers[0])));
     llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, 1.10f, 0.0f, 0.0f));
     llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));

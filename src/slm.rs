@@ -852,15 +852,28 @@ fn hit_stop_string(tokenizer: &Tokenizer, generated: &[u32], stops: &[&str]) -> 
     }
 }
 
-/// Strip a self-emitted `<think>…</think>` block (e.g. Qwen3 with `/no_think`
-/// still emits an empty `<think></think>` pair). When no closing tag is present
-/// the original text is returned (the model answered directly) — never an empty
-/// string — so a direct answer is preserved.
+/// Strip a self-emitted reasoning block that H6 "thinking" models (Qwen3.5, GLM-4, Gemma-4) leak
+/// ahead of the answer when the GGUF's built-in chat template leaves thinking on. Each dialect has
+/// its own close marker; we cut everything up to + including the LAST one present, then trim. When
+/// no close marker is found the text is returned as-is (the model answered directly) — never empty,
+/// so a direct answer is preserved. (Adapts upstream Keryx-Labs/keryx-miner d9e09a53 to our fork,
+/// which formats via the GGUF template rather than a manual per-model prompt, so we strip the leak
+/// post-hoc instead of prefilling a closed block.)
 fn strip_think_tags(text: &str) -> String {
-    match text.find("</think>") {
-        Some(end) => text[end + "</think>".len()..].trim().to_string(),
-        None => text.trim().to_string(),
+    // Ordered by how far into the output the answer begins; use the LAST occurrence of each so a
+    // reasoning block that itself quotes the marker doesn't cut the real answer short.
+    const CLOSERS: &[&str] = &[
+        "</think>",            // Qwen3.x / GLM-4 / DeepSeek ChatML think block
+        "<channel|>message",   // Gemma-4 <|channel>thought … <channel|>message<answer>
+        "<channel|>",          // Gemma-4 fallback (empty/closed thought channel)
+        "<|/thought|>",        // GLM channel-thought variant
+    ];
+    for close in CLOSERS {
+        if let Some(pos) = text.rfind(close) {
+            return text[pos + close.len()..].trim().to_string();
+        }
     }
+    text.trim().to_string()
 }
 
 fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Result<String> {
@@ -1809,7 +1822,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                 }
                 // Upstream 0795e92: a successful generation re-announces the model in ai:cap.
                 mark_model_available(model_id, "generation_success");
-                return Some(text);
+                return Some(strip_think_tags(&text));
             }
             log::warn!("SlmEngine: in-process llama generate failed on GPU {} — trying the next engine.", gpu);
         } else {
@@ -1824,7 +1837,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
     #[cfg(feature = "pom-opencl")]
     if crate::llama_engine_vk::available() {
         if let Some(text) = crate::llama_engine_vk::generate(prompt, max_tokens) {
-            return Some(text);
+            return Some(strip_think_tags(&text));
         }
         log::warn!("SlmEngine: in-process llama-vk generate failed — trying the next engine.");
     }
@@ -1832,7 +1845,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
     if crate::llama_vulkan::available() {
         if let Some(text) = crate::llama_vulkan::generate(prompt, max_tokens) {
-            return Some(text);
+            return Some(strip_think_tags(&text));
         }
         log::warn!("SlmEngine: llama-server inference returned nothing — falling back to candle for this challenge.");
     }
