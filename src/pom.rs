@@ -1029,6 +1029,12 @@ impl WeightIndex {
         // candle's qt.data() yielded, but arch-agnostic (see the GgufMeta note above).
         const SLAB_CHUNKS: u64 = 1 << 16; // 2 MiB per read
         let mut slab = vec![0u8; (SLAB_CHUNKS * 32) as usize];
+        // Live progress for the possession-index build (users reported "stuck at verifying/preparing
+        // forever" — this multi-minute chunk-hash pass had no output). Total chunks are known from the
+        // tensor sizes up front; log %, elapsed and ETA every ~10 s so the rig shows real progress.
+        let total_chunks: u64 = names.iter().map(|n| meta.tensors[n].nbytes / 32).sum();
+        let idx_build_start = std::time::Instant::now();
+        let mut last_idx_log = idx_build_start;
         for name in &names {
             let t = &meta.tensors[name];
             let file_off = meta.tensor_data_offset + t.offset;
@@ -1051,6 +1057,18 @@ impl WeightIndex {
                     }
                 }
                 done += take;
+                if last_idx_log.elapsed().as_secs() >= 10 {
+                    last_idx_log = std::time::Instant::now();
+                    let el = idx_build_start.elapsed().as_secs_f64();
+                    let rate = n_chunks as f64 / el.max(0.001);
+                    let pct = if total_chunks > 0 { n_chunks * 100 / total_chunks } else { 0 };
+                    let eta = total_chunks.saturating_sub(n_chunks) as f64 / rate.max(1.0);
+                    log::info!(
+                        "PoM: building possession index — {}/{} chunks ({}%), {:.0}s elapsed, ETA ~{:.0}s — \
+                         mining starts automatically when done, this is NOT a stall.",
+                        n_chunks, total_chunks, pct, el, eta,
+                    );
+                }
             }
         }
         if !batch_buf.is_empty() {
