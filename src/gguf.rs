@@ -212,19 +212,43 @@ impl GgufMeta {
 /// True when `path` is a parseable GGUF whose on-disk size covers every tensor.
 /// Used to reuse already-downloaded models without hitting the network again.
 pub fn is_complete_file(path: &std::path::Path) -> bool {
+    completeness_reason(path).is_none()
+}
+
+fn human_bytes(n: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 { v /= 1024.0; i += 1; }
+    format!("{:.2} {}", v, U[i])
+}
+
+/// `None` when the file is a complete, adoptable GGUF; otherwise a human-readable reason it was
+/// rejected (absent, unreadable, header won't parse, or truncated). Drives the staging diagnostics
+/// so a rejected hand-placed model.gguf explains itself instead of looping silently on
+/// "staging/verifying files". `is_complete_file` is the boolean view of the same check.
+pub fn completeness_reason(path: &std::path::Path) -> Option<String> {
     let mut f = match File::open(path) {
         Ok(f) => f,
-        Err(_) => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some("file not present".into()),
+        Err(e) => return Some(format!("cannot open file ({e})")),
     };
     let meta = match GgufMeta::read(&mut f) {
         Ok(m) => m,
-        Err(_) => return false,
+        Err(e) => return Some(format!("not a parseable GGUF header ({e})")),
     };
     let file_len = match f.metadata() {
         Ok(m) => m.len(),
-        Err(_) => return false,
+        Err(e) => return Some(format!("cannot stat file ({e})")),
     };
-    file_len >= meta.required_file_len()
+    let required = meta.required_file_len();
+    if file_len < required {
+        return Some(format!(
+            "incomplete/truncated — on-disk {} < required {} for {} tensors (finish the download / re-copy the full file)",
+            human_bytes(file_len), human_bytes(required), meta.tensors.len()
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
