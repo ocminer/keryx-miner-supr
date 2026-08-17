@@ -51,13 +51,14 @@ pub mod llama_engine_vk {
 // In-process llama.cpp engine (dlopen'd libkeryx-llama.{so,dylib}): candle-independence — when
 // present it hosts the model (the walk gathers over its VRAM on CUDA / zero-dup; on Metal the
 // walk today keeps its own packed buffer) AND serves OPoI text. Compiled on every unix target
-// (Linux CUDA + macOS Metal), stubbed on Windows since dlopen semantics differ.
-#[cfg(all(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")), unix))]
+// In-process llama.cpp engine — Linux CUDA + macOS Metal + Windows CUDA. Loads keryx-llama.{so,dll,
+// dylib} via `libloading` (dlopen / LoadLibrary), so it is now a REAL module on Windows too (it was
+// previously stubbed there, which left Windows NVIDIA rigs unable to serve H4/H6 models — they only
+// load via llama.cpp). The stub below only remains for exotic non-unix, non-windows targets.
+#[cfg(all(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")), any(unix, windows)))]
 pub mod llama_engine;
-// Windows: no dlopen — the in-process engine is unavailable there (candle stays the default;
-// the llama-server subprocess path still works via KERYX_LLAMA_SERVER). Stub keeps call sites
-// identical across platforms.
-#[cfg(all(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")), not(unix)))]
+// Fallback stub for any target that is neither unix nor windows — keeps call sites identical.
+#[cfg(all(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")), not(any(unix, windows))))]
 pub mod llama_engine {
     pub fn ensure_loaded(_gguf: &str, _gpu: usize) -> bool { false }
     pub fn ensure_loaded_on(_gguf: &str, _gpu: usize) -> bool { false }

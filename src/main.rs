@@ -1313,6 +1313,12 @@ async fn run() -> Result<(), Error> {
 
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
+    // CPU inference is OFF by default: a card that can't run GPU inference withdraws from OPoI
+    // rather than doing futile CPU work. Either flag opts in; --cpu-inference additionally forces
+    // CPU from the start.
+    if opt.cpu_inference || opt.enable_cpu_inference {
+        keryx_miner::slm::set_cpu_inference_allowed(true);
+    }
     if opt.cpu_inference {
         // Explicit operator opt-out: force OPoI inference onto the CPU for the whole session.
         keryx_miner::slm::set_cpu_inference(true);

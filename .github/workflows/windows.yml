@@ -273,6 +273,33 @@ jobs:
           & "$env:CUDA_PATH\bin\nvcc.exe" --version
           cargo build --release --target $env:TARGET --features static-cuda,pom-cuda -p keryx-miner-supr
 
+      # The in-process llama.cpp engine as keryx-llama.dll. Without it a Windows NVIDIA rig cannot
+      # serve the H4/H6 models (they load ONLY via llama.cpp; candle has no loader) and inference
+      # falls through to unusable CPU. Built here because CUDA + MSVC are already set up in this job.
+      # 90-virtual emits compute_90 PTX that forward-JITs to sm_120 (5070Ti/5080/5090) at load, so a
+      # CUDA 12.5 toolchain predating sm_120 SASS still runs on Blackwell.
+      - name: Build keryx-llama.dll (in-process llama.cpp engine)
+        shell: pwsh
+        run: |
+          $tag = "b10015"
+          if (-not (Test-Path "llama-src")) {
+            git clone --quiet --depth 1 --branch $tag https://github.com/ggml-org/llama.cpp llama-src
+          }
+          $llamaSrc = (Resolve-Path "llama-src").Path
+          cmake -S tools/keryx-llama -B build-llama `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DLLAMA_SRC="$llamaSrc" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;90-virtual" `
+            -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH\bin\nvcc.exe"
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          cmake --build build-llama --config Release --target keryx-llama -j 4
+          if ($LASTEXITCODE -ne 0) { throw "keryx-llama.dll build failed" }
+          $dll = Get-ChildItem -Path build-llama -Recurse -Filter keryx-llama.dll | Select-Object -First 1
+          if (-not $dll) { throw "keryx-llama.dll not produced" }
+          Write-Host "built $($dll.FullName) ($([math]::Round($dll.Length/1MB,1)) MB)"
+          Copy-Item $dll.FullName "keryx-llama.dll" -Force
+
       - name: Stage artifact (exe + bundled CUDA runtime DLLs)
         shell: pwsh
         run: |
@@ -280,6 +307,12 @@ jobs:
           $out = "dist-win-cuda-pom"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "$rel\keryx-miner-supr.exe" $out\
+          # In-process llama.cpp engine — REQUIRED to serve H4/H6 models on Windows/NVIDIA.
+          if (Test-Path "keryx-llama.dll") {
+            Copy-Item "keryx-llama.dll" $out\
+          } else {
+            throw "keryx-llama.dll missing — the NVIDIA PoM package must ship the llama.cpp engine"
+          }
           $cudaBin = "$env:CUDA_PATH\bin"
           foreach ($pat in @("cublas64_*.dll","cublasLt64_*.dll","curand64_*.dll","cudart64_*.dll")) {
             Get-ChildItem -Path $cudaBin -Filter $pat -ErrorAction SilentlyContinue | Copy-Item -Destination $out
