@@ -109,7 +109,7 @@ pub struct ShareStats {
     pub stale: AtomicU64,
     pub low_diff: AtomicU64,
     pub duplicate: AtomicU64,
-    pub shares_pending: Mutex<HashMap<u32, String>>,
+    pub shares_pending: Mutex<HashMap<u32, (String, u32)>>,
 }
 
 static SHARE_STATS: OnceLock<Arc<ShareStats>> = OnceLock::new();
@@ -621,12 +621,14 @@ impl StratumHandler {
             // re-dispatching until served, and stops once served).
             let mut last_attached_req_id: Option<String> = None;
             while let Some(seed) = recv_stream.next().await {
-                let (nonce, job_id, pom_proof) = match seed {
-                    BlockSeed::PartialBlock { nonce, id, pom_proof, .. } => (nonce, id, pom_proof),
+                let (nonce, job_id, pom_proof, device_id) = match seed {
+                    BlockSeed::PartialBlock { nonce, id, pom_proof, device_id, .. } => (nonce, id, pom_proof, device_id),
                     BlockSeed::FullBlock(_) => unreachable!(),
                 };
                 let msg_id = last_stratum_id.fetch_add(1, Ordering::SeqCst);
-                share_stats.shares_pending.try_lock().unwrap().insert(msg_id, job_id.clone());
+                // Store the finding GPU alongside the job id so the accept/reject response (matched by
+                // msg_id) can be attributed per-card.
+                share_stats.shares_pending.try_lock().unwrap().insert(msg_id, (job_id.clone(), device_id));
                 let nonce_hex = format!("{:016x}", nonce);
                 let opoi_tag = keryx_inference::tag_fixed(nonce);
 
@@ -818,7 +820,7 @@ impl StratumHandler {
                                 if self.telemetry_req_ids.remove(&rid) {
                                     return Ok(());
                                 }
-                                if let Some(_jobid) = self
+                                if let Some((_jobid, device_id)) = self
                                     .shares_stats
                                     .shares_pending
                                     .try_lock()
@@ -826,7 +828,8 @@ impl StratumHandler {
                                     .remove(&rid)
                                 {
                                     self.shares_stats.accepted.fetch_add(1, Ordering::SeqCst);
-                                    info!("Share accepted");
+                                    crate::pow::record_share_accepted(device_id);
+                                    info!("Share accepted (GPU {})", device_id);
                                 } else {
                                     info!("{:?} (Last: {})", msg.clone(), self.last_stratum_id.load(Ordering::SeqCst));
                                     warn!("Ignoring result for now");
@@ -906,6 +909,7 @@ impl StratumHandler {
                                         nonce_fixed: self.nonce_fixed,
                                         hash: None,
                                         pom_proof: Vec::new(),
+                                        device_id: 0,
                                     }))
                                     .await
                             }
@@ -948,6 +952,7 @@ impl StratumHandler {
                                     nonce_fixed: self.nonce_fixed,
                                     hash: None,
                                     pom_proof: Vec::new(),
+                                        device_id: 0,
                                 }))
                                 .await
                         }
@@ -1018,6 +1023,7 @@ impl StratumHandler {
                                     nonce_fixed: self.nonce_fixed,
                                     hash: None,
                                     pom_proof: Vec::new(),
+                                        device_id: 0,
                                 }))
                                 .await
                         }
@@ -1063,7 +1069,13 @@ impl StratumHandler {
                     }
                     return Ok(());
                 }
-                let jobid = { self.shares_stats.shares_pending.try_lock().unwrap().remove(&id) };
+                let pending = { self.shares_stats.shares_pending.try_lock().unwrap().remove(&id) };
+                // Any error code here means this submitted share was NOT accepted — attribute the
+                // rejection to the GPU that found it (the R: column).
+                if let Some((_, device_id)) = &pending {
+                    crate::pow::record_share_rejected(*device_id);
+                }
+                let jobid = pending.map(|(j, _)| j);
                 match code {
                     ErrorCode::Unknown => {
                         // Match solo-mining behaviour (grpc.rs SubmitBlockResponse): a rejected
