@@ -1285,12 +1285,20 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // card serves GLM). The result is cached per model, so only the first card per model generates; a
     // model that fails is withdrawn from ai:cap and NOT mined on any card. (`inference_gpu` above.)
     if !crate::slm::run_inference_self_test(&model_id, inference_gpu) {
+        // Surface the reason in the miner status loop (refreshed every attempt) so an operator whose
+        // rig "won't mine" sees WHY, not just a silent 0 h/s. Log once to avoid per-job spam.
+        crate::slm::set_staging_error(format!(
+            "GPU {} could not SERVE this model (inference self-test failed on GPU {}) — the miner will not \
+             mine a tier it cannot serve. Usually too little VRAM for this tier, a bad model file, or a GPU \
+             fault. Check the GPU/driver, or force a smaller tier (--very-light / --light).",
+            device_id, inference_gpu
+        ));
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
-            info!(
-                "PoM[gpu{}]: model not proven serveable (inference self-test failed on the serving \
-                 GPU) — NOT mining this tier (we do not mine a tier we cannot serve).",
-                device_id
+            log::warn!(
+                "PoM[gpu{}]: model not proven serveable (inference self-test failed on GPU {}) — NOT mining \
+                 this tier (we do not mine a tier we cannot serve).",
+                device_id, inference_gpu
             );
         }
         return false;
@@ -1322,6 +1330,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 }
             }
             install(device_id, gm);
+            crate::slm::clear_staging_error();
             info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches host index)", device_id, n);
             true
         }
@@ -1376,6 +1385,12 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                         set_device_model(device_id, smaller.model_id, gguf);
                     }
                     None => {
+                        crate::slm::set_staging_error(format!(
+                            "GPU {} ({} MB VRAM) ran OUT OF MEMORY loading the model and no smaller staged tier \
+                             fits — this card cannot mine any available tier. Use a card with more VRAM, or \
+                             force a lighter tier (--very-light Qwen3.5-9B / --light GLM-4-9B).",
+                            device_id, vram_mb
+                        ));
                         static WARNED_HALT: AtomicBool = AtomicBool::new(false);
                         if !WARNED_HALT.swap(true, Ordering::Relaxed) {
                             log::error!(
@@ -1391,6 +1406,11 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 return false;
             }
             log::error!("PoM[gpu{}]: device miner build failed: {}", device_id, e);
+            crate::slm::set_staging_error(format!(
+                "GPU {} failed to LOAD the model onto the card: {}. Check the GPU/driver (nvidia-smi), VRAM, \
+                 and that the model file is valid; mining on this card is suspended until the load succeeds.",
+                device_id, e
+            ));
             false
         }
     }

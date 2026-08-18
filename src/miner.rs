@@ -775,10 +775,14 @@ impl MinerManager {
                 if keryx_miner::slm::is_downloading() {
                     "still downloading the model (one-time first-run setup) — mining starts automatically when done, this is NOT a stall"
                 } else if keryx_miner::slm::loaded_model_ids().is_empty() {
-                    // Stuck with no model ready and nothing downloading — the common "manually
-                    // pasted a model.gguf but it never goes ready" case. Surface the exact expected
-                    // path + per-model reason (~once/min) so the loop stops being a silent spinner.
-                    if prep_diag_ticks % 6 == 0 {
+                    // Stuck with no model ready and nothing downloading. If a concrete failure was
+                    // recorded (download / disk-full / corrupt file), surface it LOUD every cycle so it
+                    // is always in the last log lines an operator sees — the reassuring "preparing…"
+                    // line used to bury it. Otherwise fall back to the per-model path/reason (~once/min).
+                    let staging_err = keryx_miner::slm::last_staging_error();
+                    if let Some(err) = &staging_err {
+                        error!("MODEL STAGING FAILED — mining is suspended: {}", err);
+                    } else if prep_diag_ticks % 6 == 0 {
                         let diags = keryx_miner::slm::staging_diagnostics();
                         if diags.is_empty() {
                             warn!("model staging: no model lineup installed yet (waiting for chain tip / tier selection).");
@@ -788,7 +792,11 @@ impl MinerManager {
                         }
                     }
                     prep_diag_ticks = prep_diag_ticks.wrapping_add(1);
-                    "preparing models (staging/verifying files) — mining starts automatically when ready, this is NOT a stall"
+                    if staging_err.is_some() {
+                        "model staging FAILED — see the ERROR line above (mining stays suspended until it is fixed)"
+                    } else {
+                        "preparing models (staging/verifying files) — mining starts automatically when ready, this is NOT a stall"
+                    }
                 } else {
                     "building the possession index / resident tree — mining starts automatically when done, this is NOT a stall"
                 }

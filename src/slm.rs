@@ -165,6 +165,42 @@ pub fn gguf_path_for(spec: &ModelSpec) -> std::path::PathBuf {
 /// content is immutable (CID-addressed), so appending resumed bytes is always
 /// consistent, and an already-complete file (e.g. pre-staged with `wget -c`) is
 /// detected via a 416 response and left untouched instead of being re-downloaded.
+/// The most recent model-staging failure (download / disk / corrupt file / GPU load), in
+/// plain actionable English. The mining loop surfaces this LOUDLY and repeatedly while mining is
+/// suspended, so an operator who only reads the last few log lines still sees WHAT went wrong (not
+/// just the reassuring "preparing…" spinner). Cleared the moment a model goes ready.
+static LAST_STAGING_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+fn staging_error_slot() -> &'static Mutex<Option<String>> {
+    LAST_STAGING_ERROR.get_or_init(|| Mutex::new(None))
+}
+/// Record a staging failure (also logged at ERROR by the caller). Shown by the miner status loop.
+pub fn set_staging_error(msg: impl Into<String>) {
+    if let Ok(mut g) = staging_error_slot().lock() { *g = Some(msg.into()); }
+}
+/// Clear the staging failure once a model is ready again.
+pub fn clear_staging_error() {
+    if let Ok(mut g) = staging_error_slot().lock() { *g = None; }
+}
+/// The last recorded staging failure, if any (for the miner status line).
+pub fn last_staging_error() -> Option<String> {
+    staging_error_slot().lock().ok().and_then(|g| g.clone())
+}
+
+/// Best-effort free bytes on the filesystem holding `dir` (or its parent), via POSIX `df -kP`.
+/// `None` (Windows, or `df` unavailable) → callers skip the pre-check; a real ENOSPC still surfaces
+/// loudly at write time.
+#[cfg(unix)]
+fn free_disk_bytes(path: &std::path::Path) -> Option<u64> {
+    let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+    let out = std::process::Command::new("df").arg("-kP").arg(dir).output().ok()?;
+    if !out.status.success() { return None; }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let avail_kb: u64 = text.lines().last()?.split_whitespace().nth(3)?.parse().ok()?;
+    Some(avail_kb.saturating_mul(1024))
+}
+#[cfg(not(unix))]
+fn free_disk_bytes(_path: &std::path::Path) -> Option<u64> { None }
+
 fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
     const MAX_ATTEMPTS: u32 = 240; // survives long gateway outages (~40 min of retries)
     const BACKOFF_SECS: u64 = 10;
@@ -200,7 +236,15 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
             Err(e) => {
                 attempt += 1;
                 if attempt >= MAX_ATTEMPTS {
-                    return Err(anyhow!("HTTP GET {} failed after {} attempts: {}", url, attempt, e));
+                    let msg = format!(
+                        "DOWNLOAD FAILED: could not fetch {} after {} attempts ({}). The IPFS gateway is \
+                         unreachable or blocked — check this rig's internet/DNS/firewall, or set \
+                         KERYX_IPFS_GATEWAY to a working gateway. Mining stays suspended until the model downloads.",
+                        url, attempt, e
+                    );
+                    log::error!("[keryx-miner] {msg}");
+                    set_staging_error(&msg);
+                    return Err(anyhow!(msg));
                 }
                 eprintln!("\n[keryx-miner] connect error ({e}); retry {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s (resume @ {} MB)…",
                     resume_from / 1_000_000);
@@ -265,6 +309,29 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                 (f, 0u64, total)
             };
 
+        // DISK-SPACE PREFLIGHT: refuse to start a download we can't finish, and say exactly where +
+        // how short we are, instead of streaming until ENOSPC and dying with an opaque OS error.
+        if let Some(t) = total {
+            let need = t.saturating_sub(downloaded);
+            const MARGIN: u64 = 512_000_000; // headroom for the possession index / temp files
+            if let Some(free) = free_disk_bytes(dest) {
+                if free < need.saturating_add(MARGIN) {
+                    let where_dir = dest.parent().unwrap_or(dest);
+                    let msg = format!(
+                        "NOT ENOUGH DISK SPACE for {}: need ~{} MB more (download {} MB + 512 MB headroom) \
+                         but only {} MB free on the filesystem holding {}. Free up space or move --model-dir \
+                         to a bigger disk, then restart the miner.",
+                        dest.display(), (need + MARGIN) / 1_000_000, need / 1_000_000,
+                        free / 1_000_000, where_dir.display()
+                    );
+                    log::error!("[keryx-miner] {msg}");
+                    eprintln!("\n[keryx-miner] ERROR: {msg}\n");
+                    set_staging_error(&msg);
+                    return Err(anyhow!(msg));
+                }
+            }
+        }
+
         let mut reader = response.into_reader();
         let mut buf = vec![0u8; 65_536];
         let mut stream_err: Option<String> = None;
@@ -325,8 +392,15 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
 
         attempt += 1;
         if attempt >= MAX_ATTEMPTS {
-            return Err(anyhow!("download {} interrupted after {} attempts (got {} MB)",
-                url, attempt, downloaded / 1_000_000));
+            let msg = format!(
+                "DOWNLOAD FAILED: {} kept interrupting after {} attempts (got {} MB). Unstable link or a \
+                 flaky IPFS gateway — check this rig's internet, or set KERYX_IPFS_GATEWAY to a working \
+                 gateway. The partial file is kept and will resume on restart; mining stays suspended until it completes.",
+                url, attempt, downloaded / 1_000_000
+            );
+            log::error!("[keryx-miner] {msg}");
+            set_staging_error(&msg);
+            return Err(anyhow!(msg));
         }
         let why = stream_err.unwrap_or_else(|| "short read".into());
         eprintln!("\n[keryx-miner] interrupted ({why}); resuming {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s @ {} MB…",
@@ -406,6 +480,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
                 spec.name, dir.display()
             );
         }
+        clear_staging_error();
         return Ok((tok, gguf));
     }
 
@@ -439,11 +514,18 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
         // download_file resumes a truncated GGUF, refuses to wipe a partial on Range-less
         // gateways (keeps bytes + backoff-retries), and no-ops a complete one (Range → 416).
         download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
-        if !crate::gguf::is_complete_file(&gguf) {
-            return Err(anyhow!(
-                "model '{}' download finished but GGUF is incomplete at {}",
-                spec.name, gguf.display()
-            ));
+        if let Some(reason) = crate::gguf::completeness_reason(&gguf) {
+            // The download reported complete but the file still doesn't parse/cover its tensors —
+            // corrupt bytes, or a WRONG file a user hand-placed at this path. We can't safely repair
+            // it automatically, so tell the operator EXACTLY what to do rather than loop forever.
+            let msg = format!(
+                "model '{}' file at {} is INVALID after download ({}). If YOU copied a file here, it is \
+                 the wrong/corrupt model — DELETE {} and restart so the miner re-downloads the correct one.",
+                spec.name, gguf.display(), reason, gguf.display()
+            );
+            log::error!("[keryx-miner] {msg}");
+            set_staging_error(&msg);
+            return Err(anyhow!(msg));
         }
     }
     if need_tok && !tok.exists() {
@@ -451,6 +533,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     }
 
     std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
+    clear_staging_error();
     eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
     Ok((tok, gguf))
 }
