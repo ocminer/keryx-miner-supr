@@ -189,12 +189,19 @@ pub fn build_telemetry(
     acc: u64,
     rej: u64,
     stale: u64,
+    served_models: &[String],
 ) -> Value {
     let mut o = Map::new();
     o.insert("v".into(), json!(SCHEMA_VERSION));
     o.insert("uptime_s".into(), json!(uptime_s));
     o.insert("hashrate_total".into(), json!(total_hashrate.round() as u64));
     o.insert("local_shares".into(), json!({ "acc": acc, "rej": rej, "stale": stale }));
+    // Live serveable model set (hex model-ids), sent on EVERY telemetry tick so the pool's view of
+    // what this rig can serve reflects reality once the model finishes loading — the one-shot
+    // `mining.hello` is sent at authorize before the model is resident, so on its own it reports none.
+    if !served_models.is_empty() {
+        o.insert("models".into(), json!(served_models));
+    }
     let gpus = gpu_dynamic(per_gpu_hashrate);
     if !gpus.is_empty() {
         o.insert("gpus".into(), Value::Array(gpus));
@@ -332,7 +339,7 @@ mod tests {
 
     #[test]
     fn telemetry_is_wellformed() {
-        let v = build_telemetry(3600, 65_000_000.0, &[65_000_000.0], 1234, 5, 2);
+        let v = build_telemetry(3600, 65_000_000.0, &[65_000_000.0], 1234, 5, 2, &["aabb".to_string()]);
         assert_eq!(v["v"], json!(SCHEMA_VERSION));
         assert_eq!(v["uptime_s"], json!(3600));
         assert_eq!(v["hashrate_total"], json!(65_000_000u64));
