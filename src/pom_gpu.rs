@@ -143,6 +143,121 @@ pub struct PomGpuMiner {
     _uploads: Vec<CudaSlice<u8>>, // our own device copies of llama-engine host-resident tensors
 }
 
+/// Where each canonical tensor's bytes come from for the walk gather.
+enum GatherSource {
+    /// llama holds this tensor on-device, byte-identical to the GGUF — walk it in place (zero-dup).
+    DevicePtr(u64),
+    /// llama holds it in a host (CPU) ggml buffer — upload our own device copy of the raw bytes.
+    HostPtr(u64),
+    /// llama repacked / duplicated / dropped it (e.g. Gemma materialises a separate `output.weight`
+    /// from its tied embeddings) — upload this tensor's canonical bytes from the possession index,
+    /// so the walked blob is always the canonical one R_T pins regardless of runtime repacking.
+    FromIndex,
+}
+
+/// Per-tensor plan for gathering the canonical layout from llama's resident tensors.
+struct GatherPlan {
+    entries: Vec<(usize, GatherSource)>, // (nbytes, source), in canonical name-sorted order
+    total_bytes: u64,
+    index_bytes: u64, // bytes that must be re-uploaded from the possession index
+    zero_dup: usize,
+    host_uploads: usize,
+    index_uploads: Vec<String>,
+}
+
+impl GatherPlan {
+    /// Past this share of the blob, walking a raw canonical copy (`load_raw`) costs less VRAM than
+    /// keeping llama resident plus the uploads — so fall back to the raw copy instead.
+    fn exceeds_upload_budget(&self) -> bool {
+        self.index_bytes * 4 > self.total_bytes
+    }
+}
+
+/// Match llama's resident tensors against the canonical GGUF list. A canonical tensor is walked
+/// from llama only on an unambiguous match — unique name AND exact byte size; a duplicated name,
+/// a resized copy or a missing tensor falls back to the possession index, so runtime repacking
+/// never changes what the walk reads.
+fn plan_canonical_gather(
+    canonical: &[(String, usize)],
+    resident: &[(String, u64, usize, bool)],
+) -> GatherPlan {
+    let mut by_name: HashMap<&str, Vec<&(String, u64, usize, bool)>> = HashMap::with_capacity(resident.len());
+    for t in resident {
+        by_name.entry(t.0.as_str()).or_default().push(t);
+    }
+    let mut plan = GatherPlan {
+        entries: Vec::with_capacity(canonical.len()),
+        total_bytes: 0,
+        index_bytes: 0,
+        zero_dup: 0,
+        host_uploads: 0,
+        index_uploads: Vec::new(),
+    };
+    for (name, nbytes) in canonical {
+        plan.total_bytes += *nbytes as u64;
+        let source = match by_name.get(name.as_str()).map(Vec::as_slice) {
+            Some([t]) if t.2 == *nbytes && t.3 => {
+                plan.zero_dup += 1;
+                GatherSource::DevicePtr(t.1)
+            }
+            Some([t]) if t.2 == *nbytes => {
+                plan.host_uploads += 1;
+                GatherSource::HostPtr(t.1)
+            }
+            _ => {
+                plan.index_bytes += *nbytes as u64;
+                plan.index_uploads.push(name.clone());
+                GatherSource::FromIndex
+            }
+        };
+        plan.entries.push((*nbytes, source));
+    }
+    plan
+}
+
+/// Canonical (name, nbytes) list of a GGUF in name-sorted order — the layout the possession index
+/// chunks and R_T commits.
+fn canonical_tensor_list(gguf: &str) -> Option<Vec<(String, usize)>> {
+    let mut file = std::fs::File::open(gguf).ok()?;
+    let meta = crate::gguf::GgufMeta::read(&mut file).ok()?;
+    meta.sorted_names()
+        .into_iter()
+        .map(|name| {
+            let nbytes = usize::try_from(meta.tensors[&name].nbytes).ok()?;
+            Some((name, nbytes))
+        })
+        .collect()
+}
+
+/// True when a host possession index is available to back `FromIndex` uploads on this device.
+fn has_possession_index(device_id: usize) -> bool {
+    crate::pom::active_index_for(device_id as u32).is_some() || crate::pom::active_index().is_some()
+}
+
+/// None when the llama-resident layout can back the canonical walk (with per-tensor index
+/// fallback for repacked tensors), Some(reason) when the raw canonical copy must be walked instead.
+fn llama_gather_blocker(gguf: &str, device_id: usize) -> Option<String> {
+    let resident = match crate::llama_engine::tensors_for(device_id) {
+        Some(ts) => ts,
+        None => return Some("llama engine tensors unavailable".into()),
+    };
+    let canonical = match canonical_tensor_list(gguf) {
+        Some(c) => c,
+        None => return Some("canonical GGUF tensor list unreadable".into()),
+    };
+    let plan = plan_canonical_gather(&canonical, &resident);
+    if plan.exceeds_upload_budget() {
+        return Some(format!(
+            "llama-resident layout too foreign ({} of {} bytes would need a canonical upload)",
+            plan.index_bytes, plan.total_bytes
+        ));
+    }
+    if plan.index_bytes > 0 && !has_possession_index(device_id) {
+        return Some("canonical fallback needs the host possession index".into());
+    }
+    None
+}
+
 impl PomGpuMiner {
     /// Load the mining model's GGUF into candle on a specific CUDA device, build the gather
     /// index, load the kernel.
@@ -304,12 +419,15 @@ impl PomGpuMiner {
         Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, block_dim: AtomicU32::new(256), use_ilp2: AtomicBool::new(false), _tensors: raw, _shared: kept_shared, _uploads: Vec::new() })
     }
 
-    /// Phase-2 zero-dup over the IN-PROCESS llama.cpp engine (candle hosts nothing): bases/prefix
-    /// straight over the engine's resident device tensors in canonical name-sorted order (the
-    /// wrapper pre-sorts; byte-identity to the on-disk GGUF proven by tools/llama_zerodup_spike).
-    /// The few host-resident tensors (e.g. token_embd stays on the CPU buffer) get a small device
-    /// upload of our own. candle's CudaDevice here is pure CUDA plumbing (context/stream/kernel).
-    pub fn load_llama(device_id: usize) -> candle_core::Result<Self> {
+    /// Phase-2 canonical gather over the IN-PROCESS llama.cpp engine (candle hosts nothing): walk
+    /// the canonical (name-sorted) GGUF tensor list, and for EACH canonical tensor pick its source —
+    /// llama's on-device copy (zero-dup, byte-identity proven by tools/llama_zerodup_spike), llama's
+    /// host (CPU) copy (small device upload), or, when llama repacked/duplicated/dropped it (e.g.
+    /// Gemma materialises a separate `output.weight` from its tied embeddings), the canonical bytes
+    /// from the possession index. This keeps the big matrices zero-dup while patching only the
+    /// repacked tensors, so a repacking arch fits ONE resident copy (walk + inference) instead of a
+    /// full second raw copy. candle's CudaDevice here is pure CUDA plumbing (context/stream/kernel).
+    pub fn load_llama(gguf: &str, device_id: usize) -> candle_core::Result<Self> {
         let device = Device::new_cuda(device_id)?;
         let cuda = match &device {
             Device::Cuda(c) => c.clone(),
@@ -318,27 +436,60 @@ impl PomGpuMiner {
         let stream = cuda.cuda_stream();
         let ts = crate::llama_engine::tensors_for(device_id)
             .ok_or_else(|| candle_core::Error::Msg("PoM GPU: llama engine tensors unavailable".into()))?;
+        let canonical = canonical_tensor_list(gguf)
+            .ok_or_else(|| candle_core::Error::Msg("PoM GPU: canonical GGUF tensor list unreadable".into()))?;
+        let plan = plan_canonical_gather(&canonical, &ts);
+        if plan.exceeds_upload_budget() {
+            return Err(candle_core::Error::Msg(format!(
+                "PoM GPU: llama-resident layout too foreign — {} of {} bytes need a canonical upload",
+                plan.index_bytes, plan.total_bytes
+            )));
+        }
+        // Possession index backs the FromIndex uploads (repacked tensors) and the byte gate below.
+        let idx_ref = crate::pom::active_index_for(device_id as u32)
+            .map(|t| &t.0)
+            .or_else(|| crate::pom::active_index().map(|(i, _)| i));
+        if plan.index_bytes > 0 && idx_ref.is_none() {
+            return Err(candle_core::Error::Msg(
+                "PoM GPU: canonical fallback needs the host possession index".into(),
+            ));
+        }
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
         let mut bases: Vec<u64> = Vec::new();
         let mut prefix: Vec<u64> = vec![0];
         let mut uploads: Vec<CudaSlice<u8>> = Vec::new();
-        let mut n_uploaded = 0usize;
-        for (_name, ptr, nbytes, is_dev) in &ts {
+        for (nbytes, source) in &plan.entries {
             let chunks = (nbytes / CHUNK_BYTES) as u64;
             if chunks == 0 {
                 continue;
             }
-            let base = if *is_dev {
-                *ptr
-            } else {
-                // Host-resident in ggml (CPU buffer): the walk needs device memory — upload our
-                // own copy of the raw bytes (identical to the GGUF bytes, same as the pointer).
-                let host: &[u8] = unsafe { std::slice::from_raw_parts(*ptr as *const u8, *nbytes) };
-                let dev = stream.clone_htod(host).map_err(candle_core::Error::wrap)?;
-                use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-                let p = dev.device_ptr(&stream).0 as u64;
-                uploads.push(dev);
-                n_uploaded += 1;
-                p
+            let base = match source {
+                GatherSource::DevicePtr(p) => *p,
+                GatherSource::HostPtr(p) => {
+                    // Host-resident in ggml (CPU buffer): the walk needs device memory — upload our
+                    // own copy of the raw bytes (identical to the GGUF bytes, same as the pointer).
+                    let host: &[u8] = unsafe { std::slice::from_raw_parts(*p as *const u8, *nbytes) };
+                    let dev = stream.clone_htod(host).map_err(candle_core::Error::wrap)?;
+                    let ptr = dev.device_ptr(&stream).0 as u64;
+                    uploads.push(dev);
+                    ptr
+                }
+                GatherSource::FromIndex => {
+                    // llama repacked this tensor — upload its canonical bytes from the possession
+                    // index. `start` is this tensor's canonical chunk offset (prefix accumulates in
+                    // canonical order), so read_chunk_bytes(start + i) yields the right canonical chunk.
+                    let idx = idx_ref.unwrap();
+                    let start = *prefix.last().unwrap();
+                    let mut buf = vec![0u8; chunks as usize * CHUNK_BYTES];
+                    for i in 0..chunks as usize {
+                        buf[i * CHUNK_BYTES..][..CHUNK_BYTES]
+                            .copy_from_slice(&idx.read_chunk_bytes(start + i as u64));
+                    }
+                    let dev = stream.clone_htod(buf.as_slice()).map_err(candle_core::Error::wrap)?;
+                    let ptr = dev.device_ptr(&stream).0 as u64;
+                    uploads.push(dev);
+                    ptr
+                }
             };
             bases.push(base);
             prefix.push(prefix.last().unwrap() + chunks);
@@ -348,17 +499,23 @@ impl PomGpuMiner {
             return Err(candle_core::Error::Msg("PoM GPU: llama engine produced 0 chunks".into()));
         }
         info!(
-            "PoM llama zero-dup gather: {} tensors ({} host-resident uploaded), N={} chunks",
-            bases.len(), n_uploaded, n_total_chunks
+            "PoM llama canonical gather: {} tensors ({} zero-dup, {} host uploads, {} index uploads{}), N={} chunks",
+            bases.len(),
+            plan.zero_dup,
+            plan.host_uploads,
+            plan.index_uploads.len(),
+            if plan.index_uploads.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", plan.index_uploads.iter().take(4).cloned().collect::<Vec<_>>().join(", "))
+            },
+            n_total_chunks
         );
         // BYTE GATE (consensus safety): the pool does not deep-verify every share, so a wrong
-        // gather would mine garbage silently. Read back evenly-spaced chunks from the llama-owned
-        // device memory and compare them byte-for-byte against the host index (GGUF pread) —
-        // any mismatch refuses to mine. (Full-model byte-identity for this llama build was proven
-        // once by tools/llama_zerodup_spike; this guards every startup against regressions.)
-        let idx_ref = crate::pom::active_index_for(device_id as u32)
-            .map(|t| &t.0)
-            .or_else(|| crate::pom::active_index().map(|(i, _)| i));
+        // gather would mine garbage silently. Read back evenly-spaced chunks from the walked device
+        // memory and compare them byte-for-byte against the host index (GGUF pread) — any mismatch
+        // refuses to mine. (Full-model byte-identity for the zero-dup llama build was proven once by
+        // tools/llama_zerodup_spike; this guards every startup and the per-tensor patch.)
         if let Some(idx) = idx_ref {
             if idx.n_chunks == n_total_chunks {
                 use candle_core::cuda_backend::cudarc::driver::result as cures;
@@ -939,12 +1096,31 @@ pub fn query_all_gpus_vram() -> Vec<(u32, u64)> {
 /// (resident again) and rebuild the zero-dup gather. Heavy (model reload) but only when needed —
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
 /// the miner is ready to mine.
+/// `--low-ram`/`--save-ram`: serialize model bring-up across GPUs so peak SYSTEM RAM ≈ ONE model,
+/// not N. Each card's possession-index build + llama GGUF load pulls the multi-GB weights through
+/// host RAM; bringing up many cards in parallel spikes system RAM and OOMs low-RAM rigs. When set,
+/// a global lock loads one card FULLY (index + walk + self-test) before the next starts. Slower
+/// startup, far lower peak RAM. Off by default (parallel bring-up).
+static LOW_RAM: AtomicBool = AtomicBool::new(false);
+pub fn set_low_ram(on: bool) { LOW_RAM.store(on, Ordering::Relaxed); }
+pub fn low_ram() -> bool { LOW_RAM.load(Ordering::Relaxed) }
+fn load_lock() -> &'static Mutex<()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+}
+
 pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
     if is_installed(device_id) {
         return true;
     }
     // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
     LOADING.fetch_add(1, Ordering::Relaxed);
+    // --low-ram: one card's full model bring-up at a time (peak host RAM = one model, not N).
+    let _load_guard = if low_ram() {
+        Some(load_lock().lock().unwrap_or_else(|p| p.into_inner()))
+    } else {
+        None
+    };
     let ok = ensure_installed_inner(device_id, daa);
     LOADING.fetch_sub(1, Ordering::Relaxed);
     ok
@@ -1083,28 +1259,23 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             crate::slm::mark_model_unavailable(&model_id, "llama_wrong_device");
         }
     }
-    // BYTE-COMPAT GATE: llama.cpp repacks some architectures on load (e.g. Gemma-3 materialises a
-    // separate output.weight from its tied embeddings), so its resident chunk count differs from
-    // the canonical GGUF the walk MUST gather and R_T pins. When that happens the zero-dup walk is
-    // impossible — free llama's VRAM and walk a raw canonical copy (`load_raw`) instead (inference
-    // for this model is then unavailable). Cheaper than letting load_llama build a doomed gather
-    // that the N-guard then rejects into a mine-refusing loop.
+    // BYTE-COMPAT GATE: llama.cpp repacks some architectures on load (e.g. Gemma materialises a
+    // separate output.weight from its tied embeddings), so its resident layout can differ from the
+    // canonical GGUF the walk MUST gather and R_T pins. The canonical gather reconciles that PER
+    // TENSOR (repacked/duplicated/dropped tensors are uploaded from the possession index while the
+    // rest stay zero-dup); only a layout too foreign to reconcile within the upload budget (>25% of
+    // the blob) falls back to a full raw canonical copy WITHOUT llama (inference then unavailable).
+    // This keeps a repacking arch (Gemma) resident as one copy — walk + inference — on a 16 GB card.
     if use_llama {
-        let host_n = crate::pom::active_index_for(device_id as u32).map(|t| t.0.n_chunks)
-            .or_else(|| crate::pom::active_index().map(|(i, _)| i.n_chunks));
-        let llama_n = crate::llama_engine::tensors_for(device_id as usize).map(|ts| {
-            ts.iter().map(|(_, _, nbytes, _)| (*nbytes / CHUNK_BYTES) as u64).sum::<u64>()
-        });
-        if let (Some(hn), Some(ln)) = (host_n, llama_n) {
-            if ln != hn {
-                info!(
-                    "PoM[gpu{}]: llama-resident layout N={} != canonical N={} (llama repacks this model arch) — walking a raw canonical copy; inference for this model is unavailable.", device_id, ln, hn
-                );
-                crate::llama_engine::unload_for_gpu(device_id as usize);
-                use_llama = false;
-                // Upstream 0795e92: this model's llama layout can't be served here — withdraw it.
-                crate::slm::mark_model_unavailable(&model_id, "llama_layout_incompatible");
-            }
+        if let Some(reason) = llama_gather_blocker(&gguf, device_id as usize) {
+            info!(
+                "PoM[gpu{}]: {} — walking a raw canonical copy; inference for this model is unavailable.",
+                device_id, reason
+            );
+            crate::llama_engine::unload_for_gpu(device_id as usize);
+            use_llama = false;
+            // This model's llama layout can't back the walk here — withdraw it from ai:cap.
+            crate::slm::mark_model_unavailable(&model_id, "llama_layout_incompatible");
         }
     }
     // SERVEABILITY GATE — the network exists to serve inference, so we NEVER mine a tier we cannot
@@ -1133,7 +1304,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     let m = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if use_llama {
             info!("PoM[gpu{}]: zero-dup — walking the llama.cpp engine's resident weights (candle dormant)", device_id);
-            PomGpuMiner::load_llama(device_id as usize)
+            PomGpuMiner::load_llama(&gguf, device_id as usize)
         } else {
             info!("PoM[gpu{}]: raw gather — standalone canonical GGUF upload (mining-only card)", device_id);
             PomGpuMiner::load_raw(&gguf, device_id as usize)

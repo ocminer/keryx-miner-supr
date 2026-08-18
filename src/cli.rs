@@ -72,6 +72,14 @@ pub struct Opt {
     pub cpu_inference: bool,
 
     #[clap(
+        long = "low-ram",
+        visible_alias = "save-ram",
+        help = "Load models onto GPUs ONE AT A TIME instead of all cards in parallel, so peak SYSTEM RAM ≈ one model (not N). Each card's index build + GGUF load pulls the weights through host RAM; parallel bring-up on many cards can OOM a low-RAM rig. Slower startup, much lower peak RAM.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub low_ram: bool,
+
+    #[clap(
         long = "enable-cpu-inference",
         help = "Allow OPoI inference to FALL BACK to the CPU when GPU inference cannot load (OFF by default). CPU inference is very slow and rarely worthwhile; without this flag a card that cannot run GPU inference withdraws from OPoI instead of doing futile CPU work. NVIDIA/Windows: the fix for 'GPU inference failed' is to ship keryx-llama.dll + the CUDA runtime DLLs next to the miner, NOT this flag.",
         help_heading = "OPoI / Inference"

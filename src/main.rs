@@ -1321,6 +1321,13 @@ async fn run() -> Result<(), Error> {
 
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
+    // --low-ram / --save-ram: serialize model bring-up across GPUs (peak host RAM = one model).
+    #[cfg(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))))]
+    if opt.low_ram {
+        keryx_miner::pom_gpu::set_low_ram(true);
+        info!("--low-ram: loading models onto GPUs one at a time (lower peak system RAM, slower startup).");
+    }
+
     // CPU inference is OFF by default: a card that can't run GPU inference withdraws from OPoI
     // rather than doing futile CPU work. Either flag opts in; --cpu-inference additionally forces
     // CPU from the start.

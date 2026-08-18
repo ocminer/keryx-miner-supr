@@ -201,12 +201,14 @@ pub const GEMMA_4_12B_ABLITERATED: ModelSpec = ModelSpec {
     tokenizer_cid: "",
     config_cid: "",
     weight_cids: &["QmSDVicqRDwitecBaPitHsAePLUEamgL4KfrBWYHVWQyx9"],
-    // 20 GB, not 12-13: the PoM walk gather + the inference context/KV need real headroom beyond the
-    // raw weights, and a 16 GB card (5070Ti/5080) OOMs the walk build for this 12B model. Requiring
-    // ~20 GB keeps auto-tier off 16 GB cards (they run t0/t1 9B) and onto 24 GB+ cards that fit.
+    // 15 GB, matching the Default auto-select floor (Tier::pom_tier_floor_mb). This abliterated
+    // Gemma-4-12B is UNTIED, so the zero-dup llama engine hosts walk + inference in ONE resident copy
+    // (~9.1 GB weights + KV + CUDA workspace ≈ 12-13 GB) — fits a 16 GB card. The capability gate
+    // (main.rs) compares against FREE VRAM (~15.8 GB on a 16 GB card after display), so 15 GB (not
+    // upstream's nominal 16 GB) is what actually lets a 5070 Ti/5080 announce+load Gemma. (The old
+    // 20 GB was from an OOM on the pre-v0.10.6 candle path, which loaded a SECOND full copy.)
     dir_name: "Gemma-4-12B-abliterated",
-    // ~9.8 GB Q6_K weights + ~2 GB KV/workspace → 16 GB card (fills the 12→24 GB gap).
-    min_vram_mb: 20_000,
+    min_vram_mb: 15_000,
 };
 
 pub const GEMMA_3_4B: ModelSpec = ModelSpec {
@@ -539,6 +541,23 @@ impl Tier {
     /// Tiers from largest to smallest — used by `--tier auto` to pick the biggest that fits.
     pub const DESCENDING: [Tier; 5] = [Tier::VeryHigh, Tier::High, Tier::Default, Tier::Light, Tier::VeryLight];
 
+    /// Per-tier VRAM floor (MiB) for `--tier auto` — the practical minimum to load that tier's model
+    /// (weights + KV cache + CUDA workspace) via the zero-dup llama engine (ONE resident copy; every
+    /// H6 model is untied). Imported VERBATIM from upstream keryx-miner v0.4.8's `pom_tier_ladder`
+    /// so our auto-selection uses the same field-proven boundaries — notably Gemma-4-12B ("default")
+    /// runs on a 16 GB card (5070 Ti / 5080 / 4080), where our old `min_vram+2GB` math wrongly
+    /// demoted it to GLM. The floor IS the final threshold (margin already baked in — no extra
+    /// headroom added, matching upstream).
+    pub fn pom_tier_floor_mb(self) -> u64 {
+        match self {
+            Tier::VeryLight => 7_000,
+            Tier::Light => 11_000,
+            Tier::Default => 15_000,
+            Tier::High => 22_000,
+            Tier::VeryHigh => 28_000,
+        }
+    }
+
     /// Human-readable name of the model this tier mines/proves under the OPoI-v2 (PoM) lineup.
     pub fn pom_model_name(self) -> &'static str {
         self.pom_spec().name
@@ -585,19 +604,19 @@ impl Tier {
 ///
 /// `cpu_inference`: when true, GPU inference is off, so the GPU only needs to hold the PoM walk's
 /// resident weights (no inference KV/workspace), but we keep the same conservative margin.
-pub fn auto_select_tier(vram_mb: u64, headroom_mb: u64) -> (Tier, u64) {
+pub fn auto_select_tier(vram_mb: u64, _headroom_mb: u64) -> (Tier, u64) {
+    // Upstream-parity floors (`Tier::pom_tier_floor_mb`) ARE the threshold — margin baked in, no
+    // extra headroom added (that is what wrongly pushed Gemma to 22 GB before). `_headroom_mb` is
+    // kept only for call-site compatibility. Largest tier whose floor the card meets wins.
     for tier in Tier::DESCENDING {
-        let need = tier.pom_spec().min_vram_mb.saturating_add(headroom_mb);
-        if vram_mb >= need {
-            return (tier, need);
+        let floor = tier.pom_tier_floor_mb();
+        if vram_mb >= floor {
+            return (tier, floor);
         }
     }
-    // VeryLight (EXAONE) has min_vram_mb=0, so it fits any card — the correct floor for a card too
-    // small for every heavier tier. (The old lineup floored to Light because Light=Gemma was the
-    // min_vram=0 model; in the H4 lineup Light=Mistral needs 8 GB, so flooring to Light would OOM an
-    // 8 GB card's inference context — the 3070+Mistral bug. VeryLight is now in DESCENDING too, so a
-    // card ≥ headroom already selects it in the loop; this floor only catches <headroom cards.)
-    (Tier::VeryLight, headroom_mb)
+    // Card below even the VeryLight floor — still floor to VeryLight (smallest model), matching
+    // upstream's fallback: it may be tight but it's the only tier that could possibly load.
+    (Tier::VeryLight, Tier::VeryLight.pom_tier_floor_mb())
 }
 
 /// Cumulative model set for a hardware tier within the lineup active at `daa`.
