@@ -276,6 +276,19 @@ fn filter_specs_by_vram(
             }
         })
         .collect();
+    if kept.is_empty() {
+        // NEVER stage an empty lineup: init_supported([]) leaves SUPPORTED_SPECS empty → the miner
+        // reports "no model lineup installed — waiting for chain tip" and NEVER downloads a model
+        // (the Windows "silent stall" bug). If the VRAM gate would drop everything the query is
+        // almost certainly wrong/undersized — keep the lineup so the model downloads and mining can
+        // start; a genuinely-too-big model then OOM-demotes to a fitting tier at walk build.
+        log::warn!(
+            "VRAM capability gate would drop ALL {} model(s) (GPU VRAM read as {} MB — likely an \
+             unreliable query) — keeping the lineup so the model still downloads and mining can start.",
+            specs.len(), gpu0_mb
+        );
+        return specs;
+    }
     if kept.len() == specs.len() {
         specs
     } else {
@@ -406,9 +419,16 @@ fn select_tier_nvidia(opt: &cli::Opt) -> keryx_miner::models::Tier {
 fn select_tier_auto() -> keryx_miner::models::Tier {
     use keryx_miner::models::{self, Tier};
 
-    let Some(vram_mb) = query_vram_mb() else {
-        warn!("--tier auto: cannot query GPU VRAM (no nvidia-smi) — falling back to --light (Gemma-3-4B).");
-        return Tier::Light;
+    // Prefer the CUDA-driver VRAM (query_all_gpus_vram) and only fall back to the nvidia-smi CLI.
+    // The nvidia-smi `-i 0` form fails on some setups (notably Windows), which used to make this
+    // fall back to Tier::Light (GLM, 12 GB) — a model `filter_specs_by_vram` (which DOES read the
+    // CUDA driver) then dropped on a 10 GB card, leaving an EMPTY lineup: "no model lineup installed
+    // — no download — stall". Reading the same source here keeps the two in agreement; the fallback
+    // tier is the smallest model (fits any card) so an unknown VRAM never stages an unloadable tier.
+    let vram_mb = all_gpus_vram().into_iter().map(|(_, m)| m).max().or_else(query_vram_mb);
+    let Some(vram_mb) = vram_mb else {
+        warn!("--tier auto: cannot query GPU VRAM (CUDA driver + nvidia-smi both failed) — falling back to --very-light (Qwen3.5-9B, smallest, fits any card).");
+        return Tier::VeryLight;
     };
 
     let (picked, need) = models::auto_select_tier(vram_mb, AUTO_TIER_HEADROOM_MB);
