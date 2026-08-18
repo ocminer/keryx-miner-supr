@@ -262,6 +262,13 @@ pub struct StratumHandler {
     /// moment it can serve it. Empty until the first successful declare. Fixes the race where a rig
     /// authorized before its model was ready declared `models:[]` and never re-announced.
     declared_model_ids: Vec<String>,
+    /// When we last SENT a `mining.declare_capabilities` (regardless of change). The declaration is a
+    /// fire-and-forget notification with no pool ACK, so a single one lost to a race (pool not yet
+    /// ready to associate it with the worker) or a bridge/registry reset would leave the pool showing
+    /// `declared=[]` forever — the rig then mines a tier it is never asked to serve → strikes. We
+    /// therefore RE-declare the current serveable set periodically, not just on change, so the pool
+    /// self-heals. `None` until the first declare.
+    last_declare_at: Option<std::time::Instant>,
 }
 
 /// Ref-counted PoW-pause guard. On drop it decrements the in-flight-inference counter and, when it
@@ -462,14 +469,21 @@ impl StratumHandler {
             .into_iter()
             .map(hex::encode)
             .collect();
-        if model_ids == self.declared_model_ids {
-            return Ok(()); // no change — don't re-spam the pool
-        }
         // Only announce a non-empty set (an empty declare tells the pool nothing useful and would
         // churn while a model is still loading). Once we HAVE declared, a later drop to empty is
         // left as-is until a real model is ready again.
         if model_ids.is_empty() {
             return Ok(());
+        }
+        // Re-declare when the set CHANGED, OR periodically even if unchanged. The declaration has no
+        // pool ACK, so a single notification lost to a startup race or a pool-side registry reset
+        // would otherwise leave `declared=[]` permanently — the rig mines a tier it is never asked to
+        // serve, accruing inference strikes. Re-sending every REDECLARE_EVERY makes the pool
+        // self-heal without spamming a declaration on every job.
+        const REDECLARE_EVERY: std::time::Duration = std::time::Duration::from_secs(90);
+        let stale = self.last_declare_at.map_or(true, |t| t.elapsed() >= REDECLARE_EVERY);
+        if model_ids == self.declared_model_ids && !stale {
+            return Ok(()); // unchanged and freshly declared — don't re-spam every job
         }
         info!(
             "OPoI: declaring {} model(s) to pool bridge ({})",
@@ -487,6 +501,7 @@ impl StratumHandler {
             })
             .await?;
         self.declared_model_ids = model_ids;
+        self.last_declare_at = Some(std::time::Instant::now());
         Ok(())
     }
 
@@ -597,6 +612,7 @@ impl StratumHandler {
             telemetry_req_ids: HashSet::new(),
             start_time: std::time::Instant::now(),
             declared_model_ids: Vec::new(),
+            last_declare_at: None,
         }))
     }
 
@@ -789,7 +805,8 @@ impl StratumHandler {
         let rej = self.shares_stats.low_diff.load(Ordering::SeqCst)
             + self.shares_stats.duplicate.load(Ordering::SeqCst);
         let uptime = self.start_time.elapsed().as_secs();
-        let obj = keryx_miner::telemetry::build_telemetry(uptime, total, &per_gpu, acc, rej, stale);
+        let served: Vec<String> = keryx_miner::slm::serveable_model_ids().into_iter().map(hex::encode).collect();
+        let obj = keryx_miner::telemetry::build_telemetry(uptime, total, &per_gpu, acc, rej, stale, &served);
 
         let id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
         // Track for error-20 attribution; bound the set in case the pool never acks.
