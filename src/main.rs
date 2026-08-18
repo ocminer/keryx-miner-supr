@@ -1089,10 +1089,34 @@ async fn run() -> Result<(), Error> {
         if let Some(ps) = pom_spec {
             let one: &'static [&'static keryx_miner::models::ModelSpec] =
                 Box::leak(vec![ps].into_boxed_slice());
-            match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(one)).await {
-                Ok(Ok(())) => info!("Mining-tier model '{}' ready — PoM can build its possession index.", ps.dir_name),
-                Ok(Err(e)) => warn!("Mining-tier model '{}' prefetch failed: {} — PoM index build will wait + retry.", ps.dir_name, e),
-                Err(e) => warn!("Mining-tier model prefetch task panicked: {}", e),
+            // RETRY until the mining-tier model is actually on disk. The previous build logged one
+            // "will retry" line and then the task ENDED — nothing retried, so a failed download left
+            // the rig stuck at "preparing…" forever with the real reason scrolled off. Now every
+            // failure is logged LOUD (with the specific staging error) and we re-attempt with backoff,
+            // so a transient gateway/disk problem self-heals AND the error stays in view until it does.
+            let mut round: u32 = 0;
+            loop {
+                match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(one)).await {
+                    Ok(Ok(())) => {
+                        keryx_miner::slm::clear_staging_error();
+                        info!("Mining-tier model '{}' ready — PoM can build its possession index.", ps.dir_name);
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        round += 1;
+                        let detail = keryx_miner::slm::last_staging_error().unwrap_or_else(|| e.to_string());
+                        error!(
+                            "MINING-TIER MODEL '{}' NOT READY (attempt {}): {} — mining is SUSPENDED until this \
+                             is fixed. Retrying in 60s.",
+                            ps.dir_name, round, detail
+                        );
+                    }
+                    Err(e) => {
+                        round += 1;
+                        error!("Mining-tier model prefetch task crashed (attempt {}): {} — retrying in 60s.", round, e);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         }
         // Then the rest (best-effort) for OPoI inference. A failure here (e.g. small disk) only skips
