@@ -26,7 +26,8 @@ pub struct PomMiner {
     /// Work-group size for the chosen v3 kernel flavor: 128 (2-rows/item, RDNA3+) or 256 (1-row).
     v3_local: usize,
     weights: Vec<Buffer<cl_ulong>>,
-    slab_shift: u32,
+    /// Chunks per slab (single-slab layout: == n_chunks). Slabs are tile-aligned (mult of 2048).
+    slab_chunks: u64,
     winner: Buffer<cl_ulong>,
     pub n_chunks: u64,
     /// Nonces per work-item of the chosen kernel (1 = pom_mine, 2 = _ilp2, 4 = _ilp4). Autotuned.
@@ -45,7 +46,7 @@ unsafe impl Send for PomMiner {}
 /// sweep can pass disjoint field borrows. The tid guard in every kernel makes the rounded-up global
 /// size safe (padding items exit immediately).
 #[allow(clippy::too_many_arguments)]
-fn dispatch_raw(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>], slab_shift: u32, winner: &mut Buffer<cl_ulong>, n_chunks: u64,
+fn dispatch_raw(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>], slab_chunks: u64, winner: &mut Buffer<cl_ulong>, n_chunks: u64,
                 ilp: u64, local: usize, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4],
                 base: u64, n_nonces: u64, walk_v2: bool) -> Option<Option<u64>> {
     let wv2: u32 = walk_v2 as u32;
@@ -58,7 +59,7 @@ fn dispatch_raw(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulon
         .set_arg(sl(0)).set_arg(sl(1)).set_arg(sl(2)).set_arg(sl(3))
         .set_arg(&n_chunks)
         .set_arg(&POM_WALK_STEPS)
-        .set_arg(&slab_shift)
+        .set_arg(&slab_chunks)
         .set_arg(&pph[0]).set_arg(&pph[1]).set_arg(&pph[2]).set_arg(&pph[3])
         .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
         .set_arg(&time)
@@ -84,15 +85,18 @@ fn dispatch_raw(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulon
 /// then finishes ONCE, keeping the GPU continuously fed (no per-sub-dispatch stall that lets the clock
 /// sag) instead of the old enqueue→finish→read per 128 nonces.
 #[allow(clippy::too_many_arguments)]
-fn enqueue_v3(queue: &CommandQueue, kernel: &Kernel, blob: &Buffer<cl_ulong>, winner: &Buffer<cl_ulong>, v3_local: usize,
+fn enqueue_v3(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>], slab_tiles: u64, winner: &Buffer<cl_ulong>, v3_local: usize,
               n_tiles: u64, k: u32, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4],
               base: u64, n_nonces: u64) -> Option<()> {
+    // 4 slab args; absent slabs repeat slab 0 (never selected: off/slab_tiles bounds to real slabs).
+    let sl = |i: usize| weights.get(i).unwrap_or(&weights[0]);
     // local size comes from the chosen kernel flavor (128 = 2-rows/item on RDNA3+, 256 = 1-row).
     const V3_MERKLE_LDS_BYTES: usize = 3072 * 4;   // 256 leaves×8 + 128-hash ping-pong = 12 KB
     let global = (n_nonces * v3_local as u64) as usize;
     ExecuteKernel::new(kernel)
-        .set_arg(blob)
+        .set_arg(sl(0)).set_arg(sl(1)).set_arg(sl(2)).set_arg(sl(3))
         .set_arg(&n_tiles)
+        .set_arg(&slab_tiles)
         .set_arg(&k)
         .set_arg(&pph[0]).set_arg(&pph[1]).set_arg(&pph[2]).set_arg(&pph[3])
         .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
@@ -129,21 +133,91 @@ impl PomMiner {
     pub fn new(device: Device, index: &crate::pom::WeightIndex, n_chunks: u64) -> Result<Self, String> {
         let context = Arc::new(Context::from_device(&device).map_err(|e| e.to_string())?);
         let queue = CommandQueue::create(&context, device.id(), 0).map_err(|e| e.to_string())?;
-        // Bake the tier's chunk count into the JIT build: the per-step `state % n` is a 64-bit
-        // division with a runtime divisor (a slow ALU library routine, 256×/nonce); with -D POM_NC
-        // the compiler strength-reduces it to its exact multiply-high sequence (byte-exact — the
-        // compiler's own constant-division transform). Falls back to the arg if the build with the
-        // define fails for any reason.
-        // RDNA3+/CDNA (gfx11/gfx12) have the native `v_dot4_i32_i8` (dot9-insts): -D USE_AMD_DOT4
-        // routes the v3 int8 matmul (the walk's hot loop) through `__builtin_amdgcn_sudot4` — 1
-        // instruction instead of the 4-mul scalar unpack, byte-identical result. Older AMD (GCN/
-        // Polaris/Vega/RDNA1/2) and Windows Adrenalin (which can reject the builtin) keep the scalar
-        // path; if the dot4 build fails for any reason we retry without the define.
-        // Native int8 dot: RDNA3+/gfx11-12 use `sudot4` (dot9-insts); GCN/CDNA gfx906/908/90a (Vega20
-        // MI50, MI100, MI200) use the older `sdot4` (dot1-insts). Both are byte-identical to the scalar
-        // unpack; everything else (Polaris/RDNA1-2/Windows Adrenalin) keeps scalar. KERYX_NO_AMD_DOT4
-        // forces scalar; if the hardware-dot build fails for any reason we retry without the define.
+        // worker.rs pattern: a context ref that outlives the borrow checker (Arc kept in struct).
+        let cref = unsafe { Arc::as_ptr(&context).as_ref().unwrap() };
         let dev_name = device.name().unwrap_or_default();
+
+        // ---- blob layout FIRST (the JIT bakes the layout's divisors in below) -----------------
+        // AMD caps a single allocation at CL_DEVICE_MAX_MEM_ALLOC_SIZE — and the REPORT is
+        // unreliable in both directions: ORCA/RX 580 reports 8 GiB but rejects >~4 GiB, other
+        // Polaris drivers report ~25% of VRAM (2012 MiB on an 8 GB card, field report) and mean
+        // it. So the layout is chosen by TRYING: 1..=4 slabs, each slab TILE-ALIGNED (a multiple
+        // of the 2048-chunk v3 tile so a 64 KB tile never straddles a slab) and sized
+        // ceil(n/k) — NOT a power of two, so 4 slabs really can tile e.g. a 6.2 GB blob under a
+        // 2012 MiB cap (4 × 1553 MiB), which the old 2-GiB-only fallback could not. Layouts whose
+        // slab size exceeds the driver's reported max-alloc are skipped up front (no point
+        // issuing a create the driver already told us it will refuse); the create/write result
+        // decides the rest. Byte-exact in every layout: chunks keep their canonical index.
+        let blob_bytes = n_chunks.saturating_mul(32);
+        let reported_max = device.max_mem_alloc_size().unwrap_or(u64::MAX);
+        log::info!(
+            "PoM: tier blob {} MiB; device max single-buffer alloc {} MiB, global mem {} MiB.",
+            blob_bytes / (1024 * 1024),
+            reported_max / (1024 * 1024),
+            device.global_mem_size().map(|b| b / (1024 * 1024)).unwrap_or(0),
+        );
+        if blob_bytes > reported_max {
+            log::info!(
+                "PoM: tier blob ({} MiB) exceeds this GPU's reported max single-buffer allocation \
+                 ({} MiB) — the blob will be SPLIT across multiple buffers (slab layout).",
+                blob_bytes / (1024 * 1024), reported_max / (1024 * 1024),
+            );
+        }
+        const V3_TILE: u64 = POM_V3_TILE_CHUNKS; // slab alignment quantum (2048 chunks = 64 KB)
+        let align_up = |c: u64| c.div_ceil(V3_TILE) * V3_TILE;
+        // KERYX_POM_CL_SLABS forces a slab count; KERYX_POM_CL_SLAB_SHIFT (legacy) forces a
+        // 2^shift-chunk slab size, translated to the equivalent count. Unset = adaptive 1..=4.
+        let forced_k: Option<u64> = std::env::var("KERYX_POM_CL_SLABS").ok()
+            .and_then(|v| v.parse::<u64>().ok()).filter(|&k| (1..=4).contains(&k))
+            .or_else(|| {
+                std::env::var("KERYX_POM_CL_SLAB_SHIFT").ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .map(|sh| if sh >= 63 { 1 } else { n_chunks.div_ceil(1u64 << sh).clamp(1, 4) })
+            });
+        let attempts: Vec<u64> = match forced_k {
+            Some(k) => vec![k],
+            None => vec![1, 2, 3, 4],
+        };
+        let mut built: Option<(Vec<Buffer<cl_ulong>>, u64)> = None;
+        let mut last_err = String::new();
+        for k in attempts {
+            let slab_chunks = if k == 1 { n_chunks } else { align_up(n_chunks.div_ceil(k)) };
+            let slab_bytes = slab_chunks.saturating_mul(32);
+            if k > 1 && slab_bytes > reported_max {
+                last_err = format!("{k}-slab layout needs {} MiB/slab > reported max-alloc {} MiB",
+                                   slab_bytes / (1024 * 1024), reported_max / (1024 * 1024));
+                log::info!("PoM: skipping {k}-slab layout ({last_err}).");
+                continue;
+            }
+            match Self::build_slabs(cref, &queue, index, n_chunks, slab_chunks) {
+                Ok(v) => {
+                    if v.len() > 1 {
+                        log::info!(
+                            "PoM: blob resident as {} slabs of {} MiB (tile-aligned, {} chunks/slab).",
+                            v.len(), slab_bytes / (1024 * 1024), slab_chunks,
+                        );
+                    }
+                    built = Some((v, slab_chunks));
+                    break;
+                }
+                Err(e) => {
+                    last_err = e;
+                    log::warn!("PoM: {k}-slab layout failed ({last_err}) — trying a smaller slab size.");
+                }
+            }
+        }
+        let Some((weights, slab_chunks)) = built else {
+            return Err(format!("blob allocation failed in every layout (1-4 slabs): {last_err}"));
+        };
+
+        // ---- JIT with the layout + tier baked in ---------------------------------------------
+        // POM_NC (chunk count), POM_SLABC (chunks/slab), POM_SLABT (tiles/slab) are runtime-
+        // divisor divisions in the hot paths; baking them strength-reduces each to a multiply-high
+        // (byte-exact — the compiler's own constant-division transform). Falls back to runtime
+        // args if the define build fails. Native int8 dot: RDNA3+/gfx11-12 use `sudot4`
+        // (dot9-insts); GCN/CDNA gfx906/908/90a use `sdot4` (dot1-insts); both byte-identical to
+        // the scalar unpack; everything else (Polaris/RDNA1-2/Windows Adrenalin) keeps scalar.
+        // KERYX_NO_AMD_DOT4 forces scalar; failed builds retry define-less.
         let allow_dot = std::env::var("KERYX_NO_AMD_DOT4").is_err();
         let dot_def = if !allow_dot {
             None
@@ -154,7 +228,10 @@ impl PomMiner {
         } else {
             None
         };
-        let base = format!("-D POM_NC={}UL", n_chunks);
+        let base = format!(
+            "-D POM_NC={}UL -D POM_SLABC={}UL -D POM_SLABT={}UL",
+            n_chunks, slab_chunks, slab_chunks / V3_TILE,
+        );
         let opts = match dot_def { Some((_, d)) => format!("{base} {d}"), None => base.clone() };
         let program = match Program::create_and_build_from_source(&context, POM_SRC, &opts) {
             Ok(p) => {
@@ -164,7 +241,7 @@ impl PomMiner {
                 p
             }
             Err(e) => {
-                log::warn!("PoM: JIT with {opts:?} failed ({e}) — retrying without the dot4/baked-count defines.");
+                log::warn!("PoM: JIT with {opts:?} failed ({e}) — retrying without the dot4/baked-layout defines.");
                 match Program::create_and_build_from_source(&context, POM_SRC, &base) {
                     Ok(p) => p,
                     Err(_) => Program::create_and_build_from_source(&context, POM_SRC, "")?,
@@ -174,11 +251,12 @@ impl PomMiner {
         let kernel = Kernel::create(&program, "pom_mine").map_err(|e| e.to_string())?;
         let kernel_ilp2 = Kernel::create(&program, "pom_mine_ilp2").map_err(|e| e.to_string())?;
         let kernel_ilp4 = Kernel::create(&program, "pom_mine_ilp4").map_err(|e| e.to_string())?;
-        // v3 kernel flavor: BIG RDNA3 (gfx1100/gfx1101 — Navi31/32) uses the 2-rows-per-work-item variant (128-thread
-        // groups, each 128-bit column load feeds 8 int8 dots — measured +5-7% on an RX 7900 XTX,
-        // it is issue-bound at ~92% of its pure-dot ceiling). Everything else keeps the 1-row
-        // 256-thread layout: on GCN wave64 (MI50) the 2-row register pressure HALVES occupancy
-        // (measured -21%), and small RDNA3 (gfx1102) measured -4%. KERYX_POM_V3_2R=0/1 overrides.
+        // v3 kernel flavor: BIG RDNA3 (gfx1100/gfx1101 — Navi31/32) uses the 2-rows-per-work-item
+        // variant (128-thread groups, each 128-bit column load feeds 8 int8 dots — measured +5-7%
+        // on an RX 7900 XTX; the kernel is issue-bound at ~92% of its pure-dot ceiling). Everything
+        // else keeps the 1-row 256-thread layout: on GCN wave64 (MI50) the 2-row register pressure
+        // HALVES occupancy (measured -21%), and small RDNA3 (gfx1102) measured -4%.
+        // KERYX_POM_V3_2R=0/1 overrides.
         let use_2r = match std::env::var("KERYX_POM_V3_2R").ok().as_deref() {
             Some("0") => false,
             Some("1") => true,
@@ -187,71 +265,6 @@ impl PomMiner {
         let (v3_name, v3_local) = if use_2r { ("pom_mine_v3_2r", 128usize) } else { ("pom_mine_v3", 256usize) };
         let kernel_v3 = Kernel::create(&program, v3_name).map_err(|e| e.to_string())?;
         log::info!("PoM: v3 walk kernel = {v3_name} (local {v3_local}) on {dev_name}.");
-        // worker.rs pattern: a context ref that outlives the borrow checker (Arc kept in struct).
-        let cref = unsafe { Arc::as_ptr(&context).as_ref().unwrap() };
-        // The whole tier blob lives in ONE cl_mem. AMD caps a single allocation at
-        // CL_DEVICE_MAX_MEM_ALLOC_SIZE; if the blob exceeds it the driver returns a partial/broken
-        // buffer and the walk reads garbage → the card hashes but never finds a valid share (the
-        // classic Polaris/RX-580 post-H5 failure — the Qwen3-8B blob is ~4.8 GB). main() raises the
-        // cap via GPU_SINGLE_ALLOC_PERCENT=100 before OpenCL inits; warn loudly if it's STILL too
-        // small (a driver that ignores the env var) so the failure is diagnosable, not silent.
-        let blob_bytes = n_chunks.saturating_mul(32);
-        if let Ok(max_alloc) = device.max_mem_alloc_size() {
-            // Always log the numbers — makes "hashing but no shares" reports diagnosable from the
-            // log alone (is the blob within this driver's single-buffer cap or not?).
-            log::info!(
-                "PoM: tier blob {} MiB; device max single-buffer alloc {} MiB, global mem {} MiB.",
-                blob_bytes / (1024 * 1024),
-                max_alloc / (1024 * 1024),
-                device.global_mem_size().map(|b| b / (1024 * 1024)).unwrap_or(0),
-            );
-            if blob_bytes > max_alloc {
-                log::info!(
-                    "PoM: tier blob ({} MiB) exceeds this GPU's reported max single-buffer allocation \
-                     ({} MiB) — the blob will be SPLIT across multiple buffers (slab layout).",
-                    blob_bytes / (1024 * 1024), max_alloc / (1024 * 1024),
-                );
-            }
-        }
-        // Slab layout: single buffer first (fast path, existing fleet unchanged). If ANY create or
-        // write in that path fails — Polaris/ORCA rejects >~4 GiB per buffer with
-        // CL_MEM_OBJECT_ALLOCATION_FAILURE even though it REPORTS an 8 GiB max-alloc (RX 580 field
-        // report), so the reported limit cannot be trusted — retry with 2^SLAB_SHIFT_FALLBACK-chunk
-        // (2 GiB) slabs, up to 4 (kernel arg count). KERYX_POM_CL_SLAB_SHIFT forces a slab size
-        // (testing / stubborn drivers). Byte-exact either way: the kernel's pom_fetch maps canonical
-        // chunk index -> (slab, intra) and the chunk bytes are identical.
-        const SLAB_SHIFT_FALLBACK: u32 = 26; // 2^26 chunks * 32 B = 2 GiB per slab
-        let forced_shift = std::env::var("KERYX_POM_CL_SLAB_SHIFT").ok().and_then(|v| v.parse::<u32>().ok());
-        let attempts: Vec<u32> = match forced_shift {
-            Some(sh) => vec![sh.clamp(20, 63)],
-            None => vec![63, SLAB_SHIFT_FALLBACK],
-        };
-        let mut built: Option<(Vec<Buffer<cl_ulong>>, u32)> = None;
-        let mut last_err = String::new();
-        for shift in attempts {
-            match Self::build_slabs(cref, &queue, index, n_chunks, shift) {
-                Ok(v) => {
-                    if shift < 63 {
-                        log::info!(
-                            "PoM: blob resident as {} slab(s) of {} MiB (slab_shift {shift}).",
-                            v.len(), (1u64 << shift) * 32 / (1024 * 1024),
-                        );
-                    }
-                    built = Some((v, shift));
-                    break;
-                }
-                Err(e) => {
-                    last_err = e;
-                    log::warn!(
-                        "PoM: blob layout with slab_shift {shift} failed ({last_err}) — {}",
-                        if shift == 63 { "retrying with 2 GiB slabs (Polaris per-buffer limit workaround)." } else { "no smaller layout available." },
-                    );
-                }
-            }
-        }
-        let Some((weights, slab_shift)) = built else {
-            return Err(format!("blob allocation failed in every layout: {last_err}"));
-        };
         let mut winner = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_WRITE, 1, ptr::null_mut())
             .map_err(|e| e.to_string())?;
 
@@ -281,7 +294,7 @@ impl PomMiner {
                 let mut ok = true;
                 for round in 0..3 {
                     let t0 = std::time::Instant::now();
-                    if dispatch_raw(&queue, k, &weights, slab_shift, &mut winner, n_chunks, ilp, local,
+                    if dispatch_raw(&queue, k, &weights, slab_chunks, &mut winner, n_chunks, ilp, local,
                                     [1, 2, 3, 4], [1, 2, 3, 4], 1, [0; 4], 0, tune_nonces, true).is_none() {
                         ok = false;
                         break;
@@ -308,13 +321,12 @@ impl PomMiner {
             best_name, best_ilp, best_local, best_rate / 1e6,
             if pin_ilp.is_some() || pin_local.is_some() { " [env-pinned]" } else { "" },
         );
-        Ok(Self { _context: context, queue, kernel: chosen, kernel_v3, v3_local, weights, slab_shift, winner, n_chunks, ilp: best_ilp, local: best_local })
+        Ok(Self { _context: context, queue, kernel: chosen, kernel_v3, v3_local, weights, slab_chunks, winner, n_chunks, ilp: best_ilp, local: best_local })
     }
 
     /// Create + stream the blob as ceil(n_chunks / 2^shift) buffers (shift>=63 = one buffer).
     /// Fails cleanly on any create/write error so the caller can retry a smaller layout.
-    fn build_slabs(cref: &Context, queue: &CommandQueue, index: &crate::pom::WeightIndex, n_chunks: u64, shift: u32) -> Result<Vec<Buffer<cl_ulong>>, String> {
-        let slab_chunks: u64 = if shift >= 63 { n_chunks } else { 1u64 << shift };
+    fn build_slabs(cref: &Context, queue: &CommandQueue, index: &crate::pom::WeightIndex, n_chunks: u64, slab_chunks: u64) -> Result<Vec<Buffer<cl_ulong>>, String> {
         let n_slabs = n_chunks.div_ceil(slab_chunks.max(1));
         if n_slabs > 4 {
             return Err(format!("{n_slabs} slabs needed but the kernel takes at most 4 — tier too big for this layout"));
@@ -355,7 +367,7 @@ impl PomMiner {
             let sub = (batch - done).min(SUB_DISPATCH_NONCES);
             let base = nonce_base.wrapping_add(done);
             // Disjoint field borrows: kernel/queue/weights immutably, winner mutably.
-            match dispatch_raw(&self.queue, &self.kernel, &self.weights, self.slab_shift, &mut self.winner, self.n_chunks,
+            match dispatch_raw(&self.queue, &self.kernel, &self.weights, self.slab_chunks, &mut self.winner, self.n_chunks,
                                self.ilp, self.local, pph, seed, time, target, base, sub, walk_v2) {
                 None => return None,             // OpenCL error — abort the batch (old ok()? behavior)
                 Some(Some(w)) => return Some(w), // lowest winner in this ascending sub-batch
@@ -373,10 +385,8 @@ impl PomMiner {
     /// blob (n_tiles addresses one contiguous buffer); big-VRAM RDNA cards (the H6 target) always
     /// stream one slab.
     pub fn mine_v3(&mut self, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64) -> Option<u64> {
-        if self.weights.len() != 1 {
-            log::error!("PoM v3: blob is {} slabs — the v3 kernel needs one contiguous buffer; this card can't do the H6 walk.", self.weights.len());
-            return None;
-        }
+        // Multi-slab is fully supported: slabs are tile-aligned, so each step's 64 KB tile lives
+        // in exactly one slab (v3_slab in the kernel picks it by off / slab_tiles).
         let n_tiles = self.n_chunks / POM_V3_TILE_CHUNKS;
         if n_tiles == 0 {
             log::error!("PoM v3: blob too small ({} chunks < one 2048-chunk tile).", self.n_chunks);
@@ -393,7 +403,7 @@ impl PomMiner {
         while done < batch {
             let sub = (batch - done).min(sub_dispatch);
             let base = nonce_base.wrapping_add(done);
-            enqueue_v3(&self.queue, &self.kernel_v3, &self.weights[0], &self.winner, self.v3_local,
+            enqueue_v3(&self.queue, &self.kernel_v3, &self.weights, self.slab_chunks / POM_V3_TILE_CHUNKS, &self.winner, self.v3_local,
                        n_tiles, k, pph, seed, time, target, base, sub)?;
             done += sub;
         }
