@@ -250,7 +250,7 @@ jobs:
       # cuRAND (link import libs + headers). Install everything to be safe.
       - name: Install CUDA toolkit (full)
         id: cuda
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.26   # v0.2.26 is the first with CUDA 12.9.1 (v0.2.24 tops out at 12.9.0)
         with:
           cuda: '12.9.1'
           method: 'network'
