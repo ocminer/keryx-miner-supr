@@ -1587,6 +1587,22 @@ pub fn pom_v3_activation_daa() -> u64 {
 }
 static POM_V3_ACTIVATION_DAA_CELL: OnceLock<u64> = OnceLock::new();
 
+/// H8 request-identity gate. At/after this score a request is identified by the transaction id of
+/// the AiRequest, not by the digest of its payload. MUST equal the node's `reward_routing_activation`:
+/// a miner deriving the other identity signs responses the node cannot credit and is struck for work
+/// it actually did. Mainnet default 79_251_000; override for testnet via env.
+/// (Pool miners are unaffected — the pool derives the identity and relays reqId; this is the SOLO
+/// keryxd path, kept in parity with upstream keryx-miner v0.4.9 commit 54129d80.)
+pub fn reward_routing_activation_daa() -> u64 {
+    static CELL: OnceLock<u64> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("KERYX_REWARD_ROUTING_ACTIVATION_DAA")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(79_251_000)
+    })
+}
+
 /// AUTO-SWITCH: is this block at/after the H6 (PoM v3 matrix-walk) gate? Decided per job from the
 /// block's own `daa_score` so an already-running miner flips to the v3 walk + witness on the first
 /// post-gate job. Logs ONCE on first crossing.
