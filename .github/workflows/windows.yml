@@ -250,9 +250,9 @@ jobs:
       # cuRAND (link import libs + headers). Install everything to be safe.
       - name: Install CUDA toolkit (full)
         id: cuda
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.24
         with:
-          cuda: '12.5.1'
+          cuda: '12.9.1'
           method: 'network'
 
       # nvcc (candle-kernels) needs the MSVC host compiler cl.exe on PATH.
@@ -276,8 +276,11 @@ jobs:
       # The in-process llama.cpp engine as keryx-llama.dll. Without it a Windows NVIDIA rig cannot
       # serve the H4/H6 models (they load ONLY via llama.cpp; candle has no loader) and inference
       # falls through to unusable CPU. Built here because CUDA + MSVC are already set up in this job.
-      # 90-virtual emits compute_90 PTX that forward-JITs to sm_120 (5070Ti/5080/5090) at load, so a
-      # CUDA 12.5 toolchain predating sm_120 SASS still runs on Blackwell.
+      # 120-real = NATIVE Blackwell (5070Ti/5080/5090) SASS — needs CUDA >= 12.8 (why the toolkit is
+      # 12.9 above). 90-virtual keeps a compute_90 PTX fallback that forward-JITs to any newer arch.
+      # Native sm_120 avoids the load-time JIT and any Blackwell-on-Windows JIT edge case (a community
+      # dev found upstream's no-120 llama build crashed 5090s on every inference → strikes; ours is
+      # safe because Linux ships native 120 and Windows had 90-virtual, but native 120 hardens both).
       - name: Build keryx-llama.dll (in-process llama.cpp engine)
         shell: pwsh
         run: |
@@ -290,7 +293,7 @@ jobs:
             -G "Visual Studio 17 2022" -A x64 `
             -DLLAMA_SRC="$llamaSrc" `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;90-virtual" `
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;120-real;90-virtual" `
             -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH\bin\nvcc.exe"
           if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
           cmake --build build-llama --config Release --target keryx-llama -j 4
