@@ -97,6 +97,16 @@ fn walk_load_err(e: impl std::fmt::Display) -> candle_core::Error {
 /// Load the walk kernel, turning a bare driver error (typically CUDA_ERROR_INVALID_PTX when the
 /// GPU is OLDER than the PTX target — PTX only JITs forward) into an actionable message naming
 /// this build's PTX arch and the right build line for older cards.
+/// Bind THIS stream's CUDA context to the calling thread. On a MULTI-GPU rig the mining worker
+/// threads rotate, so a raw driver call (kernel launch, memcpy, htod upload) would otherwise run
+/// against whatever context happens to be current — often another device's — dereferencing a
+/// pointer that belongs to a different GPU and raising a sticky CUDA_ERROR_ILLEGAL_ADDRESS that
+/// poisons the context (a silent native crash). Upstream binds at every such entry point; we must
+/// too. Single-GPU never mis-binds (one context), which is why this only bit multi-GPU rigs.
+fn bind_device_ctx(stream: &Arc<CudaStream>) -> candle_core::Result<()> {
+    stream.context().bind_to_thread().map_err(candle_core::Error::wrap)
+}
+
 fn load_walk_func(cuda: &CudaDevice, name: &str) -> candle_core::Result<WalkFunc> {
     let stream = cuda.cuda_stream();
     let ctx = stream.context().clone();
@@ -268,6 +278,7 @@ impl PomGpuMiner {
             _ => return Err(candle_core::Error::Msg("PoM GPU: not a CUDA device".into())),
         };
         let stream = cuda.cuda_stream();
+        bind_device_ctx(&stream)?; // multi-GPU: bind this device's context before raw uploads
 
         let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::wrap)?;
         let content = gguf_file::Content::read(&mut file)?;
@@ -316,6 +327,7 @@ impl PomGpuMiner {
             _ => return Err(candle_core::Error::Msg("PoM GPU: not a CUDA device".into())),
         };
         let stream = cuda.cuda_stream();
+        bind_device_ctx(&stream)?; // multi-GPU: bind this device's context before raw uploads
 
         let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::wrap)?;
         let meta = crate::gguf::GgufMeta::read(&mut file)
@@ -369,6 +381,7 @@ impl PomGpuMiner {
             _ => return Err(candle_core::Error::Msg("PoM GPU: shared load requires a CUDA device".into())),
         };
         let stream = cuda.cuda_stream();
+        bind_device_ctx(&stream)?; // multi-GPU: bind this device's context before raw uploads
 
         let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::wrap)?;
         let content = gguf_file::Content::read(&mut file)?;
@@ -434,6 +447,7 @@ impl PomGpuMiner {
             _ => return Err(candle_core::Error::Msg("PoM GPU: not a CUDA device".into())),
         };
         let stream = cuda.cuda_stream();
+        bind_device_ctx(&stream)?; // multi-GPU: bind this device's context before raw uploads/byte-gate
         let ts = crate::llama_engine::tensors_for(device_id)
             .ok_or_else(|| candle_core::Error::Msg("PoM GPU: llama engine tensors unavailable".into()))?;
         let canonical = canonical_tensor_list(gguf)
@@ -557,6 +571,7 @@ impl PomGpuMiner {
         let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
+        bind_device_ctx(&self.stream)?; // multi-GPU: bind this device's context before the raw launch
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
         let block = self.block_dim.load(Ordering::Relaxed).max(1);
         // ILP-x2 kernel grinds 2 nonces/thread -> ceil(batch/2) threads; ILP1 -> `batch` threads.
@@ -593,6 +608,7 @@ impl PomGpuMiner {
         let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
         let t = words4(target_le);
         let k = crate::pom_v3::POM_V3_K as u32;
+        bind_device_ctx(&self.stream)?; // multi-GPU: bind this device's context before the raw launch
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
         let cfg = LaunchConfig {
             grid_dim: (batch as u32, 1, 1),
