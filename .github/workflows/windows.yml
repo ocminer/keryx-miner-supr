@@ -250,9 +250,9 @@ jobs:
       # cuRAND (link import libs + headers). Install everything to be safe.
       - name: Install CUDA toolkit (full)
         id: cuda
-        uses: Jimver/cuda-toolkit@v0.2.26   # v0.2.26 is the first with CUDA 12.9.1 (v0.2.24 tops out at 12.9.0)
+        uses: Jimver/cuda-toolkit@v0.2.24   # settled action version; has CUDA 12.8.1 (first with sm_120)
         with:
-          cuda: '12.9.1'
+          cuda: '12.8.1'
           method: 'network'
           # Newer CUDA network installs reject a bare "full" fetch — pin the components candle-CUDA
           # (cudart/cublas/curand/nvrtc + dev import libs) and the llama.cpp nvcc build need.
