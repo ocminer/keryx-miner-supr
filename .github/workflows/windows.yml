@@ -254,6 +254,9 @@ jobs:
         with:
           cuda: '12.9.1'
           method: 'network'
+          # Newer CUDA network installs reject a bare "full" fetch — pin the components candle-CUDA
+          # (cudart/cublas/curand/nvrtc + dev import libs) and the llama.cpp nvcc build need.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev", "thrust", "visual_studio_integration"]'
 
       # nvcc (candle-kernels) needs the MSVC host compiler cl.exe on PATH.
       - name: Set up MSVC (cl.exe in PATH)
