@@ -20,79 +20,34 @@ const POM_SRC: &str = include_str!("../plugins/opencl/resources/pom_mine.cl");
 pub struct PomMiner {
     _context: Arc<Context>,
     queue: CommandQueue,
-    kernel: Kernel,
-    /// H6 PoM v3 matrix-state walk kernel (one work-group per nonce). Grinds the int8 D×D×K matmul.
-    kernel_v3: Kernel,
-    /// Work-group size for the chosen v3 kernel flavor: 128 (2-rows/item, RDNA3+) or 256 (1-row).
-    v3_local: usize,
+    /// PoM v4 walk kernel (v0.11.0): 256-thread groups of 8 sub-nonces × 32 lanes.
+    kernel_v4: Kernel,
     weights: Vec<Buffer<cl_ulong>>,
-    /// Chunks per slab (single-slab layout: == n_chunks). Slabs are tile-aligned (mult of 2048).
+    /// Chunks per slab (single-slab layout: == n_chunks). Slabs are tile-aligned.
     slab_chunks: u64,
     winner: Buffer<cl_ulong>,
     pub n_chunks: u64,
-    /// Nonces per work-item of the chosen kernel (1 = pom_mine, 2 = _ilp2, 4 = _ilp4). Autotuned.
-    ilp: u64,
-    /// Chosen work-group size (autotuned). Global size is rounded up to a multiple of this.
-    local: usize,
 }
 
 // OpenCL handles are plain cl_* pointers usable from any single thread; the global Mutex
 // serializes all access (one mining thread), so sending the miner across threads is sound.
 unsafe impl Send for PomMiner {}
 
-/// One raw kernel dispatch: `n_nonces` nonces on `kernel` with `ilp` nonces/work-item and the given
-/// work-group size, blocking until complete. `None` = OpenCL error; `Some(None)` = ran clean with no
-/// winner; `Some(Some(n))` = winning nonce. Free function (not a method) so mine() and the autotune
-/// sweep can pass disjoint field borrows. The tid guard in every kernel makes the rounded-up global
-/// size safe (padding items exit immediately).
+/// Enqueue one v4 sub-dispatch (no finish/read): 256-thread workgroups of V4_NPG(8) sub-nonces.
+/// `n_nonces` nonces from `base`; groups = ceil(n_nonces/8) (tail sub-nonces walk a dummy nonce and
+/// never submit — uniform barriers). The kernel CAS-mins into the shared `winner`; mine_v4 enqueues
+/// the whole batch back-to-back then finishes ONCE so the GPU queue never drains mid-batch.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_raw(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>], slab_chunks: u64, winner: &mut Buffer<cl_ulong>, n_chunks: u64,
-                ilp: u64, local: usize, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4],
-                base: u64, n_nonces: u64, walk_v2: bool) -> Option<Option<u64>> {
-    let wv2: u32 = walk_v2 as u32;
-    queue.enqueue_write_buffer(winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
-    let items = n_nonces.div_ceil(ilp);
-    let global = (items.div_ceil(local as u64) * local as u64) as usize;
-    // 4 slab args; absent slabs repeat slab 0 (never addressed: off>>shift bounds to real slabs).
-    let sl = |i: usize| weights.get(i).unwrap_or(&weights[0]);
-    ExecuteKernel::new(kernel)
-        .set_arg(sl(0)).set_arg(sl(1)).set_arg(sl(2)).set_arg(sl(3))
-        .set_arg(&n_chunks)
-        .set_arg(&POM_WALK_STEPS)
-        .set_arg(&slab_chunks)
-        .set_arg(&pph[0]).set_arg(&pph[1]).set_arg(&pph[2]).set_arg(&pph[3])
-        .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
-        .set_arg(&time)
-        .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
-        .set_arg(&base).set_arg(&n_nonces)
-        .set_arg(winner)
-        .set_arg(&wv2)
-        .set_global_work_size(global)
-        .set_local_work_size(local)
-        .enqueue_nd_range(queue)
-        .ok()?;
-    queue.finish().ok()?;
-    let mut w = [u64::MAX];
-    queue.enqueue_read_buffer(winner, CL_BLOCKING, 0, &mut w, &[]).ok()?;
-    Some(if w[0] != u64::MAX { Some(w[0]) } else { None })
-}
-
-/// H6 PoM v3: ENQUEUE one sub-dispatch (no finish/read). ONE work-group per nonce, local=256 (one
-/// per state row x). The whole tier blob is a SINGLE contiguous cl_mem reinterpreted as `uint*`; the
-/// tile is read straight from it (VRAM/L2), so LDS holds only the 12 KB Merkle scratch. `n_nonces` ==
-/// number of work-groups. The kernel does an atomic-min into `winner`, so many sub-dispatches sharing
-/// one winner buffer accumulate the global-min nonce — mine_v3 enqueues the whole batch back-to-back
-/// then finishes ONCE, keeping the GPU continuously fed (no per-sub-dispatch stall that lets the clock
-/// sag) instead of the old enqueue→finish→read per 128 nonces.
-#[allow(clippy::too_many_arguments)]
-fn enqueue_v3(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>], slab_tiles: u64, winner: &Buffer<cl_ulong>, v3_local: usize,
-              n_tiles: u64, k: u32, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4],
-              base: u64, n_nonces: u64) -> Option<()> {
+fn enqueue_v4(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>], slab_tiles: u64,
+              winner: &Buffer<cl_ulong>, n_tiles: u64, k: u32, pph: [u64; 4], seed: [u64; 4],
+              time: u64, target: [u64; 4], base: u64, n_nonces: u64) -> Option<()> {
+    const V4_LOCAL: usize = 256;
+    const V4_NPG: u64 = 8;                       // sub-nonces per workgroup (kernel mirror)
+    const V4_LDS_BYTES: usize = 8 * 512 * 4;     // 8 strips × 512 u32 = 16 KB
     // 4 slab args; absent slabs repeat slab 0 (never selected: off/slab_tiles bounds to real slabs).
     let sl = |i: usize| weights.get(i).unwrap_or(&weights[0]);
-    // local size comes from the chosen kernel flavor (128 = 2-rows/item on RDNA3+, 256 = 1-row).
-    const V3_MERKLE_LDS_BYTES: usize = 3072 * 4;   // 256 leaves×8 + 128-hash ping-pong = 12 KB
-    let global = (n_nonces * v3_local as u64) as usize;
+    let groups = n_nonces.div_ceil(V4_NPG);
+    let global = (groups * V4_LOCAL as u64) as usize;
     ExecuteKernel::new(kernel)
         .set_arg(sl(0)).set_arg(sl(1)).set_arg(sl(2)).set_arg(sl(3))
         .set_arg(&n_tiles)
@@ -104,9 +59,9 @@ fn enqueue_v3(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>
         .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
         .set_arg(&base).set_arg(&n_nonces)
         .set_arg(winner)
-        .set_arg_local_buffer(V3_MERKLE_LDS_BYTES)
+        .set_arg_local_buffer(V4_LDS_BYTES)
         .set_global_work_size(global)
-        .set_local_work_size(v3_local)
+        .set_local_work_size(V4_LOCAL)
         .enqueue_nd_range(queue)
         .ok()?;
     Some(())
@@ -125,7 +80,7 @@ const UPLOAD_WINDOW_CHUNKS: u64 = 1 << 22;
 /// at 0.5 MH/s while amortizing launch overhead (<0.5% at MI60/7600 XT rates). Sub-batches run
 /// in ascending nonce order, so the first one with a winner holds the batch's lowest nonce —
 /// early-returning there is result-identical and submits the share sooner.
-const SUB_DISPATCH_NONCES: u64 = 1 << 18;
+
 
 impl PomMiner {
     /// Build the resident tier on `device` by streaming the canonical chunks straight from the
@@ -163,7 +118,7 @@ impl PomMiner {
                 blob_bytes / (1024 * 1024), reported_max / (1024 * 1024),
             );
         }
-        const V3_TILE: u64 = POM_V3_TILE_CHUNKS; // slab alignment quantum (2048 chunks = 64 KB)
+        const V3_TILE: u64 = POM_V4_TILE_CHUNKS; // slab alignment quantum (32 chunks = 1 KB tile)
         let align_up = |c: u64| c.div_ceil(V3_TILE) * V3_TILE;
         // KERYX_POM_CL_SLABS forces a slab count; KERYX_POM_CL_SLAB_SHIFT (legacy) forces a
         // 2^shift-chunk slab size, translated to the equivalent count. Unset = adaptive 1..=4.
@@ -228,9 +183,11 @@ impl PomMiner {
         } else {
             None
         };
+        // v4 bakes n_tiles (POM_NT) and tiles-per-slab (POM_SLABT) — the two runtime-divisor
+        // divisions in the walk's hot paths (offset % n_tiles, off / slab_tiles).
         let base = format!(
-            "-D POM_NC={}UL -D POM_SLABC={}UL -D POM_SLABT={}UL",
-            n_chunks, slab_chunks, slab_chunks / V3_TILE,
+            "-D POM_NT={}UL -D POM_SLABT={}UL",
+            n_chunks / V3_TILE, slab_chunks / V3_TILE,
         );
         let opts = match dot_def { Some((_, d)) => format!("{base} {d}"), None => base.clone() };
         let program = match Program::create_and_build_from_source(&context, POM_SRC, &opts) {
@@ -248,83 +205,18 @@ impl PomMiner {
                 }
             }
         };
-        let kernel = Kernel::create(&program, "pom_mine").map_err(|e| e.to_string())?;
-        let kernel_ilp2 = Kernel::create(&program, "pom_mine_ilp2").map_err(|e| e.to_string())?;
-        let kernel_ilp4 = Kernel::create(&program, "pom_mine_ilp4").map_err(|e| e.to_string())?;
-        // v3 kernel flavor: BIG RDNA3 (gfx1100/gfx1101 — Navi31/32) uses the 2-rows-per-work-item
-        // variant (128-thread groups, each 128-bit column load feeds 8 int8 dots — measured +5-7%
-        // on an RX 7900 XTX; the kernel is issue-bound at ~92% of its pure-dot ceiling). Everything
-        // else keeps the 1-row 256-thread layout: on GCN wave64 (MI50) the 2-row register pressure
-        // HALVES occupancy (measured -21%), and small RDNA3 (gfx1102) measured -4%.
-        // KERYX_POM_V3_2R=0/1 overrides.
-        let use_2r = match std::env::var("KERYX_POM_V3_2R").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => true,
-            _ => dev_name.contains("gfx1100") || dev_name.contains("gfx1101"),
-        };
-        let (v3_name, v3_local) = if use_2r { ("pom_mine_v3_2r", 128usize) } else { ("pom_mine_v3", 256usize) };
-        let kernel_v3 = Kernel::create(&program, v3_name).map_err(|e| e.to_string())?;
-        log::info!("PoM: v3 walk kernel = {v3_name} (local {v3_local}) on {dev_name}.");
-        let mut winner = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_WRITE, 1, ptr::null_mut())
-            .map_err(|e| e.to_string())?;
+        let kernel_v4 = Kernel::create(&program, "pom_mine_v4").map_err(|e| e.to_string())?;
+        log::info!("PoM: v4 walk kernel ready on {dev_name}{}.",
+            match dot_def { Some((d, _)) => format!(" (native int8 dot: {d})"), None => String::new() });
 
-        // ---- per-device launch autotune (mirror of pom_gpu::autotune_block for CUDA) ----------
-        // Time each (kernel-ILP × work-group size) over the resident blob with an impossible
-        // target and pin the fastest. Block size + ILP affect only scheduling/occupancy, never a
-        // nonce's math — byte-exact by construction; the walk is latency-bound, and how many
-        // independent walks a lane carries decides how much DRAM latency it can hide (our MI50/
-        // MI60 runs at ~17% of HBM2 bandwidth at ILP1 = idle miss slots). Env pins for ops:
-        // KERYX_POM_CL_ILP (1|2|4) and KERYX_POM_CL_LOCAL skip the sweep.
-        let pin_ilp = std::env::var("KERYX_POM_CL_ILP").ok().and_then(|s| s.parse::<u64>().ok());
-        let pin_local = std::env::var("KERYX_POM_CL_LOCAL").ok().and_then(|s| s.parse::<usize>().ok());
-        let variants: [(u64, &str, &Kernel); 3] =
-            [(1, "pom_mine", &kernel), (2, "pom_mine_ilp2", &kernel_ilp2), (4, "pom_mine_ilp4", &kernel_ilp4)];
-        let locals: &[usize] = &[64, 128, 256];
-        // 2^18 per timed run: the top configs sit ~1% apart, so the sample must be big enough to
-        // rank them above run-to-run noise. Full sweep ≈ 9 configs × 3 runs ≈ 0.7 s per card, once
-        // per tier load.
-        let tune_nonces: u64 = 1 << 18;
-        let (mut best_name, mut best_ilp, mut best_local, mut best_rate) = ("pom_mine", 1u64, 256usize, 0f64);
-        for (ilp, name, k) in variants {
-            if pin_ilp.is_some_and(|p| p != ilp) { continue; }
-            for &local in locals {
-                if pin_local.is_some_and(|p| p != local) { continue; }
-                // 1 warmup + 2 timed, best-of (steadier on a busy card).
-                let mut rate = 0f64;
-                let mut ok = true;
-                for round in 0..3 {
-                    let t0 = std::time::Instant::now();
-                    if dispatch_raw(&queue, k, &weights, slab_chunks, &mut winner, n_chunks, ilp, local,
-                                    [1, 2, 3, 4], [1, 2, 3, 4], 1, [0; 4], 0, tune_nonces, true).is_none() {
-                        ok = false;
-                        break;
-                    }
-                    if round > 0 {
-                        rate = rate.max(tune_nonces as f64 / t0.elapsed().as_secs_f64());
-                    }
-                }
-                if ok && rate > best_rate {
-                    best_rate = rate;
-                    best_ilp = ilp;
-                    best_local = local;
-                    best_name = name;
-                }
-            }
-        }
-        let chosen = match best_name {
-            "pom_mine_ilp2" => kernel_ilp2,
-            "pom_mine_ilp4" => kernel_ilp4,
-            _ => kernel,
-        };
-        log::info!(
-            "PoM: OpenCL walk autotune -> {} (ILP x{}) @ work-group {} ({:.2} MH/s in-tune){}",
-            best_name, best_ilp, best_local, best_rate / 1e6,
-            if pin_ilp.is_some() || pin_local.is_some() { " [env-pinned]" } else { "" },
-        );
-        Ok(Self { _context: context, queue, kernel: chosen, kernel_v3, v3_local, weights, slab_chunks, winner, n_chunks, ilp: best_ilp, local: best_local })
+        let winner = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_WRITE, 1, ptr::null_mut())
+            .map_err(|e| e.to_string())?;
+        log::info!("PoM: tier resident ({} MiB, {} slab(s)) on {dev_name} — v4 ready.",
+            blob_bytes / (1024 * 1024), weights.len());
+        Ok(Self { _context: context, queue, kernel_v4, weights, slab_chunks, winner, n_chunks })
     }
 
-    /// Create + stream the blob as ceil(n_chunks / 2^shift) buffers (shift>=63 = one buffer).
+    /// Create + stream the blob as ceil(n_chunks / slab_chunks) buffers (single slab = one buffer).
     /// Fails cleanly on any create/write error so the caller can retry a smaller layout.
     fn build_slabs(cref: &Context, queue: &CommandQueue, index: &crate::pom::WeightIndex, n_chunks: u64, slab_chunks: u64) -> Result<Vec<Buffer<cl_ulong>>, String> {
         let n_slabs = n_chunks.div_ceil(slab_chunks.max(1));
@@ -359,51 +251,29 @@ impl PomMiner {
         Ok(slabs)
     }
 
-    /// Grind one batch of `batch` nonces from `nonce_base` in TDR-safe sub-dispatches. Returns
-    /// the lowest nonce whose pom_pow_value <= target, or None.
-    pub fn mine(&mut self, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64, walk_v2: bool) -> Option<u64> {
-        let mut done: u64 = 0;
-        while done < batch {
-            let sub = (batch - done).min(SUB_DISPATCH_NONCES);
-            let base = nonce_base.wrapping_add(done);
-            // Disjoint field borrows: kernel/queue/weights immutably, winner mutably.
-            match dispatch_raw(&self.queue, &self.kernel, &self.weights, self.slab_chunks, &mut self.winner, self.n_chunks,
-                               self.ilp, self.local, pph, seed, time, target, base, sub, walk_v2) {
-                None => return None,             // OpenCL error — abort the batch (old ok()? behavior)
-                Some(Some(w)) => return Some(w), // lowest winner in this ascending sub-batch
-                Some(None) => {}                 // clean, no winner — next sub-batch
-            }
-            done += sub;
-        }
-        None
-    }
-
-    /// H6 (PoM v3): grind `batch` nonces from `nonce_base` through the int8 matrix-state walk on
-    /// the resident blob. One work-group per nonce; sub-dispatched to keep any single NDRange short
-    /// (each v3 nonce is a 256×256×256 int8 GEMM × 256 steps — heavy). Returns the lowest winning
-    /// nonce (host re-walks it byte-exact to build the witness), or None. Requires a single-slab
-    /// blob (n_tiles addresses one contiguous buffer); big-VRAM RDNA cards (the H6 target) always
-    /// stream one slab.
-    pub fn mine_v3(&mut self, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64) -> Option<u64> {
-        // Multi-slab is fully supported: slabs are tile-aligned, so each step's 64 KB tile lives
-        // in exactly one slab (v3_slab in the kernel picks it by off / slab_tiles).
-        let n_tiles = self.n_chunks / POM_V3_TILE_CHUNKS;
+    /// PoM v4 (v0.11.0): grind `batch` nonces from `nonce_base` through the D=32 int8 matrix-state
+    /// walk on the resident blob (32 threads/nonce, 8 nonces per 256-thread workgroup). Returns the
+    /// lowest winning nonce (host re-walks it byte-exact to build the witness), or None. Multi-slab
+    /// aware — slabs are tile-aligned so each step's 1 KB tile lives in one slab (v4_slab picks it).
+    pub fn mine_v4(&mut self, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64) -> Option<u64> {
+        let n_tiles = self.n_chunks / POM_V4_TILE_CHUNKS;
         if n_tiles == 0 {
-            log::error!("PoM v3: blob too small ({} chunks < one 2048-chunk tile).", self.n_chunks);
+            log::error!("PoM v4: blob too small ({} chunks < one 32-chunk tile).", self.n_chunks);
             return None;
         }
-        let k = POM_V3_K as u32;
-        // Reset the shared winner, enqueue the WHOLE batch back-to-back (each sub-dispatch stays
-        // under the Windows TDR limit but there is NO finish between them, so the GPU never drains
-        // its queue mid-batch — the boost clock stays pinned), then finish + read once. The kernel's
-        // atomic-min makes the single winner buffer hold the batch's lowest winning nonce.
+        let k = POM_V4_K as u32;
+        let slab_tiles = self.slab_chunks / POM_V4_TILE_CHUNKS;
+        // Reset the shared winner, enqueue the WHOLE batch back-to-back (each sub-dispatch stays under
+        // the Windows TDR limit but there is NO finish between them, so the GPU never drains its queue
+        // mid-batch — the boost clock stays pinned), then finish + read once. The kernel's atomic-min
+        // makes the single winner buffer hold the batch's lowest winning nonce.
         self.queue.enqueue_write_buffer(&mut self.winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
-        let sub_dispatch = v3_sub_dispatch_nonces();
+        let sub_dispatch = v4_sub_dispatch_nonces();
         let mut done: u64 = 0;
         while done < batch {
             let sub = (batch - done).min(sub_dispatch);
             let base = nonce_base.wrapping_add(done);
-            enqueue_v3(&self.queue, &self.kernel_v3, &self.weights, self.slab_chunks / POM_V3_TILE_CHUNKS, &self.winner, self.v3_local,
+            enqueue_v4(&self.queue, &self.kernel_v4, &self.weights, slab_tiles, &self.winner,
                        n_tiles, k, pph, seed, time, target, base, sub)?;
             done += sub;
         }
@@ -414,20 +284,17 @@ impl PomMiner {
     }
 }
 
-/// PoM v3 walk constants (mirror src/pom_v3.rs — the byte-exact host reference).
-const POM_V3_TILE_CHUNKS: u64 = 2048;   // 64 KB tile / 32 B chunk
-const POM_V3_K: usize = 256;            // walk steps
-/// Work-groups (= nonces) per v3 NDRange. This is ONE work-group per nonce, so it's also the number
-/// of work-groups the GPU sees per dispatch — it MUST be large enough to fill all the CUs and give
-/// the scheduler enough waves to hide the per-step cold-tile latency. 128 (the old value) barely
-/// covered a 96-CU card (measured 1.94 vs 3.85 knonce/s at 1024 on an RX 7900 XTX — a ~2x loss from
-/// underfilling + the in-order queue draining between tiny dispatches). 1024 saturates big cards and,
-/// at ~1-4 knonce/s, each dispatch is still ~0.25-1 s — safely under the Windows TDR (~2 s) even on
-/// the slowest supported card. Override for a specific card via KERYX_POM_V3_SUB_DISPATCH.
-fn v3_sub_dispatch_nonces() -> u64 {
-    std::env::var("KERYX_POM_V3_SUB_DISPATCH").ok()
+/// PoM v4 walk constants (mirror src/pom_v4.rs — the byte-exact host reference).
+const POM_V4_TILE_CHUNKS: u64 = 32;     // 1 KB tile / 32 B chunk
+const POM_V4_K: usize = 256;            // walk steps
+/// Nonces per v4 sub-dispatch (must be a multiple of 8 = sub-nonces/workgroup). A v4 nonce is
+/// K×(32×32 int8 GEMM) — ~512x lighter than a v3 nonce — so batches are large; 8192 keeps each
+/// NDRange well under the Windows TDR while filling big cards. Override via KERYX_POM_V4_SUB_DISPATCH.
+fn v4_sub_dispatch_nonces() -> u64 {
+    std::env::var("KERYX_POM_V4_SUB_DISPATCH").ok()
         .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0)
-        .unwrap_or(1024)
+        .map(|n| n.max(8) / 8 * 8)
+        .unwrap_or(8192)
 }
 
 // ============================================================================
@@ -506,17 +373,6 @@ fn is_shared_dev(device_id: usize) -> bool {
 /// walk, so a v3 card must NOT claim zero-dup (it would route to the wrong shader and never install
 /// the OpenCL blob mine_v3 needs). On the 24 GB H6 target the engine (for OPoI inference) and the
 /// blob (for the walk) coexist. Cleared/left false pre-fork.
-static V3_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Called by the miner when it enters the PoM v3 (H6) era so the AMD driver keeps each card on its
-/// OpenCL blob (mine_v3) instead of the zero-dup Vulkan v2 walk. Idempotent.
-pub fn set_v3_mode(on: bool) {
-    V3_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn v3_mode() -> bool {
-    V3_MODE.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 /// AMD sysfs health sample (the NVML-free analog). Plain data — miner.rs maps it into the shared
 /// gpu_health::GpuHealth (that module is binary-side; pom_opencl is lib-side, so no direct ref).
@@ -619,6 +475,10 @@ fn device_pci(device_id: usize) -> Option<(u32, u32, u32)> {
 ///   on that device blocks forever, and unloading the engine (vkDeviceWaitIdle) wedges the whole
 ///   rig until reboot. Never dispatch the gate there — the policy check runs BEFORE the gate.
 /// KERYX_ZERO_DUP=force still overrides for experiments. gfx name via CL_DEVICE_NAME.
+// Retained through the v4 port though currently unreferenced: zero-dup is disabled for PoM v4
+// (the Vulkan walk shader only implemented v2), but this arch/VRAM policy — RDNA1 BDA hangs, RADV
+// GTT overcommit — is the hard-won field knowledge a future v4 zero-dup shader would reuse.
+#[allow(dead_code)]
 #[cfg(unix)]
 fn device_is_rdna(device_id: usize) -> bool {
     let name = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id)
@@ -632,6 +492,7 @@ fn device_is_rdna(device_id: usize) -> bool {
 
 /// Zero-dup default policy: claim only when it never costs hashrate. `KERYX_ZERO_DUP` = `force`
 /// (claim any PCI-matched card, VRAM over hashrate) / `off` (never) / unset = RDNA-only (default).
+#[allow(dead_code)]
 #[cfg(unix)]
 fn zero_dup_allowed(device_id: usize) -> bool {
     match std::env::var("KERYX_ZERO_DUP").ok().as_deref() {
@@ -651,6 +512,7 @@ fn zero_dup_allowed(device_id: usize) -> bool {
 /// SUCCEED — nothing fails) and the walk crawls at PCIe latency: the autotune sweep alone can run
 /// for an hour, so the card looks permanently dead at 0 hash (RX 5700 XT 8 GB field log). So the
 /// engine must be unloaded BEFORE the install on such cards, not on install *failure*.
+#[allow(dead_code)]
 #[cfg(unix)]
 fn model_plus_blob_fits(device_id: usize, blob_bytes: u64) -> bool {
     let model_bytes = TIER
@@ -666,64 +528,13 @@ fn model_plus_blob_fits(device_id: usize, blob_bytes: u64) -> bool {
 }
 
 #[cfg(unix)]
-fn try_claim_shared(device_id: usize) -> bool {
-    if is_shared_dev(device_id) {
-        return true;
-    }
-    // H6 (PoM v3): the walk is the OpenCL pom_mine_v3 kernel over this card's own blob. The zero-dup
-    // Vulkan walk is the pre-H6 v2 shader, so never claim zero-dup in v3 — install the OpenCL blob
-    // (the engine can still host the model on this card for OPoI inference; both fit on 24 GB).
-    if v3_mode() {
-        return false;
-    }
-    if SHARED_DEV.lock().unwrap().is_some() || !crate::llama_engine_vk::pom_ready() {
-        return false;
-    }
-    let (Some((_, eb, ed, ef)), Some((b, d, f))) = (crate::llama_engine_vk::pom_pci(), device_pci(device_id)) else {
-        return false;
-    };
-    if (eb, ed, ef) != (b, d, f) {
-        return false; // the engine hosts the model on a different card
-    }
-    if !zero_dup_allowed(device_id) {
-        let blob = crate::pom::active_index().map(|(i, _)| i.n_chunks.saturating_mul(32)).unwrap_or(0);
-        if blob > 0 && !model_plus_blob_fits(device_id, blob) {
-            // Model + blob can't share this card. DEDICATE it to OPoI inference (8x-reward path,
-            // fast GPU answers) instead of unloading: no blob is installed here, the card mines
-            // nothing, every other card mines at full rate. (Operator call: CPU inference is too
-            // slow to be worth trading for one card's hashrate.) KERYX_ZERO_DUP=force overrides
-            // on zero-dup-capable archs.
-            *DEDICATED_DEV.lock().unwrap() = Some(device_id);
-            log::info!(
-                "PoM: card {device_id:#x} DEDICATED to OPoI inference (hosts the model; model + blob \
-                 exceed its VRAM so it does not mine). Other cards mine at full rate."
-            );
-        } else {
-            log::info!(
-                "PoM: card {device_id:#x} hosts the llama engine but is not RDNA — keeping its OpenCL blob \
-                 (full hashrate; set KERYX_ZERO_DUP=force to trade ~2.4 GB VRAM for it)."
-            );
-        }
-        return false;
-    }
-    let Some((idx, _)) = crate::pom::active_index() else { return false };
-    if !crate::llama_engine_vk::pom_byte_gate(idx) {
-        // Zero-dup is OFF for this card, but the engine still holds the model on it. If model +
-        // blob can't BOTH fit, unload NOW: with RADV overcommit the upcoming blob install would
-        // not fail — it would silently spill to GTT and the card would crawl at ~0 hash forever.
-        if !model_plus_blob_fits(device_id, idx.n_chunks.saturating_mul(32)) {
-            log::warn!(
-                "PoM: byte gate failed on card {device_id:#x} and model + blob exceed its VRAM —                  unloading the in-process engine so the blob gets real VRAM (OPoI inference falls                  back to CPU; mining beats inference)."
-            );
-            crate::llama_engine_vk::unload();
-        }
-        return false;
-    }
-    *SHARED_DEV.lock().unwrap() = Some(device_id);
-    log::info!(
-        "PoM: card {device_id:#x} walks the llama-engine-resident weights (zero-dup — no OpenCL blob for this card)."
-    );
-    true
+fn try_claim_shared(_device_id: usize) -> bool {
+    // PoM v4/v3 (post-H6): the walk is ALWAYS the OpenCL pom_mine_v4 kernel over the card's own
+    // resident blob. The zero-dup Vulkan walk only ever implemented the pre-H6 v2 shader (there is
+    // no v4 Vulkan walk), so zero-dup can never serve v4 — every card installs its own OpenCL blob.
+    // The in-process llama engine still hosts the model on its card for GPU OPoI inference; the blob
+    // and model coexist on a 24 GB card. (Kept as a stub so the install path's call site is unchanged.)
+    false
 }
 #[cfg(not(unix))]
 fn try_claim_shared(_device_id: usize) -> bool {
@@ -977,46 +788,22 @@ pub fn ensure_installed() {
     }
 }
 
-/// Grind one batch of `batch` nonces from `nonce_base` on THIS thread's bound GPU. Returns the
-/// lowest nonce whose pom_pow_value <= target, or None. pph/target are the 32-byte LE forms.
-/// Per-card lock → the other GPUs' threads grind concurrently.
-pub fn mine(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool) -> Option<u64> {
+/// PoM v4 (v0.11.0) grind on THIS thread's bound GPU: the D=32 int8 matrix-state walk on the
+/// resident blob. Returns the lowest winning nonce; the caller rebuilds the witness host-side
+/// (byte-exact CPU re-walk in `pow::generate_block_if_pom`), so a kernel false-positive is silently
+/// dropped, never submitted. Every card runs its own OpenCL blob (no zero-dup for v4).
+///
+/// Word sets mirror `pom_gpu::mine_v4` / `pom_v4.rs`: the POW fold uses the H3-salted pph words
+/// ("v4 pow uses the h3 fold") and the SEED fold uses the v4-salted words. Both are pure host-side
+/// derivations, so the kernel is era-agnostic — only the uploaded words differ.
+pub fn mine_v4(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64) -> Option<u64> {
     let id = target_dev()?;
-    // H3: salt the pph words host-side (POM_H3_PPH_SALT) — both walk backends fold whatever
-    // words they receive, so no kernel/shader change at the gate.
-    // H5 (walk_v2): the non-foldable mix64-chain transition IS a kernel/shader change — threaded
-    // into BOTH backends (the OpenCL blob kernel `pom_mine.cl` and the zero-dup Vulkan walk shader).
-    // H5.1/H5.2 (h5_1/h5_2): the SEED fold swaps to that era's salted pph words
-    // (`seed_pph_words_for_era` selects h5_2 > h5_1 > h3 > base) while the POW fold keeps the
-    // H3-salted words — both backends take TWO word sets (pow `p` + seed `s`). The GPU kernels are
-    // era-agnostic on the seed words: a new seed salt is a pure host-side change (like H3), so
-    // pom_mine.cl / pom_walk_vk.comp / the vk .so are UNCHANGED — only the words we upload differ.
-    let p = crate::pom::pph_words_for_era(pph, h3);
-    let s = crate::pom::seed_pph_words_for_era(pph, h3, h5_1, h5_2);
-    let t = words(target_le);
-    // Zero-dup card: grind over the llama-engine-resident weights (byte-gate-verified).
-    if is_shared_dev(id) {
-        return crate::llama_engine_vk::pom_mine(p, s, time, t, nonce_base, batch, walk_v2);
-    }
-    let miner = miner_for(id)?;
-    let mut g = miner.lock().unwrap();
-    g.mine(p, s, time, t, nonce_base, batch, walk_v2)
-}
-
-/// H6 (PoM v3) grind on THIS thread's bound GPU: the int8 matrix-state walk on the resident blob.
-/// Mirrors `mine()`'s host-side era word selection (POW words `p` from `pph_words_for_era`, SEED
-/// words `s` from `seed_pph_words_for_era`), then dispatches the `pom_mine_v3` kernel. Returns the
-/// lowest winning nonce; the caller rebuilds the witness host-side (byte-exact CPU re-walk), so a
-/// kernel false-positive is silently dropped, never submitted. v3 always runs on the card's own
-/// OpenCL blob (never the zero-dup Vulkan walk — that shader is the pre-H6 v2 walk).
-pub fn mine_v3(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64, h3: bool, h5_1: bool, h5_2: bool) -> Option<u64> {
-    let id = target_dev()?;
-    let p = crate::pom::pph_words_for_era(pph, h3);
-    let s = crate::pom::seed_pph_words_for_era(pph, h3, h5_1, h5_2);
+    let p = crate::pom::pph_words_for_era(pph, true);
+    let s = crate::pom::pph_words_v4(pph);
     let t = words(target_le);
     let miner = miner_for(id)?;
     let mut g = miner.lock().unwrap();
-    g.mine_v3(p, s, time, t, nonce_base, batch)
+    g.mine_v4(p, s, time, t, nonce_base, batch)
 }
 
 /// Build the resident tier from a GGUF (shared proof WeightIndex, streamed to VRAM) and make it
@@ -1041,37 +828,36 @@ fn hex32(b: &[u8; 32]) -> String {
 }
 
 #[cfg(test)]
-mod v3_byte_exact {
-    //! Byte-exact GPU-vs-CPU check for the H6 (PoM v3) walk. Builds a synthetic possession blob,
-    //! grinds a handful of nonces on a REAL OpenCL GPU via `pom_mine_v3`, and asserts the winner
-    //! matches the CPU host reference (`pom_v3::host_walk_via_index` + `pom_pow_value`). Consensus
-    //! is byte-exact, so any divergence is a kernel bug. Needs an AMD OpenCL GPU (skips if none).
+mod v4_byte_exact {
+    //! Byte-exact GPU-vs-CPU check for the PoM v4 (v0.11.0) walk. Builds a synthetic possession
+    //! blob, grinds a handful of nonces on a REAL OpenCL GPU via `pom_mine_v4`, and asserts the
+    //! winner matches the CPU host reference (`pom_v4::build_proof_v4` gives the final_state, then
+    //! `pom_pow_value`). Consensus is byte-exact, so any divergence is a kernel bug. Force a slab
+    //! count with KERYX_POM_CL_SLABS=2/4 to exercise the multi-slab addressing. Needs an AMD
+    //! OpenCL GPU (skips if none).
     use super::*;
-    use crate::pom_v3;
 
-    // CPU reference pow-value (256-bit LE) for one nonce over `index`, era flags all false.
+    // CPU reference pow-value (256-bit LE) for one nonce over `index`. v4 seed = pom_block_seed_v4;
+    // pow fold uses the H3-salted words ("v4 pow uses the h3 fold").
     fn cpu_pow(index: &crate::pom::WeightIndex, pph: &[u8; 32], time: u64, nonce: u64) -> [u8; 32] {
-        let seed = crate::pom::pom_block_seed(pph, time, nonce, false, false, false);
-        let (states, _snips) = pom_v3::host_walk_via_index(seed, index).unwrap();
-        let d2 = 256 * 256;
-        let sk = &states[256 * d2..257 * d2]; // S_K (final state)
-        let root = pom_v3::v3_state_root(sk);
-        let fin = pom_v3::fold64(&root);
-        crate::pom::pom_pow_value(fin, pph, false)
+        let seed = crate::pom::pom_block_seed_v4(pph, time, nonce);
+        let (_proof, fin) = crate::pom_v4::build_proof_v4(0, seed, index).unwrap();
+        crate::pom::pom_pow_value(fin, pph, true)
     }
 
     #[test]
-    fn gpu_v3_matches_cpu_reference() {
+    fn gpu_v4_matches_cpu_reference() {
         // First AMD OpenCL GPU, or skip (CI without a GPU).
         let dev_ids = match opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU) {
             Ok(v) if !v.is_empty() => v,
-            _ => { eprintln!("no OpenCL GPU — skipping v3 byte-exact test"); return; }
+            _ => { eprintln!("no OpenCL GPU — skipping v4 byte-exact test"); return; }
         };
         let dev = opencl3::device::Device::new(dev_ids[0]);
-        eprintln!("v3 byte-exact on: {}", dev.name().unwrap_or_default());
+        eprintln!("v4 byte-exact on: {}", dev.name().unwrap_or_default());
 
-        // Synthetic 4-tile blob (8192 chunks). Varied signed bytes to exercise the int8 dot.
-        let n_chunks: u64 = 4 * POM_V3_TILE_CHUNKS;
+        // Synthetic 128-tile blob (4096 chunks). Multiple tiles so the offset chain visits several,
+        // and 128 tiles split cleanly into tile-aligned slabs at KERYX_POM_CL_SLABS=2/4.
+        let n_chunks: u64 = 128 * POM_V4_TILE_CHUNKS;
         let mut data = vec![0u8; (n_chunks * 32) as usize];
         for (i, b) in data.iter_mut().enumerate() {
             *b = (i.wrapping_mul(131).wrapping_add(i / 7).wrapping_add(17)) as u8;
@@ -1080,13 +866,12 @@ mod v3_byte_exact {
 
         let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(23).wrapping_add(5));
         let time: u64 = 0x0123_4567_89AB_CDEF;
-        const NN: u64 = 4; // host walk is ~4.3 GMAC/nonce — keep it small (run with --release)
+        const NN: u64 = 32; // v4 nonce is light (K×32×32 int8) — a full workgroup's worth
 
         // CPU: find the argmin pow over 0..NN; target = that min → only the argmin passes.
         let mut best = ([0xFFu8; 32], u64::MAX);
         for nonce in 0..NN {
             let pv = cpu_pow(&index, &pph, time, nonce);
-            // LE compare (least-significant word first).
             let le_le = |a: &[u8; 32], b: &[u8; 32]| {
                 for k in (0..4).rev() {
                     let (wa, wb) = (
@@ -1104,10 +889,10 @@ mod v3_byte_exact {
 
         // GPU: grind 0..NN with target = the argmin's pow. Expect it to return w_cpu.
         let mut miner = PomMiner::new(dev, &index, n_chunks).expect("PomMiner::new");
-        let p = crate::pom::pph_words_for_era(&pph, false);
-        let s = crate::pom::seed_pph_words_for_era(&pph, false, false, false);
+        let p = crate::pom::pph_words_for_era(&pph, true);
+        let s = crate::pom::pph_words_v4(&pph);
         let t = words(&target);
-        let got = miner.mine_v3(p, s, time, t, 0, NN);
-        assert_eq!(got, Some(w_cpu), "GPU v3 winner must match the CPU reference argmin");
+        let got = miner.mine_v4(p, s, time, t, 0, NN);
+        assert_eq!(got, Some(w_cpu), "GPU v4 winner must match the CPU reference argmin");
     }
 }

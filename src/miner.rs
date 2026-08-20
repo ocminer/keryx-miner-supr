@@ -362,7 +362,8 @@ impl MinerManager {
                 // most of it). The pool side also widened its job-retention window to 25 s, so a
                 // one-rotation-late submit now resolves as a share (or an honest stale), never a
                 // false PowValueMismatch.
-                #[cfg(all(target_os = "macos", feature = "pom-metal", not(feature = "pom-opencl"), not(feature = "pom-cuda")))]
+                // (The Apple-specific POM_BATCH const the comment above describes was removed with
+                // the v4-only cleanup — its #[cfg] attribute must not dangle onto the seam below.)
                 // Driver seam: AMD = OpenCL, NVIDIA = candle-CUDA, Apple Silicon = candle-Metal. All
                 // expose the same interface (is_installed / ensure_installed / mine / set_mining_tier).
                 // OpenCL wins if both on; Metal is macOS-only (never combined with the others).
