@@ -80,8 +80,16 @@ pub struct CudaGPUWorker<'gpu> {
 
 impl<'gpu> Worker for CudaGPUWorker<'gpu> {
     fn id(&self) -> String {
-        let device = CurrentContext::get_device().unwrap();
-        format!("#{} ({})", self.device_id, device.name().unwrap())
+        // Do NOT unwrap here. On a MIXED / multi-GPU rig a sibling card's failure (an OOM or a
+        // deinitialized context — e.g. after the PoM path takes over this device) can leave this
+        // worker thread with no current CUDA context. `id()` is called from telemetry/logging on
+        // that thread; panicking crosses the plugin FFI (dylib) boundary as a foreign C++ exception
+        // and ABORTS the whole process, taking down every other (healthy) card. Degrade to the known
+        // device_id label instead so one card's fault stays isolated to that card.
+        match CurrentContext::get_device() {
+            Ok(device) => format!("#{} ({})", self.device_id, device.name().unwrap_or_else(|_| "GPU".to_string())),
+            Err(_) => format!("#{}", self.device_id),
+        }
     }
 
     fn load_block_constants(&mut self, hash_header: &[u8; 72], matrix: &[[u16; 64]; 64], target: &[u64; 4]) {
