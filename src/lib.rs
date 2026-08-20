@@ -21,7 +21,7 @@ pub mod quantized_qwen3_split;
 // `keryx_miner::Error`, `keryx_miner::xoshiro256starstar` and
 // `keryx_miner::declare_plugin!` keep resolving for the rest of the tree.
 pub mod pom;
-pub mod pom_v3;
+pub mod pom_v4;
 #[cfg(feature = "pom-opencl")]
 pub mod pom_opencl;
 // llama.cpp llama-server inference: AMD (Vulkan) always; NVIDIA (CUDA server) since Phase 1 of
