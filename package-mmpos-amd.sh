@@ -26,9 +26,12 @@ SRC="$REPO/mmpos/keryx-miner-supr-amd"
 [[ -f "$PLUGIN" ]] || { echo "ERROR: $PLUGIN missing — run hiveos/build-amd-glibc.sh first"; exit 1; }
 
 # Sanity: the PoM OpenCL kernel must be embedded, else AMD mines the dead algo post-fork.
+# Match the kernel NAME (pom_mine_v4), not `__kernel void pom_mine`: the v4 grind kernel carries a
+# reqd_work_group_size attribute between `__kernel` and `void`, so the old contiguous pattern no
+# longer matches the current source (it would false-fail every v0.11.0+ build).
 # (grep -c reads all input so `strings` doesn't take SIGPIPE under `set -o pipefail`.)
-if [[ "$(strings "$BIN" | grep -c '__kernel void pom_mine' || true)" -eq 0 ]]; then
-    echo "ERROR: $BIN has no embedded PoM kernel — was it built with --features pom-opencl?"; exit 1
+if [[ "$(strings "$BIN" | grep -c 'pom_mine_v4' || true)" -eq 0 ]]; then
+    echo "ERROR: $BIN has no embedded PoM v4 kernel — was it built with --features pom-opencl?"; exit 1
 fi
 
 STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' EXIT
