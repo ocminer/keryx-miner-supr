@@ -38,118 +38,6 @@ __device__ __forceinline__ bool pom_le_leq(const unsigned long long a[4],
     if (a[1] != b1) return a[1] < b1;
     return a[0] <= b0;
 }
-
-extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsigned long long* prefix,
-                                    unsigned int T, unsigned long long n_total_chunks, unsigned int K,
-                                    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
-                                    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
-                                    unsigned long long time_,
-                                    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
-                                    unsigned long long nonce_base, unsigned long long n_nonces,
-                                    unsigned long long* winner, unsigned int walk_v2) {
-    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_nonces) return;
-    unsigned long long nonce = nonce_base + tid;
-
-    // H5.1: the SEED fold reads the (host-salted) seed words s0..s3; the pow fold below keeps p0..p3.
-    // Pre-H5.1 the host passes s == p, so this stays byte-identical to the H5 build.
-    unsigned long long state = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
-    unsigned long long off = state % n_total_chunks;
-    for (unsigned int i = 0; i < K; i++) {
-        unsigned int lo = 0, hi = T;
-        while (lo + 1 < hi) {
-            unsigned int mid = (lo + hi) >> 1;
-            if (prefix[mid] <= off) lo = mid; else hi = mid;
-        }
-        unsigned long long local = off - prefix[lo];
-        // 128-bit vector loads: read the 32-byte chunk as 2x ulonglong2 instead of 4x u64. Same
-        // bytes XOR'd (a.x^a.y^c.x^c.y == the 4 u64), so BYTE-EXACT, but half the load instructions
-        // and better coalescing → +1.8% on H200/Hopper (byte-exact validated), neutral+ elsewhere.
-        const ulonglong2* p = (const ulonglong2*)bases[lo];
-        unsigned long long base2 = local * 2ULL;
-        ulonglong2 a = p[base2], c = p[base2 + 1];
-        unsigned long long h = state;
-        if (walk_v2) {
-            // H5 non-foldable walk: chain mix64 through each of the 4 chunk words (order a.x,a.y,c.x,c.y
-            // = w0..w3) so all 32 bytes are load-bearing. walk_v2 is uniform -> no warp divergence.
-            h = mix64(h ^ a.x); h = mix64(h ^ a.y); h = mix64(h ^ c.x); h = mix64(h ^ c.y);
-            state = h;
-        } else {
-            // Pre-H5 fold (frozen — validates all blocks below H5_ACTIVATION_DAA).
-            h ^= a.x; h ^= a.y; h ^= c.x; h ^= c.y;
-            state = mix64(h);
-        }
-        off = state % n_total_chunks;
-    }
-    unsigned long long pv[4];
-    pom_pow_fold(state, p0, p1, p2, p3, pv);
-    if (pom_le_leq(pv, t0, t1, t2, t3)) {
-        atomicMin(winner, nonce);
-    }
-}
-
-// ILP x2 variant: each thread grinds TWO nonces with their walk steps interleaved, so the second
-// walk's search/mix work overlaps the first walk's DRAM fetch (both chunk loads issue back-to-back
-// -> their latencies overlap). BYTE-EXACT per nonce — each walk's math is untouched, only the
-// scheduling interleaves. Helps latency-bound parts that DON'T already saturate their outstanding-
-// miss slots at 1 nonce/thread (e.g. GDDR6X 3090). NEUTRAL-to-NEGATIVE where the slots are already
-// full (measured: 5090/GDDR7 -6%, 3070/GDDR6 ~0). The miner autotunes ILP1-vs-ILP2 per device
-// (pom_gpu::autotune_block) and only uses this where it actually wins — never a forced default.
-// Host launches ceil(batch/2) threads (grid in pom_gpu.rs). Identical signature to pom_mine.
-extern "C" __global__ void pom_mine_ilp2(const unsigned long long* bases, const unsigned long long* prefix,
-                                    unsigned int T, unsigned long long n_total_chunks, unsigned int K,
-                                    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
-                                    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
-                                    unsigned long long time_,
-                                    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
-                                    unsigned long long nonce_base, unsigned long long n_nonces,
-                                    unsigned long long* winner, unsigned int walk_v2) {
-    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned long long i0 = tid * 2ULL;
-    if (i0 >= n_nonces) return;
-    unsigned long long i1 = i0 + 1ULL;
-    bool has1 = i1 < n_nonces;
-    unsigned long long nonce0 = nonce_base + i0;
-    // Odd-batch boundary thread: walk nonce0 twice (the duplicate result is dropped below) rather
-    // than branching the whole body on has1 — keeps both lanes busy, byte-exact for nonce0.
-    unsigned long long nonce1 = nonce_base + (has1 ? i1 : i0);
-
-    unsigned long long state0 = pom_seed_fold(nonce0, time_, s0, s1, s2, s3);
-    unsigned long long state1 = pom_seed_fold(nonce1, time_, s0, s1, s2, s3);
-    unsigned long long off0 = state0 % n_total_chunks;
-    unsigned long long off1 = state1 % n_total_chunks;
-    for (unsigned int i = 0; i < K; i++) {
-        unsigned int lo0 = 0, hi0 = T;
-        while (lo0 + 1 < hi0) { unsigned int mid = (lo0 + hi0) >> 1; if (prefix[mid] <= off0) lo0 = mid; else hi0 = mid; }
-        unsigned int lo1 = 0, hi1 = T;
-        while (lo1 + 1 < hi1) { unsigned int mid = (lo1 + hi1) >> 1; if (prefix[mid] <= off1) lo1 = mid; else hi1 = mid; }
-        const ulonglong2* q0 = (const ulonglong2*)bases[lo0];
-        const ulonglong2* q1 = (const ulonglong2*)bases[lo1];
-        unsigned long long b0 = (off0 - prefix[lo0]) * 2ULL;
-        unsigned long long b1 = (off1 - prefix[lo1]) * 2ULL;
-        ulonglong2 a0 = q0[b0], c0 = q0[b0 + 1]; // both fetches issue back-to-back ->
-        ulonglong2 a1 = q1[b1], c1 = q1[b1 + 1]; // their DRAM latencies overlap
-        unsigned long long h0 = state0, h1 = state1;
-        if (walk_v2) {
-            h0 = mix64(h0 ^ a0.x); h1 = mix64(h1 ^ a1.x);
-            h0 = mix64(h0 ^ a0.y); h1 = mix64(h1 ^ a1.y);
-            h0 = mix64(h0 ^ c0.x); h1 = mix64(h1 ^ c1.x);
-            h0 = mix64(h0 ^ c0.y); h1 = mix64(h1 ^ c1.y);
-            state0 = h0; state1 = h1;
-        } else {
-            h0 ^= a0.x; h0 ^= a0.y; h0 ^= c0.x; h0 ^= c0.y; state0 = mix64(h0);
-            h1 ^= a1.x; h1 ^= a1.y; h1 ^= c1.x; h1 ^= c1.y; state1 = mix64(h1);
-        }
-        off0 = state0 % n_total_chunks;
-        off1 = state1 % n_total_chunks;
-    }
-    unsigned long long pv0[4]; pom_pow_fold(state0, p0, p1, p2, p3, pv0);
-    if (pom_le_leq(pv0, t0, t1, t2, t3)) atomicMin(winner, nonce0);
-    if (has1) {
-        unsigned long long pv1[4]; pom_pow_fold(state1, p0, p1, p2, p3, pv1);
-        if (pom_le_leq(pv1, t0, t1, t2, t3)) atomicMin(winner, nonce1);
-    }
-}
 // ============================ PoM v3 (H6 matrix-state walk) ============================
 // Byte-exact mirror of the node's consensus/core/src/pom_v3.rs / POM_V3_SPEC.md.
 // One CUDA block = one nonce; blockDim.x == 256 == D; thread x owns state row x as 64
@@ -369,8 +257,114 @@ __device__ __forceinline__ unsigned long long v3_walk_block(
     return (unsigned long long)src[0] | ((unsigned long long)src[1] << 32);
 }
 
-// v3 grind: one block per nonce. Dynamic shared = 64 KB (the tile).
-extern "C" __global__ void pom_mine_v3(
+// ============================================================================
+// PoM v4 (D=32 re-walk). Byte-exact mirror of consensus/core/src/pom_v4.rs.
+// One block of 32 threads per nonce; the moat is the K dependent 1 KB tile reads.
+// ============================================================================
+#define V4_D 32
+#define V4_D4 (V4_D / 4)          // 8 uints per row/column
+#define V4_TILE_BYTES 1024
+#define V4_TILE_CHUNKS 32
+static_assert(V4_D == 32, "PoM v4 requires D=32");
+
+#define V4_S0_ROW_SALT       0x03421325594C3C51ULL
+#define V4_OFFSET_FIRST_SALT 0x6D1CCF96AC4D76F9ULL
+#define V4_OFFSET_STEP_SALT  0x89050E78D34609EFULL
+
+// One 1 KB tile (32 canonical chunks) into shared, one chunk per lane.
+__device__ __forceinline__ void v4_load_tile(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long tile_index, unsigned int* s_tile, unsigned int lane) {
+    const unsigned long long idx = tile_index * (unsigned long long)V4_TILE_CHUNKS + lane;
+    unsigned int lo = 0, hi = T;
+    while (lo + 1 < hi) { unsigned int mid = (lo + hi) >> 1; if (prefix[mid] <= idx) lo = mid; else hi = mid; }
+    const ulonglong2* q = (const ulonglong2*)bases[lo];
+    const unsigned long long b = (idx - prefix[lo]) * 2ULL;
+    ulonglong2* dst = (ulonglong2*)(s_tile + lane * 8);
+    dst[0] = q[b];
+    dst[1] = q[b + 1];
+}
+
+// blake3 of a 32-byte state row (single partial block).
+__device__ __forceinline__ void b3_hash_row32(const unsigned int row[8], unsigned int out[8]) {
+    unsigned int cv[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+    unsigned int m[16];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) m[i] = row[i];
+    #pragma unroll
+    for (int i = 8; i < 16; i++) m[i] = 0u;
+    b3_compress(cv, m, 32, B3_CHUNK_START | B3_CHUNK_END | B3_ROOT);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) out[i] = cv[i];
+}
+
+// fold64(v4_state_root(S_K)); valid on thread 0 only.
+__device__ __forceinline__ unsigned long long v4_walk_block(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long n_tiles, unsigned int K, unsigned long long seed, unsigned int* s_tile) {
+    const unsigned int x = threadIdx.x;   // state row, 0..31
+
+    // S_0: mix64 keystream per row.
+    unsigned int row4[V4_D4];
+    {
+        unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)x));
+        #pragma unroll
+        for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); row4[k4] = (unsigned int)h; }
+    }
+
+    unsigned long long off = mix64(seed ^ V4_OFFSET_FIRST_SALT) % n_tiles;
+
+    for (unsigned int step = 1; step <= K; step++) {
+        v4_load_tile(bases, prefix, T, off, s_tile, x);
+        __syncthreads();
+
+        // Next offset from the CURRENT tile's snippet (first 32 bytes = 8 words).
+        {
+            unsigned long long sf = 0;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) sf = mix64(sf ^ (unsigned long long)s_tile[w]);
+            off = mix64(seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf) % n_tiles;
+        }
+
+        // Transition: this thread's new row = rho(row . tile_col_j) for j in 0..32.
+        const unsigned int step_tweak = step * 0x9E3779B9u + x * 0xC2B2AE35u;
+        unsigned int new4[V4_D4];
+        #pragma unroll
+        for (int j4 = 0; j4 < V4_D4; j4++) {
+            unsigned int packed = 0;
+            #pragma unroll
+            for (int jj = 0; jj < 4; jj++) {
+                const int j = j4 * 4 + jj;
+                const unsigned int* col = &s_tile[j * V4_D4];   // column j = 32 bytes
+                int acc = 0;
+                #pragma unroll
+                for (int k = 0; k < V4_D4; k++) acc = __dp4a((int)row4[k], (int)col[k], acc);
+                packed |= (unsigned int)v3_rho8(acc, step_tweak + (unsigned int)j * 0x85EBCA6Bu) << (8 * jj);
+            }
+            new4[j4] = packed;
+        }
+        #pragma unroll
+        for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = new4[k4];
+        __syncthreads();
+    }
+
+    // root_K: 32 blake3 row leaves + complete depth-5 tree (scratch reuses the tile region).
+    b3_hash_row32(row4, s_tile + x * 8);
+    __syncthreads();
+    unsigned int* src = s_tile;
+    unsigned int* dst = s_tile + V4_D * 8;
+    for (unsigned int n = V4_D; n > 1; n >>= 1) {
+        if (x < n / 2) b3_hash_pair(src + x * 16, dst + x * 8);
+        __syncthreads();
+        unsigned int* tmp = src; src = dst; dst = tmp;
+    }
+    return (unsigned long long)src[0] | ((unsigned long long)src[1] << 32);
+}
+
+// v4 grind: one block of 32 threads per nonce. Dynamic shared = 2 KB (tile + fold scratch).
+extern "C" __global__ void pom_mine_v4(
     const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
     unsigned long long n_tiles, unsigned int K,
     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
@@ -379,34 +373,14 @@ extern "C" __global__ void pom_mine_v3(
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
     unsigned long long* winner) {
-    extern __shared__ unsigned int s_tile32[];
+    extern __shared__ unsigned int s_shared[];
     if ((unsigned long long)blockIdx.x >= n_nonces) return;
     const unsigned long long nonce = nonce_base + blockIdx.x;
     const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
-
-    const unsigned long long fin = v3_walk_block(bases, prefix, T, n_tiles, K, seed, s_tile32, nullptr, nullptr);
-
+    const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared);
     if (threadIdx.x == 0) {
         unsigned long long pv[4];
         pom_pow_fold(fin, p0, p1, p2, p3, pv);
-        if (pom_le_leq(pv, t0, t1, t2, t3)) {
-            atomicMin(winner, nonce);
-        }
+        if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, nonce);
     }
-}
-
-// v3 dump: re-walk ONE (winning) nonce, writing all K+1 states and K snippets for the host
-// proof-build. Launch with a single block.
-extern "C" __global__ void pom_mine_v3_dump(
-    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
-    unsigned long long n_tiles, unsigned int K,
-    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
-    unsigned long long time_, unsigned long long nonce,
-    unsigned char* states_out, unsigned char* snippets_out, unsigned long long* final_state_out) {
-    extern __shared__ unsigned int s_tile32[];
-    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
-
-    const unsigned long long fin = v3_walk_block(bases, prefix, T, n_tiles, K, seed, s_tile32, states_out, snippets_out);
-
-    if (threadIdx.x == 0) *final_state_out = fin;
 }

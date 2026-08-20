@@ -14,7 +14,7 @@ use crate::{
     Error, Hash,
 };
 use keryx_miner::pom::{self, WeightIndex};
-use keryx_miner::pom_v3;
+use keryx_miner::pom_v4;
 use keryx_miner::Worker;
 
 mod hasher;
@@ -204,32 +204,6 @@ impl State {
                 *hash = Some(format!("{:x}", self.calculate_pow(nonce)))
             }
         }
-        // PoM PASSTHROUGH (pre-fork live test): keep the kHeavyHash nonce above (the only valid PoW
-        // pre-fork) but also attach a PomProof so the wire envelope can be exercised. The proof is
-        // built from the HOST possession index (no GPU model needed); its pom_pow_value need not meet
-        // target — pre-fork the daemon stores it without verifying. No-op unless the index is ready.
-        #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
-        if pom::passthrough_enabled() {
-            if let Some((index, tier)) = pom::active_index() {
-                let mut pph = [0u8; 32];
-                pph.copy_from_slice(&self.pow_hash_header[0..32]);
-                let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
-                let h3 = pom::h3_active(self.daa_score);
-                // Pre-fork kHeavyHash passthrough — never reaches H5.1/H5.2 (both > H4 > PoM fork).
-                let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3, false, false);
-                let proof = pom::build_proof(
-                    *tier, &pph, nonce, seed, index.n_chunks, pom::POM_WALK_STEPS, pom::POM_OPENINGS,
-                    |o| index.read_chunk(o), |o| index.merkle_path(o), h3,
-                );
-                let bytes = proof.to_wire_bytes();
-                let n = bytes.len();
-                match block_seed {
-                    BlockSeed::FullBlock(ref mut block) => block.pom_proof = bytes,
-                    BlockSeed::PartialBlock { ref mut pom_proof, .. } => *pom_proof = bytes,
-                }
-                log::info!("PoM passthrough: attached proof ({} B) to kHeavyHash share", n);
-            }
-        }
         Some(block_seed)
     }
 
@@ -242,108 +216,33 @@ impl State {
         pph.copy_from_slice(&self.pow_hash_header[0..32]);
         let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
 
-        // H3 (AUTO-SWITCH): at/after the block-level gate the pph words feeding BOTH PoM folds are
-        // salted (POM_H3_PPH_SALT, forced update). `h3_active` decides per block from daa_score, so
-        // the switch happens automatically at the gate. The proof carries the winning walk's
-        // `final_state`; the pool (PartialBlock) path forwards the proof and the pool fills the
-        // header `pomFinalState` on submitBlock, while the solo (FullBlock) path fills the header
-        // field itself below (H3: the node requires proof.final_state == header.pom_final_state).
-        let h3 = pom::h3_active(self.daa_score);
-        // H5: non-foldable mix64-chained walk at/after the gate. MUST match the GPU search era
-        // (`pom_gpu::mine(.., walk_v2)`) or the CPU rebuild derives a different final_state.
-        let walk_v2 = self.daa_score >= pom::h5_activation_daa();
-        // H5.1 (emergency relaunch): the walk SEED derives from the H5.1-salted pph words at/after
-        // the gate (the pow fold stays H3-salted). MUST match the GPU search era (`pom_gpu::mine(..,
-        // h5_1)`) or the CPU rebuild derives a different seed → wrong walk → node rejects the block.
-        let h5_1 = self.daa_score >= pom::h5_1_activation_daa();
-        // H5.2 (chain anchoring, keryxd v1.4.0): H5.2-salted seed words at/after the gate. Same
-        // MUST-match-GPU-era rule as h5_1 (seed selection: h5_2 > h5_1 > h3 > base).
-        let h5_2 = self.daa_score >= pom::h5_2_activation_daa();
-        let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3, h5_1, h5_2);
-
-        // H6 (AUTO-SWITCH): at/after the pom_v3 gate the PoW IS the int8 matrix-state walk. The
-        // GPU grind (`pom_gpu::mine_v3`) found this candidate nonce; the witness is built host-side
-        // by re-walking the resident index (byte-exact `pom_v3::v3_walk`), so a GPU false-positive
-        // (unverified kernel) is caught here by the target re-check and dropped, never submitted.
-        // `final_state = fold64(roots[K])` and `pow_value = era_pow_fold(final_state)` are the
-        // header-stable H3 fold — the header carries `final_state` exactly like the v1/v2 eras.
-        if self.daa_score >= pom::pom_v3_activation_daa() {
-            let (states, snippets) = pom_v3::host_walk_via_index(seed, index).ok()?;
-            let v3 = pom_v3::build_proof_v3(tier, &pph, nonce, seed, &states, &snippets, index)
-                .map_err(|e| info!("PoM v3 proof build failed: {e}"))
-                .ok()?;
-            let final_state = pom_v3::fold64(&v3.roots[pom_v3::POM_V3_K]);
-            let pow_value = pom::pom_pow_value(final_state, &pph, h3);
-            if !pom::le_leq(&pow_value, &self.target.to_le_bytes()) {
-                return None; // GPU grind false-positive (or clock/target drift) — drop it.
-            }
-            if !pom_v3::verify_proof_v3(&pph, nonce, seed, &v3, &index.r_t, index.n_chunks) {
-                info!("PoM v3 proof discarded: pre-submit self-check failed");
-                return None;
-            }
-            let proof = pom::PomProof {
-                tier,
-                trace_root: [0u8; 32],
-                pow_value,
-                final_state,
-                initial_trace_path: vec![],
-                final_trace_path: vec![],
-                openings: vec![],
-                steps_v2: None,
-                v3: Some(v3),
-            };
-            let wire = proof.to_wire_bytes();
-            info!(
-                "PoM v3: H6 proof built + submitting (nonce {}, daa {}, tier {}, {} B)",
-                nonce,
-                self.daa_score,
-                tier,
-                wire.len()
-            );
-            return self.assemble_pom_block(nonce, final_state, tier, wire);
+        // PoM v4 (relaunch, keryxd v1.5.1): the PoW IS the D=32 int8 matrix re-walk. The GPU grind
+        // (`pom_gpu::mine_v4`) found this candidate nonce; the witness is rebuilt host-side by
+        // re-walking the resident index (byte-exact `pom_v4::build_proof_v4`) — the K tiles plus one
+        // Merkle range proof each against R_T. A GPU false-positive is caught by the target re-check
+        // below and dropped, never submitted. The header carries `final_state` (the pool fills
+        // `pomFinalState` on submitBlock; the solo `FullBlock` path fills it in `assemble_pom_block`).
+        let seed = pom::pom_block_seed_v4(&pph, timestamp, nonce);
+        let (v4, final_state) = pom_v4::build_proof_v4(tier, seed, index)
+            .map_err(|e| info!("PoM v4 proof build failed: {e}"))
+            .ok()?;
+        // "v4 pow uses the h3 fold": the POW value folds the H3-salted pph words.
+        let pow_value = pom::pom_pow_value(final_state, &pph, true);
+        if !pom::le_leq(&pow_value, &self.target.to_le_bytes()) {
+            return None; // GPU grind false-positive (or clock/target drift) — drop it.
         }
-
-        let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), walk_v2);
-        if !pom::le_leq(&pom::pom_pow_value(final_state, &pph, h3), &self.target.to_le_bytes()) {
+        // Pre-submit self-check: re-walk the proof against R_T and confirm the derived final_state.
+        let checked = pom_v4::verify_proof_v4(seed, &v4, &index.r_t, index.n_chunks)
+            .map_err(|e| info!("PoM v4 self-check failed: {e}"))
+            .ok()?;
+        if checked != final_state {
+            info!("PoM v4 proof discarded: pre-submit self-check final_state mismatch");
             return None;
         }
-
-        // H4 (AUTO-SWITCH): at/after the coin-age gate the node runs `verify_pom_proof_v2`
-        // (recompute-from-chunks: it re-walks all K transitions and re-derives final_state), so
-        // we emit the v2 proof — every K chunk read + its Merkle path under R_T, no trace tree,
-        // no Fiat-Shamir openings. Below the gate the legacy trace-tree proof. `to_wire_bytes`
-        // keeps a pre-H4 proof byte-identical to the 7-field layout the not-yet-H4 node decodes.
-        // Proof-build latency is a solo block-race factor at 10 BPS (~30-40 ms sparse vs
-        // lookup-time with KERYX_RESIDENT_TREE=1) — log it at debug so the effect is measurable.
-        let proof_t0 = std::time::Instant::now();
-        let proof = if self.daa_score >= pom::h4_activation_daa() {
-            pom::build_proof_v2(
-                tier,
-                &pph,
-                seed,
-                index.n_chunks,
-                pom::POM_WALK_STEPS,
-                |o| index.read_chunk(o),
-                |o| index.merkle_path(o),
-                h3,
-                walk_v2,
-            )
-        } else {
-            pom::build_proof(
-                tier,
-                &pph,
-                nonce,
-                seed,
-                index.n_chunks,
-                pom::POM_WALK_STEPS,
-                pom::POM_OPENINGS,
-                |o| index.read_chunk(o),
-                |o| index.merkle_path(o),
-                h3,
-            )
-        };
-        log::debug!("PoM: proof built in {:.1} ms", proof_t0.elapsed().as_secs_f64() * 1e3);
-        self.assemble_pom_block(nonce, proof.final_state, tier, proof.to_wire_bytes())
+        let proof = pom::PomProof::v4(tier, pow_value, final_state, v4);
+        let wire = proof.to_wire_bytes();
+        info!("PoM v4: proof built + submitting (nonce {}, tier {}, {} B)", nonce, tier, wire.len());
+        self.assemble_pom_block(nonce, final_state, tier, wire)
     }
 
     /// Stamp the winning `nonce`, `final_state` (header pin) and the borsh proof bytes into a clone

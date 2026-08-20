@@ -349,7 +349,6 @@ impl MinerManager {
                 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
                 let mut pom_nonce: u64 = thread_rng().next_u64();
                 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
-                const POM_BATCH: u64 = 1 << 22;
                 // Apple Silicon: at M-class PoM rates (~0.8 MH/s on an M2) the 2^22 batch above is a
                 // ~5 s blocking launch — new jobs are only picked up at batch boundaries (see the
                 // get_changed() poll after the winner branch), so every winner was submitted ~5-10 s
@@ -364,7 +363,6 @@ impl MinerManager {
                 // one-rotation-late submit now resolves as a share (or an honest stale), never a
                 // false PowValueMismatch.
                 #[cfg(all(target_os = "macos", feature = "pom-metal", not(feature = "pom-opencl"), not(feature = "pom-cuda")))]
-                const POM_BATCH: u64 = 1 << 19;
                 // Driver seam: AMD = OpenCL, NVIDIA = candle-CUDA, Apple Silicon = candle-Metal. All
                 // expose the same interface (is_installed / ensure_installed / mine / set_mining_tier).
                 // OpenCL wins if both on; Metal is macOS-only (never combined with the others).
@@ -398,62 +396,25 @@ impl MinerManager {
                     // (e.g. testnet pom_v3=5000 while base=37.78M), so gating on base alone would keep
                     // running kHeavyHash on an H6 pool and never build a v3 proof.
                     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
-                    if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::activation_daa() || s.daa_score >= keryx_miner::pom::pom_v3_activation_daa()) {
+                    if let Some(s0) = state.as_ref() { let _ = s0;
                         let (pph, time, target_le, daa) = {
                             let s = state.as_ref().unwrap();
                             let mut pph = [0u8; 32];
                             pph.copy_from_slice(&s.pow_hash_header[0..32]);
                             (pph, u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap()), s.target.to_le_bytes(), s.daa_score)
                         };
-                        // H3 gate (AUTO-SWITCH): at/after POM_LEVEL_ACTIVATION_DAA the pph words
-                        // feeding both PoM folds are salted (POM_H3_PPH_SALT). Decided per job from
-                        // the block's daa_score, so a running miner flips at the gate with no restart.
-                        // The kernel (CUDA/Metal) is unchanged — the host salts the words it uploads.
-                        let h3 = keryx_miner::pom::h3_active(daa);
-                        // H5 era: non-foldable mix64-chained walk at/after the gate (must match the
-                        // host proof rebuild in pow::generate_block_if_pom). Dormant until scheduled.
-                        let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
-                        // H5.1 (emergency relaunch): swap the SEED pph words to the H5.1 salt at/after
-                        // the gate (pow words stay H3). Host-side per pom_gpu::mine; kernel-agnostic.
-                        let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
-                        // H5.2 (chain anchoring, keryxd v1.4.0): swap the SEED pph words to the
-                        // H5.2 salt at/after the gate (pow words stay H3). Host-side per
-                        // pom_gpu::mine; kernel-agnostic. Selection: h5_2 > h5_1 > h3 > base.
-                        let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
-                        // H6 (matrix-state walk): at/after the pom_v3 gate the GPU grinds the v3
-                        // kernel (one CUDA block per nonce, int8 D×D×K matmul) instead of the
-                        // possession walk. The host builds the witness in generate_block_if_pom
-                        // (host re-walk of the index). CUDA only; dormant on mainnet (gate u64::MAX).
-                        let v3 = daa >= keryx_miner::pom::pom_v3_activation_daa();
-                        // AMD: at the v3 gate keep each card on its OpenCL blob (pom_mine_v3) rather
-                        // than the zero-dup Vulkan v2 walk shader (wrong for H6). No-op pre-fork / on
-                        // non-OpenCL builds.
-                        #[cfg(feature = "pom-opencl")]
-                        if v3 { pom_driver::set_v3_mode(true); }
-                        // v3 grinds ~4.3 GMAC per nonce, so a full POM_BATCH of blocks is absurd —
-                        // grind a small slice per launch (env KERYX_POM_V3_BATCH overrides). AMD sub-
-                        // dispatches this at v3_sub_dispatch_nonces() work-groups (default 1024) to fill
-                        // the GPU; 2^10 = one saturating dispatch per launch on a big card.
-                        // AMD default 2^11: the RDNA3 2-rows/item kernel runs 128-thread groups
-                        // (4 waves/nonce instead of 8), so it needs twice the nonces in flight to
-                        // keep the same wave count for latency hiding (measured: 2r at batch 1024
-                        // is flat vs 1-row; at 2048 it holds its +4-6%). Harmless for the 1-row
-                        // cards (a 2048 batch is still <1 s per call at MI50 rates).
-                        #[cfg(feature = "pom-opencl")]
-                        const V3_BATCH_DEFAULT: u64 = 1 << 11;
-                        #[cfg(not(feature = "pom-opencl"))]
-                        const V3_BATCH_DEFAULT: u64 = 1 << 10;
-                        let batch = if v3 {
-                            std::env::var("KERYX_POM_V3_BATCH").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0).unwrap_or(V3_BATCH_DEFAULT)
-                        } else {
-                            POM_BATCH
-                        };
-                        // NVIDIA (CUDA) + Apple Silicon (Metal): per-device PoM. Each GPU thread
-                        // builds + walks its OWN device's blob (per-device MINERS map) so no-flag
-                        // multi-GPU works without CUDA_VISIBLE_DEVICES. Device id = the worker's
-                        // `#N (name)` label. Both backends share this identical per-device interface.
-                        // Device id from the worker's "#N (name)" label — used for BOTH the walk and
-                        // the per-device model/index/tier lookup (mixed-rig per-card models).
+                        // PoM v4 (relaunch, keryxd v1.5.1): ONE entry, no era flags, no gating.
+                        // The GPU grinds the D=32 int8 matrix re-walk (pom_mine_v4); the host rebuilds
+                        // the witness in pow::generate_block_if_pom (byte-exact re-walk of the resident
+                        // index), so a kernel false-positive is dropped there, never submitted. v4 is
+                        // one CUDA block (32 threads) per nonce — grind a bounded slice per launch
+                        // (env KERYX_POM_V4_BATCH) to keep block latency low at 10 BPS.
+                        const POM_V4_BATCH: u64 = 1 << 14;
+                        let batch = std::env::var("KERYX_POM_V4_BATCH").ok()
+                            .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0)
+                            .unwrap_or(POM_V4_BATCH);
+                        // NVIDIA (CUDA) + Apple Silicon (Metal): per-device v4 grind. Device id = the
+                        // worker's "#N (name)" label (per-device MINERS map → no CUDA_VISIBLE_DEVICES).
                         #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                         let wdid = gpu_work.id().strip_prefix('#')
                             .and_then(|s| s.split_whitespace().next())
@@ -462,11 +423,8 @@ impl MinerManager {
                         #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                         let found = {
                             if !pom_driver::is_installed(wdid) {
-                                // A resident-model reload (inference evicted the walk) is a
-                                // multi-second blocking GPU op with no cooperative Close check
-                                // inside it. If a shutdown or newer job is already pending, act
-                                // on it NOW instead of starting a reload that would outlive the
-                                // shutdown grace window (upstream 13d9515).
+                                // Cooperative pre-reload check: act on a pending shutdown / newer job
+                                // before a multi-second blocking model reload.
                                 if let Some(new_cmd) = block_channel.get_changed()? {
                                     state = match new_cmd {
                                         Some(WorkerCommand::Job(s)) => Some(s),
@@ -477,18 +435,13 @@ impl MinerManager {
                                 }
                                 pom_driver::ensure_installed(wdid, daa);
                             }
-                            if v3 {
-                                pom_driver::mine_v3(wdid, &pph, time, &target_le, pom_nonce, batch, h3, h5_1, h5_2)
-                            } else {
-                                pom_driver::mine(wdid, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2)
-                            }
+                            pom_driver::mine_v4(wdid, &pph, time, &target_le, pom_nonce, batch)
                         };
-                        // AMD: the thread is already bound to its card (bind_thread_device), so the
-                        // deviceless OpenCL API is per-GPU via thread-local binding.
+                        // AMD (OpenCL): the thread is already bound to its card; the deviceless API is
+                        // per-GPU via thread-local binding.
                         #[cfg(feature = "pom-opencl")]
                         let found = {
                             if !pom_driver::is_installed() {
-                                // Same cooperative pre-reload check as the CUDA/Metal branch above.
                                 if let Some(new_cmd) = block_channel.get_changed()? {
                                     state = match new_cmd {
                                         Some(WorkerCommand::Job(s)) => Some(s),
@@ -499,15 +452,7 @@ impl MinerManager {
                                 }
                                 let _ = pom_driver::ensure_installed();
                             }
-                            // H6: at/after the pom_v3 gate the AMD GPU grinds the int8 matrix-state
-                            // walk (pom_mine_v3 OpenCL kernel, one work-group per nonce). The host
-                            // rebuilds the witness in generate_block_if_pom (byte-exact CPU re-walk),
-                            // so a kernel false-positive is dropped, not submitted.
-                            if v3 {
-                                pom_driver::mine_v3(&pph, time, &target_le, pom_nonce, batch, h3, h5_1, h5_2)
-                            } else {
-                                pom_driver::mine(&pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2)
-                            }
+                            pom_driver::mine_v4(&pph, time, &target_le, pom_nonce, batch)
                         };
                         pom_nonce = pom_nonce.wrapping_add(batch);
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);
