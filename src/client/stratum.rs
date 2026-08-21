@@ -189,18 +189,28 @@ static LAST_DAA_SCORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// the next job builds a real PoM proof instead of looping on rejects forever.
 static POOL_FORCED_POM: AtomicBool = AtomicBool::new(false);
 
-/// The keryx H6 pool embeds the block DAA in the wire jobId as `<rand8>_<daa>` (e.g.
-/// `32fc29f1_500000` → daa 500000). The plain `Short` `mining.notify` carries NO daa_score field, so
-/// this trailing suffix is the AUTHORITATIVE per-job DAA on that pool — it must reach the PoM path so
-/// the fork gates (H3/H4/H5/H6) and the seed/pow salts resolve exactly as the node does for the same
-/// block. Returns None when the jobId has no `_<digits>` suffix (older pools); the caller then falls
+/// The keryx pool embeds the block DAA in the wire jobId. Two layouts are seen in the wild:
+///   H6 pool:      `<rand>_<daa>`               (e.g. `32fc29f1_500000` → daa 500000)
+///   v4 relaunch:  `<rand>_<daa>_<extraNonce>`  (e.g. `e3916d71_79834287_1` → daa 79834287)
+/// The plain `Short` `mining.notify` carries NO daa_score field, so this embedded DAA is the
+/// AUTHORITATIVE per-job DAA on that pool — it must reach the PoM path so the fork gates
+/// (H3/H4/H5/H6, PoM v4) and the seed/pow salts resolve exactly as the node does for the same block.
+/// The DAA is therefore parsed POSITIONALLY: it is the LAST field on a 2-field jobId, but the MIDDLE
+/// (second-to-last) field once an `_<extraNonce>` tail is appended — reading the last field there would
+/// pick up the extraNonce (a small counter), leave PoM disabled, and get every share rejected without
+/// proof. Returns None when no field parses as digits (older suffix-less pools); the caller then falls
 /// back to the LAST_DAA_SCORE/POOL_FORCED_POM flooring.
 fn job_id_daa(job_id: &str) -> Option<u64> {
-    let (_, tail) = job_id.rsplit_once('_')?;
-    if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
+    let parts: Vec<&str> = job_id.split('_').collect();
+    let daa_field = match parts.len() {
+        0 | 1 => return None,
+        2 => parts[1],                    // <rand>_<daa>
+        _ => parts[parts.len() - 2],      // <rand>_..._<daa>_<extraNonce>
+    };
+    if daa_field.is_empty() || !daa_field.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    tail.parse::<u64>().ok()
+    daa_field.parse::<u64>().ok()
 }
 
 #[allow(dead_code)]
@@ -1584,5 +1594,31 @@ fn do_inference_and_upload(
             warn!("OPoI [{}]: IPFS upload failed: {}", stable_id, e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod job_id_daa_tests {
+    use super::job_id_daa;
+
+    #[test]
+    fn v4_relaunch_three_field_reads_middle_as_daa() {
+        // <random>_<daa>_<extraNonce> — DAA is the MIDDLE field, not the trailing extraNonce.
+        assert_eq!(job_id_daa("e3916d71_79834287_1"), Some(79834287));
+        assert_eq!(job_id_daa("32fc29f1_500000_42"), Some(500000));
+    }
+
+    #[test]
+    fn h6_two_field_reads_last_as_daa() {
+        // <random>_<daa> — legacy layout, DAA is the last field.
+        assert_eq!(job_id_daa("32fc29f1_500000"), Some(500000));
+    }
+
+    #[test]
+    fn no_numeric_daa_field_is_none() {
+        assert_eq!(job_id_daa("deadbeef"), None); // suffix-less (older pools)
+        assert_eq!(job_id_daa(""), None);
+        assert_eq!(job_id_daa("abcd_xyz"), None); // non-numeric daa field
+        assert_eq!(job_id_daa("abcd__1"), None); // empty daa field
     }
 }
