@@ -1057,21 +1057,61 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // card serves GLM). The result is cached per model, so only the first card per model generates; a
     // model that fails is withdrawn from ai:cap and NOT mined on any card. (`inference_gpu` above.)
     if !crate::slm::run_inference_self_test(&model_id, inference_gpu) {
-        // Surface the reason in the miner status loop (refreshed every attempt) so an operator whose
-        // rig "won't mine" sees WHY, not just a silent 0 h/s. Log once to avoid per-job spam.
-        crate::slm::set_staging_error(format!(
-            "GPU {} could not SERVE this model (inference self-test failed on GPU {}) — the miner will not \
-             mine a tier it cannot serve. Usually too little VRAM for this tier, a bad model file, or a GPU \
-             fault. Check the GPU/driver, or force a smaller tier (--very-light / --light).",
-            device_id, inference_gpu
-        ));
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::Relaxed) {
-            log::warn!(
-                "PoM[gpu{}]: model not proven serveable (inference self-test failed on GPU {}) — NOT mining \
-                 this tier (we do not mine a tier we cannot serve).",
+        // The tier's model could not be SERVED (inference self-test failed) — usually the serving GPU
+        // can't fit this tier alongside the model it already hosts (mixed rig), too little VRAM, a bad
+        // file, or a GPU fault. We never mine a tier we cannot serve. DEMOTE to the next smaller
+        // serveable tier — the SAME fallback the walk-OOM path uses — so a small card that auto-picked
+        // an unservable tier (e.g. an 8 GB 3070 → Qwen3.5-9B whose self-test OOMs on the shared serving
+        // card) falls back to a model it can both walk AND serve (Gemma-3-4B) instead of idling.
+        // --force-model is honored verbatim (no demotion). Withdraw the failed model so it is not
+        // re-picked; the demoted model self-tests fresh next cycle.
+        crate::slm::mark_model_unavailable(&model_id, "self_test_failed");
+        let vram_mb = query_all_gpus_vram().into_iter()
+            .find(|(d, _)| *d == device_id).map(|(_, m)| m).unwrap_or(0);
+        if is_device_forced(device_id) {
+            crate::slm::set_staging_error(format!(
+                "GPU {} could not SERVE the FORCED model (inference self-test failed on GPU {}) — \
+                 --force-model is honored without a fallback. Choose a smaller --force-model or a serving \
+                 card with more free VRAM. Not demoting (forced).",
                 device_id, inference_gpu
-            );
+            ));
+            static WARNED_FORCED_SERVE: AtomicBool = AtomicBool::new(false);
+            if !WARNED_FORCED_SERVE.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "PoM[gpu{}]: FORCED model not serveable (self-test failed on GPU {}) — NOT mining, NOT \
+                     demoting (forced). Force a smaller tier or use a bigger serving card.",
+                    device_id, inference_gpu
+                );
+            }
+            return false;
+        }
+        match crate::slm::next_smaller_ready_spec(&model_id, vram_mb) {
+            Some(smaller) => {
+                log::warn!(
+                    "PoM[gpu{}]: tier not serveable (inference self-test failed on GPU {}) — DEMOTING to \
+                     '{}' ({} MB budget) and rebuilding next cycle. For a specific tier use --force-model.",
+                    device_id, inference_gpu, smaller.name, smaller.min_vram_mb
+                );
+                let gguf = crate::slm::gguf_path_for(smaller).to_string_lossy().into_owned();
+                set_device_model(device_id, smaller.model_id, gguf);
+                crate::slm::clear_staging_error();
+            }
+            None => {
+                crate::slm::set_staging_error(format!(
+                    "GPU {} could not SERVE this model (inference self-test failed on GPU {}) and NO smaller \
+                     staged tier is serveable — this card cannot mine any available tier. Use a card with more \
+                     VRAM, stage a lighter model, or force a smaller tier (--very-light / --light).",
+                    device_id, inference_gpu
+                ));
+                static WARNED_HALT_SERVE: AtomicBool = AtomicBool::new(false);
+                if !WARNED_HALT_SERVE.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "PoM[gpu{}]: model not serveable (self-test failed on GPU {}) and no smaller staged \
+                         tier fits — mining halted for this device until a fitting/serveable model exists.",
+                        device_id, inference_gpu
+                    );
+                }
+            }
         }
         return false;
     }
