@@ -55,17 +55,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-env-changed=POM_CUDA_ARCH");
         let arch_override = env::var("POM_CUDA_ARCH").ok();
         let committed_fatbin = "cuda/pom_mine.fatbin";
-        // Ship the native-SASS fatbin ONLY where the driver's PTX→sm_120 JIT is bad: WINDOWS.
-        // Measured on a 5080: Linux JITs compute_75 PTX to ~7.5 kh/s, but WINDOWS JITs the SAME PTX
-        // to only ~1.2 kh/s ("limited on power"); native sm_120 SASS runs ~6.8 kh/s regardless of OS.
-        // So Windows uses the fatbin (1.2 → ~6.8, matches/beats upstream) while Linux keeps the PTX
-        // path (native SASS is ~9% SLOWER than Linux's good JIT — no fleet regression). Override with
-        // POM_WALK_IMAGE=fatbin|ptx. Legacy/pascal (POM_CUDA_ARCH set) always use PTX (old cards, no
-        // Blackwell-JIT issue, and the fatbin has no sm_60/70).
+        // MODERN ships the committed native-SASS fatbin on EVERY OS since the v4 tensor-core
+        // solver (pom_mine_v4_tc): mma.sync.m16n8k32.s8 needs real sm_80+ SASS, and the old
+        // Linux default (compute_75 PTX, JIT'd) can only ever carry the sub-sm_80 STUB of the
+        // tc kernel — Linux rigs would silently lose the +35% tc path. The historical reason
+        // Linux kept PTX (its compute_75 JIT of the dp4a walk was ~9% faster than native SASS)
+        // is outweighed by the tc gain. Override with POM_WALK_IMAGE=fatbin|ptx. Legacy/pascal
+        // (POM_CUDA_ARCH set) always use PTX (old cards; the fatbin has no sm_60/70, and their
+        // cc < 8.0 dispatches the classic pom_mine_v4 anyway).
         let want_fatbin = match env::var("POM_WALK_IMAGE").ok().as_deref() {
             Some("fatbin") => true,
             Some("ptx") => false,
-            _ => env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows"),
+            _ => true,
         };
 
         if arch_override.is_none() && want_fatbin && std::path::Path::new(committed_fatbin).exists() {

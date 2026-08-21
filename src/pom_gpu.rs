@@ -568,22 +568,85 @@ impl PomGpuMiner {
         let k = crate::pom_v4::POM_V4_K as u32;
         bind_device_ctx(&self.stream)?; // multi-GPU: bind this device's context before the raw launch
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
-        let cfg = LaunchConfig {
-            grid_dim: (batch as u32, 1, 1),
-            block_dim: (crate::pom_v4::POM_V4_D as u32, 1, 1),
-            shared_mem_bytes: 2048,
-        };
-        let func = load_walk_func(&self.cuda, "pom_mine_v4")?;
-        let mut b = func.builder();
-        b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
-            .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
-            .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
-            .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
-            .arg(&start).arg(&batch).arg(&winner);
-        unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
+
+        if self.v4_tc_available() {
+            // Tensor-core solver: resolve the whole tile-offset chain first (it depends only on
+            // tile snippets, never on the walk state), then walk with a depth-3 cp.async tile
+            // pipeline + 8x mma.sync.m16n8k32.s8 per step. Byte-exact vs pom_mine_v4/the host;
+            // measured +35% on Blackwell. KERYX_POM_V4_TC=0 forces the classic kernel.
+            let offsets = self
+                .stream
+                .alloc_zeros::<u32>((batch as usize) * (k as usize))
+                .map_err(candle_core::Error::wrap)?;
+            let chase_cfg = LaunchConfig {
+                grid_dim: (((batch + 255) / 256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let chase = load_walk_func(&self.cuda, "pom_mine_v4_chase")?;
+            let mut b = chase.builder();
+            b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
+                .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+                .arg(&start).arg(&batch).arg(&offsets);
+            unsafe { b.launch(chase_cfg).map_err(candle_core::Error::wrap)?; }
+
+            const TC_WARPS: u64 = 4; // must match V4_TC_WARPS in pom_mine.cu
+            let walk_cfg = LaunchConfig {
+                grid_dim: (((batch + TC_WARPS - 1) / TC_WARPS) as u32, 1, 1),
+                block_dim: ((TC_WARPS * 32) as u32, 1, 1),
+                shared_mem_bytes: (TC_WARPS as u32) * 4096, // 3 tile buffers + state per warp
+            };
+            let func = load_walk_func(&self.cuda, "pom_mine_v4_tc")?;
+            let mut b = func.builder();
+            b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&k)
+                .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
+                .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+                .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
+                .arg(&start).arg(&batch).arg(&offsets).arg(&winner);
+            unsafe { b.launch(walk_cfg).map_err(candle_core::Error::wrap)?; }
+        } else {
+            let cfg = LaunchConfig {
+                grid_dim: (batch as u32, 1, 1),
+                block_dim: (crate::pom_v4::POM_V4_D as u32, 1, 1),
+                shared_mem_bytes: 2048,
+            };
+            let func = load_walk_func(&self.cuda, "pom_mine_v4")?;
+            let mut b = func.builder();
+            b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
+                .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
+                .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+                .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
+                .arg(&start).arg(&batch).arg(&winner);
+            unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
+        }
         self.stream.synchronize().map_err(candle_core::Error::wrap)?;
         let w = self.stream.clone_dtoh(&winner).map_err(candle_core::Error::wrap)?[0];
         Ok(if w == u64::MAX { None } else { Some(w) })
+    }
+
+    /// Whether the tensor-core v4 solver can run on this device: needs real int8
+    /// mma SASS (sm_80+ — below that the module carries only the stub) and not
+    /// force-disabled via `KERYX_POM_V4_TC=0`. Logged once per device.
+    fn v4_tc_available(&self) -> bool {
+        if std::env::var("KERYX_POM_V4_TC").ok().as_deref() == Some("0") {
+            return false;
+        }
+        match self.stream.context().compute_capability() {
+            Ok((major, _)) => {
+                let ok = major >= 8;
+                static LOGGED: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+                let mut seen = LOGGED.get_or_init(|| Mutex::new(std::collections::HashSet::new())).lock().unwrap();
+                if seen.insert(self.stream.context().ordinal() as u32) {
+                    if ok {
+                        log::info!("PoM v4: tensor-core solver active (sm_{}x, chase + mma.m16n8k32 pipeline).", major);
+                    } else {
+                        log::info!("PoM v4: sm_{}x has no int8 mma — using the classic dp4a kernel.", major);
+                    }
+                }
+                ok
+            }
+            Err(_) => false,
+        }
     }
 
 }
@@ -1425,25 +1488,36 @@ mod v4_kernel_tests {
         let data = blob(2048);
         let index = crate::pom::index_from_ram(data.clone());
         let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
-        for &nonce in &[1u64, 7, 42, 1000, 65_535, 1_000_003] {
-            let seed = crate::pom::pom_block_seed_v4(&PPH, TS, nonce);
-            let (v4, fs) = crate::pom_v4::build_proof_v4(0, seed, &index).unwrap();
-            // Host self-consistency: the witness re-verifies to the same final_state.
-            let re = crate::pom_v4::verify_proof_v4(seed, &v4, &index.r_t, index.n_chunks).unwrap();
-            assert_eq!(re, fs, "host verify_proof_v4 != build_proof_v4 final_state (nonce {nonce})");
-            let pow = crate::pom::pom_pow_value(fs, &PPH, true);
-            // GPU wins at target == host pow_value ...
-            assert_eq!(
-                miner.mine_v4(&PPH, TS, &pow, nonce, 1).unwrap(),
-                Some(nonce),
-                "GPU did NOT find nonce {nonce} at host pow target — GPU pow > host pow (divergence)"
-            );
-            // ... and LOSES one below it -> GPU pow == host pow exactly (byte-exact final_state).
-            assert_eq!(
-                miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1).unwrap(),
-                None,
-                "GPU found nonce {nonce} below host pow — GPU pow < host pow (divergence)"
-            );
+        // Cover BOTH kernels: the tensor-core solver (default on sm_80+; on older cards this
+        // pass silently uses the classic kernel too) and the classic dp4a kernel (forced).
+        for force_classic in [false, true] {
+            if force_classic {
+                std::env::set_var("KERYX_POM_V4_TC", "0");
+            } else {
+                std::env::remove_var("KERYX_POM_V4_TC");
+            }
+            let tag = if force_classic { "classic" } else { "auto/tc" };
+            for &nonce in &[1u64, 7, 42, 1000, 65_535, 1_000_003] {
+                let seed = crate::pom::pom_block_seed_v4(&PPH, TS, nonce);
+                let (v4, fs) = crate::pom_v4::build_proof_v4(0, seed, &index).unwrap();
+                // Host self-consistency: the witness re-verifies to the same final_state.
+                let re = crate::pom_v4::verify_proof_v4(seed, &v4, &index.r_t, index.n_chunks).unwrap();
+                assert_eq!(re, fs, "host verify_proof_v4 != build_proof_v4 final_state (nonce {nonce})");
+                let pow = crate::pom::pom_pow_value(fs, &PPH, true);
+                // GPU wins at target == host pow_value ...
+                assert_eq!(
+                    miner.mine_v4(&PPH, TS, &pow, nonce, 1).unwrap(),
+                    Some(nonce),
+                    "[{tag}] GPU did NOT find nonce {nonce} at host pow target — GPU pow > host pow (divergence)"
+                );
+                // ... and LOSES one below it -> GPU pow == host pow exactly (byte-exact final_state).
+                assert_eq!(
+                    miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1).unwrap(),
+                    None,
+                    "[{tag}] GPU found nonce {nonce} below host pow — GPU pow < host pow (divergence)"
+                );
+            }
         }
+        std::env::remove_var("KERYX_POM_V4_TC");
     }
 }
