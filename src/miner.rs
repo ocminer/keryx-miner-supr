@@ -409,8 +409,11 @@ impl MinerManager {
                         // the witness in pow::generate_block_if_pom (byte-exact re-walk of the resident
                         // index), so a kernel false-positive is dropped there, never submitted. v4 is
                         // one CUDA block (32 threads) per nonce — grind a bounded slice per launch
-                        // (env KERYX_POM_V4_BATCH) to keep block latency low at 10 BPS.
-                        const POM_V4_BATCH: u64 = 1 << 14;
+                        // (env KERYX_POM_V4_BATCH) to keep block latency low at 10 BPS. Default 64K:
+                        // the tensor-core solver amortizes its per-batch chase/launch cost with batch
+                        // size (measured +10% at 64K vs the old 16K on a 5070 Ti), and a 64K batch is
+                        // still only ~25 ms on a mid Blackwell card — well under the 100 ms block time.
+                        const POM_V4_BATCH: u64 = 1 << 16;
                         let batch = std::env::var("KERYX_POM_V4_BATCH").ok()
                             .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0)
                             .unwrap_or(POM_V4_BATCH);
