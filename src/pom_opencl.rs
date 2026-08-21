@@ -12,7 +12,7 @@ use opencl3::device::Device;
 use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE};
 use opencl3::program::Program;
-use opencl3::types::{cl_ulong, CL_BLOCKING};
+use opencl3::types::{cl_uint, cl_ulong, CL_BLOCKING};
 
 pub const POM_WALK_STEPS: u32 = 256;
 const POM_SRC: &str = include_str!("../plugins/opencl/resources/pom_mine.cl");
@@ -22,6 +22,14 @@ pub struct PomMiner {
     queue: CommandQueue,
     /// PoM v4 walk kernel (v0.11.0): 256-thread groups of 8 sub-nonces × 32 lanes.
     kernel_v4: Kernel,
+    /// Two-phase v4 (v0.11.5 port): phase-1 offset chase + phase-2 pipelined walk.
+    kernel_chase: Kernel,
+    kernel_v4_tp: Kernel,
+    /// Global scratch for phase-1 offsets ([sub_dispatch][K] u32); allocated lazily on first
+    /// two-phase mine_v4. None when two-phase is disabled (KERYX_POM_V4_TP=0) or not yet used.
+    offsets: Option<Buffer<cl_uint>>,
+    /// Two-phase enabled (default; KERYX_POM_V4_TP=0 forces the single-phase kernel).
+    use_tp: bool,
     weights: Vec<Buffer<cl_ulong>>,
     /// Chunks per slab (single-slab layout: == n_chunks). Slabs are tile-aligned.
     slab_chunks: u64,
@@ -58,6 +66,57 @@ fn enqueue_v4(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>
         .set_arg(&time)
         .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
         .set_arg(&base).set_arg(&n_nonces)
+        .set_arg(winner)
+        .set_arg_local_buffer(V4_LDS_BYTES)
+        .set_global_work_size(global)
+        .set_local_work_size(V4_LOCAL)
+        .enqueue_nd_range(queue)
+        .ok()?;
+    Some(())
+}
+
+/// Two-phase v4 sub-dispatch: phase 1 (chase) resolves all K offsets into `offsets`, then phase 2
+/// (pipelined walk) reads them and prefetches tile t+1 during matmul t. Same in-order queue, so the
+/// walk sees the chase's writes without an explicit barrier. `offsets` must hold ≥ n_nonces*K u32.
+#[allow(clippy::too_many_arguments)]
+fn enqueue_v4_tp(queue: &CommandQueue, chase: &Kernel, walk: &Kernel, weights: &[Buffer<cl_ulong>],
+                 slab_tiles: u64, offsets: &Buffer<cl_uint>, winner: &Buffer<cl_ulong>, n_tiles: u64,
+                 k: u32, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], base: u64,
+                 n_nonces: u64) -> Option<()> {
+    const V4_LOCAL: usize = 256;
+    const V4_NPG: u64 = 8;
+    const V4_LDS_BYTES: usize = 8 * 512 * 4;
+    const CHASE_LOCAL: usize = 64;               // plain 1D latency-bound pointer chase
+    let sl = |i: usize| weights.get(i).unwrap_or(&weights[0]);
+    // Phase 1: one work-item per nonce, rounded up to CHASE_LOCAL.
+    let chase_global = (n_nonces as usize).div_ceil(CHASE_LOCAL) * CHASE_LOCAL;
+    ExecuteKernel::new(chase)
+        .set_arg(sl(0)).set_arg(sl(1)).set_arg(sl(2)).set_arg(sl(3))
+        .set_arg(&n_tiles)
+        .set_arg(&slab_tiles)
+        .set_arg(&k)
+        .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
+        .set_arg(&time)
+        .set_arg(&base).set_arg(&n_nonces)
+        .set_arg(offsets)
+        .set_global_work_size(chase_global)
+        .set_local_work_size(CHASE_LOCAL)
+        .enqueue_nd_range(queue)
+        .ok()?;
+    // Phase 2: pipelined walk.
+    let groups = n_nonces.div_ceil(V4_NPG);
+    let global = (groups * V4_LOCAL as u64) as usize;
+    ExecuteKernel::new(walk)
+        .set_arg(sl(0)).set_arg(sl(1)).set_arg(sl(2)).set_arg(sl(3))
+        .set_arg(&n_tiles)
+        .set_arg(&slab_tiles)
+        .set_arg(&k)
+        .set_arg(&pph[0]).set_arg(&pph[1]).set_arg(&pph[2]).set_arg(&pph[3])
+        .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
+        .set_arg(&time)
+        .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
+        .set_arg(&base).set_arg(&n_nonces)
+        .set_arg(offsets)
         .set_arg(winner)
         .set_arg_local_buffer(V4_LDS_BYTES)
         .set_global_work_size(global)
@@ -206,14 +265,27 @@ impl PomMiner {
             }
         };
         let kernel_v4 = Kernel::create(&program, "pom_mine_v4").map_err(|e| e.to_string())?;
-        log::info!("PoM: v4 walk kernel ready on {dev_name}{}.",
+        let kernel_chase = Kernel::create(&program, "pom_mine_v4_chase").map_err(|e| e.to_string())?;
+        let kernel_v4_tp = Kernel::create(&program, "pom_mine_v4_tp").map_err(|e| e.to_string())?;
+        // Two-phase (offset-chase + pipelined walk) is a PORT of the CUDA v4 restructure, but it is
+        // OPT-IN (KERYX_POM_V4_TP=1) and OFF by default: it is a measured LOSS with the dp4a/scalar
+        // inner loop (gfx1102 -42%, gfx906 -58%, RX 7600 XT). Reason: the single-phase AMD kernel
+        // already hides tile latency across nonces via workgroup occupancy, so the extra chase pass
+        // is pure overhead. NVIDIA's +20% needed tensor cores to make the matmul near-free so per-
+        // warp MEMORY became the bottleneck — the regime this pipeline helps. Kept (bit-exact
+        // validated) as groundwork for an RDNA3 int8-WMMA inner loop, which would recreate that
+        // regime; do NOT enable by default until a WMMA build measures a win.
+        let use_tp = std::env::var("KERYX_POM_V4_TP").ok().as_deref() == Some("1");
+        log::info!("PoM: v4 walk = {} on {dev_name}{}.",
+            if use_tp { "two-phase (chase + pipelined, EXPERIMENTAL)" } else { "single-phase" },
             match dot_def { Some((d, _)) => format!(" (native int8 dot: {d})"), None => String::new() });
 
         let winner = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_WRITE, 1, ptr::null_mut())
             .map_err(|e| e.to_string())?;
         log::info!("PoM: tier resident ({} MiB, {} slab(s)) on {dev_name} — v4 ready.",
             blob_bytes / (1024 * 1024), weights.len());
-        Ok(Self { _context: context, queue, kernel_v4, weights, slab_chunks, winner, n_chunks })
+        Ok(Self { _context: context, queue, kernel_v4, kernel_chase, kernel_v4_tp,
+                  offsets: None, use_tp, weights, slab_chunks, winner, n_chunks })
     }
 
     /// Create + stream the blob as ceil(n_chunks / slab_chunks) buffers (single slab = one buffer).
@@ -269,12 +341,28 @@ impl PomMiner {
         // makes the single winner buffer hold the batch's lowest winning nonce.
         self.queue.enqueue_write_buffer(&mut self.winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
         let sub_dispatch = v4_sub_dispatch_nonces();
+        // Two-phase needs a global offsets buffer ([sub_dispatch][K] u32); allocate it once, lazily.
+        if self.use_tp && self.offsets.is_none() {
+            let cref = unsafe { Arc::as_ptr(&self._context).as_ref().unwrap() };
+            let n = (sub_dispatch * POM_V4_K as u64).max(1);
+            match Buffer::<cl_uint>::create(cref, CL_MEM_READ_WRITE, n as usize, ptr::null_mut()) {
+                Ok(b) => self.offsets = Some(b),
+                Err(e) => {
+                    log::warn!("PoM v4: offsets buffer alloc failed ({e}) — falling back to single-phase.");
+                    self.use_tp = false;
+                }
+            }
+        }
         let mut done: u64 = 0;
         while done < batch {
             let sub = (batch - done).min(sub_dispatch);
             let base = nonce_base.wrapping_add(done);
-            enqueue_v4(&self.queue, &self.kernel_v4, &self.weights, slab_tiles, &self.winner,
-                       n_tiles, k, pph, seed, time, target, base, sub)?;
+            match (self.use_tp, self.offsets.as_ref()) {
+                (true, Some(offsets)) => enqueue_v4_tp(&self.queue, &self.kernel_chase, &self.kernel_v4_tp,
+                    &self.weights, slab_tiles, offsets, &self.winner, n_tiles, k, pph, seed, time, target, base, sub)?,
+                _ => enqueue_v4(&self.queue, &self.kernel_v4, &self.weights, slab_tiles, &self.winner,
+                    n_tiles, k, pph, seed, time, target, base, sub)?,
+            }
             done += sub;
         }
         self.queue.finish().ok()?;
@@ -866,7 +954,8 @@ mod v4_byte_exact {
 
         let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(23).wrapping_add(5));
         let time: u64 = 0x0123_4567_89AB_CDEF;
-        const NN: u64 = 32; // v4 nonce is light (K×32×32 int8) — a full workgroup's worth
+        const NN: u64 = 2048; // matches the CUDA gate: a mapping/ordering bug in either kernel or
+                              // the two-phase offset chain shows up as an argmin mismatch here
 
         // CPU: find the argmin pow over 0..NN; target = that min → only the argmin passes.
         let mut best = ([0xFFu8; 32], u64::MAX);
@@ -887,12 +976,64 @@ mod v4_byte_exact {
         let (target, w_cpu) = best;
         eprintln!("cpu argmin nonce = {w_cpu}");
 
-        // GPU: grind 0..NN with target = the argmin's pow. Expect it to return w_cpu.
+        // GPU: grind 0..NN with target = the argmin's pow. Expect it to return w_cpu. Validate BOTH
+        // the single-phase kernel AND the (default-off) two-phase chase+pipeline path — regardless
+        // of the KERYX_POM_V4_TP env default — so neither can silently diverge from consensus.
         let mut miner = PomMiner::new(dev, &index, n_chunks).expect("PomMiner::new");
         let p = crate::pom::pph_words_for_era(&pph, true);
         let s = crate::pom::pph_words_v4(&pph);
         let t = words(&target);
-        let got = miner.mine_v4(p, s, time, t, 0, NN);
-        assert_eq!(got, Some(w_cpu), "GPU v4 winner must match the CPU reference argmin");
+        miner.use_tp = false;
+        assert_eq!(miner.mine_v4(p, s, time, t, 0, NN), Some(w_cpu), "single-phase v4 winner mismatch");
+        miner.use_tp = true;
+        assert_eq!(miner.mine_v4(p, s, time, t, 0, NN), Some(w_cpu), "two-phase v4 winner mismatch");
+    }
+
+    /// Throughput A/B: single-phase vs two-phase v4 on a memory-bound synthetic blob. Ignored
+    /// (needs a GPU + is slow). Run: cargo test --release -p keryx-miner-supr --features pom-opencl
+    /// --lib v4_two_phase_bench -- --ignored --nocapture   (KERYX_BENCH_CL_DEV picks the device).
+    #[test]
+    #[ignore]
+    fn v4_two_phase_bench() {
+        let dev_ids = match opencl3::device::get_all_devices(opencl3::device::CL_DEVICE_TYPE_GPU) {
+            Ok(v) if !v.is_empty() => v,
+            _ => { eprintln!("no OpenCL GPU — skipping"); return; }
+        };
+        let di: usize = std::env::var("KERYX_BENCH_CL_DEV").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let dev = opencl3::device::Device::new(dev_ids[di]);
+        eprintln!("v4 two-phase bench on: {}", dev.name().unwrap_or_default());
+
+        // ~256 MB blob (262144 tiles) — far larger than any GPU last-level cache, so the cold-tile
+        // chase is genuinely memory-latency-bound (where the pipeline helps).
+        let n_tiles: u64 = std::env::var("KERYX_BENCH_TILES").ok().and_then(|s| s.parse().ok()).unwrap_or(262144);
+        let n_chunks = n_tiles * POM_V4_TILE_CHUNKS;
+        eprintln!("building {} MiB synthetic blob ({n_tiles} tiles)…", n_chunks * 32 / (1024 * 1024));
+        let mut data = vec![0u8; (n_chunks * 32) as usize];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(131).wrapping_add(i / 7).wrapping_add(17)) as u8;
+        }
+        let index = crate::pom::index_from_ram(data);
+        let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(23).wrapping_add(5));
+        let p = crate::pom::pph_words_for_era(&pph, true);
+        let s = crate::pom::pph_words_v4(&pph);
+        let t = [0u64; 4]; // impossible target → full grind, no early winner
+        let batch: u64 = std::env::var("KERYX_BENCH_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 16);
+
+        let mut miner = PomMiner::new(dev, &index, n_chunks).expect("PomMiner::new");
+        let bench = |m: &mut PomMiner, label: &str| {
+            m.mine_v4(p, s, 1_700_000_000, t, 0, batch); // warmup
+            let rounds = 6u64;
+            let start = std::time::Instant::now();
+            for r in 0..rounds { m.mine_v4(p, s, 1_700_000_000, t, r * batch, batch); }
+            let secs = start.elapsed().as_secs_f64();
+            let mhs = (rounds * batch) as f64 / secs / 1e6;
+            eprintln!("{label}: {mhs:.3} Mh/s ({} nonces in {secs:.2}s)", rounds * batch);
+            mhs
+        };
+        miner.use_tp = false;
+        let single = bench(&mut miner, "single-phase");
+        miner.use_tp = true;
+        let two = bench(&mut miner, "two-phase ");
+        eprintln!("two-phase speedup: {:+.1}%", (two / single - 1.0) * 100.0);
     }
 }
