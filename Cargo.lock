@@ -1887,7 +1887,7 @@ dependencies = [
 
 [[package]]
 name = "keryx-miner-supr"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "anyhow",
  "async-trait",
