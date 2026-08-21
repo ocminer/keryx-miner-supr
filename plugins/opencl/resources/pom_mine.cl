@@ -450,3 +450,270 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_tp(
         }
     }
 }
+
+// ============================================================================
+// PoM v4 WMMA walk (RDNA3 gfx11 / gfx12 only — needs V_WMMA_I32_16X16X16_IU8).
+// Two-phase like pom_mine_v4_tp (offsets from pom_mine_v4_chase, double-buffered
+// tile prefetch), but the 32x32x32 int8 transition runs on the matrix cores: one
+// wave32 per nonce, 2x2 output blocks x 2 k-steps = 8 WMMA/step. This makes the
+// matmul near-free so the tile-load latency becomes the bottleneck — the regime
+// the two-phase pipeline was built for. The state lives in LDS (WMMA A-fragments
+// need any lane to read any row); rho8 is applied to the int32 accumulators with
+// destination-computed (x,j), byte-exact with pom_v4::v4_transition (validated in
+// scratchpad/clcheck/wmma_v4.cl and the v4_byte_exact test).
+#ifdef USE_AMD_WMMA
+typedef int int4v __attribute__((ext_vector_type(4)));
+typedef int int8v __attribute__((ext_vector_type(8)));
+
+// Per sub-nonce LDS strip (u32): S ping-pong (2x256) + tile double-buffer (2x256) = 1024 u32 = 4 KB.
+#define V4W_STRIP_U32 1024
+
+__kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma(
+    __global const uint* restrict b0,
+    __global const uint* restrict b1,
+    __global const uint* restrict b2,
+    __global const uint* restrict b3,
+    const u64 n_tiles,
+    const u64 slab_tiles,
+    const uint K,
+    const u64 p0, const u64 p1, const u64 p2, const u64 p3,
+    const u64 s0, const u64 s1, const u64 s2, const u64 s3,
+    const u64 time_,
+    const u64 t0, const u64 t1, const u64 t2, const u64 t3,
+    const u64 nonce_base, const u64 n_nonces,
+    __global const uint* restrict offsets,
+    volatile __global u64* winner,
+    __local uint* scratch)                     // V4_NPG * V4W_STRIP_U32 u32 = 32 KB
+{
+    const uint lid  = get_local_id(0);
+    const uint sub  = lid >> 5;
+    const uint lane = lid & 31u;               // wave lane 0..31
+    const u64  gsub = (u64)get_group_id(0) * V4_NPG + sub;
+    const bool live  = gsub < n_nonces;
+    const u64  idx   = live ? gsub : 0UL;
+    const u64  nonce = nonce_base + idx;
+    const u64  seed  = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    __local uint* strip = scratch + sub * V4W_STRIP_U32;
+    __local uint* sA = strip;                  // state buffer A (256 u32 = 32x32 int8)
+    __local uint* sB = strip + 256;            // state buffer B
+    __local uint* tA = strip + 512;            // tile buffer A
+    __local uint* tB = strip + 768;            // tile buffer B
+    __global const uint* my = offsets + idx * (u64)K;
+
+    // S_0: lane `lane` writes state row `lane` (all 32 rows filled across the wave).
+    {
+        u64 h = pom_mix64(seed ^ (V4_S0_ROW_SALT + (u64)lane));
+        V4_UNROLL for (int k4 = 0; k4 < V4_D4; k4++) { h = pom_mix64(h); sA[lane * 8 + k4] = (uint)h; }
+    }
+    // Prologue: load tile my[0] into tA (lane loads chunk `lane`).
+    {
+        u64 tin;
+        const __global uint* sb = v4_slab(b0, b1, b2, b3, (u64)my[0], slab_tiles, &tin);
+        const __global uint* src = sb + (tin * (u64)V4_TILE_CHUNKS + lane) * 8UL;
+        V4_UNROLL for (int w = 0; w < 8; w++) tA[lane * 8 + w] = src[w];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (uint step = 1; step <= K; step++) {
+        __local uint* scur = (step & 1u) ? sA : sB;   // step1 reads sA, writes sB
+        __local uint* snxt = (step & 1u) ? sB : sA;
+        __local uint* tcur = ((step - 1u) & 1u) ? tB : tA;
+        __local uint* tnxt = ((step - 1u) & 1u) ? tA : tB;
+
+        // Prefetch NEXT tile into registers (overlaps the WMMA compute).
+        const bool has_next = (step < K);
+        uint pref[8];
+        if (has_next) {
+            u64 tin;
+            const __global uint* sb = v4_slab(b0, b1, b2, b3, (u64)my[step], slab_tiles, &tin);
+            const __global uint* src = sb + (tin * (u64)V4_TILE_CHUNKS + lane) * 8UL;
+            V4_UNROLL for (int w = 0; w < 8; w++) pref[w] = src[w];
+        }
+
+        // WMMA transition: next = rho8(S · T^T, tweak). 2x2 blocks x 2 k-steps.
+        __local const char* Sc = (__local const char*)scur;
+        __local const char* Tc = (__local const char*)tcur;
+        const uint xi = lane & 15u;
+        const uint ji = lane & 15u;
+        const uint step_base = step * 0x9E3779B9u;
+        V4_UNROLL for (uint xb = 0; xb < 2; xb++) {
+            V4_UNROLL for (uint jb = 0; jb < 2; jb++) {
+                int8v acc = (int8v)(0);
+                V4_UNROLL for (uint kb = 0; kb < 2; kb++) {
+                    int4v a, b; char* ap = (char*)&a; char* bp = (char*)&b;
+                    V4_UNROLL for (int ki = 0; ki < 16; ki++) {
+                        ap[ki] = Sc[(16u*xb + xi) * 32 + 16u*kb + ki];
+                        bp[ki] = Tc[(16u*jb + ji) * 32 + 16u*kb + ki];   // T^T (col-major B)
+                    }
+                    acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, acc, false);
+                }
+                V4_UNROLL for (int vv = 0; vv < 8; vv++) {
+                    const uint x = 16u*xb + 2u*(uint)vv + (lane >> 4);
+                    const uint j = 16u*jb + (lane & 15u);
+                    const uint tw = step_base + x * 0xC2B2AE35u + j * 0x85EBCA6Bu;
+                    ((__local char*)snxt)[x * 32 + j] = (char)v4_rho8(acc[vv], tw);
+                }
+            }
+        }
+
+        // Stage the prefetched tile into the other buffer, then barrier (snxt visible for step+1;
+        // all lanes done reading scur/tcur before step+2 reuses them).
+        if (has_next) {
+            V4_UNROLL for (int w = 0; w < 8; w++) tnxt[lane * 8 + w] = pref[w];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // Final state is in the buffer written at step K: (K & 1) ? sB : sA.
+    __local uint* sfin = (K & 1u) ? sB : sA;
+    uint row4[V4_D4];
+    V4_UNROLL for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = sfin[lane * 8 + k4];
+    barrier(CLK_LOCAL_MEM_FENCE);   // done reading sfin before merkle reuses the strip
+
+    // root_K: reuse tile region (strip+512.. = 512 u32) for the merkle tree.
+    __local uint* ms = strip + 512;
+    b3_hash_row32(row4, ms + lane * 8);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __local uint* src = ms;
+    __local uint* dst = ms + V4_D * 8;
+    for (uint n = V4_D; n > 1; n >>= 1) {
+        if (lane < n / 2) b3_hash_pair(src + lane * 16, dst + lane * 8);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        __local uint* tmp = src; src = dst; dst = tmp;
+    }
+
+    if (lane == 0 && live) {
+        const u64 fin = (u64)src[0] | ((u64)src[1] << 32);
+        u64 pv[4];
+        pom_pow_fold(fin, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) {
+            u64 old = *winner;
+            while (nonce < old) {
+                u64 prev = atom_cmpxchg(winner, old, nonce);
+                if (prev == old) break;
+                old = prev;
+            }
+        }
+    }
+}
+#endif // USE_AMD_WMMA
+
+#ifdef USE_AMD_WMMA
+// PoM v4 SINGLE-PHASE WMMA walk (RDNA3+): no offset chase — computes the next offset inline from
+// the snippet like pom_mine_v4, but runs the 32x32x32 transition on the matrix cores. This is the
+// combination that fits AMD: the single-phase kernel is already occupancy-latency-hidden (so the
+// two-phase chase is dead weight on AMD), while WMMA still speeds the matmul itself. State lives in
+// LDS (ping-pong); byte-exact with pom_v4::v4_transition (same layout as pom_mine_v4_wmma).
+// Per sub-nonce LDS: 2 state (2x256) + 1 tile (256) = 768 u32 = 3 KB.
+#define V4WSP_STRIP_U32 768
+__kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma_sp(
+    __global const uint* restrict b0,
+    __global const uint* restrict b1,
+    __global const uint* restrict b2,
+    __global const uint* restrict b3,
+    const u64 n_tiles,
+    const u64 slab_tiles,
+    const uint K,
+    const u64 p0, const u64 p1, const u64 p2, const u64 p3,
+    const u64 s0, const u64 s1, const u64 s2, const u64 s3,
+    const u64 time_,
+    const u64 t0, const u64 t1, const u64 t2, const u64 t3,
+    const u64 nonce_base, const u64 n_nonces,
+    volatile __global u64* winner,
+    __local uint* scratch)                     // V4_NPG * V4WSP_STRIP_U32 u32 = 24 KB
+{
+    const uint lid  = get_local_id(0);
+    const uint sub  = lid >> 5;
+    const uint lane = lid & 31u;
+    const u64  gsub = (u64)get_group_id(0) * V4_NPG + sub;
+    const bool live  = gsub < n_nonces;
+    const u64  nonce = nonce_base + (live ? gsub : 0UL);
+    const u64  seed  = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    __local uint* strip = scratch + sub * V4WSP_STRIP_U32;
+    __local uint* sA = strip;
+    __local uint* sB = strip + 256;
+    __local uint* tile = strip + 512;
+
+    // S_0: lane writes state row `lane`.
+    {
+        u64 h = pom_mix64(seed ^ (V4_S0_ROW_SALT + (u64)lane));
+        V4_UNROLL for (int k4 = 0; k4 < V4_D4; k4++) { h = pom_mix64(h); sA[lane * 8 + k4] = (uint)h; }
+    }
+    u64 off = pom_mix64(seed ^ V4_OFFSET_FIRST_SALT) % V4_NT(n_tiles);
+
+    for (uint step = 1; step <= K; step++) {
+        __local uint* scur = (step & 1u) ? sA : sB;
+        __local uint* snxt = (step & 1u) ? sB : sA;
+
+        // Load this step's tile (lane loads chunk `lane`).
+        {
+            u64 tin;
+            const __global uint* sb = v4_slab(b0, b1, b2, b3, off, slab_tiles, &tin);
+            const __global uint* src = sb + (tin * (u64)V4_TILE_CHUNKS + lane) * 8UL;
+            V4_UNROLL for (int w = 0; w < 8; w++) tile[lane * 8 + w] = src[w];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // Next offset from this tile's snippet (chunk 0 = tile[0..8]).
+        {
+            u64 sf = 0;
+            V4_UNROLL for (int w = 0; w < 8; w++) sf = pom_mix64(sf ^ (u64)tile[w]);
+            off = pom_mix64(seed ^ (u64)(step + 1) * V4_OFFSET_STEP_SALT ^ sf) % V4_NT(n_tiles);
+        }
+
+        // WMMA transition (same as pom_mine_v4_wmma).
+        __local const char* Sc = (__local const char*)scur;
+        __local const char* Tc = (__local const char*)tile;
+        const uint xi = lane & 15u, ji = lane & 15u;
+        const uint step_base = step * 0x9E3779B9u;
+        V4_UNROLL for (uint xb = 0; xb < 2; xb++) {
+            V4_UNROLL for (uint jb = 0; jb < 2; jb++) {
+                int8v acc = (int8v)(0);
+                V4_UNROLL for (uint kb = 0; kb < 2; kb++) {
+                    int4v a, b; char* ap = (char*)&a; char* bp = (char*)&b;
+                    V4_UNROLL for (int ki = 0; ki < 16; ki++) {
+                        ap[ki] = Sc[(16u*xb + xi) * 32 + 16u*kb + ki];
+                        bp[ki] = Tc[(16u*jb + ji) * 32 + 16u*kb + ki];
+                    }
+                    acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, acc, false);
+                }
+                V4_UNROLL for (int vv = 0; vv < 8; vv++) {
+                    const uint x = 16u*xb + 2u*(uint)vv + (lane >> 4);
+                    const uint j = 16u*jb + (lane & 15u);
+                    const uint tw = step_base + x * 0xC2B2AE35u + j * 0x85EBCA6Bu;
+                    ((__local char*)snxt)[x * 32 + j] = (char)v4_rho8(acc[vv], tw);
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    __local uint* sfin = (K & 1u) ? sB : sA;
+    uint row4[V4_D4];
+    V4_UNROLL for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = sfin[lane * 8 + k4];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __local uint* ms = strip;                  // reuse state region for merkle (512 u32)
+    b3_hash_row32(row4, ms + lane * 8);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __local uint* src = ms;
+    __local uint* dst = ms + V4_D * 8;
+    for (uint n = V4_D; n > 1; n >>= 1) {
+        if (lane < n / 2) b3_hash_pair(src + lane * 16, dst + lane * 8);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        __local uint* tmp = src; src = dst; dst = tmp;
+    }
+    if (lane == 0 && live) {
+        const u64 fin = (u64)src[0] | ((u64)src[1] << 32);
+        u64 pv[4];
+        pom_pow_fold(fin, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) {
+            u64 old = *winner;
+            while (nonce < old) {
+                u64 prev = atom_cmpxchg(winner, old, nonce);
+                if (prev == old) break;
+                old = prev;
+            }
+        }
+    }
+}
+#endif // USE_AMD_WMMA

@@ -25,11 +25,15 @@ pub struct PomMiner {
     /// Two-phase v4 (v0.11.5 port): phase-1 offset chase + phase-2 pipelined walk.
     kernel_chase: Kernel,
     kernel_v4_tp: Kernel,
-    /// Global scratch for phase-1 offsets ([sub_dispatch][K] u32); allocated lazily on first
-    /// two-phase mine_v4. None when two-phase is disabled (KERYX_POM_V4_TP=0) or not yet used.
+    /// RDNA3+ matrix-core (WMMA) two-phase walk; None on non-gfx11/12. Paired with the chase.
+    kernel_wmma: Option<Kernel>,
+    /// RDNA3+ SINGLE-phase WMMA walk (no chase) — the AMD-fit combination. None on non-gfx11/12.
+    kernel_wmma_sp: Option<Kernel>,
+    /// Selected v4 walk mode.
+    mode: V4Mode,
+    /// Global scratch for phase-1 offsets ([sub_dispatch][K] u32); allocated lazily on the first
+    /// two-phase mine_v4. None for single-phase modes or not yet used.
     offsets: Option<Buffer<cl_uint>>,
-    /// Two-phase enabled (default; KERYX_POM_V4_TP=0 forces the single-phase kernel).
-    use_tp: bool,
     weights: Vec<Buffer<cl_ulong>>,
     /// Chunks per slab (single-slab layout: == n_chunks). Slabs are tile-aligned.
     slab_chunks: u64,
@@ -41,6 +45,12 @@ pub struct PomMiner {
 // serializes all access (one mining thread), so sending the miner across threads is sound.
 unsafe impl Send for PomMiner {}
 
+/// v4 walk kernel selection. Single-phase dp4a is the portable default; the WMMA modes are RDNA3+
+/// only. SingleWmma (matrix-core matmul, NO offset chase) is the AMD-fit path — the two-phase chase
+/// is dead weight on AMD because the single-phase kernel is already occupancy-latency-hidden.
+#[derive(Clone, Copy, PartialEq)]
+enum V4Mode { SingleDp4a, SingleWmma, TwoPhaseDp4a, TwoPhaseWmma }
+
 /// Enqueue one v4 sub-dispatch (no finish/read): 256-thread workgroups of V4_NPG(8) sub-nonces.
 /// `n_nonces` nonces from `base`; groups = ceil(n_nonces/8) (tail sub-nonces walk a dummy nonce and
 /// never submit — uniform barriers). The kernel CAS-mins into the shared `winner`; mine_v4 enqueues
@@ -48,10 +58,9 @@ unsafe impl Send for PomMiner {}
 #[allow(clippy::too_many_arguments)]
 fn enqueue_v4(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>], slab_tiles: u64,
               winner: &Buffer<cl_ulong>, n_tiles: u64, k: u32, pph: [u64; 4], seed: [u64; 4],
-              time: u64, target: [u64; 4], base: u64, n_nonces: u64) -> Option<()> {
+              time: u64, target: [u64; 4], base: u64, n_nonces: u64, lds_bytes: usize) -> Option<()> {
     const V4_LOCAL: usize = 256;
     const V4_NPG: u64 = 8;                       // sub-nonces per workgroup (kernel mirror)
-    const V4_LDS_BYTES: usize = 8 * 512 * 4;     // 8 strips × 512 u32 = 16 KB
     // 4 slab args; absent slabs repeat slab 0 (never selected: off/slab_tiles bounds to real slabs).
     let sl = |i: usize| weights.get(i).unwrap_or(&weights[0]);
     let groups = n_nonces.div_ceil(V4_NPG);
@@ -67,7 +76,7 @@ fn enqueue_v4(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>
         .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
         .set_arg(&base).set_arg(&n_nonces)
         .set_arg(winner)
-        .set_arg_local_buffer(V4_LDS_BYTES)
+        .set_arg_local_buffer(lds_bytes)
         .set_global_work_size(global)
         .set_local_work_size(V4_LOCAL)
         .enqueue_nd_range(queue)
@@ -82,10 +91,9 @@ fn enqueue_v4(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>
 fn enqueue_v4_tp(queue: &CommandQueue, chase: &Kernel, walk: &Kernel, weights: &[Buffer<cl_ulong>],
                  slab_tiles: u64, offsets: &Buffer<cl_uint>, winner: &Buffer<cl_ulong>, n_tiles: u64,
                  k: u32, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], base: u64,
-                 n_nonces: u64) -> Option<()> {
+                 n_nonces: u64, walk_lds_bytes: usize) -> Option<()> {
     const V4_LOCAL: usize = 256;
     const V4_NPG: u64 = 8;
-    const V4_LDS_BYTES: usize = 8 * 512 * 4;
     const CHASE_LOCAL: usize = 64;               // plain 1D latency-bound pointer chase
     let sl = |i: usize| weights.get(i).unwrap_or(&weights[0]);
     // Phase 1: one work-item per nonce, rounded up to CHASE_LOCAL.
@@ -118,7 +126,7 @@ fn enqueue_v4_tp(queue: &CommandQueue, chase: &Kernel, walk: &Kernel, weights: &
         .set_arg(&base).set_arg(&n_nonces)
         .set_arg(offsets)
         .set_arg(winner)
-        .set_arg_local_buffer(V4_LDS_BYTES)
+        .set_arg_local_buffer(walk_lds_bytes)
         .set_global_work_size(global)
         .set_local_work_size(V4_LOCAL)
         .enqueue_nd_range(queue)
@@ -244,10 +252,14 @@ impl PomMiner {
         };
         // v4 bakes n_tiles (POM_NT) and tiles-per-slab (POM_SLABT) — the two runtime-divisor
         // divisions in the walk's hot paths (offset % n_tiles, off / slab_tiles).
-        let base = format!(
-            "-D POM_NT={}UL -D POM_SLABT={}UL",
-            n_chunks / V3_TILE, slab_chunks / V3_TILE,
-        );
+        // RDNA3/RDNA4 (gfx11/gfx12) also get -D USE_AMD_WMMA=1, which compiles the matrix-core
+        // v4 walk (V_WMMA_I32_16X16X16_IU8); the kernel is #ifdef'd out elsewhere (the builtin
+        // needs the wmma target feature). `have_wmma` gates kernel creation below.
+        let have_wmma = dev_name.contains("gfx11") || dev_name.contains("gfx12");
+        let base = {
+            let b = format!("-D POM_NT={}UL -D POM_SLABT={}UL", n_chunks / V3_TILE, slab_chunks / V3_TILE);
+            if have_wmma { format!("{b} -D USE_AMD_WMMA=1") } else { b }
+        };
         let opts = match dot_def { Some((_, d)) => format!("{base} {d}"), None => base.clone() };
         let program = match Program::create_and_build_from_source(&context, POM_SRC, &opts) {
             Ok(p) => {
@@ -275,17 +287,40 @@ impl PomMiner {
         // warp MEMORY became the bottleneck — the regime this pipeline helps. Kept (bit-exact
         // validated) as groundwork for an RDNA3 int8-WMMA inner loop, which would recreate that
         // regime; do NOT enable by default until a WMMA build measures a win.
-        let use_tp = std::env::var("KERYX_POM_V4_TP").ok().as_deref() == Some("1");
+        // RDNA3+ matrix-core (WMMA) kernels: both the single-phase (no chase) and two-phase flavors.
+        // Absent on non-gfx11/12 (the builtin is #ifdef'd out); create failures degrade to dp4a.
+        let (kernel_wmma_sp, kernel_wmma) = if have_wmma {
+            (Kernel::create(&program, "pom_mine_v4_wmma_sp").ok(),
+             Kernel::create(&program, "pom_mine_v4_wmma").ok())
+        } else { (None, None) };
+        // Mode: KERYX_POM_V4_MODE = sp(single-phase dp4a) | wmma(single-phase matrix-core) |
+        // tp(two-phase dp4a) | tpwmma(two-phase matrix-core). WMMA modes fall back to dp4a if the
+        // kernels are absent. DEFAULT: single-phase WMMA on RDNA3+ (measured +11% on an RX 7600 XT
+        // vs single-phase dp4a — WMMA speeds the 32x32x32 matmul; the two-phase chase is dead weight
+        // on AMD because the walk is already occupancy-latency-hidden), single-phase dp4a elsewhere.
+        let mode = match std::env::var("KERYX_POM_V4_MODE").ok().as_deref() {
+            Some("wmma")   if kernel_wmma_sp.is_some() => V4Mode::SingleWmma,
+            Some("tpwmma") if kernel_wmma.is_some()    => V4Mode::TwoPhaseWmma,
+            Some("tp")     => V4Mode::TwoPhaseDp4a,
+            Some("sp")     => V4Mode::SingleDp4a,
+            _ if kernel_wmma_sp.is_some()              => V4Mode::SingleWmma,   // RDNA3+ default
+            _                                          => V4Mode::SingleDp4a,
+        };
         log::info!("PoM: v4 walk = {} on {dev_name}{}.",
-            if use_tp { "two-phase (chase + pipelined, EXPERIMENTAL)" } else { "single-phase" },
+            match mode {
+                V4Mode::SingleDp4a => "single-phase dp4a",
+                V4Mode::SingleWmma => "single-phase WMMA matrix-core",
+                V4Mode::TwoPhaseDp4a => "two-phase dp4a (experimental)",
+                V4Mode::TwoPhaseWmma => "two-phase WMMA (experimental)",
+            },
             match dot_def { Some((d, _)) => format!(" (native int8 dot: {d})"), None => String::new() });
 
         let winner = Buffer::<cl_ulong>::create(cref, CL_MEM_READ_WRITE, 1, ptr::null_mut())
             .map_err(|e| e.to_string())?;
         log::info!("PoM: tier resident ({} MiB, {} slab(s)) on {dev_name} — v4 ready.",
             blob_bytes / (1024 * 1024), weights.len());
-        Ok(Self { _context: context, queue, kernel_v4, kernel_chase, kernel_v4_tp,
-                  offsets: None, use_tp, weights, slab_chunks, winner, n_chunks })
+        Ok(Self { _context: context, queue, kernel_v4, kernel_chase, kernel_v4_tp, kernel_wmma,
+                  kernel_wmma_sp, mode, offsets: None, weights, slab_chunks, winner, n_chunks })
     }
 
     /// Create + stream the blob as ceil(n_chunks / slab_chunks) buffers (single slab = one buffer).
@@ -341,15 +376,22 @@ impl PomMiner {
         // makes the single winner buffer hold the batch's lowest winning nonce.
         self.queue.enqueue_write_buffer(&mut self.winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
         let sub_dispatch = v4_sub_dispatch_nonces();
-        // Two-phase needs a global offsets buffer ([sub_dispatch][K] u32); allocate it once, lazily.
-        if self.use_tp && self.offsets.is_none() {
+        // LDS per mode (8 sub-nonces × strip): single dp4a 512 u32 (16 KB), single WMMA 768 (24 KB),
+        // two-phase dp4a 512 (16 KB), two-phase WMMA 1024 (32 KB).
+        const SP_DP4A_LDS: usize = 8 * 512 * 4;
+        const SP_WMMA_LDS: usize = 8 * 768 * 4;
+        const TP_DP4A_LDS: usize = 8 * 512 * 4;
+        const TP_WMMA_LDS: usize = 8 * 1024 * 4;
+        // Two-phase modes need a global offsets buffer ([sub_dispatch][K] u32); lazy-allocate it.
+        let two_phase = matches!(self.mode, V4Mode::TwoPhaseDp4a | V4Mode::TwoPhaseWmma);
+        if two_phase && self.offsets.is_none() {
             let cref = unsafe { Arc::as_ptr(&self._context).as_ref().unwrap() };
             let n = (sub_dispatch * POM_V4_K as u64).max(1);
             match Buffer::<cl_uint>::create(cref, CL_MEM_READ_WRITE, n as usize, ptr::null_mut()) {
                 Ok(b) => self.offsets = Some(b),
                 Err(e) => {
                     log::warn!("PoM v4: offsets buffer alloc failed ({e}) — falling back to single-phase.");
-                    self.use_tp = false;
+                    self.mode = V4Mode::SingleDp4a;
                 }
             }
         }
@@ -357,11 +399,21 @@ impl PomMiner {
         while done < batch {
             let sub = (batch - done).min(sub_dispatch);
             let base = nonce_base.wrapping_add(done);
-            match (self.use_tp, self.offsets.as_ref()) {
-                (true, Some(offsets)) => enqueue_v4_tp(&self.queue, &self.kernel_chase, &self.kernel_v4_tp,
-                    &self.weights, slab_tiles, offsets, &self.winner, n_tiles, k, pph, seed, time, target, base, sub)?,
-                _ => enqueue_v4(&self.queue, &self.kernel_v4, &self.weights, slab_tiles, &self.winner,
-                    n_tiles, k, pph, seed, time, target, base, sub)?,
+            // Resolve the walk kernel: WMMA modes fall back to dp4a if the kernel is missing.
+            match self.mode {
+                V4Mode::SingleWmma => enqueue_v4(&self.queue,
+                    self.kernel_wmma_sp.as_ref().unwrap_or(&self.kernel_v4),
+                    &self.weights, slab_tiles, &self.winner, n_tiles, k, pph, seed, time, target, base, sub,
+                    if self.kernel_wmma_sp.is_some() { SP_WMMA_LDS } else { SP_DP4A_LDS })?,
+                V4Mode::TwoPhaseWmma => enqueue_v4_tp(&self.queue, &self.kernel_chase,
+                    self.kernel_wmma.as_ref().unwrap_or(&self.kernel_v4_tp), &self.weights, slab_tiles,
+                    self.offsets.as_ref().unwrap(), &self.winner, n_tiles, k, pph, seed, time, target, base, sub,
+                    if self.kernel_wmma.is_some() { TP_WMMA_LDS } else { TP_DP4A_LDS })?,
+                V4Mode::TwoPhaseDp4a => enqueue_v4_tp(&self.queue, &self.kernel_chase, &self.kernel_v4_tp,
+                    &self.weights, slab_tiles, self.offsets.as_ref().unwrap(), &self.winner, n_tiles, k,
+                    pph, seed, time, target, base, sub, TP_DP4A_LDS)?,
+                V4Mode::SingleDp4a => enqueue_v4(&self.queue, &self.kernel_v4, &self.weights, slab_tiles,
+                    &self.winner, n_tiles, k, pph, seed, time, target, base, sub, SP_DP4A_LDS)?,
             }
             done += sub;
         }
@@ -983,10 +1035,22 @@ mod v4_byte_exact {
         let p = crate::pom::pph_words_for_era(&pph, true);
         let s = crate::pom::pph_words_v4(&pph);
         let t = words(&target);
-        miner.use_tp = false;
-        assert_eq!(miner.mine_v4(p, s, time, t, 0, NN), Some(w_cpu), "single-phase v4 winner mismatch");
-        miner.use_tp = true;
-        assert_eq!(miner.mine_v4(p, s, time, t, 0, NN), Some(w_cpu), "two-phase v4 winner mismatch");
+        // Validate every walk mode against the CPU argmin — a mapping bug in any kernel or the
+        // two-phase offset chain shows up as a winner mismatch here.
+        let modes: &[(V4Mode, &str)] = &[
+            (V4Mode::SingleDp4a, "single dp4a"),
+            (V4Mode::TwoPhaseDp4a, "two-phase dp4a"),
+            (V4Mode::SingleWmma, "single WMMA"),
+            (V4Mode::TwoPhaseWmma, "two-phase WMMA"),
+        ];
+        for &(m, name) in modes {
+            // Skip WMMA modes if the kernels didn't build (non-RDNA3).
+            if matches!(m, V4Mode::SingleWmma) && miner.kernel_wmma_sp.is_none() { continue; }
+            if matches!(m, V4Mode::TwoPhaseWmma) && miner.kernel_wmma.is_none() { continue; }
+            miner.mode = m;
+            assert_eq!(miner.mine_v4(p, s, time, t, 0, NN), Some(w_cpu), "{name} v4 winner mismatch");
+            eprintln!("{name}: OK");
+        }
     }
 
     /// Throughput A/B: single-phase vs two-phase v4 on a memory-bound synthetic blob. Ignored
@@ -1030,10 +1094,19 @@ mod v4_byte_exact {
             eprintln!("{label}: {mhs:.3} Mh/s ({} nonces in {secs:.2}s)", rounds * batch);
             mhs
         };
-        miner.use_tp = false;
-        let single = bench(&mut miner, "single-phase");
-        miner.use_tp = true;
-        let two = bench(&mut miner, "two-phase ");
-        eprintln!("two-phase speedup: {:+.1}%", (two / single - 1.0) * 100.0);
+        miner.mode = V4Mode::SingleDp4a;
+        let single = bench(&mut miner, "single-phase dp4a ");
+        miner.mode = V4Mode::TwoPhaseDp4a;
+        let _ = bench(&mut miner, "two-phase dp4a    ");
+        if miner.kernel_wmma_sp.is_some() {
+            miner.mode = V4Mode::SingleWmma;
+            let spw = bench(&mut miner, "single-phase WMMA ");
+            eprintln!(">> single-phase WMMA vs single-phase dp4a: {:+.1}%", (spw / single - 1.0) * 100.0);
+        }
+        if miner.kernel_wmma.is_some() {
+            miner.mode = V4Mode::TwoPhaseWmma;
+            let tpw = bench(&mut miner, "two-phase WMMA    ");
+            eprintln!(">> two-phase WMMA vs single-phase dp4a: {:+.1}%", (tpw / single - 1.0) * 100.0);
+        }
     }
 }
