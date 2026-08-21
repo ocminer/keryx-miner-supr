@@ -79,6 +79,41 @@ impl WalkFunc {
 /// path. Replaces the `custom_modules` cache the vendored candle-core kept device-side.
 static WALK_MODULES: OnceLock<Mutex<HashMap<usize, Arc<CudaModule>>>> = OnceLock::new();
 
+/// Per-device cached v4 tile-offsets buffer (batch*K u32). PLAIN alloc, never zeroed — the chase
+/// kernel overwrites every word before the walk reads it. The old per-batch `alloc_zeros` paid a
+/// cudaMalloc + full memset + free EVERY batch (measured 6-10% of the whole solve at batch 16K).
+/// Grows monotonically; ~16-64 MB/device held for the miner's lifetime (same policy as WALK_MODULES).
+static V4_OFFSETS: OnceLock<Mutex<HashMap<usize, Arc<CudaSlice<u32>>>>> = OnceLock::new();
+
+fn v4_offsets_buf(stream: &Arc<CudaStream>, len: usize) -> candle_core::Result<Arc<CudaSlice<u32>>> {
+    let m = V4_OFFSETS.get_or_init(|| Mutex::new(HashMap::new()));
+    let ord = stream.context().ordinal();
+    let mut g = m.lock().unwrap();
+    if let Some(s) = g.get(&ord) {
+        if s.len() >= len {
+            return Ok(s.clone());
+        }
+    }
+    let s = Arc::new(unsafe { stream.alloc::<u32>(len) }.map_err(candle_core::Error::wrap)?);
+    g.insert(ord, s.clone());
+    Ok(s)
+}
+
+/// Per-device secondary stream for the overlapped chase (sub-batch pipelining in `mine_v4`).
+static V4_CHASE_STREAMS: OnceLock<Mutex<HashMap<usize, Arc<CudaStream>>>> = OnceLock::new();
+
+fn v4_chase_stream(stream: &Arc<CudaStream>) -> candle_core::Result<Arc<CudaStream>> {
+    let m = V4_CHASE_STREAMS.get_or_init(|| Mutex::new(HashMap::new()));
+    let ord = stream.context().ordinal();
+    let mut g = m.lock().unwrap();
+    if let Some(s) = g.get(&ord) {
+        return Ok(s.clone());
+    }
+    let s = stream.context().new_stream().map_err(candle_core::Error::wrap)?;
+    g.insert(ord, s.clone());
+    Ok(s)
+}
+
 fn walk_load_err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(format!(
         "PoM walk kernel failed to load ({e}). TWO distinct causes: \
@@ -574,36 +609,68 @@ impl PomGpuMiner {
             // tile snippets, never on the walk state), then walk with a depth-3 cp.async tile
             // pipeline + 8x mma.sync.m16n8k32.s8 per step. Byte-exact vs pom_mine_v4/the host;
             // measured +35% on Blackwell. KERYX_POM_V4_TC=0 forces the classic kernel.
-            let offsets = self
-                .stream
-                .alloc_zeros::<u32>((batch as usize) * (k as usize))
-                .map_err(candle_core::Error::wrap)?;
-            let chase_cfg = LaunchConfig {
-                grid_dim: (((batch + 255) / 256) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let chase = load_walk_func(&self.cuda, "pom_mine_v4_chase")?;
-            let mut b = chase.builder();
-            b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
-                .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
-                .arg(&start).arg(&batch).arg(&offsets);
-            unsafe { b.launch(chase_cfg).map_err(candle_core::Error::wrap)?; }
-
+            //
+            // The offsets buffer is CACHED per device (plain alloc, never zeroed — the chase
+            // overwrites every word): the old per-batch alloc_zeros paid a cudaMalloc + a full
+            // 16 MB memset + free EVERY batch (~180x/s at batch 16384), measured worth 6-10%.
+            let offsets = v4_offsets_buf(&self.stream, (batch as usize) * (k as usize))?;
             const TC_WARPS: u64 = 4; // must match V4_TC_WARPS in pom_mine.cu
-            let walk_cfg = LaunchConfig {
-                grid_dim: (((batch + TC_WARPS - 1) / TC_WARPS) as u32, 1, 1),
-                block_dim: ((TC_WARPS * 32) as u32, 1, 1),
-                shared_mem_bytes: (TC_WARPS as u32) * 4096, // 3 tile buffers + state per warp
-            };
-            let func = load_walk_func(&self.cuda, "pom_mine_v4_tc")?;
-            let mut b = func.builder();
-            b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&k)
-                .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
-                .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
-                .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
-                .arg(&start).arg(&batch).arg(&offsets).arg(&winner);
-            unsafe { b.launch(walk_cfg).map_err(candle_core::Error::wrap)?; }
+            let chase = load_walk_func(&self.cuda, "pom_mine_v4_chase")?;
+            let walk = load_walk_func(&self.cuda, "pom_mine_v4_tc")?;
+
+            // Sub-batch pipelining (KERYX_POM_V4_OVERLAP=0 to disable): chase sub-batch k+1 on a
+            // second stream while sub-batch k walks — the walk stream waits per sub-batch on an
+            // event. The two phases share DRAM/SMs so this only merges (not hides) the chase, but
+            // it is still a measured ~+2% (bench C4, bit-exact 2048/2048). Skipped for small
+            // batches where sub-batches would be tiny.
+            const SUBS: u64 = 4;
+            let overlap = std::env::var("KERYX_POM_V4_OVERLAP").ok().as_deref() != Some("0")
+                && batch >= SUBS * 4096;
+            let n_sub = if overlap { SUBS } else { 1 };
+            let sub = (batch + n_sub - 1) / n_sub;
+            let chase_stream = if overlap { Some(v4_chase_stream(&self.stream)?) } else { None };
+
+            for i in 0..n_sub {
+                let s_start = start + i * sub;
+                let s_batch = sub.min(batch - i * sub);
+                let view = offsets
+                    .try_slice((i * sub) as usize * (k as usize)..((i * sub + s_batch) as usize * k as usize))
+                    .ok_or_else(|| candle_core::Error::Msg("PoM v4: offsets slice out of range".into()))?;
+                let chase_cfg = LaunchConfig {
+                    grid_dim: (((s_batch + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                if let Some(cs) = &chase_stream {
+                    let func = chase.func.clone();
+                    let mut b = cs.launch_builder(&func);
+                    b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
+                        .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+                        .arg(&s_start).arg(&s_batch).arg(&view);
+                    unsafe { b.launch(chase_cfg).map_err(candle_core::Error::wrap)?; }
+                    let ev = cs.record_event(None).map_err(candle_core::Error::wrap)?;
+                    self.stream.wait(&ev).map_err(candle_core::Error::wrap)?;
+                } else {
+                    let mut b = chase.builder();
+                    b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
+                        .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+                        .arg(&s_start).arg(&s_batch).arg(&view);
+                    unsafe { b.launch(chase_cfg).map_err(candle_core::Error::wrap)?; }
+                }
+
+                let walk_cfg = LaunchConfig {
+                    grid_dim: (((s_batch + TC_WARPS - 1) / TC_WARPS) as u32, 1, 1),
+                    block_dim: ((TC_WARPS * 32) as u32, 1, 1),
+                    shared_mem_bytes: (TC_WARPS as u32) * 4096, // 3 tile buffers + state per warp
+                };
+                let mut b = walk.builder();
+                b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&k)
+                    .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
+                    .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+                    .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
+                    .arg(&s_start).arg(&s_batch).arg(&view).arg(&winner);
+                unsafe { b.launch(walk_cfg).map_err(candle_core::Error::wrap)?; }
+            }
         } else {
             let cfg = LaunchConfig {
                 grid_dim: (batch as u32, 1, 1),
