@@ -1,0 +1,5 @@
+# Keep the docker build context tiny — the Dockerfile only COPYs hiveos/dist-modern/ + docker/.
+*
+!hiveos/dist-modern
+!docker
+hiveos/dist-modern/**/*.lock
