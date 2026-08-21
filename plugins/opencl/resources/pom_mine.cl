@@ -282,3 +282,171 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4(
         }
     }
 }
+
+// ============================================================================
+// Two-phase v4 solver (port of cuda/pom_mine.cu pom_mine_v4_chase + the phase-2
+// pipeline of pom_mine_v4_tc; the tensor-core inner loop is CUDA-only — here the
+// matmul stays the same dp4a/scalar dot as pom_mine_v4). +20% expected dp4a-only.
+//
+// KEY INSIGHT: the v4 offset chain depends ONLY on tile snippets (chunk 0 of each
+// tile), NEVER on the walk state. So the whole 256-tile offset sequence can be
+// resolved BEFORE the matmul chain runs. In the single-phase kernel each step
+// serializes load->snippet-fold->(next offset)->load, so the matmul overlaps no
+// memory. Splitting it lets phase 2 prefetch tile t+1 while computing matmul t.
+// ============================================================================
+
+// PHASE 1 — chase: one work-item per nonce follows the snippet chain and records
+// all K tile offsets (u32 each; n_tiles < 2^32 for any real model). Reads only
+// chunk 0 (32 B) of each tile — a latency-bound pointer chase the GPU hides with
+// parallelism (~10% of total time, +3% memory traffic). Byte-exact with the
+// single-phase snippet fold: same 8 u32 words (LE, zero-extended), same order.
+__kernel void pom_mine_v4_chase(
+    __global const uint* restrict b0,
+    __global const uint* restrict b1,
+    __global const uint* restrict b2,
+    __global const uint* restrict b3,
+    const u64 n_tiles,
+    const u64 slab_tiles,
+    const uint K,
+    const u64 s0, const u64 s1, const u64 s2, const u64 s3,   // SEED-fold pph words (v4-salted)
+    const u64 time_,
+    const u64 nonce_base, const u64 n_nonces,
+    __global uint* restrict offsets)                          // [n_nonces][K]
+{
+    const u64 i = (u64)get_global_id(0);
+    if (i >= n_nonces) return;
+    const u64 nonce = nonce_base + i;
+    const u64 seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    __global uint* my = offsets + i * (u64)K;
+    u64 off = pom_mix64(seed ^ V4_OFFSET_FIRST_SALT) % V4_NT(n_tiles);
+    for (uint step = 1; step <= K; step++) {
+        my[step - 1] = (uint)off;
+        // chunk 0 of tile `off` = 8 u32 (the snippet).
+        u64 tin;
+        const __global uint* sb = v4_slab(b0, b1, b2, b3, off, slab_tiles, &tin);
+        const __global uint* c0 = sb + tin * (u64)V4_TILE_U32;   // tin*256 = chunk 0 of this tile
+        u64 sf = 0;
+        V4_UNROLL for (int w = 0; w < 8; w++) sf = pom_mix64(sf ^ (u64)c0[w]);
+        off = pom_mix64(seed ^ (u64)(step + 1) * V4_OFFSET_STEP_SALT ^ sf) % V4_NT(n_tiles);
+    }
+}
+
+// PHASE 2 — pipelined walk: identical math to pom_mine_v4, but the offsets come
+// from phase 1 (no snippet fold in the hot loop) and each step DOUBLE-BUFFERS the
+// tile: prefetch tile[step] into registers while the matmul for tile[step-1] runs,
+// then stage the registers into the other LDS buffer. The matmul never waits on
+// DRAM. Same V4_NPG(8)-sub-nonce × 32-lane layout and 16 KB LDS as pom_mine_v4
+// (strip = 2×256 u32 tile double-buffer; merkle reuses it).
+__kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_tp(
+    __global const uint* restrict b0,
+    __global const uint* restrict b1,
+    __global const uint* restrict b2,
+    __global const uint* restrict b3,
+    const u64 n_tiles,
+    const u64 slab_tiles,
+    const uint K,
+    const u64 p0, const u64 p1, const u64 p2, const u64 p3,   // POW-fold pph words (H3-salted)
+    const u64 s0, const u64 s1, const u64 s2, const u64 s3,   // SEED-fold pph words (v4-salted)
+    const u64 time_,
+    const u64 t0, const u64 t1, const u64 t2, const u64 t3,
+    const u64 nonce_base, const u64 n_nonces,
+    __global const uint* restrict offsets,                    // [n_nonces][K] from phase 1
+    volatile __global u64* winner,
+    __local uint* scratch)                                    // V4_NPG * V4_STRIP_U32 u32 = 16 KB
+{
+    const uint lid  = get_local_id(0);
+    const uint sub  = lid >> 5;
+    const uint lane = lid & 31u;
+    const u64  gsub = (u64)get_group_id(0) * V4_NPG + sub;
+    const bool live  = gsub < n_nonces;
+    const u64  idx   = live ? gsub : 0UL;      // dummy sub-nonces read nonce 0's offsets (in-bounds)
+    const u64  nonce = nonce_base + idx;
+    const u64  seed  = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    __local uint* strip = scratch + sub * V4_STRIP_U32;
+    __local uint* buf0 = strip;                // tile double-buffer A
+    __local uint* buf1 = strip + V4_TILE_U32;  // tile double-buffer B
+    __global const uint* my = offsets + idx * (u64)K;
+
+    // S_0 row `lane`.
+    uint row4[V4_D4];
+    {
+        u64 h = pom_mix64(seed ^ (V4_S0_ROW_SALT + (u64)lane));
+        V4_UNROLL for (int k4 = 0; k4 < V4_D4; k4++) { h = pom_mix64(h); row4[k4] = (uint)h; }
+    }
+
+    // Prologue: load tile my[0] into buf0.
+    {
+        u64 tin;
+        const __global uint* sb = v4_slab(b0, b1, b2, b3, (u64)my[0], slab_tiles, &tin);
+        const __global uint* src = sb + (tin * (u64)V4_TILE_CHUNKS + lane) * 8UL;
+        __local uint* dst = buf0 + lane * 8;
+        V4_UNROLL for (int w = 0; w < 8; w++) dst[w] = src[w];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (uint step = 1; step <= K; step++) {
+        __local uint* cur = ((step - 1u) & 1u) ? buf1 : buf0;   // step1->buf0, step2->buf1, ...
+        __local uint* nxt = ((step - 1u) & 1u) ? buf0 : buf1;
+
+        // Prefetch NEXT tile (my[step], 0-indexed) into registers — issued BEFORE the matmul so
+        // its DRAM latency overlaps the compute. `has_next` is uniform across the workgroup.
+        const bool has_next = (step < K);
+        uint pref[8];
+        if (has_next) {
+            u64 tin;
+            const __global uint* sb = v4_slab(b0, b1, b2, b3, (u64)my[step], slab_tiles, &tin);
+            const __global uint* src = sb + (tin * (u64)V4_TILE_CHUNKS + lane) * 8UL;
+            V4_UNROLL for (int w = 0; w < 8; w++) pref[w] = src[w];
+        }
+
+        // Matmul on `cur` — identical to pom_mine_v4.
+        const uint step_tweak = step * 0x9E3779B9u + lane * 0xC2B2AE35u;
+        uint new4[V4_D4];
+        V4_UNROLL for (int j4 = 0; j4 < V4_D4; j4++) {
+            uint packed = 0;
+            V4_UNROLL for (int jj = 0; jj < 4; jj++) {
+                const int j = j4 * 4 + jj;
+                __local const uint* col = cur + j * V4_D4;
+                int acc = 0;
+                V4_UNROLL for (int k = 0; k < V4_D4; k++) acc = v4_dp4(row4[k], col[k], acc);
+                packed |= v4_rho8(acc, step_tweak + (uint)j * 0x85EBCA6Bu) << (8 * jj);
+            }
+            new4[j4] = packed;
+        }
+        V4_UNROLL for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = new4[k4];
+
+        // Stage the prefetched next tile into the other buffer, then one barrier: it guarantees
+        // (a) `nxt` fully written before step+1 reads it and (b) all lanes done reading `cur`
+        // before step+2 overwrites it (double-buffer).
+        if (has_next) {
+            __local uint* dst = nxt + lane * 8;
+            V4_UNROLL for (int w = 0; w < 8; w++) dst[w] = pref[w];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // root_K: identical tail to pom_mine_v4 (merkle reuses the strip).
+    b3_hash_row32(row4, strip + lane * 8);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __local uint* src = strip;
+    __local uint* dst = strip + V4_D * 8;
+    for (uint n = V4_D; n > 1; n >>= 1) {
+        if (lane < n / 2) b3_hash_pair(src + lane * 16, dst + lane * 8);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        __local uint* tmp = src; src = dst; dst = tmp;
+    }
+
+    if (lane == 0 && live) {
+        const u64 fin = (u64)src[0] | ((u64)src[1] << 32);
+        u64 pv[4];
+        pom_pow_fold(fin, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) {
+            u64 old = *winner;
+            while (nonce < old) {
+                u64 prev = atom_cmpxchg(winner, old, nonce);
+                if (prev == old) break;
+                old = prev;
+            }
+        }
+    }
+}
