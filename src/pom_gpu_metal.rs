@@ -29,7 +29,7 @@
 //! ordering are unchanged; only the data path is de-candled.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use log::info;
@@ -45,7 +45,9 @@ use objc2_metal::{
 
 const METAL_SRC: &str = include_str!("../metal/pom_mine.metal");
 const CHUNK_BYTES: usize = 32;
-const THREADGROUP_SIZE: usize = 256;
+/// PoM v4: one threadgroup per nonce, 32 threads (thread x owns state row x). Matches the
+/// `pom_mine_v4` kernel's `threads_per_threadgroup`.
+const POM_V4_THREADS: usize = 32;
 
 /// Shared-storage: CPU and GPU see the same unified-memory backing, so the host writes uniforms /
 /// reads the winner with no blit — the same choice candle makes for its own transient buffers.
@@ -60,16 +62,20 @@ fn words4(b: &[u8; 32]) -> [u64; 4] {
     w
 }
 
-// Matches PomUniforms in metal/pom_mine.metal — field order and padding are load-bearing.
+// Matches PomV4Uniforms in metal/pom_mine.metal — field order and padding are load-bearing.
 #[repr(C)]
 struct Uniforms {
-    n_total_chunks: u64,
-    k_steps: u32,
+    n_tiles: u64,   // n_total_chunks / POM_V4_TILE_CHUNKS(32)
+    k_steps: u32,   // POM_V4_K = 256
     n_tensors: u32,
-    p0: u64, // POW-fold words (H3-salted)
+    p0: u64, // POW-fold words (H3-salted pph)
     p1: u64,
     p2: u64,
     p3: u64,
+    s0: u64, // SEED-fold words (v4-salted pph)
+    s1: u64,
+    s2: u64,
+    s3: u64,
     time_: u64,
     t0: u64,
     t1: u64,
@@ -77,11 +83,7 @@ struct Uniforms {
     t3: u64,
     nonce_base: u64,
     n_nonces: u32,
-    walk_v2: u32,   // H5 non-foldable transition era gate (0/1)
-    s0: u64, // SEED-fold words (H5.1/H5.2-salted; == p pre-H5.1)
-    s1: u64,
-    s2: u64,
-    s3: u64,
+    _pad: u32,
 }
 
 pub struct PomGpuMiner {
@@ -128,7 +130,7 @@ impl PomGpuMiner {
             .new_library_with_source(METAL_SRC, None)
             .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: compile: {e}")))?;
         let func = library
-            .get_function("pom_mine", None)
+            .get_function("pom_mine_v4", None)
             .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: get_function: {e}")))?;
         let pipeline = mdev
             .new_compute_pipeline_state_with_function(&func)
@@ -136,7 +138,7 @@ impl PomGpuMiner {
         #[cfg(test)]
         let debug_pipeline = {
             let f = library
-                .get_function("pom_walk_states", None)
+                .get_function("pom_walk_states_v4", None)
                 .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: get_function debug: {e}")))?;
             mdev.new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: debug pipeline: {e}")))?
@@ -268,22 +270,19 @@ impl PomGpuMiner {
         self.n_total_chunks
     }
 
-    /// Search nonces in `[start, start + batch)`. Returns the lowest nonce whose `pom_pow_value`
-    /// is `<= target_le`, or None. `batch` must fit in `u32` (POM_BATCH is < 2^32) so the winner
-    /// atomic stays a 32-bit tid — byte-identical to CUDA's `atomicMin(winner, nonce)`.
-    /// `h3` salts the pph words host-side (`POM_H3_PPH_SALT`) — the Metal kernel is era-agnostic,
-    /// it folds whatever words it receives, so there is no shader change at the H3 gate.
-    pub fn mine(
+    /// PoM v4 grind. Search nonces in `[start, start + batch)`; return the lowest nonce whose
+    /// `pom_pow_value(fold64(v4_state_root(S_K)))` is `<= target_le`, or None. `batch` must fit in
+    /// `u32` so the winner atomic stays a 32-bit tid. ONE THREADGROUP per nonce (32 threads, thread
+    /// x owns state row x) — see `pom_mine_v4` in metal/pom_mine.metal. Word derivation matches
+    /// `pom_gpu::mine_v4`: POW words = H3-salted pph (`pph_words_for_era(_, true)`), SEED words =
+    /// v4-salted pph (`pph_words_v4`).
+    pub fn mine_v4(
         &self,
         pre_pow_hash: &[u8; 32],
         timestamp: u64,
         target_le: &[u8; 32],
         start: u64,
         batch: u64,
-        h3: bool,
-        walk_v2: bool,
-        h5_1: bool,
-        h5_2: bool,
     ) -> candle_core::Result<Option<u64>> {
         if batch > u32::MAX as u64 {
             return Err(candle_core::Error::Msg("PoM Metal: batch exceeds u32".into()));
@@ -291,33 +290,14 @@ impl PomGpuMiner {
         if batch == 0 {
             return Ok(None);
         }
-        // POW fold keeps the H3-salted words; the SEED fold uses the era-salted words (H5.1/H5.2).
-        // Pre-H5.1 (h5_1=h5_2=false) seed_pph_words_for_era == pph_words_for_era, so s == p and the
-        // walk is byte-identical to the pre-H5 build. See pom.rs::seed_pph_words_for_era.
-        let p = crate::pom::pph_words_for_era(pre_pow_hash, h3);
-        let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
+        let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        if n_tiles == 0 {
+            return Err(candle_core::Error::Msg("PoM Metal: blob too small for the v4 walk".into()));
+        }
+        let p = crate::pom::pph_words_for_era(pre_pow_hash, true);
+        let s = crate::pom::pph_words_v4(pre_pow_hash);
         let t = words4(target_le);
-        let uniforms = Uniforms {
-            n_total_chunks: self.n_total_chunks,
-            k_steps: crate::pom::POM_WALK_STEPS,
-            n_tensors: self.n_tensors,
-            p0: p[0],
-            p1: p[1],
-            p2: p[2],
-            p3: p[3],
-            time_: timestamp,
-            t0: t[0],
-            t1: t[1],
-            t2: t[2],
-            t3: t[3],
-            nonce_base: start,
-            n_nonces: batch as u32,
-            walk_v2: walk_v2 as u32,
-            s0: s[0],
-            s1: s[1],
-            s2: s[2],
-            s3: s[3],
-        };
+        let uniforms = self.v4_uniforms(n_tiles, &p, &s, timestamp, [t[0], t[1], t[2], t[3]], start, batch as u32);
 
         let uniforms_buf = self
             .device
@@ -338,62 +318,55 @@ impl PomGpuMiner {
         enc.set_buffer(1, Some(&self.addrs_buf), 0);
         enc.set_buffer(2, Some(&uniforms_buf), 0);
         enc.set_buffer(3, Some(&winner_buf), 0);
-        // Bindless: the resident per-tensor buffers are dereffed via raw gpuAddress in the kernel,
-        // so nothing binds them to a slot — we must still tell the driver they'll be read.
         for buf in &self.resources {
             enc.use_resource(buf, MTLResourceUsage::Read);
         }
-        let grid = MTLSize { width: batch as usize, height: 1, depth: 1 };
-        let tg = MTLSize { width: THREADGROUP_SIZE, height: 1, depth: 1 };
+        // One threadgroup (POM_V4_THREADS=32) per nonce: total threads = batch*32, tg = 32, so
+        // threadgroup_position_in_grid = nonce index, thread_position_in_threadgroup = state row.
+        let grid = MTLSize { width: (batch as usize) * POM_V4_THREADS, height: 1, depth: 1 };
+        let tg = MTLSize { width: POM_V4_THREADS, height: 1, depth: 1 };
         enc.dispatch_threads(grid, tg);
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
 
-        // Safe: shared-storage buffer is CPU-visible and the dispatch has completed.
         let w = unsafe { *(winner_buf.contents() as *const u32) };
         Ok(if w == u32::MAX { None } else { Some(start + w as u64) })
     }
 
-    /// Test-only: runs the walk on the GPU for `batch` consecutive nonces starting at `start` and
-    /// returns each nonce's `final_state`. Uses the SAME uniform + tensor plumbing as `mine()`,
-    /// so any divergence from the CPU walk over the same weights is a kernel/indexing bug.
+    /// Build the v4 uniform block. Shared by mine_v4 and the debug walk (which passes target=0).
+    fn v4_uniforms(&self, n_tiles: u64, p: &[u64; 4], s: &[u64; 4], timestamp: u64, t: [u64; 4], start: u64, n: u32) -> Uniforms {
+        Uniforms {
+            n_tiles,
+            k_steps: crate::pom_v4::POM_V4_K as u32,
+            n_tensors: self.n_tensors,
+            p0: p[0], p1: p[1], p2: p[2], p3: p[3],
+            s0: s[0], s1: s[1], s2: s[2], s3: s[3],
+            time_: timestamp,
+            t0: t[0], t1: t[1], t2: t[2], t3: t[3],
+            nonce_base: start,
+            n_nonces: n,
+            _pad: 0,
+        }
+    }
+
+    /// Test-only: runs the v4 walk on the GPU for `batch` consecutive nonces and returns each
+    /// nonce's `fold64(v4_state_root(S_K))`. Same uniform + tensor plumbing as `mine_v4()`, so any
+    /// divergence from `pom_v4::build_proof_v4`'s final_state is a kernel/indexing bug.
     #[cfg(test)]
-    pub fn debug_walk_states(
+    pub fn debug_walk_states_v4(
         &self,
         pre_pow_hash: &[u8; 32],
         timestamp: u64,
         start: u64,
         batch: u64,
-        h3: bool,
-        walk_v2: bool,
-        h5_1: bool,
-        h5_2: bool,
     ) -> candle_core::Result<Vec<u64>> {
         assert!(batch > 0 && batch <= u32::MAX as u64);
-        let p = crate::pom::pph_words_for_era(pre_pow_hash, h3);
-        let s = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
-        let uniforms = Uniforms {
-            n_total_chunks: self.n_total_chunks,
-            k_steps: crate::pom::POM_WALK_STEPS,
-            n_tensors: self.n_tensors,
-            p0: p[0],
-            p1: p[1],
-            p2: p[2],
-            p3: p[3],
-            time_: timestamp,
-            t0: 0,
-            t1: 0,
-            t2: 0,
-            t3: 0,
-            nonce_base: start,
-            n_nonces: batch as u32,
-            walk_v2: walk_v2 as u32,
-            s0: s[0],
-            s1: s[1],
-            s2: s[2],
-            s3: s[3],
-        };
+        let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        assert!(n_tiles > 0, "blob too small for the v4 walk");
+        let p = crate::pom::pph_words_for_era(pre_pow_hash, true);
+        let s = crate::pom::pph_words_v4(pre_pow_hash);
+        let uniforms = self.v4_uniforms(n_tiles, &p, &s, timestamp, [0, 0, 0, 0], start, batch as u32);
         let uniforms_buf = self
             .device
             .new_buffer_with_data(&uniforms as *const _ as *const _, std::mem::size_of::<Uniforms>(), SHARED_STORAGE)
@@ -416,8 +389,8 @@ impl PomGpuMiner {
         for buf in &self.resources {
             enc.use_resource(buf, MTLResourceUsage::Read);
         }
-        let grid = MTLSize { width: batch as usize, height: 1, depth: 1 };
-        let tg = MTLSize { width: THREADGROUP_SIZE, height: 1, depth: 1 };
+        let grid = MTLSize { width: (batch as usize) * POM_V4_THREADS, height: 1, depth: 1 };
+        let tg = MTLSize { width: POM_V4_THREADS, height: 1, depth: 1 };
         enc.dispatch_threads(grid, tg);
         enc.end_encoding();
         cmd.commit();
@@ -481,24 +454,34 @@ pub fn is_loading() -> bool {
     LOADING.load(Ordering::Relaxed) > 0
 }
 
-/// Convenience: search a nonce batch via the installed miner for a specific device.
-pub fn mine(
+/// Backend-parity with `pom_gpu::set_inference_paused` (CUDA): slm.rs pauses the walk before it
+/// uninstalls a device's miner to reload the inference model, so uninstall() doesn't race a live
+/// batch. On Metal the walk is a single synchronous `wait_until_completed()` dispatch (no async
+/// batch in flight to protect), so this is a plain flag kept for API symmetry.
+static INFERENCE_PAUSED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_inference_paused(paused: bool) {
+    INFERENCE_PAUSED.store(paused, Ordering::Release);
+}
+
+pub fn is_inference_paused() -> bool {
+    INFERENCE_PAUSED.load(Ordering::Acquire)
+}
+
+/// Convenience: search a nonce batch via the installed miner for a specific device (PoM v4).
+pub fn mine_v4(
     device_id: u32,
     pre_pow_hash: &[u8; 32],
     timestamp: u64,
     target_le: &[u8; 32],
     start: u64,
     batch: u64,
-    h3: bool,
-    walk_v2: bool,
-    h5_1: bool,
-    h5_2: bool,
 ) -> Option<u64> {
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
-    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2).ok().flatten()
+    miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
 }
 
 /// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup — the PROCESS-WIDE
@@ -658,7 +641,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pom;
+    use crate::{pom, pom_v4};
 
     /// Build a miner from multiple synthetic tensor buffers — exercises the same multi-buffer
     /// bindless plumbing the real GGUF path uses (`upper_bound_prefix` non-trivial, `use_resource`
@@ -700,177 +683,34 @@ mod tests {
         PomGpuMiner::build(mdev, &prefix, &addrs, vec![buf], n_chunks).expect("build test miner")
     }
 
-    /// Byte-exact CPU oracle: reproduce the walk over the same blob using pom.rs primitives.
-    /// Pre-H3 era (h3=false). `walk_v2` selects the H5 non-foldable transition (false = pre-H5 fold).
-    fn cpu_pow_value(bytes: &[u8], n_chunks: u64, pph: &[u8; 32], ts: u64, nonce: u64, walk_v2: bool) -> [u8; 32] {
-        let seed = pom::pom_block_seed(pph, ts, nonce, false, false, false);
-        let read = |off: u64| -> [u64; pom::CHUNK_WORDS] {
-            let o = (off as usize) * CHUNK_BYTES;
-            let mut c = [0u8; 32];
-            c.copy_from_slice(&bytes[o..o + 32]);
-            pom::chunk_to_words(&c)
-        };
-        let final_state = pom::walk_final(seed, n_chunks, pom::POM_WALK_STEPS, read, walk_v2);
-        pom::pom_pow_value(final_state, pph, false)
+    /// Byte-exact CPU oracle for the v4 walk over a raw synthetic blob (no WeightIndex needed).
+    /// Reproduces pom_v4::build_proof_v4's derivation using the crate's pub v4 primitives:
+    /// v4_initial_state → 256×(read tile, transition, next_offset) → fold64(v4_state_root).
+    fn v4_final_state(bytes: &[u8], n_chunks: u64, seed: u64) -> u64 {
+        use crate::pom_v4::*;
+        let n_tiles = n_chunks / POM_V4_TILE_CHUNKS;
+        let mut state = v4_initial_state(seed);
+        let mut off = v4_first_offset(seed, n_tiles);
+        for step in 1..=POM_V4_K as u64 {
+            let mut tile = vec![0u8; POM_V4_TILE_BYTES];
+            for c in 0..POM_V4_TILE_CHUNKS {
+                let ci = (off * POM_V4_TILE_CHUNKS + c) as usize;
+                tile[c as usize * 32..c as usize * 32 + 32].copy_from_slice(&bytes[ci * 32..ci * 32 + 32]);
+            }
+            let snippet: [u8; 32] = tile[..POM_V4_SNIPPET_BYTES].try_into().unwrap();
+            state = v4_transition(&state, &tile, step as u32);
+            if step < POM_V4_K as u64 {
+                off = v4_next_offset(seed, step, &snippet, n_tiles);
+            }
+        }
+        fold64(&v4_state_root(&state))
     }
 
-    /// On-device diagnostic (real Gemma-3-4B GGUF): loads the production `PomGpuMiner::load`,
-    /// which now packs raw GGUF quantized bytes into ONE Metal buffer, and asserts:
-    ///
-    /// 1. The packed buffer's chunks match the host `WeightIndex::read_chunk` byte-for-byte at a
-    ///    broad set of sampled offsets (start, end, mid, and a stratified sweep).
-    /// 2. `debug_walk_states` (real Metal kernel) → same `final_state` as the host walk over the
-    ///    same `WeightIndex`, for 5 spot nonces + a 4096-nonce single-dispatch sweep.
-    /// 3. The `mine()` winner path returns the correct lowest nonce for a target derived from a
-    ///    real nonce's `pom_pow_value`.
-    /// 4. All of the above also under `h3=true` (post-fork era) — proves the pph-salt plumbing
-    ///    stays byte-exact after the switch to the packed single buffer.
-    ///
-    /// Gated by `KERYX_TEST_GGUF` + `#[ignore]` so `cargo test` on a plain checkout still passes;
-    /// run with `KERYX_TEST_GGUF=/path/to/model.gguf cargo test --release --features pom-metal \
-    /// metal_load_bytes_match_host_index_real_model -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn metal_load_bytes_match_host_index_real_model() {
-        let gguf = match std::env::var("KERYX_TEST_GGUF") {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("skip: set KERYX_TEST_GGUF to the model.gguf path");
-                return;
-            }
-        };
-
-        // Build the host WeightIndex (reuses pom-tree.bin next to the GGUF if present).
-        eprintln!("building host WeightIndex from {gguf} (may reuse pom-tree.bin)…");
-        let idx = pom::WeightIndex::build_from_gguf(&gguf, [0u8; 32]).expect("host index");
-        eprintln!("host index: N = {} chunks", idx.n_chunks);
-
-        // Production loader — packs raw GGUF bytes into ONE MTLBuffer, no candle Metal touch.
-        let miner = PomGpuMiner::load(&gguf, 0).expect("PomGpuMiner::load");
-        eprintln!(
-            "miner: N = {} chunks (packed single buffer, {} MiB)",
-            miner.n_chunks(),
-            (miner.n_chunks() as usize * CHUNK_BYTES) / (1024 * 1024)
-        );
-        assert_eq!(miner.n_chunks(), idx.n_chunks, "N mismatch between packed buffer and host index");
-
-        // ── (1) Packed buffer vs host WeightIndex: sample chunks across the whole 2.4 GB range.
-        eprintln!("\n── packed buffer vs host WeightIndex (byte-exact per-chunk) ──");
-        let n = miner.n_chunks();
-        // Sample offsets: 0, 1, N-1, N/2, plus a stratified sweep across the buffer at 1/16 steps.
-        let mut sample_offs: Vec<u64> = vec![0, 1, n - 1, n / 2];
-        for i in 1..16 {
-            sample_offs.push((n * i) / 16);
-        }
-        sample_offs.sort_unstable();
-        sample_offs.dedup();
-        let base_ptr = miner.resources[0].contents() as *const u8;
-        assert!(!base_ptr.is_null(), "packed buffer contents() is null");
-        let mut mismatches = 0usize;
-        for &off in &sample_offs {
-            let mut buf = [0u8; 32];
-            // SAFETY: `off < N`, `off * 32 + 32 <= N * 32 = buffer length`.
-            unsafe { std::ptr::copy_nonoverlapping(base_ptr.add((off as usize) * 32), buf.as_mut_ptr(), 32) };
-            let host_words = idx.read_chunk(off);
-            let host = pom::words_to_bytes(&host_words);
-            let ok = buf == host;
-            eprintln!(
-                "  off={off:>10}  packed={}  host={}  {}",
-                hex32(&buf),
-                hex32(&host),
-                if ok { "OK" } else { "MISMATCH" }
-            );
-            if !ok {
-                mismatches += 1;
-            }
-        }
-        assert_eq!(mismatches, 0, "packed buffer differs from host WeightIndex");
-
-        // ── (2) Metal-kernel `debug_walk_states` vs host walk_final for 5 spot nonces.
-        eprintln!("\n── Metal-kernel walk_final vs host walk_final (5 nonces) ──");
-        let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(31).wrapping_add(7));
-        let ts: u64 = 0x1122_3344_5566_7788;
-        let test_nonces: &[u64] = &[0, 1, 42, 100_000, 12345678];
-        for &nonce in test_nonces {
-            let seed = pom::pom_block_seed(&pph, ts, nonce, false, false, false);
-            let host_state = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
-            let gpu_states = miner.debug_walk_states(&pph, ts, nonce, 8, false, false, false, false).expect("debug_walk_states");
-            let gpu_state = gpu_states[0];
-            eprintln!(
-                "  nonce={nonce:<10}  host=0x{host_state:016x}  metal=0x{gpu_state:016x}  {}",
-                if host_state == gpu_state { "OK" } else { "MISMATCH" }
-            );
-            assert_eq!(host_state, gpu_state, "walk diverges for nonce {nonce}");
-        }
-
-        // ── (3) Large-batch sweep: 4096 consecutive nonces in one dispatch, all must agree.
-        eprintln!("\n── large-batch (4096 nonces) Metal-kernel walk vs host walk ──");
-        let sweep_batch: u64 = 4096;
-        let sweep_start: u64 = 100_000;
-        let sweep_gpu = miner.debug_walk_states(&pph, ts, sweep_start, sweep_batch, false, false, false, false).expect("sweep");
-        let mut disagreements = 0usize;
-        for i in 0..sweep_batch {
-            let nonce = sweep_start + i;
-            let seed = pom::pom_block_seed(&pph, ts, nonce, false, false, false);
-            let host = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
-            if host != sweep_gpu[i as usize] {
-                if disagreements < 5 {
-                    eprintln!("  DIVERGE nonce={nonce} host=0x{host:016x} gpu=0x{:016x}", sweep_gpu[i as usize]);
-                }
-                disagreements += 1;
-            }
-        }
-        eprintln!("large batch: {disagreements}/{sweep_batch} disagreements");
-        assert_eq!(disagreements, 0, "large-batch Metal kernel walk diverges");
-
-        // ── (4) mine() winner path: target derived from a real nonce's pow_value → the LOWEST
-        //       satisfying nonce in the batch must be the winner returned.
-        eprintln!("\n── mine() winner path ──");
-        let winner_start: u64 = 500_000;
-        let winner_batch: u64 = 8192;
-        let n_star = winner_start + winner_batch / 3;
-        let seed_star = pom::pom_block_seed(&pph, ts, n_star, false, false, false);
-        let final_star = pom::walk_final(seed_star, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
-        let target = pom::pom_pow_value(final_star, &pph, false);
-        let expected = (winner_start..winner_start + winner_batch).find(|&nn| {
-            let s = pom::pom_block_seed(&pph, ts, nn, false, false, false);
-            let fs = pom::walk_final(s, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
-            pom::le_leq(&pom::pom_pow_value(fs, &pph, false), &target)
-        });
-        let got = miner.mine(&pph, ts, &target, winner_start, winner_batch, false, false, false, false).expect("mine");
-        eprintln!("  mine() returned {got:?} — expected {expected:?}");
-        assert_eq!(got, expected, "mine() winner disagrees with host reference");
-
-        // ── (5) H3 era: pph-salt plumbing byte-exact under h3=true. 1024-nonce sweep + winner.
-        eprintln!("\n── H3 era (h3=true) walk parity ──");
-        let h3_sweep: u64 = 1024;
-        let h3_gpu = miner.debug_walk_states(&pph, ts, sweep_start, h3_sweep, true, false, false, false).expect("h3 sweep");
-        let mut h3_disagreements = 0usize;
-        for i in 0..h3_sweep {
-            let nonce = sweep_start + i;
-            let seed = pom::pom_block_seed(&pph, ts, nonce, true, false, false);
-            let host = pom::walk_final(seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
-            if host != h3_gpu[i as usize] {
-                if h3_disagreements < 5 {
-                    eprintln!("  H3 DIVERGE nonce={nonce} host=0x{host:016x} gpu=0x{:016x}", h3_gpu[i as usize]);
-                }
-                h3_disagreements += 1;
-            }
-        }
-        eprintln!("H3 batch: {h3_disagreements}/{h3_sweep} disagreements");
-        assert_eq!(h3_disagreements, 0, "H3 kernel walk diverges");
-
-        let h3_seed = pom::pom_block_seed(&pph, ts, n_star, true, false, false);
-        let h3_final = pom::walk_final(h3_seed, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
-        let h3_target = pom::pom_pow_value(h3_final, &pph, true);
-        let h3_expected = (winner_start..winner_start + winner_batch).find(|&nn| {
-            let s = pom::pom_block_seed(&pph, ts, nn, true, false, false);
-            let fs = pom::walk_final(s, n, pom::POM_WALK_STEPS, |o| idx.read_chunk(o), false);
-            pom::le_leq(&pom::pom_pow_value(fs, &pph, true), &h3_target)
-        });
-        let h3_got = miner.mine(&pph, ts, &h3_target, winner_start, winner_batch, true, false, false, false).expect("mine h3");
-        eprintln!("  H3 mine() returned {h3_got:?} — expected {h3_expected:?}");
-        assert_eq!(h3_got, h3_expected, "H3 mine() winner disagrees");
+    /// v4 pow value over a synthetic blob for a given nonce (POW words = H3-salted pph, matching
+    /// mine_v4 / pom_gpu::mine_v4).
+    fn v4_pow_value(bytes: &[u8], n_chunks: u64, pph: &[u8; 32], ts: u64, nonce: u64) -> [u8; 32] {
+        let seed = pom::pom_block_seed_v4(pph, ts, nonce);
+        pom::pom_pow_value(v4_final_state(bytes, n_chunks, seed), pph, true)
     }
 
     fn hex32(b: &[u8; 32]) -> String {
@@ -881,16 +721,92 @@ mod tests {
         s
     }
 
-    /// Multi-tensor byte-exact test: splits a deterministic pseudo-random blob into 12 unevenly
-    /// sized tensors, uploads each into its own MTLBuffer (so `use_resource` handles 12 buffers,
-    /// `upper_bound_prefix` performs a real search, and `local` boundary math is exercised), and
-    /// checks the Metal `mine()` winner matches the CPU oracle over the concatenated bytes. This
-    /// guards against the class of bugs the on-device diagnostic
-    /// (`metal_load_bytes_match_host_index_real_model`) verified are absent in the real 444-tensor
-    /// path, and runs on any Apple Silicon CI without the 2.4 GB GGUF.
+    /// On-device diagnostic (real Gemma/Mistral GGUF): production `PomGpuMiner::load` packs the raw
+    /// GGUF bytes into ONE Metal buffer, then we assert:
+    ///   1. packed buffer chunks == host `WeightIndex::read_chunk` at sampled offsets;
+    ///   2. `debug_walk_states_v4` (real Metal v4 kernel) == host `pom_v4::build_proof_v4` final_state
+    ///      for spot nonces + a batch sweep;
+    ///   3. `mine_v4` winner path returns the correct lowest nonce for a target from a real nonce.
+    /// Gated by `KERYX_TEST_GGUF` + `#[ignore]`.
+    #[test]
+    #[ignore]
+    fn metal_load_bytes_match_host_index_real_model() {
+        let gguf = match std::env::var("KERYX_TEST_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("skip: set KERYX_TEST_GGUF to the model.gguf path");
+                return;
+            }
+        };
+        eprintln!("building host WeightIndex from {gguf} …");
+        let idx = pom::WeightIndex::build_from_gguf(&gguf, [0u8; 32]).expect("host index");
+        let miner = PomGpuMiner::load(&gguf, 0).expect("PomGpuMiner::load");
+        assert_eq!(miner.n_chunks(), idx.n_chunks, "N mismatch");
+        let n = miner.n_chunks();
+
+        // (1) packed buffer vs host WeightIndex at sampled offsets.
+        eprintln!("── packed buffer vs host WeightIndex ──");
+        let mut sample_offs: Vec<u64> = vec![0, 1, n - 1, n / 2];
+        for i in 1..16 { sample_offs.push((n * i) / 16); }
+        sample_offs.sort_unstable();
+        sample_offs.dedup();
+        let base_ptr = miner.resources[0].contents() as *const u8;
+        let mut mismatches = 0usize;
+        for &off in &sample_offs {
+            let mut buf = [0u8; 32];
+            unsafe { std::ptr::copy_nonoverlapping(base_ptr.add(off as usize * 32), buf.as_mut_ptr(), 32) };
+            let host = pom::words_to_bytes(&idx.read_chunk(off));
+            let ok = buf == host;
+            eprintln!("  off={off:>10}  {}  {}", hex32(&buf), if ok { "OK" } else { "MISMATCH" });
+            if !ok { mismatches += 1; }
+        }
+        assert_eq!(mismatches, 0, "packed buffer differs from host WeightIndex");
+
+        // (2) Metal v4 kernel final_state == host build_proof_v4 final_state.
+        eprintln!("── Metal v4 walk vs host build_proof_v4 (5 nonces) ──");
+        let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(31).wrapping_add(7));
+        let ts: u64 = 0x1122_3344_5566_7788;
+        for &nonce in &[0u64, 1, 42, 100_000, 12345678] {
+            let seed = pom::pom_block_seed_v4(&pph, ts, nonce);
+            let (_, host_fs) = pom_v4::build_proof_v4(1, seed, &idx).expect("host build_proof_v4");
+            let gpu = miner.debug_walk_states_v4(&pph, ts, nonce, 1).expect("debug_walk_states_v4")[0];
+            eprintln!("  nonce={nonce:<10} host=0x{host_fs:016x} metal=0x{gpu:016x} {}",
+                      if host_fs == gpu { "OK" } else { "MISMATCH" });
+            assert_eq!(host_fs, gpu, "v4 walk diverges for nonce {nonce}");
+        }
+
+        // (2b) batch sweep.
+        let (sweep_start, sweep_batch) = (500_000u64, 512u64);
+        let gpu = miner.debug_walk_states_v4(&pph, ts, sweep_start, sweep_batch).expect("sweep");
+        let mut diverge = 0usize;
+        for i in 0..sweep_batch {
+            let seed = pom::pom_block_seed_v4(&pph, ts, sweep_start + i);
+            let (_, host_fs) = pom_v4::build_proof_v4(1, seed, &idx).expect("host");
+            if host_fs != gpu[i as usize] { diverge += 1; }
+        }
+        assert_eq!(diverge, 0, "v4 batch sweep diverges ({diverge}/{sweep_batch})");
+
+        // (3) mine_v4 winner path.
+        let n_star = sweep_start + sweep_batch / 3;
+        let seed_star = pom::pom_block_seed_v4(&pph, ts, n_star);
+        let (_, fs_star) = pom_v4::build_proof_v4(1, seed_star, &idx).expect("host");
+        let target = pom::pom_pow_value(fs_star, &pph, true);
+        let expected = (sweep_start..sweep_start + sweep_batch).find(|&nn| {
+            let seed = pom::pom_block_seed_v4(&pph, ts, nn);
+            let (_, fs) = pom_v4::build_proof_v4(1, seed, &idx).expect("host");
+            pom::le_leq(&pom::pom_pow_value(fs, &pph, true), &target)
+        });
+        let got = miner.mine_v4(&pph, ts, &target, sweep_start, sweep_batch).expect("mine_v4");
+        eprintln!("  mine_v4 → {got:?}, expected {expected:?}");
+        assert_eq!(got, expected, "mine_v4 winner disagrees with host reference");
+    }
+
+    /// Multi-tensor v4 byte-exact guard: 12 unevenly sized tensors in their own MTLBuffers, so the
+    /// per-lane `v4_load_tile` prefix search + tile reads that span tensor boundaries are exercised.
+    /// Checks both the raw walk final_state (debug_walk_states_v4) and the mine_v4 winner vs the CPU
+    /// v4 oracle over the concatenated bytes. Runs on any Apple Silicon without a GGUF.
     #[test]
     fn metal_walk_matches_host_reference_multi_tensor() {
-        // 12 tensors, sizes chosen to be non-power-of-two multiples of 32 B and mutually distinct.
         let per_tensor: [usize; 12] = [
             5 * 32, 17 * 32, 41 * 32, 128 * 32, 257 * 32, 511 * 32,
             1024 * 32, 2001 * 32, 4096 * 32, 512 * 32, 91 * 32, 331 * 32,
@@ -898,155 +814,69 @@ mod tests {
         let total_bytes: usize = per_tensor.iter().sum();
         let mut bytes = vec![0u8; total_bytes];
         let mut s = 0xdead_beef_cafe_babeu64;
-        for b in bytes.iter_mut() {
-            s = pom::mix64(s);
-            *b = (s & 0xff) as u8;
-        }
+        for b in bytes.iter_mut() { s = pom::mix64(s); *b = (s & 0xff) as u8; }
         let mut tensors: Vec<&[u8]> = Vec::with_capacity(per_tensor.len());
         let mut off = 0usize;
-        for &sz in &per_tensor {
-            tensors.push(&bytes[off..off + sz]);
-            off += sz;
-        }
+        for &sz in &per_tensor { tensors.push(&bytes[off..off + sz]); off += sz; }
         let n_chunks = (total_bytes / CHUNK_BYTES) as u64;
         let miner = miner_from_tensor_blobs(&tensors);
         assert_eq!(miner.n_chunks(), n_chunks);
 
         let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(53).wrapping_add(19));
         let ts: u64 = 0xcafebabe_deadbeef;
+
+        // Walk parity: Metal final_state == CPU v4 oracle for a batch of nonces (tiles cross the
+        // 12 tensor boundaries, so v4_load_tile's per-lane prefix search is genuinely exercised).
+        let (wstart, wbatch) = (321u64, 256u64);
+        let gpu = miner.debug_walk_states_v4(&pph, ts, wstart, wbatch).expect("walk states");
+        let mut diverge = 0usize;
+        for i in 0..wbatch {
+            let seed = pom::pom_block_seed_v4(&pph, ts, wstart + i);
+            if v4_final_state(&bytes, n_chunks, seed) != gpu[i as usize] { diverge += 1; }
+        }
+        assert_eq!(diverge, 0, "multi-tensor v4 walk final_state diverges ({diverge}/{wbatch})");
+
+        // Winner path.
         let (start, batch) = (777u64, 8192u64);
         let n_star = start + batch / 2;
-        let target = cpu_pow_value(&bytes, n_chunks, &pph, ts, n_star, false);
+        let target = v4_pow_value(&bytes, n_chunks, &pph, ts, n_star);
         let expected = (start..start + batch)
-            .find(|&n| pom::le_leq(&cpu_pow_value(&bytes, n_chunks, &pph, ts, n, false), &target));
-        let got = miner.mine(&pph, ts, &target, start, batch, false, false, false, false).expect("metal mine");
-        assert_eq!(got, expected, "multi-tensor Metal winner != host reference");
-
-        // Same batch under h3=true — proves the pph-salt plumbing is byte-exact for both eras.
-        let target_h3 = {
-            let seed = pom::pom_block_seed(&pph, ts, n_star, true, false, false);
-            let read = |off: u64| -> [u64; pom::CHUNK_WORDS] {
-                let o = (off as usize) * CHUNK_BYTES;
-                let mut c = [0u8; 32];
-                c.copy_from_slice(&bytes[o..o + 32]);
-                pom::chunk_to_words(&c)
-            };
-            let final_state = pom::walk_final(seed, n_chunks, pom::POM_WALK_STEPS, read, false);
-            pom::pom_pow_value(final_state, &pph, true)
-        };
-        let expected_h3 = (start..start + batch).find(|&n| {
-            let seed = pom::pom_block_seed(&pph, ts, n, true, false, false);
-            let read = |off: u64| -> [u64; pom::CHUNK_WORDS] {
-                let o = (off as usize) * CHUNK_BYTES;
-                let mut c = [0u8; 32];
-                c.copy_from_slice(&bytes[o..o + 32]);
-                pom::chunk_to_words(&c)
-            };
-            let fs = pom::walk_final(seed, n_chunks, pom::POM_WALK_STEPS, read, false);
-            pom::le_leq(&pom::pom_pow_value(fs, &pph, true), &target_h3)
-        });
-        let got_h3 = miner.mine(&pph, ts, &target_h3, start, batch, true, false, false, false).expect("metal mine h3");
-        assert_eq!(got_h3, expected_h3, "multi-tensor Metal winner (h3) != host reference");
+            .find(|&nn| pom::le_leq(&v4_pow_value(&bytes, n_chunks, &pph, ts, nn), &target));
+        let got = miner.mine_v4(&pph, ts, &target, start, batch).expect("metal mine_v4");
+        assert_eq!(got, expected, "multi-tensor v4 Metal winner != host reference");
+        assert!(got.is_some(), "n_star must be a winner");
     }
 
-    /// H5 / H5.2 byte-exact guard: exercises BOTH new consensus pieces the H5 fork introduced and
-    /// that the Metal port was missing —
-    ///   (a) `walk_v2` — the non-foldable transition (`mix64` chained per chunk word), and
-    ///   (b) the seed/pow word SPLIT — under H5.2 the SEED fold uses `seed_pph_words_for_era`
-    ///       (RAW pph XOR POM_H5_2_PPH_SALT) while the POW fold keeps the H3-salted words. A kernel
-    ///       that reused one word set for both, or kept the v1 fold, diverges here.
-    /// Runs on the same 12-tensor synthetic blob as the reference test (no GGUF needed).
-    #[test]
-    fn metal_walk_matches_host_reference_h5_2() {
-        let per_tensor: [usize; 12] = [
-            5 * 32, 17 * 32, 41 * 32, 128 * 32, 257 * 32, 511 * 32,
-            1024 * 32, 2001 * 32, 4096 * 32, 512 * 32, 91 * 32, 331 * 32,
-        ];
-        let total_bytes: usize = per_tensor.iter().sum();
-        let mut bytes = vec![0u8; total_bytes];
-        let mut s = 0x51ec_a5d0_1234_9f27u64;
-        for b in bytes.iter_mut() {
-            s = pom::mix64(s);
-            *b = (s & 0xff) as u8;
-        }
-        let tensors: Vec<&[u8]> = {
-            let mut v = Vec::with_capacity(per_tensor.len());
-            let mut off = 0usize;
-            for &sz in &per_tensor {
-                v.push(&bytes[off..off + sz]);
-                off += sz;
-            }
-            v
-        };
-        let n_chunks = (total_bytes / CHUNK_BYTES) as u64;
-        let miner = miner_from_tensor_blobs(&tensors);
-        assert_eq!(miner.n_chunks(), n_chunks);
-
-        let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(101).wrapping_add(3));
-        let ts: u64 = 0x0badf00d_1337c0de;
-        let (start, batch) = (4242u64, 8192u64);
-        // H5.2 live-era flags: h3 pow salt on, walk_v2 on, h5_2 seed salt on (h5_1 subsumed).
-        let (h3, walk_v2, h5_1, h5_2) = (true, true, false, true);
-
-        let read = |off: u64| -> [u64; pom::CHUNK_WORDS] {
-            let o = (off as usize) * CHUNK_BYTES;
-            let mut c = [0u8; 32];
-            c.copy_from_slice(&bytes[o..o + 32]);
-            pom::chunk_to_words(&c)
-        };
-        // Host oracle: pom_block_seed(h3,h5_1,h5_2) selects the H5.2-salted SEED words; walk_final
-        // with walk_v2=true uses the non-foldable transition; pom_pow_value(h3) keeps the H3 words.
-        let host_pv = |nonce: u64| -> [u8; 32] {
-            let seed = pom::pom_block_seed(&pph, ts, nonce, h3, h5_1, h5_2);
-            let fs = pom::walk_final(seed, n_chunks, pom::POM_WALK_STEPS, read, walk_v2);
-            pom::pom_pow_value(fs, &pph, h3)
-        };
-        let n_star = start + batch / 2;
-        let target = host_pv(n_star);
-        let expected = (start..start + batch).find(|&n| pom::le_leq(&host_pv(n), &target));
-        let got = miner
-            .mine(&pph, ts, &target, start, batch, h3, walk_v2, h5_1, h5_2)
-            .expect("metal mine h5.2");
-        assert_eq!(got, expected, "H5.2 Metal winner (walk_v2 + seed-salt split) != host reference");
-        assert!(got.is_some(), "n_star must be a winner under H5.2");
-
-        // Negative control: the pre-H5 fold (walk_v2=false) must NOT reproduce the v2 target, i.e.
-        // the two transitions are genuinely different (guards against a no-op walk_v2 branch).
-        let got_v1 = miner
-            .mine(&pph, ts, &target, start, batch, h3, false, h5_1, h5_2)
-            .expect("metal mine v1");
-        assert_ne!(got_v1, got, "walk_v2 branch is a no-op — v1 and v2 produced the same winner");
-    }
-
-    // Requires a real Metal device — runs on Apple Silicon (CI macos runner / dev Mac), skipped
-    // (compiled-out) everywhere else since the whole module is macOS-only.
+    /// Single-buffer v4 guard (the real model's packed-buffer path): synthetic blob, Metal walk +
+    /// winner vs the CPU v4 oracle.
     #[test]
     fn metal_walk_matches_host_reference() {
-        // Deterministic pseudo-random weight blob (splitmix64 stream) — 4096 chunks = 128 KiB.
-        let n_chunks = 4096u64;
-        let mut bytes = vec![0u8; (n_chunks as usize) * CHUNK_BYTES];
+        let n_chunks = 4096u64; // 128 tiles
+        let mut bytes = vec![0u8; n_chunks as usize * CHUNK_BYTES];
         let mut s = 0x1234_5678_9abc_def0u64;
-        for b in bytes.iter_mut() {
-            s = pom::mix64(s);
-            *b = (s & 0xff) as u8;
-        }
+        for b in bytes.iter_mut() { s = pom::mix64(s); *b = (s & 0xff) as u8; }
         let miner = miner_from_blob(&bytes);
         assert_eq!(miner.n_chunks(), n_chunks);
 
         let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
         let ts: u64 = 0x00ff_00ff_1234u64;
-        let (start, batch) = (1_000u64, 20_000u64);
 
-        // Pick a target that at least one nonce in the batch satisfies: use the pow value of a
-        // known mid-batch nonce, so the search must find the LOWEST nonce whose pv <= target.
+        // final_state parity for spot nonces.
+        for &nonce in &[0u64, 1, 7, 4242, 999_999] {
+            let seed = pom::pom_block_seed_v4(&pph, ts, nonce);
+            let host_fs = v4_final_state(&bytes, n_chunks, seed);
+            let gpu = miner.debug_walk_states_v4(&pph, ts, nonce, 1).expect("walk")[0];
+            assert_eq!(host_fs, gpu, "v4 final_state diverges for nonce {nonce}");
+        }
+
+        // Winner path — LOWEST nonce whose pow_value <= target(n_star).
+        let (start, batch) = (1_000u64, 4_000u64);
         let n_star = start + batch / 2;
-        let target = cpu_pow_value(&bytes, n_chunks, &pph, ts, n_star, false);
-
+        let target = v4_pow_value(&bytes, n_chunks, &pph, ts, n_star);
         let expected = (start..start + batch)
-            .find(|&n| pom::le_leq(&cpu_pow_value(&bytes, n_chunks, &pph, ts, n, false), &target));
-        let got = miner.mine(&pph, ts, &target, start, batch, false, false, false, false).expect("metal mine");
-        assert_eq!(got, expected, "Metal winner != host reference");
-        assert!(got.is_some(), "n_star must be a winner");
-        assert!(got.unwrap() <= n_star);
+            .find(|&nn| pom::le_leq(&v4_pow_value(&bytes, n_chunks, &pph, ts, nn), &target));
+        let got = miner.mine_v4(&pph, ts, &target, start, batch).expect("metal mine_v4");
+        assert_eq!(got, expected, "v4 Metal winner != host reference");
+        assert!(got.is_some() && got.unwrap() <= n_star);
     }
 }
