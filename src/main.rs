@@ -1457,8 +1457,23 @@ async fn run() -> Result<(), Error> {
     info!("Found plugins: {:?}", plugins);
     info!("Plugins found {} workers", worker_count);
     if worker_count == 0 && opt.num_threads.unwrap_or(0) == 0 {
+        // This is the AMD (OpenCL) build and no AMD GPU compute device was found. The commonest
+        // cause is running the `-amd` package on an NVIDIA (or CPU-only) box — the "amd" refers to
+        // AMD Radeon GPUs, not to an x64/AMD64 CPU. Point the user at the right package.
+        #[cfg(feature = "pom-opencl")]
+        error!(
+            "No AMD GPU found — this is the AMD build (keryx-miner-supr-amd), which mines on AMD \
+             Radeon GPUs via OpenCL. If your GPUs are NVIDIA, use the NVIDIA package instead: \
+             'modern' for RTX 30xx/40xx/50xx (Ampere/Ada/Blackwell) or 'legacy' for GTX 10xx/16xx \
+             and RTX 20xx (Turing/Volta). The '-amd' package is NOT for NVIDIA or CPU-only systems."
+        );
+        #[cfg(not(feature = "pom-opencl"))]
         error!("No workers specified");
-        return Err("No workers specified".into());
+        // Hard-exit instead of returning Err: on the AMD build the in-process llama inference engine
+        // (dlopen'd libkeryx-llama-vk.so) may already be loading the model on a background thread,
+        // and unwinding out of main() races its teardown into a segfault (field report on an NVIDIA
+        // box). exit() tears the process down cleanly without running that destructor.
+        std::process::exit(1);
     }
 
     let block_template_ctr = Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16));
