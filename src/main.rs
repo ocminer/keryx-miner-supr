@@ -522,7 +522,17 @@ fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier, 
         .as_deref()
         .map(|s| s.split(',').map(|x| parse_tier_name(x)).collect())
         .unwrap_or_default();
-    let mut vrams = all_gpus_vram(); // (device_id, MiB), CUDA order
+    let mut vrams = all_gpus_vram(); // (device_id, TOTAL MiB), CUDA order
+    // AUTO budgets against FREE VRAM, not total: whatever is already resident on the card
+    // (another miner, a leaked context, a desktop) is memory the chosen tier can never
+    // allocate — the old total-based pick sailed past the check and died in cudaMalloc,
+    // cascading into self-test failures. Free query best-effort; total is the fallback.
+    #[cfg(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))))]
+    let free_map: std::collections::HashMap<u32, (u64, u64)> =
+        keryx_miner::pom_gpu::query_all_gpus_free_vram()
+            .into_iter().map(|(d, f, t)| (d, (f, t))).collect();
+    #[cfg(not(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal")))))]
+    let free_map: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
     if vrams.is_empty() {
         // No enumeration (nvidia-smi/driver missing): a forced first entry still wins for GPU 0.
         return match forced.first().copied().flatten() {
@@ -552,8 +562,18 @@ fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier, 
                 if let Some(t) = pinned {
                     (t, false)
                 } else {
-                    let (picked, need) = models::auto_select_tier(*vram, AUTO_TIER_HEADROOM_MB);
-                    info!("GPU {}: auto → {} (fits {} MiB VRAM, budget {} MiB).", dev, picked.pom_model_name(), vram, need);
+                    let budget_mb = match free_map.get(dev) {
+                        Some(&(free, _total)) if free < *vram => {
+                            info!(
+                                "GPU {}: {} MiB of {} MiB VRAM already in use by other processes —                                  auto-tier budgets against the {} MiB actually FREE.",
+                                dev, *vram - free, vram, free
+                            );
+                            free
+                        }
+                        _ => *vram,
+                    };
+                    let (picked, need) = models::auto_select_tier(budget_mb, AUTO_TIER_HEADROOM_MB);
+                    info!("GPU {}: auto → {} (fits {} MiB free VRAM, budget {} MiB).", dev, picked.pom_model_name(), budget_mb, need);
                     (picked, false)
                 }
             }

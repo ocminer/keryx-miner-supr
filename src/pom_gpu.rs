@@ -1119,6 +1119,43 @@ fn has_device_override(device_id: u32) -> bool {
 /// and the miner's worker ids use) — sourced from the CUDA driver, NOT nvidia-smi line order (which
 /// can map to the wrong card). Empty vec if no CUDA driver (CPU-only / AMD). Never panics.
 /// (upstream Keryx-Labs/keryx-miner@cb7f81c)
+/// Per-GPU (ordinal, FREE MiB, TOTAL MiB) via the driver API. FREE is what a tier pick can
+/// actually allocate: budgeting against TOTAL (the old behavior) chose tiers that cudaMalloc'd
+/// straight into an OOM whenever anything else was resident on the card (another miner, a leaked
+/// context, a desktop session) — which then cascaded into self-test failures and, pre-failover,
+/// a whole-rig suspend. Uses each device's PRIMARY context (retain → mem_get_info → release), so
+/// it neither creates spurious contexts nor disturbs live ones. Ordinals are CUDA ordinals —
+/// same space as every other pom_gpu call.
+pub fn query_all_gpus_free_vram() -> Vec<(u32, u64, u64)> {
+    use candle_core::cuda_backend::cudarc::driver::result;
+    std::panic::catch_unwind(|| {
+        if result::init().is_err() {
+            return Vec::new();
+        }
+        let count = result::device::get_count().unwrap_or(0);
+        let mut out = Vec::with_capacity(count.max(0) as usize);
+        for ordinal in 0..count {
+            let Ok(dev) = result::device::get(ordinal) else { continue };
+            // SAFETY: `dev` is a valid handle from device::get; retain/set_current/release are
+            // the documented primary-ctx sequence and mem_get_info runs under that context.
+            let got = unsafe {
+                result::primary_ctx::retain(dev).ok().and_then(|ctx| {
+                    let r = result::ctx::set_current(ctx)
+                        .ok()
+                        .and_then(|_| result::mem_get_info().ok());
+                    let _ = result::primary_ctx::release(dev);
+                    r
+                })
+            };
+            if let Some((free_b, total_b)) = got {
+                out.push((ordinal as u32, (free_b / (1024 * 1024)) as u64, (total_b / (1024 * 1024)) as u64));
+            }
+        }
+        out
+    })
+    .unwrap_or_default()
+}
+
 pub fn query_all_gpus_vram() -> Vec<(u32, u64)> {
     use candle_core::cuda_backend::cudarc::driver::result;
     std::panic::catch_unwind(|| {
