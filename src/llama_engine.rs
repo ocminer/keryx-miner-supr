@@ -191,7 +191,8 @@ fn so_path() -> Option<std::path::PathBuf> {
             return Some(p);
         }
         log::warn!(
-            "llama engine: this CPU lacks the AVX2/FMA/F16C/BMI2 set baked into libkeryx-llama.so and no libkeryx-llama-noavx.so is present — NOT loading it (would SIGILL). Candle fallback stays active; ship the -noavx variant from the 0.7.2+ package to enable the llama engine on this CPU."
+            "llama engine: this CPU lacks the AVX2/FMA/F16C/BMI2 set baked into libkeryx-llama.so and no {} exists in {} — NOT loading it (would SIGILL). FIX: copy libkeryx-llama-noavx.so from the release tarball into that exact directory (every release since 0.7.2 ships it next to the binary — partial/binary-only upgrades lose it), or set KERYX_LLAMA_SO=<absolute path to the -noavx .so>. Candle fallback stays active meanwhile.",
+            p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(), dir.display()
         );
         return None;
     }
