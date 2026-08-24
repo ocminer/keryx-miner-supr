@@ -109,14 +109,25 @@ pub struct ShareStats {
     pub stale: AtomicU64,
     pub low_diff: AtomicU64,
     pub duplicate: AtomicU64,
+    /// Rejections with no stratum reject-class: solo/gRPC block-submit errors land here so the
+    /// stats API can still sum a meaningful `rejected`.
+    pub rejected_other: AtomicU64,
     pub shares_pending: Mutex<HashMap<u32, (String, u32)>>,
 }
 
 static SHARE_STATS: OnceLock<Arc<ShareStats>> = OnceLock::new();
 
-/// Live share counters for the stats API (None until the pool client connects).
+/// Live share counters for the stats API (None until a client initializes them).
 pub fn share_stats() -> Option<Arc<ShareStats>> {
     SHARE_STATS.get().cloned()
+}
+
+/// Get-or-init the global counters. The stratum client has always done this on connect; the
+/// gRPC/solo client MUST call it too — before this, a solo miner's stats API reported
+/// shares 0/0 forever while accepted blocks were plainly visible in the log (the API reads
+/// these very counters and they were simply never created outside stratum).
+pub fn share_stats_init() -> Arc<ShareStats> {
+    SHARE_STATS.get_or_init(|| Arc::new(ShareStats::default())).clone()
 }
 
 // ── Multi-pool failover (opt-in; ALL of this is inert unless a --backup-pool is configured) ──
