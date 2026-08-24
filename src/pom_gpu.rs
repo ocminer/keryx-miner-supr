@@ -587,6 +587,40 @@ impl PomGpuMiner {
         self.n_total_chunks
     }
 
+    /// Which v4 walk kernel this device will actually run: "tensor-core" or "classic".
+    /// Resolves the full gate (capability + walk-image contents + the runtime stub probe), so it
+    /// is the honest answer — not just what the card could do in principle. Logged at startup so
+    /// a silent fallback is visible in the log instead of only in the hashrate.
+    pub fn v4_walk_kind(&self) -> &'static str {
+        let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        if n_tiles == 0 {
+            return "classic";
+        }
+        let pph = [0u8; 32];
+        let p = crate::pom::pph_words_for_era(&pph, true);
+        let s = crate::pom::pph_words_v4(&pph);
+        let k = crate::pom_v4::POM_V4_K as u32;
+        if bind_device_ctx(&self.stream).is_err() {
+            return "classic";
+        }
+        if self.v4_tc_usable(n_tiles, k, &p, &s, 0) { "tensor-core" } else { "classic" }
+    }
+
+    /// Diagnostic: launch the tensor-core walk ONCE with an always-win target, bypassing the
+    /// capability/image gate, and report whether it produced a result. `false` means the loaded
+    /// image's `pom_mine_v4_tc` is the empty sub-sm_80 stub (or absent) on this card — the exact
+    /// condition that used to mine nothing at a hugely inflated hashrate.
+    pub fn v4_tc_kernel_is_real(&self) -> bool {
+        let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        if n_tiles == 0 || bind_device_ctx(&self.stream).is_err() {
+            return false;
+        }
+        let pph = [0u8; 32];
+        let p = crate::pom::pph_words_for_era(&pph, true);
+        let s = crate::pom::pph_words_v4(&pph);
+        self.v4_tc_probe(n_tiles, crate::pom_v4::POM_V4_K as u32, &p, &s, 0).unwrap_or(false)
+    }
+
     /// v4 (relaunch) grind: one CUDA block of 32 threads per nonce over `[start, start + batch)`.
     /// Byte-exact mirror of `pom_v4::v4_walk` on the GPU. Returns the lowest winning nonce
     /// (`era_pow_fold(fold64(v4_state_root(S_K))) <= target`), or None. Dynamic shared = 2 KB
@@ -604,7 +638,7 @@ impl PomGpuMiner {
         bind_device_ctx(&self.stream)?; // multi-GPU: bind this device's context before the raw launch
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
 
-        if self.v4_tc_available() {
+        if self.v4_tc_usable(n_tiles, k, &p, &s, timestamp) {
             // Tensor-core solver: resolve the whole tile-offset chain first (it depends only on
             // tile snippets, never on the walk state), then walk with a depth-3 cp.async tile
             // pipeline + 8x mma.sync.m16n8k32.s8 per step. Byte-exact vs pom_mine_v4/the host;
@@ -698,14 +732,39 @@ impl PomGpuMiner {
         if std::env::var("KERYX_POM_V4_TC").ok().as_deref() == Some("0") {
             return false;
         }
+        // The DEVICE having sm_80+ is not enough: what matters is whether the WALK IMAGE we
+        // actually loaded can supply sm_80+ code for `pom_mine_v4_tc`. The kernel is compiled
+        // under `#if __CUDA_ARCH__ >= 800`; below that it is an EMPTY STUB. A PTX image
+        // generated at compute_70/75 (the legacy/Pascal packages, POM_WALK_IMAGE=ptx, or a
+        // source build without the committed fatbin) therefore carries ONLY that stub — the
+        // driver JITs the stub for the Ampere card and the "walk" writes nothing at all:
+        // no shares, and a hashrate inflated by however fast an empty kernel returns.
+        // That combination (Ampere + legacy package — which is what a rig containing pre-sm_75
+        // cards must run) is exactly the silent failure reported from the field.
+        let image_kind = env!("POM_WALK_IMAGE_KIND");
+        let image_arch = env!("POM_PTX_ARCH");
+        let image_can_tc = image_kind == "fatbin"
+            || image_arch
+                .trim_start_matches("sm_")
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|d| d.parse::<u32>().ok())
+                .map(|sm| sm >= 80)
+                .unwrap_or(false);
         match self.stream.context().compute_capability() {
             Ok((major, _)) => {
-                let ok = major >= 8;
+                let ok = major >= 8 && image_can_tc;
                 static LOGGED: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
                 let mut seen = LOGGED.get_or_init(|| Mutex::new(std::collections::HashSet::new())).lock().unwrap();
                 if seen.insert(self.stream.context().ordinal() as u32) {
                     if ok {
                         log::info!("PoM v4: tensor-core solver active (sm_{}x, chase + mma.m16n8k32 pipeline).", major);
+                    } else if major >= 8 {
+                        log::warn!(
+                            "PoM v4: sm_{}x supports the tensor-core solver but this build's walk image \
+cannot ({} {}) — it carries only the sub-sm_80 stub. Using the classic dp4a kernel (correct, ~25% slower). \
+Use the MODERN package (native sm_80-120 walk) on Ampere and newer.",
+                            major, image_kind, image_arch);
                     } else {
                         log::info!("PoM v4: sm_{}x has no int8 mma — using the classic dp4a kernel.", major);
                     }
@@ -714,6 +773,92 @@ impl PomGpuMiner {
             }
             Err(_) => false,
         }
+    }
+
+    /// Authoritative gate for the tensor-core solver: `v4_tc_available()` (capability + image
+    /// kind) AND a one-off runtime PROBE per device.
+    ///
+    /// The probe exists because "the image contains sm_80+ code" cannot be fully decided at
+    /// compile time: the committed fatbin carries native SASS for sm_75;80;86;89;90;120 only, so
+    /// a card outside that list (sm_87 Orin, sm_100/103 datacenter Blackwell) silently JITs the
+    /// embedded compute_75 PTX — i.e. the EMPTY STUB again — and a stale fatbin may not export
+    /// the symbol at all. Both fail the same silent way: no winners, fantasy hashrate.
+    ///
+    /// The probe runs the real chase+walk for ONE nonce against an all-0xFF (always-win) target:
+    /// any real kernel must record that win. A stub writes nothing. On failure the device is
+    /// demoted to the classic dp4a kernel for the process lifetime, loudly.
+    fn v4_tc_usable(&self, n_tiles: u64, k: u32, p: &[u64; 4], s: &[u64; 4], timestamp: u64) -> bool {
+        if !self.v4_tc_available() {
+            return false;
+        }
+        static PROBED: OnceLock<Mutex<std::collections::HashMap<u32, bool>>> = OnceLock::new();
+        let cache = PROBED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        let ord = self.stream.context().ordinal() as u32;
+        if let Some(&ok) = cache.lock().unwrap().get(&ord) {
+            return ok;
+        }
+        let ok = match self.v4_tc_probe(n_tiles, k, p, s, timestamp) {
+            Ok(true) => {
+                log::info!("PoM v4: tensor-core solver PROBE OK on GPU {} (1-nonce known-win recorded).", ord);
+                true
+            }
+            Ok(false) => {
+                log::error!(
+                    "PoM v4: tensor-core solver PROBE FAILED on GPU {} — the walk kernel produced NO result \
+for an always-win target, i.e. this build's image has no real sm_80+ code for this card (stub). \
+Falling back to the classic dp4a kernel so the card mines CORRECTLY. If this is an Ampere or newer \
+card, use the MODERN package to get the fast walk.", ord);
+                false
+            }
+            Err(e) => {
+                log::error!(
+                    "PoM v4: tensor-core solver PROBE ERROR on GPU {} ({e}) — falling back to the classic \
+dp4a kernel.", ord);
+                false
+            }
+        };
+        cache.lock().unwrap().insert(ord, ok);
+        ok
+    }
+
+    /// One-nonce chase+walk with an always-win target. Ok(true) = a real TC kernel ran.
+    fn v4_tc_probe(&self, n_tiles: u64, k: u32, p: &[u64; 4], s: &[u64; 4], timestamp: u64)
+        -> candle_core::Result<bool>
+    {
+        const TC_WARPS: u64 = 4;
+        let chase = load_walk_func(&self.cuda, "pom_mine_v4_chase")?;
+        let walk = load_walk_func(&self.cuda, "pom_mine_v4_tc")?;   // missing symbol -> Err -> classic
+        let offsets = v4_offsets_buf(&self.stream, k as usize)?;
+        let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
+        let (start, batch) = (0u64, 1u64);
+        let view = offsets
+            .try_slice(0..k as usize)
+            .ok_or_else(|| candle_core::Error::Msg("PoM v4 probe: offsets slice".into()))?;
+        let mut b = chase.builder();
+        b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
+            .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+            .arg(&start).arg(&batch).arg(&view);
+        unsafe {
+            b.launch(LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                .map_err(candle_core::Error::wrap)?;
+        }
+        let t_max = [u64::MAX, u64::MAX, u64::MAX, u64::MAX];   // all-0xFF target: any real walk wins
+        let mut b = walk.builder();
+        b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&k)
+            .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
+            .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+            .arg(&t_max[0]).arg(&t_max[1]).arg(&t_max[2]).arg(&t_max[3])
+            .arg(&start).arg(&batch).arg(&view).arg(&winner);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: ((TC_WARPS * 32) as u32, 1, 1),
+                shared_mem_bytes: (TC_WARPS as u32) * 4096,
+            }).map_err(candle_core::Error::wrap)?;
+        }
+        self.stream.synchronize().map_err(candle_core::Error::wrap)?;
+        let w = self.stream.clone_dtoh(&winner).map_err(candle_core::Error::wrap)?[0];
+        Ok(w != u64::MAX)
     }
 
 }
@@ -1271,6 +1416,10 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                     return false;
                 }
             }
+            // Make the resolved walk kernel VISIBLE at startup: the old failure mode (an Ampere+
+            // card silently running the stub from a PTX/legacy image) was invisible except as a
+            // hashrate that was ~10x too high with zero accepted shares.
+            info!("PoM[gpu{}]: v4 walk kernel = {}", device_id, gm.v4_walk_kind());
             install(device_id, gm);
             crate::slm::clear_staging_error();
             info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches host index)", device_id, n);
@@ -1547,6 +1696,34 @@ mod v4_kernel_tests {
             }
         }
         v
+    }
+
+    /// Reports (visibly, with --nocapture) which walk kernel this GPU resolves to, and proves the
+    /// resolved kernel is BIT-EXACT vs the host walk. Run per card / per package to verify that an
+    /// Ampere+ card really gets the tensor-core walk (modern package) and that a stub-only image
+    /// (legacy/PTX) is detected and demoted instead of silently mining nothing.
+    #[test]
+    #[ignore]
+    fn v4_walk_kind_and_exactness() {
+        let data = blob(2048);
+        let index = crate::pom::index_from_ram(data.clone());
+        let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
+        let raw = miner.v4_tc_kernel_is_real();
+        let kind = miner.v4_walk_kind();
+        println!("RAW TC-KERNEL PROBE: {}", if raw { "REAL (produced a result)" } else { "STUB (no output — would mine nothing)" });
+        println!("RESOLVED WALK KERNEL: {kind}   (image {} {})",
+                 env!("POM_WALK_IMAGE_KIND"), env!("POM_PTX_ARCH"));
+        let nonce = 42u64;
+        let seed = crate::pom::pom_block_seed_v4(&PPH, TS, nonce);
+        let (v4, fs) = crate::pom_v4::build_proof_v4(0, seed, &index).unwrap();
+        let re = crate::pom_v4::verify_proof_v4(seed, &v4, &index.r_t, index.n_chunks).unwrap();
+        assert_eq!(re, fs);
+        let pow = crate::pom::pom_pow_value(fs, &PPH, true);
+        assert_eq!(miner.mine_v4(&PPH, TS, &pow, nonce, 1).unwrap(), Some(nonce),
+                   "[{kind}] GPU did not find the nonce at the host pow target — divergence");
+        assert_eq!(miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1).unwrap(), None,
+                   "[{kind}] GPU found the nonce below the host pow — divergence");
+        println!("BIT-EXACT OK on the {kind} walk");
     }
 
     #[test]
