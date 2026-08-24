@@ -83,6 +83,43 @@ LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64 \
 
 Add `--cuda-device N` to run a single GPU, a tier flag (`--very-high`, …) to pin all cards to one tier, or `--force-model` to set a model per card (see [Model tiers](#model-tiers) below).
 
+### Overclocking & power control (built in — no external tool needed)
+
+The miner applies per-GPU clock locks, power limits and fan speed itself via NVML,
+straight from the command line. The short aliases match the names other miners use:
+
+| What | Flag (alias) | Example |
+|---|---|---|
+| Lock core clock (MHz) | `--cuda-lock-core-clocks` (`--gpu-clock`) | `--gpu-clock 2400,2400` |
+| Lock memory clock (MHz) | `--cuda-lock-mem-clocks` (`--mem-lock`) | `--mem-lock 9500,9500` |
+| Power limit (W) | `--cuda-power-limits` (`--power-limit`) | `--power-limit 450,450` |
+| Fan speed (%) | `--cuda-fan-speed` | `--cuda-fan-speed 80,80` |
+| GPU monitor line every N s | `--cuda-monitor-interval` | `--cuda-monitor-interval 30` |
+
+All are comma-separated **per GPU** (in `--cuda-device` order); if you pass fewer
+values than GPUs, the last value applies to the remaining cards.
+
+```bash
+# 2-GPU rig: lock 2400 MHz core / 9500 MHz mem, 450 W and 80% fan on both
+sudo LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64 \
+  ./keryx-miner-supr \
+    -a keryx:<your_mining_address>.<worker_name> \
+    -s stratum+tcp://krx.suprnova.cc:4401 \
+    --gpu-clock 2400,2400 --mem-lock 9500,9500 --power-limit 450,450 \
+    --cuda-fan-speed 80,80
+```
+
+Notes:
+- **Root is required** for clock/power/fan changes (plain NVIDIA driver rule — the
+  same is true for `nvidia-smi -lgc/-pl`). Without root the miner logs the NVML
+  error and keeps mining at stock settings.
+- Fan control additionally needs the card in manual fan mode:
+  `sudo nvidia-smi -i <id> -fcm 1` first (or the X/coolbits route on desktop rigs).
+- These are **clock locks** (like `nvidia-smi -lgc/-lmc`), not offset-style OC. The
+  locks persist after the miner exits — reset with `nvidia-smi -rgc -rmc` or reboot.
+- On HiveOS/mmpOS you can keep using the OS-level OC instead; the flags simply give
+  the same control on bare Linux without any external tool.
+
 For **pool** mining, `-s` must be a full URL with the `stratum+tcp://` scheme — without it the miner treats the address as a keryxd node and speaks gRPC instead (see [Solo mining](#solo-mining--straight-to-your-own-keryxd-node-grpc)). Port MUST be embedded in the URL; the standalone `-p` flag is ignored when a scheme is present.
 
 ### Solo mining — straight to your own keryxd node (gRPC)
