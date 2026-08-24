@@ -1878,6 +1878,19 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
         let specs = *SUPPORTED_SPECS.read().unwrap();
         specs.iter().find(|s| &s.model_id == model_id).map(|s| s.name).unwrap_or("?")
     };
+    if name == "?" {
+        // The model_id is not (yet) in SUPPORTED_SPECS — a startup ordering race: per-card staging
+        // can reach the self-test before init_supported() has registered the full lineup. The old
+        // path "probed" it (the spec lookup inside inference instantly returns nothing), FAILED it
+        // in 0.0s, CACHED the failure and withdrew the tier permanently — a mixed rig's smaller
+        // cards never mined again this process. Not-registered is NOT not-serveable: report
+        // not-ready WITHOUT caching or withdrawing, so the next staging cycle re-probes properly.
+        log::warn!(
+            "OPoI self-test: model id not registered in the supported lineup yet (startup ordering) — \
+             deferring the probe, will retry next staging cycle."
+        );
+        return false;
+    }
     log::info!(
         "OPoI self-test: probing '{}' on GPU {} — a model must prove it can generate before we \
          declare/mine its tier (the network exists to serve inference).", name, gpu
