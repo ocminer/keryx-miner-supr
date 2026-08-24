@@ -438,6 +438,21 @@ impl MinerManager {
                                     continue;
                                 }
                                 pom_driver::ensure_installed(wdid, daa);
+                                if !pom_driver::is_installed(wdid) {
+                                    // Staging failed (model not stageable/serveable on this card yet).
+                                    // Do NOT grind and above all do NOT count: pre-fix this loop fell
+                                    // through to mine_v4 (silent None with no walk) while still adding
+                                    // `batch` to hashes_tried — a card at 0% GPU utilization reported
+                                    // full phantom Mh/s. Idle honestly and retry next pass.
+                                    static PAUSED_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                    let n = PAUSED_WARN.fetch_add(1, Ordering::Relaxed);
+                                    if n % 60 == 0 {
+                                        log::warn!(
+                                            "PoM[gpu{}]: no walk installed (staging failed/pending) — grinding                                              PAUSED on this card, hashrate 0 (not counted). Retrying staging…", wdid);
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                                    continue;
+                                }
                             }
                             pom_driver::mine_v4(wdid, &pph, time, &target_le, pom_nonce, batch)
                         };

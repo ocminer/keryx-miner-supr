@@ -1103,6 +1103,36 @@ async fn run() -> Result<(), Error> {
     } else {
         filter_specs_by_vram(specs_all)
     };
+    // MIXED RIG: the lineup above is the PRIMARY (biggest) tier's — but per-card auto/force can
+    // assign SMALLER tiers to lighter cards (set_device_model below). Those models MUST be in
+    // SUPPORTED_SPECS too: the serveability self-test resolves specs from this registry, and a
+    // missing entry made a smaller card's probe fail instantly as '?' — on the old code that
+    // poisoned the cache and the card never mined (found live on a 3070+5080 mixed rig). Union
+    // them in (leak-once, same pattern as the filtered lineup slice).
+    #[cfg(not(feature = "pom-opencl"))]
+    let specs_v2 = {
+        let mut extra: Vec<&'static keryx_miner::models::ModelSpec> = Vec::new();
+        for (_, t, _) in &device_tiers {
+            let ds = t.pom_spec();
+            if !specs_v2.iter().any(|s| s.model_id == ds.model_id)
+                && !extra.iter().any(|e| e.model_id == ds.model_id)
+            {
+                extra.push(ds);
+            }
+        }
+        if extra.is_empty() {
+            specs_v2
+        } else {
+            info!(
+                "Mixed rig: registering {} additional per-card model(s) in the supported lineup: {}.",
+                extra.len(),
+                extra.iter().map(|s| s.name).collect::<Vec<_>>().join(", ")
+            );
+            let mut v: Vec<&'static keryx_miner::models::ModelSpec> = specs_v2.to_vec();
+            v.extend(extra);
+            &*Box::leak(v.into_boxed_slice())
+        }
+    };
     // PoM: the highest-VRAM v2 model with a pinned R_T is the tier this GPU proves possession of.
     let pom_spec = specs_v2
         .iter()
