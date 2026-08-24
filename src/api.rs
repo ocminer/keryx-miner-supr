@@ -31,7 +31,8 @@ fn shares() -> (u64, u64) {
             let acc = s.accepted.load(Ordering::SeqCst);
             let rej = s.low_diff.load(Ordering::SeqCst)
                 + s.stale.load(Ordering::SeqCst)
-                + s.duplicate.load(Ordering::SeqCst);
+                + s.duplicate.load(Ordering::SeqCst)
+                + s.rejected_other.load(Ordering::SeqCst);
             (acc, rej)
         }
         None => (0, 0),

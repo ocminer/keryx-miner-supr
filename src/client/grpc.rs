@@ -797,10 +797,21 @@ impl KeryxdHandler {
                     }
                 }
             }
-            Payload::SubmitBlockResponse(res) => match res.error {
-                None => info!("block submitted successfully!"),
-                Some(e) => warn!("Failed submitting block: {:?}", e),
-            },
+            Payload::SubmitBlockResponse(res) => {
+                // Feed the stats API the same way the stratum client does — a solo block IS this
+                // mode's "share". Without this the API showed 0/0 while the log showed accepts.
+                let stats = crate::client::stratum::share_stats_init();
+                match res.error {
+                    None => {
+                        stats.accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        info!("block submitted successfully!");
+                    }
+                    Some(e) => {
+                        stats.rejected_other.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        warn!("Failed submitting block: {:?}", e);
+                    }
+                }
+            }
             Payload::SubmitTransactionResponse(res) => {
                 // Escrow claims and OPoI submissions share this stream. Match responses to
                 // in-flight claims by identity (txid, or the txid embedded in the rejection
