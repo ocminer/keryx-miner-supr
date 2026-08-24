@@ -1823,6 +1823,77 @@ mod v4_kernel_tests {
     /// Throughput bench (no pool, synthetic blob): `--ignored v4_bench`. Blob size via
     /// KERYX_BENCH_TILES (default 6 GiB / 1KB tiles), duration via KERYX_BENCH_SECS (default 10).
     /// Impossible target => no winner => every batch runs to completion. Prints Mh/s.
+    /// build_proof_v4 WITH the dense (resident) tree — isolates what --resident-tree buys per share.
+    #[test]
+    #[ignore]
+    fn v4_proof_build_bench_dense() {
+        let data = blob(2048);
+        let mut index = crate::pom::index_from_ram(data);
+        let t = std::time::Instant::now();
+        index.build_dense();
+        println!("build_dense: {:.1} ms (one-time)", t.elapsed().as_secs_f64() * 1e3);
+        let iters = 200u64;
+        let t0 = std::time::Instant::now();
+        for n in 0..iters {
+            let seed = crate::pom::pom_block_seed_v4(&PPH, TS, n);
+            let (_p, _fs) = crate::pom_v4::build_proof_v4(0, seed, &index).unwrap();
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        println!("build_proof_v4 (DENSE): {:.1} us/proof ({} iters)", us, iters);
+    }
+
+    /// Break down where build_proof_v4's time actually goes: transition matmul vs tile reads
+    /// vs merkle paths.
+    #[test]
+    #[ignore]
+    fn v4_proof_parts_bench() {
+        use crate::pom_v4::*;
+        let data = blob(2048);
+        let index = crate::pom::index_from_ram(data);
+        let n_tiles = index.n_chunks / POM_V4_TILE_CHUNKS;
+        let seed = crate::pom::pom_block_seed_v4(&PPH, TS, 1);
+        // gather one representative tile + path
+        let off = v4_first_offset(seed, n_tiles);
+        let mut tile = Vec::with_capacity(POM_V4_TILE_BYTES);
+        for c in 0..POM_V4_TILE_CHUNKS { tile.extend_from_slice(&index.read_chunk_bytes(off * POM_V4_TILE_CHUNKS + c)); }
+        let state = v4_initial_state(seed);
+        let mut scratch = vec![0u8; 32 * 32];
+        let n = 256u32;
+        let t = std::time::Instant::now();
+        for step in 1..=n { v4_transition_into(&mut scratch, &state, &tile, step); }
+        println!("  transitions x256      : {:8.1} us", t.elapsed().as_secs_f64() * 1e6);
+        let t = std::time::Instant::now();
+        for step in 0..n as u64 {
+            let o = (off + step) % n_tiles;
+            let mut tl = Vec::with_capacity(POM_V4_TILE_BYTES);
+            for c in 0..POM_V4_TILE_CHUNKS { tl.extend_from_slice(&index.read_chunk_bytes(o * POM_V4_TILE_CHUNKS + c)); }
+            std::hint::black_box(&tl);
+        }
+        println!("  tile reads x256       : {:8.1} us", t.elapsed().as_secs_f64() * 1e6);
+        let t = std::time::Instant::now();
+        for step in 0..n as u64 {
+            let o = (off + step) % n_tiles;
+            std::hint::black_box(index.merkle_path(o * POM_V4_TILE_CHUNKS));
+        }
+        println!("  merkle_path x256      : {:8.1} us", t.elapsed().as_secs_f64() * 1e6);
+    }
+
+    /// Time the CPU proof-build (per-share witness on NVIDIA sync-submit + the whole AMD path).
+    #[test]
+    #[ignore]
+    fn v4_proof_build_bench() {
+        let data = blob(2048);
+        let index = crate::pom::index_from_ram(data);
+        let iters = 200u64;
+        let t0 = std::time::Instant::now();
+        for n in 0..iters {
+            let seed = crate::pom::pom_block_seed_v4(&PPH, TS, n);
+            let (_p, _fs) = crate::pom_v4::build_proof_v4(0, seed, &index).unwrap();
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        println!("build_proof_v4: {:.1} us/proof ({} iters)", us, iters);
+    }
+
     #[test]
     #[ignore]
     fn v4_bench() {
