@@ -52,6 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let image = format!("{}/pom_mine.image", out); // the shipped walk image (fatbin or ptx)
         println!("cargo:rerun-if-changed=src/pom_mine.cu");
         println!("cargo:rerun-if-changed=cuda/pom_mine.fatbin");
+        // Without these, switching walk image/arch silently reuses the previously built image.
+        println!("cargo:rerun-if-env-changed=POM_WALK_IMAGE");
+        println!("cargo:rerun-if-env-changed=POM_CUDA_ARCH");
+        println!("cargo:rerun-if-env-changed=NVCC");
         println!("cargo:rerun-if-env-changed=POM_CUDA_ARCH");
         let arch_override = env::var("POM_CUDA_ARCH").ok();
         let committed_fatbin = "cuda/pom_mine.fatbin";
@@ -76,18 +80,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("cargo:rustc-env=POM_WALK_IMAGE_KIND=fatbin");
             println!("cargo:rustc-env=POM_PTX_ARCH=sm_75..120-native"); // for the load-error message
         } else {
-            // LEGACY/PASCAL or no committed fatbin: compile PTX from source, JIT'd at runtime.
+            // LEGACY/PASCAL or no committed fatbin: compile from source.
+            //
+            // Prefer a FATBIN carrying `arch` PTX (for the old cards this package exists for) PLUS
+            // native SASS for the tensor-core-capable arches. A pure-PTX image compiled at
+            // compute_70/75 contains only the sub-sm_80 STUB of pom_mine_v4_tc, so every Ampere+
+            // card in a legacy fleet would be limited to the classic walk (or, before the gate fix,
+            // silently mine NOTHING). Mixed rigs (e.g. pre-sm_75 CMPs + Ampere) must run this
+            // package, so it has to serve both. Falls back to plain PTX if the toolkit is too old
+            // to know these arches.
             let nvcc = env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
             let arch = arch_override.unwrap_or_else(|| "compute_75".to_string());
-            println!("cargo:rustc-env=POM_PTX_ARCH={}", arch.replace("compute_", "sm_"));
-            let status = std::process::Command::new(&nvcc)
-                .args(["-ptx", &format!("-arch={}", arch), "-o", &image, "src/pom_mine.cu"])
-                .status()
-                .expect("pom-cuda: failed to run nvcc (CUDA toolkit required)");
-            if !status.success() {
-                panic!("pom-cuda: nvcc -ptx src/pom_mine.cu failed");
+            let tc_sms = ["80", "86", "89", "90"];
+            let mut args: Vec<String> = vec!["-fatbin".into(), format!("-gencode=arch={arch},code={arch}")];
+            for sm in tc_sms {
+                args.push(format!("-gencode=arch=compute_{sm},code=sm_{sm}"));
             }
-            println!("cargo:rustc-env=POM_WALK_IMAGE_KIND=ptx");
+            args.extend(["-o".to_string(), image.clone(), "src/pom_mine.cu".to_string()]);
+            let fat = std::process::Command::new(&nvcc).args(&args).status();
+            let fat_ok = matches!(fat, Ok(st) if st.success());
+            if fat_ok {
+                println!("cargo:rustc-env=POM_WALK_IMAGE_KIND=fatbin");
+                println!("cargo:rustc-env=POM_PTX_ARCH={}+sm_80..90-native", arch.replace("compute_", "sm_"));
+            } else {
+                println!("cargo:warning=pom-cuda: fatbin build failed — falling back to {arch} PTX; \
+tensor-core walk will be unavailable (classic kernel only) on Ampere and newer.");
+                println!("cargo:rustc-env=POM_PTX_ARCH={}", arch.replace("compute_", "sm_"));
+                let status = std::process::Command::new(&nvcc)
+                    .args(["-ptx", &format!("-arch={}", arch), "-o", &image, "src/pom_mine.cu"])
+                    .status()
+                    .expect("pom-cuda: failed to run nvcc (CUDA toolkit required)");
+                if !status.success() {
+                    panic!("pom-cuda: nvcc -ptx src/pom_mine.cu failed");
+                }
+                println!("cargo:rustc-env=POM_WALK_IMAGE_KIND=ptx");
+            }
         }
     }
     Ok(())
