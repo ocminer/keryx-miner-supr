@@ -306,6 +306,32 @@ jobs:
           Write-Host "built $($dll.FullName) ($([math]::Round($dll.Length/1MB,1)) MB)"
           Copy-Item $dll.FullName "keryx-llama.dll" -Force
 
+      - name: Build keryx-llama-noavx.dll (baseline-ISA CPU backend)
+        shell: pwsh
+        run: |
+          # Same engine, ggml CPU SIMD baked DOWN to baseline (SSE4.2): the stock dll bakes
+          # AVX2/FMA/F16C/BMI2 with NO runtime dispatch, so pre-AVX rig CPUs (Celeron/Pentium)
+          # SIGILL on it. The miner auto-selects keryx-llama-noavx.dll on such CPUs (so_path()),
+          # but until now the Windows package never shipped one — Linux has shipped the .so
+          # equivalent since 0.7.2. CUDA stays ON (the model is hosted on the GPU either way);
+          # flag set mirrors hiveos/build-keryx-llama.sh "noavx".
+          $llamaSrc = (Resolve-Path "llama-src").Path
+          cmake -S tools/keryx-llama -B build-llama-noavx `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DLLAMA_SRC="$llamaSrc" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;120-real;90-virtual" `
+            -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH\bin\nvcc.exe" `
+            -DGGML_NATIVE=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF `
+            -DGGML_F16C=OFF -DGGML_BMI2=OFF -DGGML_AVX_VNNI=OFF
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure (noavx) failed" }
+          cmake --build build-llama-noavx --config Release --target keryx-llama -j 4
+          if ($LASTEXITCODE -ne 0) { throw "keryx-llama-noavx.dll build failed" }
+          $dll = Get-ChildItem -Path build-llama-noavx -Recurse -Filter keryx-llama.dll | Select-Object -First 1
+          if (-not $dll) { throw "keryx-llama-noavx.dll not produced" }
+          Write-Host "built $($dll.FullName) ($([math]::Round($dll.Length/1MB,1)) MB)"
+          Copy-Item $dll.FullName "keryx-llama-noavx.dll" -Force
+
       - name: Stage artifact (exe + bundled CUDA runtime DLLs)
         shell: pwsh
         run: |
@@ -318,6 +344,12 @@ jobs:
             Copy-Item "keryx-llama.dll" $out\
           } else {
             throw "keryx-llama.dll missing — the NVIDIA PoM package must ship the llama.cpp engine"
+          }
+          # Baseline-ISA engine for pre-AVX CPUs — parity with the Linux packages (v0.7.2 fix).
+          if (Test-Path "keryx-llama-noavx.dll") {
+            Copy-Item "keryx-llama-noavx.dll" $out\
+          } else {
+            throw "keryx-llama-noavx.dll missing — pre-AVX Windows rigs would have no llama engine"
           }
           $cudaBin = "$env:CUDA_PATH\bin"
           foreach ($pat in @("cublas64_*.dll","cublasLt64_*.dll","curand64_*.dll","cudart64_*.dll")) {
