@@ -413,10 +413,6 @@ impl MinerManager {
                         // the tensor-core solver amortizes its per-batch chase/launch cost with batch
                         // size (measured +10% at 64K vs the old 16K on a 5070 Ti), and a 64K batch is
                         // still only ~25 ms on a mid Blackwell card — well under the 100 ms block time.
-                        const POM_V4_BATCH: u64 = 1 << 16;
-                        let batch = std::env::var("KERYX_POM_V4_BATCH").ok()
-                            .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0)
-                            .unwrap_or(POM_V4_BATCH);
                         // NVIDIA (CUDA) + Apple Silicon (Metal): per-device v4 grind. Device id = the
                         // worker's "#N (name)" label (per-device MINERS map → no CUDA_VISIBLE_DEVICES).
                         #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
@@ -424,6 +420,16 @@ impl MinerManager {
                             .and_then(|s| s.split_whitespace().next())
                             .and_then(|s| s.parse::<u32>().ok())
                             .unwrap_or(0);
+                        // Batch: env override wins, else SM-derived per this card (PR #37) — keeps a
+                        // launch inside the ~100ms template window at 10 BPS even on small cards.
+                        #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
+                        let batch = std::env::var("KERYX_POM_V4_BATCH").ok()
+                            .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0)
+                            .unwrap_or_else(|| keryx_miner::pom_gpu::v4_batch_for_device(wdid));
+                        #[cfg(not(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal"))))]
+                        let batch = std::env::var("KERYX_POM_V4_BATCH").ok()
+                            .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0)
+                            .unwrap_or(1 << 16);
                         #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                         let found = {
                             if !pom_driver::is_installed(wdid) {

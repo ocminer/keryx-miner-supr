@@ -444,8 +444,12 @@ extern "C" __global__ void pom_mine_v4_chase(
 
 #if __CUDA_ARCH__ >= 800
 
+#ifndef V4_TC_WARPS
 #define V4_TC_WARPS 4    // nonces (warps) per block
+#endif
+#ifndef V4_TC_PIPE
 #define V4_TC_PIPE  3    // cp.async tile buffers per warp
+#endif
 
 __device__ __forceinline__ void v4_cp_async16(void* smem_dst, const void* gmem_src) {
     unsigned long long sdst = __cvta_generic_to_shared(smem_dst);

@@ -38,6 +38,13 @@ const CHUNK_BYTES: usize = 32;
 /// (the Windows compute_75-PTX-JIT was ~5x slower than the native fatbin — "limited on power").
 fn walk_image() -> candle_core::Result<candle_core::cuda_backend::cudarc::nvrtc::Ptx> {
     use candle_core::cuda_backend::cudarc::nvrtc::Ptx;
+    // Bench/dev override: load an external fatbin from disk instead of the embedded image
+    // (kernel-tuning A/Bs without rebuilding the Rust binary). Never set in production.
+    if let Ok(p) = std::env::var("KERYX_WALK_FATBIN") {
+        if !p.is_empty() {
+            return Ok(Ptx::from_file(std::path::PathBuf::from(p)));
+        }
+    }
     if WALK_IMAGE_KIND == "fatbin" {
         static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
         let p = if let Some(p) = PATH.get() {
@@ -648,7 +655,16 @@ impl PomGpuMiner {
             // overwrites every word): the old per-batch alloc_zeros paid a cudaMalloc + a full
             // 16 MB memset + free EVERY batch (~180x/s at batch 16384), measured worth 6-10%.
             let offsets = v4_offsets_buf(&self.stream, (batch as usize) * (k as usize))?;
-            const TC_WARPS: u64 = 4; // must match V4_TC_WARPS in pom_mine.cu
+            // BENCH KNOB: warps/block for the tc walk MUST match the fatbin's V4_TC_WARPS. Default 4;
+            // KERYX_POM_V4_TC_WARPS lets a matched test fatbin (built -DV4_TC_WARPS=N) sweep occupancy.
+            let tc_warps: u64 = std::env::var("KERYX_POM_V4_TC_WARPS").ok()
+                .and_then(|s| s.parse().ok()).filter(|&w: &u64| w >= 1 && w <= 16).unwrap_or(4);
+            // smem/warp = state(256) + PIPE tiles. PIPE default 3 → 4 buffers × 256 words × 4 B = 4096.
+            let tc_pipe: u64 = std::env::var("KERYX_POM_V4_TC_PIPE").ok()
+                .and_then(|s| s.parse().ok()).filter(|&p: &u64| p >= 2 && p <= 8).unwrap_or(3);
+            let tc_smem: u32 = (tc_warps * 256 * (tc_pipe + 1) * 4) as u32;
+            #[allow(non_snake_case)]
+            let TC_WARPS: u64 = tc_warps;
             let chase = load_walk_func(&self.cuda, "pom_mine_v4_chase")?;
             let walk = load_walk_func(&self.cuda, "pom_mine_v4_tc")?;
 
@@ -695,7 +711,7 @@ impl PomGpuMiner {
                 let walk_cfg = LaunchConfig {
                     grid_dim: (((s_batch + TC_WARPS - 1) / TC_WARPS) as u32, 1, 1),
                     block_dim: ((TC_WARPS * 32) as u32, 1, 1),
-                    shared_mem_bytes: (TC_WARPS as u32) * 4096, // 3 tile buffers + state per warp
+                    shared_mem_bytes: tc_smem, // (PIPE+1) buffers × 256 words × 4B per warp
                 };
                 let mut b = walk.builder();
                 b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&k)
@@ -1027,6 +1043,47 @@ fn take_injected_fault(device_id: u32) -> bool {
 
 /// Convenience: v4 (relaunch) grind via the installed miner for a specific device. Same transient-
 /// fault teardown path as `mine`; block autotune is irrelevant (v4 is one block per nonce).
+/// v4 grind-batch sizing from the GPU's SM count (ported from upstream keryx-miner PR #37,
+/// GerardMensoif): the throughput plateau is broad from ~8K nonces upward (our 5090 bench: 64K/128K/
+/// 256K all within noise), so the batch's real job is to keep ONE launch well inside a template
+/// window at ~10 blocks/s — a fixed 64K over-runs the 100ms window on SMALL cards, wasting a whole
+/// batch on a stale job. Sizing per-SM keeps launch wall-time roughly card-independent: bigger cards
+/// grind more nonces in the same time, small cards fewer, both landing fresh. Env
+/// KERYX_POM_V4_BATCH still overrides absolutely.
+const POM_V4_NONCES_PER_SM: u64 = 384;
+const POM_V4_BATCH_MIN: u64 = 8192;
+const POM_V4_BATCH_FALLBACK: u64 = 32768;
+
+fn gpu_sm_count(device_id: u32) -> Option<u64> {
+    use candle_core::cuda_backend::cudarc::driver::{result, sys};
+    result::init().ok()?;
+    let dev = result::device::get(device_id as i32).ok()?;
+    let n = unsafe {
+        result::device::get_attribute(dev, sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+    }
+    .ok()?;
+    (n > 0).then_some(n as u64)
+}
+
+fn v4_batch_for_sm_count(sm: u64) -> u64 {
+    (sm * POM_V4_NONCES_PER_SM).max(POM_V4_BATCH_MIN)
+}
+
+/// The v4 grind batch to use on `device_id` (SM-derived, floored). Logged once per device.
+pub fn v4_batch_for_device(device_id: u32) -> u64 {
+    let b = match gpu_sm_count(device_id) {
+        Some(sm) => v4_batch_for_sm_count(sm),
+        None => POM_V4_BATCH_FALLBACK,
+    };
+    static LOGGED: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    if let Ok(mut seen) = LOGGED.get_or_init(|| Mutex::new(std::collections::HashSet::new())).lock() {
+        if seen.insert(device_id) {
+            log::info!("PoM[gpu{}]: v4 grind batch = {} nonces (SM-derived).", device_id, b);
+        }
+    }
+    b
+}
+
 pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
     let miner = {
         let g = miners().lock().ok()?;
@@ -1761,6 +1818,35 @@ mod v4_kernel_tests {
         assert_eq!(miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1).unwrap(), None,
                    "[{kind}] GPU found the nonce below the host pow — divergence");
         println!("BIT-EXACT OK on the {kind} walk");
+    }
+
+    /// Throughput bench (no pool, synthetic blob): `--ignored v4_bench`. Blob size via
+    /// KERYX_BENCH_TILES (default 6 GiB / 1KB tiles), duration via KERYX_BENCH_SECS (default 10).
+    /// Impossible target => no winner => every batch runs to completion. Prints Mh/s.
+    #[test]
+    #[ignore]
+    fn v4_bench() {
+        let n_tiles: usize = std::env::var("KERYX_BENCH_TILES").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(6 * 1024 * 1024);
+        let secs: u64 = std::env::var("KERYX_BENCH_SECS").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(10);
+        let data = blob(n_tiles);
+        println!("bench blob: {} tiles = {:.2} GiB", n_tiles, (n_tiles as f64) / (1024.0 * 1024.0));
+        let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
+        let target = [0u8; 32]; // impossible (pow > 0 always)
+        let batch: u64 = std::env::var("KERYX_POM_V4_BATCH").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(1 << 16);
+        // warmup
+        let _ = miner.mine_v4(&PPH, TS, &target, 0, batch).unwrap();
+        let t0 = std::time::Instant::now();
+        let mut nonces = 0u64;
+        while t0.elapsed().as_secs() < secs {
+            let _ = miner.mine_v4(&PPH, TS, &target, nonces, batch).unwrap();
+            nonces += batch;
+        }
+        let el = t0.elapsed().as_secs_f64();
+        println!("v4_bench: {} nonces in {:.2}s = {:.3} Mh/s (batch {})",
+                 nonces, el, nonces as f64 / el / 1e6, batch);
     }
 
     #[test]
