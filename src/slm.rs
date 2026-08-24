@@ -1579,11 +1579,21 @@ pub fn acquire_inference_card(model_id: &[u8; 32], deadline_ms: u64) -> Option<I
 /// `walk_devices()` = the CUDA ordinals this process's PoM walk is installed on (its `--cuda-device`
 /// set). Ordinal == CUDA ordinal because the miner runs with `CUDA_DEVICE_ORDER=PCI_BUS_ID`. If the
 /// chosen GPU still can't serve inference, `load_engine` flips to CPU (emergency fallback).
+/// Self-test failover override: when the designated inference GPU FAILS a model self-test but
+/// another walk GPU PASSES it, the winner is recorded here so every later inference site follows
+/// it. -1 = no override. Without this, one bad/mispicked serving card withdrew the model rig-wide
+/// and suspended EVERY card ("no inference = no mining") even though a healthy host existed.
+static INFERENCE_GPU_OVERRIDE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
+
 pub fn inference_gpu_ordinal() -> usize {
     if let Ok(s) = std::env::var("KERYX_INFERENCE_GPU") {
         if let Ok(n) = s.trim().parse::<usize>() {
             return n;
         }
+    }
+    let ov = INFERENCE_GPU_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov >= 0 {
+        return ov as usize;
     }
     // `pom_gpu` (the CUDA walk driver) only exists on the pom-cuda build. On non-CUDA builds
     // (default, and AMD/pom-opencl which places inference via llama_vulkan/KERYX_LLAMA_VK_DEVICE)
@@ -1875,7 +1885,44 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
     let t0 = std::time::Instant::now();
     let out = load_and_run_inference_on(gpu, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS);
     let secs = t0.elapsed().as_secs_f64();
-    let passed = matches!(&out, Some(t) if !t.trim().is_empty());
+    let mut passed = matches!(&out, Some(t) if !t.trim().is_empty());
+    // ── INFERENCE-HOST FAILOVER ──
+    // A failed probe on the DESIGNATED host must not condemn the model (and with it the whole
+    // rig: withdrawal → every card demotes/halts → zero declared models → mining suspended).
+    // Before withdrawing, retry the probe on this process's OTHER walk GPUs; the first card that
+    // proves it can generate becomes the inference host (recorded in INFERENCE_GPU_OVERRIDE so
+    // serving follows). This also self-heals a mispicked designated ordinal (the nvidia-smi
+    // PCI-order vs CUDA-ordinal mismatch under CUDA_VISIBLE_DEVICES). Skipped when the operator
+    // pinned a host (KERYX_INFERENCE_GPU / --no-shared-inference: per-card processes have no
+    // alternate card anyway) and on CPU-inference builds.
+    if !passed
+        && std::env::var("KERYX_INFERENCE_GPU").is_err()
+        && !NO_SHARED_INFERENCE.load(std::sync::atomic::Ordering::Relaxed)
+        && !cpu_inference_enabled()
+    {
+        #[cfg(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
+        let candidates: Vec<usize> = crate::pom_gpu::walk_devices()
+            .into_iter().map(|d| d as usize).filter(|&d| d != gpu).collect();
+        #[cfg(not(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal"))))]
+        let candidates: Vec<usize> = Vec::new();
+        for alt in candidates {
+            log::warn!(
+                "OPoI self-test: '{}' failed on GPU {} — FAILING OVER: retrying the probe on GPU {}                  (a healthy alternate host keeps the rig mining).", name, gpu, alt
+            );
+            let t1 = std::time::Instant::now();
+            let out2 = load_and_run_inference_on(alt, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS);
+            if matches!(&out2, Some(t) if !t.trim().is_empty()) {
+                INFERENCE_GPU_OVERRIDE.store(alt as isize, std::sync::atomic::Ordering::Relaxed);
+                log::warn!(
+                    "OPoI self-test: '{}' PASSED on GPU {} in {:.1}s — inference host MOVED {} → {}                      (GPU {} failed its probe; it keeps mining PoM, GPU {} now serves).",
+                    name, alt, t1.elapsed().as_secs_f64(), gpu, alt, gpu, alt
+                );
+                passed = true;
+                break;
+            }
+            log::warn!("OPoI self-test: '{}' also failed on GPU {} ({:.1}s).", name, alt, t1.elapsed().as_secs_f64());
+        }
+    }
     if let Ok(mut m) = self_test_state().write() { m.insert(*model_id, passed); }
     if passed {
         mark_model_available(model_id, "inference_self_test_passed");
