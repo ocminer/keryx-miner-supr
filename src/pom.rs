@@ -13,7 +13,9 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(target_family = "unix")]
@@ -402,6 +404,34 @@ pub struct WeightIndex {
     /// which at 10 BPS is a real solo block-race edge (upstream 7a6e7a0). Costs ~2N*32 B of RAM
     /// (~9.6 GB at tier-0's N=150M), so it is OPT-IN via KERYX_RESIDENT_TREE=1.
     dense: Option<Vec<Vec<[u8; 32]>>>,
+    /// Memo for UPPER-level Merkle siblings (see `merkle_path`). A proof re-walk does 256 path
+    /// lookups over random offsets; the tree's upper levels hold so few nodes that those siblings
+    /// repeat constantly across the 256, yet each miss costs a full subtree recompute (up to 32
+    /// node reads + folds) or a checkpoint read. Caching only levels with few nodes keeps this
+    /// bounded to a few MB while covering exactly the repeats — the low levels (millions of nodes,
+    /// ~never repeat) are left uncached. The tree is immutable once built, so entries never stale.
+    sibling_memo: Mutex<HashMap<(u32, u64), [u8; 32]>>,
+}
+
+/// Cache siblings only at levels holding at most this many nodes. 65536 entries x (12 B key +
+/// 32 B value + map overhead) bounds the memo at a few MB even if every slot is touched.
+const SIBLING_MEMO_MAX_NODES_DEFAULT: u64 = 65_536;
+
+/// Per-level node-count ceiling for memoization; `KERYX_POM_PATH_MEMO_MAX` overrides (power users
+/// with RAM to spare can cache deeper levels for a bigger win).
+fn sibling_memo_max_nodes() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("KERYX_POM_PATH_MEMO_MAX").ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(SIBLING_MEMO_MAX_NODES_DEFAULT)
+    })
+}
+
+/// `KERYX_POM_PATH_MEMO=0` disables the sibling memo (A/B knob + safety valve).
+fn memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KERYX_POM_PATH_MEMO").ok().as_deref() != Some("0"))
 }
 
 impl Drop for WeightIndex {
@@ -752,6 +782,7 @@ impl WeightIndex {
             total_levels,
             persistent,
             dense: None,
+            sibling_memo: Mutex::new(HashMap::new()),
         };
         Ok((idx, table_snapshot))
     }
@@ -824,6 +855,7 @@ impl WeightIndex {
             total_levels: meta.total_levels,
             persistent: true,
             dense: None,
+            sibling_memo: Mutex::new(HashMap::new()),
         })
     }
 
@@ -928,6 +960,11 @@ impl WeightIndex {
         fold_levels(&nodes, rounds)
     }
 
+    /// Number of memoized sibling entries (diagnostic / bench).
+    pub fn sibling_memo_len(&self) -> usize {
+        self.sibling_memo.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
     /// Build the in-RAM dense tree; afterwards `merkle_path` is a pure lookup. Reads every chunk
     /// once (sequential, page-cache friendly). Ported from upstream 7a6e7a0.
     pub fn build_dense(&mut self) {
@@ -971,6 +1008,17 @@ impl WeightIndex {
                 break; // root has no sibling
             }
             let sib_idx = idx ^ 1;
+            // Upper levels repeat across the 256 lookups of one proof — serve them from the memo.
+            let memoize = memo_enabled() && self.count_at_level(level) <= sibling_memo_max_nodes();
+            if memoize {
+                if let Ok(m) = self.sibling_memo.lock() {
+                    if let Some(&hit) = m.get(&(level, sib_idx)) {
+                        path.push(hit);
+                        idx >>= 1;
+                        continue;
+                    }
+                }
+            }
             let is_stored = level > 0 && (level % CHECKPOINT_INTERVAL == 0 || level == total_levels - 1);
             let node = if is_stored {
                 let cp = self.find_checkpoint(level);
@@ -985,6 +1033,11 @@ impl WeightIndex {
                 let span = 1u64 << (level - src_level);
                 self.compute_subtree_hash(real_sib_idx * span, span, src_level)
             };
+            if memoize {
+                if let Ok(mut m) = self.sibling_memo.lock() {
+                    m.insert((level, sib_idx), node);
+                }
+            }
             path.push(node);
             idx >>= 1;
         }
@@ -1418,6 +1471,7 @@ pub(crate) fn index_from_ram(data: Vec<u8>) -> WeightIndex {
         total_levels,
         persistent: false,
         dense: None,
+        sibling_memo: Mutex::new(HashMap::new()),
     }
 }
 
@@ -1476,6 +1530,7 @@ mod tests {
             total_levels,
             persistent: false,
             dense: None,
+            sibling_memo: Mutex::new(HashMap::new()),
         }
     }
 
