@@ -154,6 +154,17 @@ pub struct Opt {
     pub escrow_state_file: String,
 
     #[clap(
+        long = "escrow-dir",
+        visible_alias = "escrow-cert-dir",
+        help = "Directory holding escrow.key, escrow.cert and escrow_state.json — like --models-dir, \
+                point it OUTSIDE the miner directory so a miner update (e.g. a HiveOS reinstall, which \
+                replaces the whole miner folder) cannot wipe your escrow key and claim state. Created \
+                if absent. Also settable as KERYX_ESCROW_DIR. An --escrow-*-file given as a path still wins.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub escrow_dir: Option<String>,
+
+    #[clap(
         long = "recover-escrow",
         help = "Rebuild escrow_state.json by querying the Keryx public API. Exits after recovery.",
         help_heading = "OPoI / Inference"
@@ -308,8 +319,60 @@ fn resolve_model_dir(raw: &str) -> Result<std::path::PathBuf, Error> {
     Ok(dir)
 }
 
+/// Where `current` should live once `--escrow-dir` is in play: inside the directory when it is a
+/// bare filename, and `None` (i.e. leave it alone) when the user already gave a path — that is what
+/// keeps the per-file `--escrow-*-file` flags overriding the directory.
+fn escrow_path_in(dir: &str, current: &str) -> Option<String> {
+    if current.contains('/') || current.contains('\\') {
+        return None;
+    }
+    Some(std::path::Path::new(dir).join(current).to_string_lossy().into_owned())
+}
+
 impl Opt {
+    /// Re-homes the escrow files into `--escrow-dir` (or `KERYX_ESCROW_DIR`).
+    ///
+    /// The three escrow paths default to BARE FILENAMES, so they land in the process's working
+    /// directory — which on HiveOS is the miner directory that a reinstall replaces wholesale,
+    /// taking the escrow key and the claim state with it. Pointing them at a directory outside the
+    /// miner folder is the same trick `--models-dir` already uses for model files.
+    ///
+    /// Only bare filenames are re-homed: an `--escrow-*-file` given WITH a path is left exactly as
+    /// the user wrote it, so the per-file flags keep overriding the directory.
+    pub fn resolve_escrow_dir(&mut self) {
+        let dir = self
+            .escrow_dir
+            .clone()
+            .or_else(|| std::env::var("KERYX_ESCROW_DIR").ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let Some(dir) = dir else { return };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::warn!(
+                "--escrow-dir '{}' could not be created ({}) — falling back to the working directory. \
+                 Your escrow key and claim state will NOT survive a miner reinstall.",
+                dir, e
+            );
+            return;
+        }
+        let mut moved = Vec::new();
+        for (label, f) in [
+            ("key", &mut self.escrow_key_file),
+            ("cert", &mut self.escrow_cert_file),
+            ("state", &mut self.escrow_state_file),
+        ] {
+            if let Some(p) = escrow_path_in(&dir, f) {
+                *f = p;
+                moved.push(label);
+            }
+        }
+        if !moved.is_empty() {
+            log::info!("escrow {} file(s) live in '{}' (survives a miner update).", moved.join("/"), dir);
+        }
+    }
+
     pub fn process(&mut self) -> Result<(), Error> {
+        self.resolve_escrow_dir();
         if self.recover_escrow {
             return Ok(());
         }
@@ -376,5 +439,33 @@ impl Opt {
         } else {
             LevelFilter::Info
         }
+    }
+}
+
+#[cfg(test)]
+mod escrow_dir_tests {
+    use super::escrow_path_in;
+
+    #[test]
+    fn bare_filenames_move_into_the_escrow_dir() {
+        assert_eq!(escrow_path_in("/persist/keryx", "escrow.key").as_deref(), Some("/persist/keryx/escrow.key"));
+        assert_eq!(escrow_path_in("/persist/keryx", "escrow.cert").as_deref(), Some("/persist/keryx/escrow.cert"));
+        assert_eq!(
+            escrow_path_in("/persist/keryx", "escrow_state.json").as_deref(),
+            Some("/persist/keryx/escrow_state.json")
+        );
+    }
+
+    #[test]
+    fn an_explicit_path_is_left_alone() {
+        // Absolute and relative paths both mean "the user chose this exact location".
+        assert_eq!(escrow_path_in("/persist/keryx", "/etc/keryx/my.key"), None);
+        assert_eq!(escrow_path_in("/persist/keryx", "../shared/escrow.key"), None);
+        assert_eq!(escrow_path_in("/persist/keryx", "sub/escrow.key"), None);
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_dir_does_not_double_up() {
+        assert_eq!(escrow_path_in("/persist/keryx/", "escrow.key").as_deref(), Some("/persist/keryx/escrow.key"));
     }
 }
