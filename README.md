@@ -246,6 +246,19 @@ warning. Existing rigs upgrade seamlessly: on the first run with v0.9.4+ the mod
 `/hive/miners/custom/models` (or copy it there yourself: `mkdir -p /hive/miners/custom/models && mv
 <old-miner-dir>/models/* /hive/miners/custom/models/`) and every later upgrade reuses it.
 
+**Keeping the escrow files across updates (solo miners)**: `escrow.key`, `escrow.cert` and
+`escrow_state.json` default to the miner's working directory, which a HiveOS reinstall replaces
+wholesale — taking your escrow identity and claim state with it. Point them somewhere persistent with
+`--escrow-dir` (alias `--escrow-cert-dir`, or `KERYX_ESCROW_DIR`), exactly like `--model-dir` does for
+models:
+
+```bash
+--escrow-dir /hive/miners/custom/keryx-escrow
+```
+
+The directory is created if it does not exist, and an `--escrow-key-file` / `--escrow-cert-file` /
+`--escrow-state-file` given *with a path* still overrides it.
+
 ### Automatic per-card selection (default — recommended)
 
 With **no tier flag**, the miner runs in **AUTO** mode: it queries each GPU's VRAM independently and loads the
