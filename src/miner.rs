@@ -495,6 +495,15 @@ impl MinerManager {
                         pom_nonce = pom_nonce.wrapping_add(batch);
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);
+                        // --only-inference duty cycle: idle the card between launches so it draws
+                        // almost nothing and is instantly available to serve. No-op otherwise.
+                        #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
+                        if keryx_miner::pom_gpu::only_inference() {
+                            let ms = keryx_miner::pom_gpu::only_inference_duty_ms();
+                            if ms > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(ms));
+                            }
+                        }
                         if let Some(nonce) = found {
                             // NVIDIA/Apple: recompute the PoM tier per block (H2-boundary correct).
                             // POOL SHARES: overlap the host proof re-walk with grinding, like the AMD
