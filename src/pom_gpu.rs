@@ -682,7 +682,10 @@ impl PomGpuMiner {
         bind_device_ctx(&self.stream)?; // multi-GPU: bind this device's context before the raw launch
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
 
-        if self.v4_tc_usable(n_tiles, k, &p, &s, timestamp) {
+        // A card whose autotune measured the classic walk faster takes it even though the
+        // tensor-core kernel is available and correct here.
+        let tc_wanted = v4_tune_for(self.stream.context().ordinal() as u32).map_or(true, |t| t.tc);
+        if tc_wanted && self.v4_tc_usable(n_tiles, k, &p, &s, timestamp) {
             // Tensor-core solver: resolve the whole tile-offset chain first (it depends only on
             // tile snippets, never on the walk state), then walk with a depth-3 cp.async tile
             // pipeline + 8x mma.sync.m16n8k32.s8 per step. Byte-exact vs pom_mine_v4/the host;
@@ -708,11 +711,8 @@ impl PomGpuMiner {
             let need = (batch as usize) * (k as usize);
             let buf_a = v4_offsets_buf(&self.stream, need)?;
             let buf_b = v4_offsets_buf_b(&self.stream, need)?;
-            const TC_WARPS_DEFAULT: u64 = 4;
-            let tc_warps: u64 = std::env::var("KERYX_POM_V4_TC_WARPS").ok()
-                .and_then(|s| s.parse().ok()).filter(|&w: &u64| w >= 1 && w <= 16).unwrap_or(TC_WARPS_DEFAULT);
-            let tc_pipe: u64 = std::env::var("KERYX_POM_V4_TC_PIPE").ok()
-                .and_then(|s| s.parse().ok()).filter(|&p: &u64| p >= 2 && p <= 8).unwrap_or(3);
+            let tc_warps: u64 = v4_tc_warps();
+            let tc_pipe: u64 = v4_tc_pipe();
             let tc_smem: u32 = (tc_warps * 256 * (tc_pipe + 1) * 4) as u32;
             let chase = load_walk_func(&self.cuda, "pom_mine_v4_chase")?;
             let walk = load_walk_func(&self.cuda, "pom_mine_v4_tc")?;
@@ -1145,8 +1145,31 @@ fn reset_stale_gpu_state(device_id: u32) {
     }
     set_inference_paused_on(device_id as usize, true);
     let _resume = PauseGuard(device_id);
+    // Is this device's context still usable, or did the fault poison it? The answer decides whether
+    // llama's model may be freed normally or must be abandoned: `llama_free` on a poisoned context
+    // aborts the entire process (see `llama_engine::abandon_for_gpu`), which is how a single card's
+    // fault turned into a whole-rig restart loop in the field. The probe clones the miner handle
+    // only briefly — it must be dropped before `uninstall`, which waits for sole ownership.
+    let healthy = {
+        let m = miners().lock().ok().and_then(|g| g.get(&device_id).cloned());
+        match m {
+            Some(m) => m.stream.synchronize().is_ok(),
+            None => true,
+        }
+    };
     uninstall(device_id);
-    crate::llama_engine::unload_for_gpu(device_id as usize);
+    if healthy {
+        crate::llama_engine::unload_for_gpu(device_id as usize);
+    } else {
+        let had_engine = crate::llama_engine::abandon_for_gpu(device_id as usize);
+        log::error!(
+            "PoM[gpu{}]: this device's CUDA context is poisoned (a sticky fault survives a \
+             synchronize){} — the card cannot be recovered without restarting the miner. Other GPUs \
+             keep mining; restart the process to bring this one back.",
+            device_id,
+            if had_engine { ", so its llama model was abandoned rather than freed" } else { "" }
+        );
+    }
 }
 
 /// TEST-ONLY fault injection — dev knob, never set this in production. `KERYX_FAULT_INJECT_GPU=
@@ -1172,6 +1195,57 @@ fn take_injected_fault(device_id: u32) -> bool {
 /// batch on a stale job. Sizing per-SM keeps launch wall-time roughly card-independent: bigger cards
 /// grind more nonces in the same time, small cards fewer, both landing fresh. Env
 /// KERYX_POM_V4_BATCH still overrides absolutely.
+/// Warps per block and cp.async pipeline depth for the tensor-core walk.
+///
+/// These are NOT free parameters. They are `#define`s compiled into `pom_mine_v4_tc`, and build.rs
+/// publishes the values the loaded kernel was built with. The launch config must match them exactly:
+/// the kernel computes its nonce as `blockIdx.x * V4_TC_WARPS + warp` and slices shared memory as
+/// `warp * 256 * (V4_TC_PIPE + 1)`. Launching 2 warps/block against a 4-warp kernel does not "use
+/// less of the GPU" — it walks only the nonces whose index mod 4 is 0 or 1 while the host still
+/// counts the whole batch as hashed, i.e. an inflated hashrate and silently missed shares. Launching
+/// 16 overruns the shared-memory slice and faults the device.
+///
+/// `KERYX_POM_V4_TC_WARPS` / `_TC_PIPE` therefore only apply when a matching custom fatbin is
+/// supplied via `KERYX_WALK_FATBIN` (the profiling path, where the kernel is rebuilt with the same
+/// `-D` values). Otherwise they are ignored with one warning.
+fn v4_tc_compiled(var: &str, compiled: u64) -> u64 {
+    let Ok(raw) = std::env::var(var) else { return compiled };
+    let Ok(v) = raw.trim().parse::<u64>() else { return compiled };
+    if v == compiled {
+        return compiled;
+    }
+    if std::env::var("KERYX_WALK_FATBIN").is_ok() {
+        return v; // custom kernel image: the caller compiled it with these values
+    }
+    static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let seen = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if seen.lock().map(|mut s| s.insert(var.to_string())).unwrap_or(false) {
+        log::warn!(
+            "{}={} ignored: the walk kernel in this build is compiled for {}, and launching a \
+             different geometry would skip nonces (inflated hashrate, missed shares). Set \
+             KERYX_WALK_FATBIN to a kernel built with the same value to use it.",
+            var, v, compiled
+        );
+    }
+    compiled
+}
+
+fn v4_tc_warps() -> u64 {
+    const COMPILED: u64 = match u64::from_str_radix(env!("POM_V4_TC_WARPS"), 10) {
+        Ok(v) => v,
+        Err(_) => 4,
+    };
+    v4_tc_compiled("KERYX_POM_V4_TC_WARPS", COMPILED)
+}
+
+fn v4_tc_pipe() -> u64 {
+    const COMPILED: u64 = match u64::from_str_radix(env!("POM_V4_TC_PIPE"), 10) {
+        Ok(v) => v,
+        Err(_) => 3,
+    };
+    v4_tc_compiled("KERYX_POM_V4_TC_PIPE", COMPILED)
+}
+
 const POM_V4_NONCES_PER_SM: u64 = 384;
 const POM_V4_BATCH_MIN: u64 = 8192;
 const POM_V4_BATCH_FALLBACK: u64 = 32768;
@@ -1191,19 +1265,280 @@ fn v4_batch_for_sm_count(sm: u64) -> u64 {
     (sm * POM_V4_NONCES_PER_SM).max(POM_V4_BATCH_MIN)
 }
 
-/// The v4 grind batch to use on `device_id` (SM-derived, floored). Logged once per device.
+/// The v4 grind batch to use on `device_id`. The autotune's measured batch wins when this card has
+/// been tuned; otherwise the SM-derived estimate. Logged once per device.
 pub fn v4_batch_for_device(device_id: u32) -> u64 {
-    let b = match gpu_sm_count(device_id) {
-        Some(sm) => v4_batch_for_sm_count(sm),
-        None => POM_V4_BATCH_FALLBACK,
+    let (b, how) = match v4_tune_for(device_id) {
+        Some(t) => (t.batch, "autotuned"),
+        None => match gpu_sm_count(device_id) {
+            Some(sm) => (v4_batch_for_sm_count(sm), "SM-derived"),
+            None => (POM_V4_BATCH_FALLBACK, "fallback"),
+        },
     };
     static LOGGED: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
     if let Ok(mut seen) = LOGGED.get_or_init(|| Mutex::new(std::collections::HashSet::new())).lock() {
         if seen.insert(device_id) {
-            log::info!("PoM[gpu{}]: v4 grind batch = {} nonces (SM-derived).", device_id, b);
+            log::info!("PoM[gpu{}]: v4 grind batch = {} nonces ({}).", device_id, b, how);
         }
     }
     b
+}
+
+// ── PER-CARD LAUNCH AUTOTUNE ───────────────────────────────────────────────────────────────────
+// The v4 launch geometry that is fastest on one architecture is NOT fastest on another: warps-per-
+// block trades occupancy against the cp.async pipeline depth, and whether the tensor-core walk beats
+// the classic dp4a walk at all depends on the card's int8-mma throughput vs its DRAM bandwidth. The
+// defaults here (tc, 4 warps, pipe 3, 384 nonces/SM) were measured on Blackwell; carrying them to
+// every card in a mixed fleet leaves throughput on the table. So each card measures itself ONCE and
+// remembers the answer.
+//
+// Cost: ~6-8 s on the first grind of a fresh card, then free — the result is cached on disk keyed by
+// (GPU name, SM count, walk-table size, K), so a restart reuses it and a model/tier change re-tunes.
+// KERYX_POM_V4_AUTOTUNE=0 disables (pure defaults); =force re-measures and overwrites the cache.
+// Explicit KERYX_POM_V4_{TC,TC_WARPS,TC_PIPE,BATCH} always override the tuned value.
+///
+/// The tunable axes are deliberately limited to the ones that cannot change what the kernel
+/// computes: which walk kernel runs, and how many nonces are handed to one launch. Warps-per-block
+/// and pipeline depth are compiled into the kernel (see `v4_tc_warps`) and are NOT tuned here — a
+/// mismatched launch geometry silently skips nonces, which would look like a large speedup while
+/// quietly costing shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V4Tune {
+    pub tc: bool,
+    pub batch: u64,
+}
+
+static V4_TUNE: OnceLock<Mutex<HashMap<u32, V4Tune>>> = OnceLock::new();
+
+fn v4_tune_map() -> &'static Mutex<HashMap<u32, V4Tune>> {
+    V4_TUNE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The measured launch geometry for `device_id`, if this card has been tuned.
+pub fn v4_tune_for(device_id: u32) -> Option<V4Tune> {
+    v4_tune_map().lock().ok()?.get(&device_id).copied()
+}
+
+fn set_v4_tune(device_id: u32, t: V4Tune) {
+    if let Ok(mut g) = v4_tune_map().lock() {
+        g.insert(device_id, t);
+    }
+}
+
+fn v4_autotune_mode() -> &'static str {
+    static MODE: OnceLock<String> = OnceLock::new();
+    MODE.get_or_init(|| std::env::var("KERYX_POM_V4_AUTOTUNE").unwrap_or_default())
+        .as_str()
+}
+
+fn gpu_name(device_id: u32) -> String {
+    use candle_core::cuda_backend::cudarc::driver::result;
+    result::init()
+        .ok()
+        .and_then(|_| result::device::get(device_id as i32).ok())
+        .and_then(|d| result::device::get_name(d).ok())
+        .unwrap_or_else(|| format!("cuda{}", device_id))
+}
+
+fn v4_tune_cache_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::Path::new(&home).join(".keryx").join("v4tune.json"))
+}
+
+/// Cache key: everything that can change the right answer. The walk-table size and K matter because
+/// they set how much of the card's memory system the walk actually touches.
+fn v4_tune_key(device_id: u32, sm: u64, n_tiles: u64, k: u32) -> String {
+    format!("{}|sm{}|tiles{}|k{}", gpu_name(device_id), sm, n_tiles, k)
+}
+
+fn v4_tune_load(key: &str) -> Option<V4Tune> {
+    let raw = std::fs::read_to_string(v4_tune_cache_path()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let e = v.get(key)?;
+    Some(V4Tune {
+        tc: e.get("tc")?.as_bool()?,
+        batch: e.get("batch")?.as_u64()?,
+    })
+}
+
+fn v4_tune_save(key: &str, t: V4Tune, mhs: f64) {
+    let Some(path) = v4_tune_cache_path() else { return };
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            key.to_string(),
+            serde_json::json!({
+                "tc": t.tc, "batch": t.batch,
+                "mhs": (mhs * 1000.0).round() / 1000.0,
+            }),
+        );
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&v) {
+        let _ = std::fs::write(&path, s);
+    }
+}
+
+/// Measures one candidate geometry: grinds a never-winning target for ~`ms` and returns Mh/s.
+/// A zero target can never be met, so every nonce in the batch runs the full walk — this times the
+/// real kernel, not an early exit.
+fn v4_bench_cfg(device_id: u32, miner: &PomGpuMiner, pph: &[u8; 32], ts: u64, t: V4Tune, ms: u64) -> Option<f64> {
+    let never = [0u8; 32];
+    set_v4_tune(device_id, t);
+    miner.mine_v4(pph, ts, &never, 1, t.batch).ok()?; // warm-up: JIT, buffer alloc, clocks
+    let started = std::time::Instant::now();
+    let mut n: u64 = 0;
+    while started.elapsed() < std::time::Duration::from_millis(ms) {
+        miner.mine_v4(pph, ts, &never, 1 + n, t.batch).ok()?;
+        n += t.batch;
+    }
+    let secs = started.elapsed().as_secs_f64();
+    (secs > 0.0 && n > 0).then(|| n as f64 / secs / 1.0e6)
+}
+
+/// Tunes `device_id` once per process. Staged rather than exhaustive (kind → warps → batch) so the
+/// whole thing costs seconds, not minutes: the axes are close to independent in the measurements.
+fn v4_autotune(device_id: u32, miner: &PomGpuMiner) {
+    let mode = v4_autotune_mode();
+    if mode == "0" {
+        return;
+    }
+    let n_tiles = miner.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+    if n_tiles == 0 {
+        return;
+    }
+    let k = crate::pom_v4::POM_V4_K as u32;
+    let sm = gpu_sm_count(device_id).unwrap_or(0);
+    let base = if sm > 0 { v4_batch_for_sm_count(sm) } else { POM_V4_BATCH_FALLBACK };
+    let key = v4_tune_key(device_id, sm, n_tiles, k);
+
+    if mode != "force" {
+        if let Some(t) = v4_tune_load(&key) {
+            set_v4_tune(device_id, t);
+            log::info!(
+                "PoM[gpu{}]: launch tuning restored from cache — {} walk, batch {} ({}).",
+                device_id,
+                if t.tc { "tensor-core" } else { "classic" },
+                t.batch, key
+            );
+            return;
+        }
+    }
+
+    // The pph/timestamp only seed the walk; any fixed pair times the same work.
+    let pph = [0u8; 32];
+    let ts = 0u64;
+    let bench = |t: V4Tune, ms: u64| v4_bench_cfg(device_id, miner, &pph, ts, t, ms);
+    let defaults = V4Tune { tc: true, batch: base };
+
+    // 1) Which walk? The tensor-core kernel is a large win on Blackwell AND on Ampere (measured
+    // 3070: 1.35 vs 0.84 Mh/s), but that is a claim about these cards, not about every card — so it
+    // is measured rather than assumed. Both kernels are byte-exact mirrors of the host walk, so
+    // either answer is correct; only the speed differs.
+    let tc_mhs = if miner.v4_tc_available() { bench(defaults, 400) } else { None };
+    let classic_mhs = bench(V4Tune { tc: false, ..defaults }, 400);
+    let mut best = match (tc_mhs, classic_mhs) {
+        (Some(a), Some(b)) if a >= b => V4Tune { tc: true, ..defaults },
+        (Some(_), Some(_)) => V4Tune { tc: false, ..defaults },
+        (Some(_), None) => V4Tune { tc: true, ..defaults },
+        (None, Some(_)) => V4Tune { tc: false, ..defaults },
+        (None, None) => {
+            log::warn!("PoM[gpu{}]: autotune could not measure the walk — keeping defaults.", device_id);
+            set_v4_tune(device_id, defaults);
+            return;
+        }
+    };
+    let mut best_mhs = tc_mhs.into_iter().chain(classic_mhs).fold(0.0f64, f64::max);
+
+    // 2) Batch. A larger batch amortizes the launch and the offset chase over more nonces, but one
+    // launch must still finish well inside a block interval (~100 ms at 10 BPS) or the whole batch
+    // lands on a stale job. The SM-derived estimate is a good centre, not a maximum: it under-serves
+    // big cards (an RTX 5080 measured 3.05 Mh/s at 64K vs 2.90 at its SM-derived 32K), so the sweep
+    // looks one step either side. Requires a 2% win to move, so noise cannot flip the choice.
+    for b in [base / 2, base * 2] {
+        let b = b.max(POM_V4_BATCH_MIN);
+        if b == best.batch {
+            continue;
+        }
+        if let Some(m) = bench(V4Tune { batch: b, ..best }, 350) {
+            if m > best_mhs * 1.02 {
+                best_mhs = m;
+                best.batch = b;
+            }
+        }
+    }
+
+    // 3) The chosen configuration must find the SAME winning nonce as the reference walk. Batch size
+    // and kernel choice are not supposed to change results at all, so a mismatch means the candidate
+    // is not walking what it claims to — the failure mode that looks like free speed and quietly
+    // costs shares. Fall back to defaults rather than mine on it.
+    if !v4_config_agrees_with_reference(device_id, miner, best) {
+        log::error!(
+            "PoM[gpu{}]: autotune result {:?} did NOT reproduce the reference walk's winner — \
+             discarding it and keeping the defaults.",
+            device_id, best
+        );
+        set_v4_tune(device_id, defaults);
+        return;
+    }
+
+    set_v4_tune(device_id, best);
+    v4_tune_save(&key, best, best_mhs);
+    log::info!(
+        "PoM[gpu{}]: autotuned {} → {} walk, batch {} = {:.2} Mh/s (measured: tensor-core {:.2}, classic {:.2}).",
+        device_id,
+        gpu_name(device_id),
+        if best.tc { "tensor-core" } else { "classic" },
+        best.batch, best_mhs,
+        tc_mhs.unwrap_or(0.0), classic_mhs.unwrap_or(0.0)
+    );
+}
+
+/// Verifies a candidate configuration against the classic walk at the stock batch: same seed, same
+/// nonce range, a target loose enough that a winner exists, and the winner must be identical.
+fn v4_config_agrees_with_reference(device_id: u32, miner: &PomGpuMiner, cand: V4Tune) -> bool {
+    // Loose target: top byte 0x0f leaves roughly 1-in-16 nonces winning, so a few thousand nonces
+    // are certain to contain one, and the LOWEST winner is a strict function of the walk.
+    let mut target = [0xffu8; 32];
+    target[31] = 0x0f;
+    let pph = [0x5au8; 32];
+    let ts = 7u64;
+    let probe = 4096u64;
+    let reference = {
+        set_v4_tune(device_id, V4Tune { tc: false, batch: probe });
+        miner.mine_v4(&pph, ts, &target, 1, probe)
+    };
+    let candidate = {
+        set_v4_tune(device_id, V4Tune { batch: probe, ..cand });
+        miner.mine_v4(&pph, ts, &target, 1, probe)
+    };
+    match (reference, candidate) {
+        (Ok(a), Ok(b)) => a == b,
+        // A launch error here is itself disqualifying.
+        _ => false,
+    }
+}
+
+/// Runs the autotune the first time this device grinds, and never again in this process.
+fn ensure_v4_autotuned(device_id: u32, miner: &PomGpuMiner) {
+    static DONE: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    let done = DONE.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    {
+        let Ok(g) = done.lock() else { return };
+        if g.contains(&device_id) {
+            return;
+        }
+    }
+    // Mark BEFORE measuring: a failed tune must not retry every batch.
+    if let Ok(mut g) = done.lock() {
+        g.insert(device_id);
+    }
+    v4_autotune(device_id, miner);
 }
 
 pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
@@ -1211,6 +1546,8 @@ pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_l
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
+    // First grind on this card: measure its launch geometry (cached on disk, so this is a one-off).
+    ensure_v4_autotuned(device_id, &miner);
     match miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch) {
         Ok(w) => w,
         Err(e) => {

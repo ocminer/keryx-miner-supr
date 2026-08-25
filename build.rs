@@ -52,6 +52,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let image = format!("{}/pom_mine.image", out); // the shipped walk image (fatbin or ptx)
         println!("cargo:rerun-if-changed=src/pom_mine.cu");
         println!("cargo:rerun-if-changed=cuda/pom_mine.fatbin");
+        // The tensor-core walk's warps-per-block and pipeline depth are COMPILE-TIME constants in
+        // the kernel (`V4_TC_WARPS` / `V4_TC_PIPE`), and the host launch config must agree with them
+        // exactly: the kernel derives its nonce index as `blockIdx.x * V4_TC_WARPS + warp`, so a
+        // block launched with a different warp count silently walks the wrong nonces (or reads past
+        // its shared-memory slice). Publish what the kernel was actually compiled with so the host
+        // cannot drift from it.
+        for (name, var) in [("V4_TC_WARPS", "POM_V4_TC_WARPS"), ("V4_TC_PIPE", "POM_V4_TC_PIPE")] {
+            let def = std::fs::read_to_string("src/pom_mine.cu")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find_map(|l| {
+                            let l = l.trim();
+                            l.strip_prefix(&format!("#define {}", name))
+                                .and_then(|r| r.split_whitespace().next().map(|v| v.to_string()))
+                        })
+                })
+                .unwrap_or_else(|| panic!("pom-cuda: could not read #define {} from src/pom_mine.cu", name));
+            println!("cargo:rustc-env={}={}", var, def);
+        }
         // Without these, switching walk image/arch silently reuses the previously built image.
         println!("cargo:rerun-if-env-changed=POM_WALK_IMAGE");
         println!("cargo:rerun-if-env-changed=POM_CUDA_ARCH");
