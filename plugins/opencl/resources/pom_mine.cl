@@ -221,13 +221,15 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4(
     u64 off = pom_mix64(seed ^ V4_OFFSET_FIRST_SALT) % V4_NT(n_tiles);
 
     for (uint step = 1; step <= K; step++) {
-        // Load this sub-nonce's 1 KB tile: lane loads chunk (tile*32 + lane) = 8 u32.
+        // Load this sub-nonce's 1 KB tile: lane loads chunk (tile*32 + lane) = 32 B via 2×uint4
+        // (128-bit). 32-B-aligned src + LDS dst → fewer memory ops / better MLP on the latency-
+        // bound random gather (measured +13% on gfx1102 WMMA). Byte-exact (same bytes, wider loads).
         {
             u64 tin;
             const __global uint* sb = v4_slab(b0, b1, b2, b3, off, slab_tiles, &tin);
-            const __global uint* src = sb + (tin * (u64)V4_TILE_CHUNKS + lane) * 8UL;
-            __local uint* dst = strip + lane * 8;
-            V4_UNROLL for (int w = 0; w < 8; w++) dst[w] = src[w];
+            const __global uint4* src4 = (const __global uint4*)(sb + (tin * (u64)V4_TILE_CHUNKS + lane) * 8UL);
+            __local uint4* dst4 = (__local uint4*)(strip + lane * 8);
+            dst4[0] = src4[0]; dst4[1] = src4[1];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -645,12 +647,15 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma_
         __local uint* scur = (step & 1u) ? sA : sB;
         __local uint* snxt = (step & 1u) ? sB : sA;
 
-        // Load this step's tile (lane loads chunk `lane`).
+        // Load this step's tile (lane loads chunk `lane` = 32 B). 128-bit (uint4) transactions: the
+        // per-lane address is 32-B aligned (chunk stride) and the LDS dst is 32-B aligned, so 2×uint4
+        // replaces 8×u32 — fewer memory ops / better MLP on the latency-bound random gather. Byte-exact.
         {
             u64 tin;
             const __global uint* sb = v4_slab(b0, b1, b2, b3, off, slab_tiles, &tin);
-            const __global uint* src = sb + (tin * (u64)V4_TILE_CHUNKS + lane) * 8UL;
-            V4_UNROLL for (int w = 0; w < 8; w++) tile[lane * 8 + w] = src[w];
+            const __global uint4* src4 = (const __global uint4*)(sb + (tin * (u64)V4_TILE_CHUNKS + lane) * 8UL);
+            __local uint4* dst4 = (__local uint4*)(tile + lane * 8);
+            dst4[0] = src4[0]; dst4[1] = src4[1];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
