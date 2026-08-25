@@ -431,6 +431,20 @@ impl MinerManager {
                             .unwrap_or(1 << 16);
                         #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                         let found = {
+                            // CRASH GUARD (see pom_gpu::inference_paused_for): while THIS card is
+                            // swapping its llama model, neither run a walk nor rebuild one — the
+                            // zero-dup walk addresses the engine's weights, so touching them mid
+                            // free/reload faults with a STICKY CUDA_ERROR_ILLEGAL_ADDRESS that
+                            // poisons the context and takes the process down via ggml_abort.
+                            // Swaps last ~2 s; idle honestly (no hashes counted) until it clears.
+                            if keryx_miner::pom_gpu::inference_paused_for(wdid) {
+                                static SWAP_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                if SWAP_WAIT.fetch_add(1, Ordering::Relaxed) % 200 == 0 {
+                                    log::info!("PoM[gpu{}]: holding off — llama model swap in progress on this card (walk paused, ~2 s).", wdid);
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(25));
+                                continue;
+                            }
                             if !pom_driver::is_installed(wdid) {
                                 // Cooperative pre-reload check: act on a pending shutdown / newer job
                                 // before a multi-second blocking model reload.
