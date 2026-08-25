@@ -1403,14 +1403,25 @@ fn v4_bench_cfg(device_id: u32, miner: &PomGpuMiner, pph: &[u8; 32], ts: u64, t:
 
 /// Tunes `device_id` once per process. Staged rather than exhaustive (kind → warps → batch) so the
 /// whole thing costs seconds, not minutes: the axes are close to independent in the measurements.
-fn v4_autotune(device_id: u32, miner: &PomGpuMiner) {
+/// Returns whether tuning actually completed (false = the slot was busy, try again later).
+fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
     let mode = v4_autotune_mode();
     if mode == "0" {
-        return;
+        return true;
     }
+    // ONE CARD AT A TIME. Every device starts grinding at once, so without this the cards benchmark
+    // on top of each other and contend for the host, PCIe and power budget — enough noise that two
+    // identical 5080s in the same rig picked different batches from the same candidate set.
+    // try_lock, never lock: this runs inside the grind call, so BLOCKING here would stall a card's
+    // mining until its turn came (measured: the whole rig's hashrate sagged during startup). A card
+    // that finds the slot busy simply mines on at the default geometry and tunes on a later batch.
+    static TUNING: OnceLock<Mutex<()>> = OnceLock::new();
+    let Ok(_one_at_a_time) = TUNING.get_or_init(|| Mutex::new(())).try_lock() else {
+        return false;
+    };
     let n_tiles = miner.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
     if n_tiles == 0 {
-        return;
+        return true;
     }
     let k = crate::pom_v4::POM_V4_K as u32;
     let sm = gpu_sm_count(device_id).unwrap_or(0);
@@ -1426,7 +1437,7 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) {
                 if t.tc { "tensor-core" } else { "classic" },
                 t.batch, key
             );
-            return;
+            return true;
         }
     }
 
@@ -1484,7 +1495,7 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) {
         (None, None) => {
             log::warn!("PoM[gpu{}]: autotune could not measure the walk — keeping defaults.", device_id);
             set_v4_tune(device_id, defaults);
-            return;
+            return true;
         }
     };
     let mut best_mhs = tc_mhs.into_iter().chain(classic_mhs).fold(0.0f64, f64::max);
@@ -1502,17 +1513,26 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) {
     let cands: Vec<V4Tune> = batches.iter().map(|&b| V4Tune { batch: b, ..best }).collect();
     let batch_mhs = bench_all(&cands, 3, 300);
     for (i, m) in batch_mhs.iter().enumerate() {
-        log::debug!(
+        log::info!(
             "PoM[gpu{}]: autotune batch {} = {}",
             device_id,
             batches[i],
             m.map(|v| format!("{:.3} Mh/s", v)).unwrap_or_else(|| "failed".into())
         );
-        // 1% is enough to move once the measurement is a median of interleaved rounds.
-        if let Some(v) = *m {
-            if v > best_mhs * 1.01 {
-                best_mhs = v;
-                best.batch = batches[i];
+    }
+    // Pick the fastest, then break ties toward the LARGEST batch within 1% of it. The benchmark
+    // grinds back-to-back, so it cannot see the per-batch host work the live loop does between
+    // launches (job checks, share handling) — real mining amortizes that over the batch, which is
+    // why a batch that merely ties in here is worth more out there. Without the tie-break, two
+    // identical cards can disagree on a difference the benchmark cannot resolve.
+    let peak = batch_mhs.iter().flatten().copied().fold(0.0f64, f64::max);
+    if peak > 0.0 {
+        for (i, m) in batch_mhs.iter().enumerate() {
+            if let Some(v) = *m {
+                if v >= peak * 0.99 && batches[i] >= best.batch {
+                    best.batch = batches[i];
+                    best_mhs = v;
+                }
             }
         }
     }
@@ -1528,7 +1548,7 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) {
             device_id, best
         );
         set_v4_tune(device_id, defaults);
-        return;
+        return true;
     }
 
     set_v4_tune(device_id, best);
@@ -1541,6 +1561,7 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) {
         best.batch, best_mhs,
         tc_mhs.unwrap_or(0.0), classic_mhs.unwrap_or(0.0)
     );
+    true
 }
 
 /// Verifies a candidate configuration against the classic walk at the stock batch: same seed, same
@@ -1578,11 +1599,13 @@ fn ensure_v4_autotuned(device_id: u32, miner: &PomGpuMiner) {
             return;
         }
     }
-    // Mark BEFORE measuring: a failed tune must not retry every batch.
-    if let Ok(mut g) = done.lock() {
-        g.insert(device_id);
+    // Marked only when tuning actually ran, so a card that found the slot busy retries on a later
+    // batch. A tune that ran and failed still counts as done — it must not retry every batch.
+    if v4_autotune(device_id, miner) {
+        if let Ok(mut g) = done.lock() {
+            g.insert(device_id);
+        }
     }
-    v4_autotune(device_id, miner);
 }
 
 pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
