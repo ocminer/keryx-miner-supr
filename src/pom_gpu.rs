@@ -1063,12 +1063,49 @@ pub fn is_loading() -> bool {
 /// "inference while the model is loading" crash on mixed rigs).
 static INFERENCE_PAUSED: AtomicBool = AtomicBool::new(false);
 
+/// Per-GPU pause bitmask (bit N = CUDA ordinal N is mid model-swap). Per-card rather than global so
+/// one card serving OPoI does not stall the whole rig — only the card whose weights are being freed
+/// and reloaded has to stand still.
+static INFERENCE_PAUSED_MASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn set_inference_paused(paused: bool) {
     INFERENCE_PAUSED.store(paused, Ordering::Release);
 }
 
 pub fn inference_paused() -> bool {
     INFERENCE_PAUSED.load(Ordering::Acquire)
+}
+
+/// Mark `gpu` as mid-swap (or clear it). MUST bracket every llama uninstall/reload: while the bit is
+/// set the grind loop must neither run a walk on that card nor rebuild one.
+pub fn set_inference_paused_on(gpu: usize, paused: bool) {
+    if gpu >= 64 {
+        set_inference_paused(paused); // absurd ordinal: fall back to the global flag
+        return;
+    }
+    let bit = 1u64 << gpu;
+    if paused {
+        INFERENCE_PAUSED_MASK.fetch_or(bit, Ordering::AcqRel);
+    } else {
+        INFERENCE_PAUSED_MASK.fetch_and(!bit, Ordering::AcqRel);
+    }
+}
+
+/// Whether `device_id` must hold off mining right now: its own swap bit, or the global flag.
+///
+/// THIS IS A CRASH GUARD, not an optimisation. On the inference card the walk gathers ZERO-DUP —
+/// its base pointers address the llama engine's resident weights directly. If a walk runs (or is
+/// rebuilt) while llama frees/reloads that model, it dereferences freed VRAM:
+/// CUDA_ERROR_ILLEGAL_ADDRESS, which is STICKY — the context is poisoned, so llama's next
+/// cudaFreeHost fails inside ggml and calls ggml_abort(), taking the process down (field reports of
+/// a crash-restart loop 10-20 min in, i.e. on the first or second OPoI probe). The flag existed for
+/// exactly this but had NO reader on the CUDA path, so the guard never engaged.
+pub fn inference_paused_for(device_id: u32) -> bool {
+    if INFERENCE_PAUSED.load(Ordering::Acquire) {
+        return true;
+    }
+    let g = device_id as usize;
+    g < 64 && (INFERENCE_PAUSED_MASK.load(Ordering::Acquire) & (1u64 << g)) != 0
 }
 
 /// Transient GPU runtime fault classifier (upstream Keryx-Labs/keryx-miner@278098b): the
@@ -1099,6 +1136,15 @@ fn is_transient_gpu_runtime_fault(err: &str) -> bool {
 /// Order matters: uninstall the walk FIRST so no gather can run over tensors llama then frees.
 /// The worker loop rebuilds via `ensure_installed` on its next iteration (`is_installed` = false).
 fn reset_stale_gpu_state(device_id: u32) {
+    // Bracket the teardown with this card's pause bit for the same reason the model swap does: the
+    // walk and the llama engine share VRAM on the inference card, so nothing may touch (or rebuild)
+    // the walk while we free them. RAII-cleared, so a panic in here still resumes the card.
+    struct PauseGuard(u32);
+    impl Drop for PauseGuard {
+        fn drop(&mut self) { set_inference_paused_on(self.0 as usize, false); }
+    }
+    set_inference_paused_on(device_id as usize, true);
+    let _resume = PauseGuard(device_id);
     uninstall(device_id);
     crate::llama_engine::unload_for_gpu(device_id as usize);
 }
