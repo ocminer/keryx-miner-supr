@@ -468,6 +468,73 @@ pub fn is_inference_paused() -> bool {
     INFERENCE_PAUSED.load(Ordering::Acquire)
 }
 
+// ── BACKEND PARITY with the CUDA `pom_gpu` ─────────────────────────────────────────────────────
+// slm.rs and miner.rs share one code path across CUDA and Metal, so every symbol they call under
+// `all(target_os = "macos", feature = "pom-metal")` must exist here too. These were added on the
+// CUDA side (per-GPU inference pause, the operator batch controls) without Metal counterparts, which
+// is what has been failing the macOS build since v0.11.9.
+
+/// Per-GPU pause bits, mirroring the CUDA bitmask. A Mac has one GPU in practice, so this is the
+/// global flag addressed by ordinal — but keeping the shape identical means the shared call sites
+/// stay honest instead of silently pausing the wrong thing if that ever changes.
+pub fn set_inference_paused_on(_gpu: usize, paused: bool) {
+    set_inference_paused(paused);
+}
+
+pub fn inference_paused_for(_device_id: u32) -> bool {
+    is_inference_paused()
+}
+
+/// `--only-inference`: serve requests, barely mine. Same contract as the CUDA side.
+static ONLY_INFERENCE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_only_inference(on: bool) {
+    ONLY_INFERENCE.store(on, Ordering::Relaxed);
+}
+
+pub fn only_inference() -> bool {
+    ONLY_INFERENCE.load(Ordering::Relaxed)
+}
+
+pub fn only_inference_duty_ms() -> u64 {
+    std::env::var("KERYX_ONLY_INFERENCE_DUTY_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(250)
+        .clamp(0, 10_000)
+}
+
+/// Yields the card to an inference request while the guard lives (`--only-inference` only).
+pub struct ServingGuard(usize);
+
+impl Drop for ServingGuard {
+    fn drop(&mut self) {
+        set_inference_paused_on(self.0, false);
+    }
+}
+
+pub fn serving_now(gpu: usize) -> Option<ServingGuard> {
+    if !only_inference() {
+        return None;
+    }
+    set_inference_paused_on(gpu, true);
+    Some(ServingGuard(gpu))
+}
+
+/// The v4 grind batch for a Metal device. There is no SM count to derive from here and no autotune
+/// on this backend, so this is the plain default the Metal walk has always used; `--only-inference`
+/// still drops it to the floor so the card stays free to serve.
+pub fn v4_batch_for_device(_device_id: u32) -> u64 {
+    if only_inference() {
+        return 8192;
+    }
+    std::env::var("KERYX_POM_V4_BATCH")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(1 << 16)
+}
+
 /// Convenience: search a nonce batch via the installed miner for a specific device (PoM v4).
 pub fn mine_v4(
     device_id: u32,
