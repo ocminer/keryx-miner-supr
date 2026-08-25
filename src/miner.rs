@@ -333,9 +333,8 @@ impl MinerManager {
                 // per batch means ~1-2 in flight normally; the cap only guards a pathological
                 // low-difficulty burst from spawning unbounded threads (excess winners are dropped —
                 // the grind found more than the CPU can prove, which is fine).
-                #[cfg(feature = "pom-opencl")]
                 let inflight_proofs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                #[cfg(feature = "pom-opencl")]
+                #[allow(dead_code)]
                 const MAX_INFLIGHT_PROOFS: usize = 6;
                 // PoM (post-fork): nonce cursor + per-launch batch. The kernel grinds the whole
                 // batch before returning, so blocks/sec is capped at hashrate / POM_BATCH.
@@ -484,15 +483,54 @@ impl MinerManager {
                         worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         if let Some(nonce) = found {
                             // NVIDIA/Apple: recompute the PoM tier per block (H2-boundary correct).
+                            // POOL SHARES: overlap the host proof re-walk with grinding, like the AMD
+                            // path below. The re-walk is ~15 ms (96% of it the sparse tree's Merkle
+                            // sibling recompute — measured; --resident-tree cuts it to ~0.9 ms), and
+                            // doing it inline stalled THIS card's grind for that long on every share.
+                            // The template clone is cheap (Arc-backed) and the thread re-fetches the
+                            // index, so the worker loops straight back into the next batch. SOLO
+                            // (FullBlock) stays synchronous below: it must clear `state` so the card
+                            // stops grinding an already-mined template — a detached thread cannot.
                             #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
-                            let built = state.as_ref().and_then(|s| {
+                            // KERYX_POM_PROOF_OVERLAP=0 forces the old synchronous submit (A/B knob
+                            // and safety valve: on a CPU-starved rig the detached builds could in
+                            // principle contend with the launch loop).
+                            let overlap_pool_proof = std::env::var("KERYX_POM_PROOF_OVERLAP").ok().as_deref() != Some("0")
+                                && state.as_ref().map_or(false, |s| s.is_pool_share())
+                                && inflight_proofs.load(Ordering::Acquire) < MAX_INFLIGHT_PROOFS;
+                            #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
+                            if overlap_pool_proof {
+                                if let Some(s) = state.as_ref() {
+                                    if let Some(tier) = keryx_miner::pom_gpu::current_tier(wdid, s.daa_score) {
+                                        inflight_proofs.fetch_add(1, Ordering::AcqRel);
+                                        let s_clone = s.clone();
+                                        let tx = send_channel.clone();
+                                        let counter = std::sync::Arc::clone(&inflight_proofs);
+                                        std::thread::spawn(move || {
+                                            if let Some((idx, _)) = keryx_miner::pom::active_index_for(wdid) {
+                                                if let Some(mut block_seed) = s_clone.generate_block_if_pom(nonce, idx, tier) {
+                                                    if let crate::pow::BlockSeed::PartialBlock { device_id, .. } = &mut block_seed {
+                                                        *device_id = wdid;
+                                                    }
+                                                    match tx.blocking_send(block_seed.clone()) {
+                                                        Ok(()) => block_seed.report_block(),
+                                                        Err(e) => warn!("Could not submit PoM block — pool connection dropped ({}); reconnecting", e),
+                                                    }
+                                                }
+                                            }
+                                            counter.fetch_sub(1, Ordering::AcqRel);
+                                        });
+                                    }
+                                }
+                            }
+                            #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
+                            let built = if overlap_pool_proof { None } else { state.as_ref().and_then(|s| {
                                 keryx_miner::pom::active_index_for(wdid).and_then(|(idx, _)| {
                                     let tier = keryx_miner::pom_gpu::current_tier(wdid, s.daa_score)?;
                                     s.generate_block_if_pom(nonce, idx, tier)
                                 })
-                            });
-                            // NVIDIA/Apple keep the synchronous submit (candle's per-device driver is
-                            // not structured for the AMD detached-thread overlap).
+                            }) };
+                            // SOLO (and the overlap-declined fallback) keep the synchronous submit.
                             #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                             if let Some(mut block_seed) = built {
                                 // Tag the share with the GPU that found it so pool accept/reject is

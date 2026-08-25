@@ -189,6 +189,14 @@ impl State {
     }
 
     #[inline(always)]
+    /// True when this template is a POOL share (`PartialBlock`) rather than a SOLO full block.
+    /// The CUDA worker uses it to decide whether the proof build may be overlapped on a detached
+    /// thread: a solo win must clear the worker's `state` synchronously (stop grinding a template
+    /// that is already mined), which a detached thread cannot do.
+    pub fn is_pool_share(&self) -> bool {
+        matches!(*self.block, BlockSeed::PartialBlock { .. })
+    }
+
     pub fn generate_block_if_pow(&self, nonce: u64) -> Option<BlockSeed> {
         if !self.check_pow(nonce) {
             return None;
