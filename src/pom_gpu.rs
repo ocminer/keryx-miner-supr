@@ -1433,15 +1433,49 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) {
     // The pph/timestamp only seed the walk; any fixed pair times the same work.
     let pph = [0u8; 32];
     let ts = 0u64;
-    let bench = |t: V4Tune, ms: u64| v4_bench_cfg(device_id, miner, &pph, ts, t, ms);
     let defaults = V4Tune { tc: true, batch: base };
+
+    // Candidates are measured INTERLEAVED and reduced by median. A single timed window per candidate
+    // is not able to resolve the ~4% differences that matter here: the first pass measured 2.93 for
+    // one 5080 and 2.98 for its twin on the same batch, which is enough noise to flip the choice.
+    // Interleaving cancels slow drift (clocks ramping, neighbours' load) because every candidate
+    // sees the same conditions in every round.
+    let bench_all = |cands: &[V4Tune], reps: usize, ms: u64| -> Vec<Option<f64>> {
+        let mut samples: Vec<Vec<f64>> = vec![Vec::new(); cands.len()];
+        for _ in 0..reps {
+            for (i, c) in cands.iter().enumerate() {
+                if let Some(m) = v4_bench_cfg(device_id, miner, &pph, ts, *c, ms) {
+                    samples[i].push(m);
+                }
+            }
+        }
+        samples
+            .into_iter()
+            .map(|mut v| {
+                if v.is_empty() {
+                    return None;
+                }
+                v.sort_by(f64::total_cmp);
+                Some(v[v.len() / 2])
+            })
+            .collect()
+    };
 
     // 1) Which walk? The tensor-core kernel is a large win on Blackwell AND on Ampere (measured
     // 3070: 1.35 vs 0.84 Mh/s), but that is a claim about these cards, not about every card — so it
     // is measured rather than assumed. Both kernels are byte-exact mirrors of the host walk, so
     // either answer is correct; only the speed differs.
-    let tc_mhs = if miner.v4_tc_available() { bench(defaults, 400) } else { None };
-    let classic_mhs = bench(V4Tune { tc: false, ..defaults }, 400);
+    let kinds: Vec<V4Tune> = if miner.v4_tc_available() {
+        vec![defaults, V4Tune { tc: false, ..defaults }]
+    } else {
+        vec![V4Tune { tc: false, ..defaults }]
+    };
+    let kind_mhs = bench_all(&kinds, 3, 300);
+    let (tc_mhs, classic_mhs) = if kinds.len() == 2 {
+        (kind_mhs[0], kind_mhs[1])
+    } else {
+        (None, kind_mhs[0])
+    };
     let mut best = match (tc_mhs, classic_mhs) {
         (Some(a), Some(b)) if a >= b => V4Tune { tc: true, ..defaults },
         (Some(_), Some(_)) => V4Tune { tc: false, ..defaults },
@@ -1460,15 +1494,25 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) {
     // lands on a stale job. The SM-derived estimate is a good centre, not a maximum: it under-serves
     // big cards (an RTX 5080 measured 3.05 Mh/s at 64K vs 2.90 at its SM-derived 32K), so the sweep
     // looks one step either side. Requires a 2% win to move, so noise cannot flip the choice.
-    for b in [base / 2, base * 2] {
-        let b = b.max(POM_V4_BATCH_MIN);
-        if b == best.batch {
-            continue;
-        }
-        if let Some(m) = bench(V4Tune { batch: b, ..best }, 350) {
-            if m > best_mhs * 1.02 {
-                best_mhs = m;
-                best.batch = b;
+    let batches: Vec<u64> = {
+        let mut v = vec![(base / 2).max(POM_V4_BATCH_MIN), base, base * 2];
+        v.dedup();
+        v
+    };
+    let cands: Vec<V4Tune> = batches.iter().map(|&b| V4Tune { batch: b, ..best }).collect();
+    let batch_mhs = bench_all(&cands, 3, 300);
+    for (i, m) in batch_mhs.iter().enumerate() {
+        log::debug!(
+            "PoM[gpu{}]: autotune batch {} = {}",
+            device_id,
+            batches[i],
+            m.map(|v| format!("{:.3} Mh/s", v)).unwrap_or_else(|| "failed".into())
+        );
+        // 1% is enough to move once the measurement is a median of interleaved rounds.
+        if let Some(v) = *m {
+            if v > best_mhs * 1.01 {
+                best_mhs = v;
+                best.batch = batches[i];
             }
         }
     }
