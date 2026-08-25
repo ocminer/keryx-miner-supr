@@ -106,6 +106,43 @@ fn v4_offsets_buf(stream: &Arc<CudaStream>, len: usize) -> candle_core::Result<A
     Ok(s)
 }
 
+/// Second per-device offsets buffer, so the chase for batch N+1 can run into one buffer while the
+/// walk of batch N reads the other (cross-BATCH pipelining — see `mine_v4`).
+static V4_OFFSETS_B: OnceLock<Mutex<HashMap<usize, Arc<CudaSlice<u32>>>>> = OnceLock::new();
+
+fn v4_offsets_buf_b(stream: &Arc<CudaStream>, len: usize) -> candle_core::Result<Arc<CudaSlice<u32>>> {
+    let m = V4_OFFSETS_B.get_or_init(|| Mutex::new(HashMap::new()));
+    let ord = stream.context().ordinal();
+    let mut g = m.lock().unwrap();
+    if let Some(s) = g.get(&ord) {
+        if s.len() >= len {
+            return Ok(s.clone());
+        }
+    }
+    let s = Arc::new(unsafe { stream.alloc::<u32>(len) }.map_err(candle_core::Error::wrap)?);
+    g.insert(ord, s.clone());
+    Ok(s)
+}
+
+/// What the chase has already resolved into the *spare* buffer, so the next `mine_v4` can skip its
+/// chase entirely. Keyed per device; the key identifies the exact work the offsets belong to —
+/// seed words + timestamp + nonce range + K. A mismatch (new job, resized batch, nonce jump) simply
+/// falls back to chasing inline, so a stale prefetch can never feed the walk wrong offsets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct V4Prefetch {
+    s: [u64; 4],
+    timestamp: u64,
+    start: u64,
+    batch: u64,
+    k: u32,
+    /// WHICH of the two offset buffers the prefetch chase wrote into (0 = A, 1 = B). The buffers
+    /// alternate every batch, so this cannot be inferred from "was there a prefetch" — inferring
+    /// it made two consecutive hits both read buffer B while the second prefetch had filled A,
+    /// i.e. the walk hashed another nonce range's offsets and silently found nothing.
+    buf: u8,
+}
+static V4_PREFETCH: OnceLock<Mutex<HashMap<usize, V4Prefetch>>> = OnceLock::new();
+
 /// Per-device secondary stream for the overlapped chase (sub-batch pipelining in `mine_v4`).
 static V4_CHASE_STREAMS: OnceLock<Mutex<HashMap<usize, Arc<CudaStream>>>> = OnceLock::new();
 
@@ -654,72 +691,111 @@ impl PomGpuMiner {
             // The offsets buffer is CACHED per device (plain alloc, never zeroed — the chase
             // overwrites every word): the old per-batch alloc_zeros paid a cudaMalloc + a full
             // 16 MB memset + free EVERY batch (~180x/s at batch 16384), measured worth 6-10%.
-            let offsets = v4_offsets_buf(&self.stream, (batch as usize) * (k as usize))?;
-            // BENCH KNOB: warps/block for the tc walk MUST match the fatbin's V4_TC_WARPS. Default 4;
-            // KERYX_POM_V4_TC_WARPS lets a matched test fatbin (built -DV4_TC_WARPS=N) sweep occupancy.
+            // ── CROSS-BATCH CHASE PIPELINING ───────────────────────────────────────────────
+            // The chase (offset chain) and the walk are separate kernels. Profiled on a 5090 at a
+            // 64K batch: chase 0.81 ms / walk 10.19 ms — the chase is 7.4% of the batch, and it is
+            // pure serial overhead when run inline. The previous scheme overlapped chase and walk
+            // WITHIN a batch (4 sub-batches), but that shrinks BOTH kernels: at 16K nonces the chase
+            // covers only 64 blocks on 170 SMs (occupancy 16.5% vs 25% at full batch), which cost
+            // more than the overlap won — measured, sub-batching was slower than not overlapping.
+            //
+            // Instead, pipeline across BATCHES: both kernels stay full-size, and while the walk of
+            // batch N runs on the main stream, the chase for batch N+1 runs on the chase stream into
+            // the spare buffer. The next call finds its offsets already resolved and goes straight
+            // to the walk. The prefetch is keyed by (seed words, timestamp, nonce range, K), so a new
+            // job / resized batch / nonce jump misses the key and falls back to chasing inline —
+            // stale offsets can never reach the walk.
+            let need = (batch as usize) * (k as usize);
+            let buf_a = v4_offsets_buf(&self.stream, need)?;
+            let buf_b = v4_offsets_buf_b(&self.stream, need)?;
+            const TC_WARPS_DEFAULT: u64 = 4;
             let tc_warps: u64 = std::env::var("KERYX_POM_V4_TC_WARPS").ok()
-                .and_then(|s| s.parse().ok()).filter(|&w: &u64| w >= 1 && w <= 16).unwrap_or(4);
-            // smem/warp = state(256) + PIPE tiles. PIPE default 3 → 4 buffers × 256 words × 4 B = 4096.
+                .and_then(|s| s.parse().ok()).filter(|&w: &u64| w >= 1 && w <= 16).unwrap_or(TC_WARPS_DEFAULT);
             let tc_pipe: u64 = std::env::var("KERYX_POM_V4_TC_PIPE").ok()
                 .and_then(|s| s.parse().ok()).filter(|&p: &u64| p >= 2 && p <= 8).unwrap_or(3);
             let tc_smem: u32 = (tc_warps * 256 * (tc_pipe + 1) * 4) as u32;
-            #[allow(non_snake_case)]
-            let TC_WARPS: u64 = tc_warps;
             let chase = load_walk_func(&self.cuda, "pom_mine_v4_chase")?;
             let walk = load_walk_func(&self.cuda, "pom_mine_v4_tc")?;
+            // MEASURED NEGATIVE — default OFF. Cross-batch prefetch is sound (see
+            // v4_chase_prefetch_matches_serial) but SLOWER on a 5090: 5.92 vs 5.99 Mh/s. The walk
+            // already runs at ~91% of DRAM peak, so the chase's bytes cannot be hidden — running it
+            // concurrently only adds memory contention, plus every job change throws away a
+            // speculative chase. Kept behind the knob because a future card with bandwidth headroom
+            // (or a heavier chase) could flip the sign. `=1` enables it.
+            let pipelined = std::env::var("KERYX_POM_V4_CHASE_PREFETCH").ok().as_deref() == Some("1");
+            let ord = self.stream.context().ordinal();
+            // Is there a prefetch for exactly THIS work, and in which buffer?
+            let hit: Option<u8> = if pipelined {
+                let m = V4_PREFETCH.get_or_init(|| Mutex::new(HashMap::new()));
+                let g = m.lock().unwrap();
+                g.get(&ord).and_then(|p| {
+                    (p.s == s && p.timestamp == timestamp && p.start == start && p.batch == batch && p.k == k)
+                        .then_some(p.buf)
+                })
+            } else {
+                None
+            };
+            let prefetched = hit.is_some();
+            // The walk reads the buffer that actually holds this batch's offsets; the other one
+            // takes the next prefetch. Roles alternate every batch, so nothing is ever copied.
+            let cur_idx: u8 = hit.unwrap_or(0);
+            let (cur, spare) = if cur_idx == 1 { (buf_b.clone(), buf_a.clone()) } else { (buf_a.clone(), buf_b.clone()) };
+            let spare_idx: u8 = 1 - cur_idx;
 
-            // Sub-batch pipelining (KERYX_POM_V4_OVERLAP=0 to disable): chase sub-batch k+1 on a
-            // second stream while sub-batch k walks — the walk stream waits per sub-batch on an
-            // event. The two phases share DRAM/SMs so this only merges (not hides) the chase, but
-            // it is still a measured ~+2% (bench C4, bit-exact 2048/2048). Skipped for small
-            // batches where sub-batches would be tiny.
-            const SUBS: u64 = 4;
-            let overlap = std::env::var("KERYX_POM_V4_OVERLAP").ok().as_deref() != Some("0")
-                && batch >= SUBS * 4096;
-            let n_sub = if overlap { SUBS } else { 1 };
-            let sub = (batch + n_sub - 1) / n_sub;
-            let chase_stream = if overlap { Some(v4_chase_stream(&self.stream)?) } else { None };
-
-            for i in 0..n_sub {
-                let s_start = start + i * sub;
-                let s_batch = sub.min(batch - i * sub);
-                let view = offsets
-                    .try_slice((i * sub) as usize * (k as usize)..((i * sub + s_batch) as usize * k as usize))
+            let chase_cfg = |n: u64| LaunchConfig {
+                grid_dim: (((n + 255) / 256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            if !prefetched {
+                // No usable prefetch (first batch after a new job, or pipelining off): chase inline
+                // on the main stream, exactly as before.
+                let view = cur.try_slice(0..need)
                     .ok_or_else(|| candle_core::Error::Msg("PoM v4: offsets slice out of range".into()))?;
-                let chase_cfg = LaunchConfig {
-                    grid_dim: (((s_batch + 255) / 256) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                if let Some(cs) = &chase_stream {
-                    let func = chase.func.clone();
-                    let mut b = cs.launch_builder(&func);
-                    b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
-                        .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
-                        .arg(&s_start).arg(&s_batch).arg(&view);
-                    unsafe { b.launch(chase_cfg).map_err(candle_core::Error::wrap)?; }
-                    let ev = cs.record_event(None).map_err(candle_core::Error::wrap)?;
-                    self.stream.wait(&ev).map_err(candle_core::Error::wrap)?;
-                } else {
-                    let mut b = chase.builder();
-                    b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
-                        .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
-                        .arg(&s_start).arg(&s_batch).arg(&view);
-                    unsafe { b.launch(chase_cfg).map_err(candle_core::Error::wrap)?; }
-                }
+                let mut b = chase.builder();
+                b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
+                    .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+                    .arg(&start).arg(&batch).arg(&view);
+                unsafe { b.launch(chase_cfg(batch)).map_err(candle_core::Error::wrap)?; }
+            }
 
+            // Queue the walk for THIS batch on the main stream.
+            {
+                let view = cur.try_slice(0..need)
+                    .ok_or_else(|| candle_core::Error::Msg("PoM v4: offsets slice out of range".into()))?;
                 let walk_cfg = LaunchConfig {
-                    grid_dim: (((s_batch + TC_WARPS - 1) / TC_WARPS) as u32, 1, 1),
-                    block_dim: ((TC_WARPS * 32) as u32, 1, 1),
-                    shared_mem_bytes: tc_smem, // (PIPE+1) buffers × 256 words × 4B per warp
+                    grid_dim: (((batch + tc_warps - 1) / tc_warps) as u32, 1, 1),
+                    block_dim: ((tc_warps * 32) as u32, 1, 1),
+                    shared_mem_bytes: tc_smem,
                 };
                 let mut b = walk.builder();
                 b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&k)
                     .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
                     .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
                     .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
-                    .arg(&s_start).arg(&s_batch).arg(&view).arg(&winner);
+                    .arg(&start).arg(&batch).arg(&view).arg(&winner);
                 unsafe { b.launch(walk_cfg).map_err(candle_core::Error::wrap)?; }
+            }
+
+            // …and, concurrently, chase the NEXT nonce range into the spare buffer. This is the
+            // whole win: by the time the caller asks for that range the offsets already exist.
+            if pipelined {
+                let next_start = start.wrapping_add(batch);
+                let cs = v4_chase_stream(&self.stream)?;
+                let view = spare.try_slice(0..need)
+                    .ok_or_else(|| candle_core::Error::Msg("PoM v4: prefetch slice out of range".into()))?;
+                let func = chase.func.clone();
+                let mut b = cs.launch_builder(&func);
+                b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
+                    .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+                    .arg(&next_start).arg(&batch).arg(&view);
+                unsafe { b.launch(chase_cfg(batch)).map_err(candle_core::Error::wrap)?; }
+                // The next walk runs on the main stream, so it must not start before this chase
+                // finishes — record the dependency now, honoured at the top of the next call.
+                let ev = cs.record_event(None).map_err(candle_core::Error::wrap)?;
+                self.stream.wait(&ev).map_err(candle_core::Error::wrap)?;
+                let m = V4_PREFETCH.get_or_init(|| Mutex::new(HashMap::new()));
+                m.lock().unwrap().insert(ord, V4Prefetch { s, timestamp, start: next_start, batch, k, buf: spare_idx });
             }
         } else {
             let cfg = LaunchConfig {
@@ -1818,6 +1894,60 @@ mod v4_kernel_tests {
         assert_eq!(miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1).unwrap(), None,
                    "[{kind}] GPU found the nonce below the host pow — divergence");
         println!("BIT-EXACT OK on the {kind} walk");
+    }
+
+    /// Exercise the CROSS-BATCH CHASE PREFETCH hit path: consecutive batches of the same job, so
+    /// batch N+1's offsets come from the prefetch buffer rather than an inline chase. A key/buffer
+    /// mix-up here would feed the walk another range's offsets — the walk would still "run", just
+    /// never find a valid winner (silent zero-share mining), so this asserts the winner IS found in
+    /// the batch that contains it, and that prefetch ON and OFF agree exactly.
+    #[test]
+    #[ignore]
+    fn v4_chase_prefetch_matches_serial() {
+        let data = blob(2048);
+        let index = crate::pom::index_from_ram(data.clone());
+        let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
+        const B: u64 = 64;
+        // A nonce in the FOURTH batch, so at least two prefetch hits precede it.
+        let nonce = 3 * B + 17;
+        let seed = crate::pom::pom_block_seed_v4(&PPH, TS, nonce);
+        let (_v4, fs) = crate::pom_v4::build_proof_v4(0, seed, &index).unwrap();
+        let pow = crate::pom::pom_pow_value(fs, &PPH, true);
+        let sweep = |prefetch: &str| -> Vec<Option<u64>> {
+            std::env::set_var("KERYX_POM_V4_CHASE_PREFETCH", prefetch);
+            (0..6).map(|i| miner.mine_v4(&PPH, TS, &pow, i * B, B).unwrap()).collect()
+        };
+        let on = sweep("1");
+        let off = sweep("0");
+        std::env::remove_var("KERYX_POM_V4_CHASE_PREFETCH");
+        // The property that matters: pipelining must not change what the GPU finds.
+        assert_eq!(on, off, "prefetch ON changed the per-batch winners vs OFF");
+        // Every winner must be real: inside its own batch, and confirmed by the HOST re-walk. A
+        // buffer/key mix-up would hand the walk another range's offsets, and these checks catch it
+        // (a wrong-offset "winner" fails the host pow check, and a shifted range fails the bounds).
+        let mut confirmed = 0;
+        for (i, w) in on.iter().enumerate() {
+            let Some(n) = *w else { continue };
+            let lo = i as u64 * B;
+            assert!((lo..lo + B).contains(&n), "batch {i} returned nonce {n} outside [{lo},{})", lo + B);
+            let sd = crate::pom::pom_block_seed_v4(&PPH, TS, n);
+            let (_p, f) = crate::pom_v4::build_proof_v4(0, sd, &index).unwrap();
+            let host_pow = crate::pom::pom_pow_value(f, &PPH, true);
+            // pow values are 256-bit LITTLE-endian: compare from the most significant byte down.
+            // (Rust's derived `<=` on [u8;32] would compare the LEAST significant byte first.)
+            let le_leq = |a: &[u8; 32], b: &[u8; 32]| -> bool {
+                for k in (0..32).rev() {
+                    if a[k] != b[k] {
+                        return a[k] < b[k];
+                    }
+                }
+                true
+            };
+            assert!(le_leq(&host_pow, &pow), "batch {i} nonce {n}: GPU claimed a win the host re-walk rejects");
+            confirmed += 1;
+        }
+        assert!(confirmed >= 3, "expected several confirmed winners across 6 batches, got {confirmed}");
+        println!("prefetch hit-path OK: {confirmed} winners host-confirmed, ON==OFF {on:?}");
     }
 
     /// Throughput bench (no pool, synthetic blob): `--ignored v4_bench`. Blob size via
