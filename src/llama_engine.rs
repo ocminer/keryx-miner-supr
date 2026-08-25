@@ -336,6 +336,22 @@ pub fn unload_for_gpu(gpu: usize) {
     }
 }
 
+/// Drops `gpu`'s engine handle WITHOUT calling llama's free.
+///
+/// Only for a device whose CUDA context is already poisoned (sticky ILLEGAL_ADDRESS). Freeing
+/// through llama there runs `llama_context`'s destructor into `cudaFreeHost`/`ggml_backend_buffer_free`
+/// on the dead context; ggml treats a CUDA error in teardown as unrecoverable and calls `ggml_abort`,
+/// which kills the WHOLE PROCESS — on a 6-card rig that takes down five healthy cards because one
+/// card faulted, then HiveOS restarts the miner, and the cycle repeats every few minutes. The engine
+/// allocation is unreachable anyway until the context is destroyed, so leaking it is strictly better
+/// than aborting. Returns whether a handle was actually abandoned.
+pub fn abandon_for_gpu(gpu: usize) -> bool {
+    let slot = slot_for(gpu);
+    let mut g = match slot.inner.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    // `Engine` has no Drop impl — the free is always explicit — so simply dropping it frees nothing.
+    g.take().is_some()
+}
+
 /// Resident tensors of the engine on `gpu` in CANONICAL (name-sorted) order:
 /// (name, data_ptr, nbytes, is_device). The zero-dup PoM walk on `gpu` gathers over these.
 pub fn tensors_for(gpu: usize) -> Option<Vec<(String, u64, usize, bool)>> {

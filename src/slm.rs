@@ -1609,15 +1609,54 @@ pub fn inference_gpu_ordinal() -> usize {
     }
     match walk.len() {
         1 => walk[0] as usize,
-        n if n > 1 => biggest_cuda_gpu().unwrap_or(walk[0] as usize),
-        // Walk not installed yet (inference before the first PoM job) — best effort, not cached.
-        _ => biggest_cuda_gpu().unwrap_or(0),
+        n if n > 1 => biggest_cuda_gpu_within(&walk.iter().map(|d| *d as usize).collect::<Vec<_>>())
+            .unwrap_or(walk[0] as usize),
+        // Walk not installed yet. This is the STARTUP case, and picking the globally-biggest card
+        // here used to deadlock a process that does not own it: with `--cuda-device 0` on a rig whose
+        // biggest card is 2, every staging attempt on 0 saw inference_gpu=2, the serveability gate
+        // refused to mine a tier nothing could serve, so no miner ever installed — which is what
+        // keeps `walk` empty. The card would sit at 0 h/s, "preparing", logging once a second forever.
+        // Our own --cuda-device set is knowable without the walk: it is in this process's argv.
+        _ => {
+            let own = cli_cuda_devices();
+            match own.len() {
+                0 => biggest_cuda_gpu_within(&[]).unwrap_or(0),
+                1 => own[0],
+                _ => biggest_cuda_gpu_within(&own).unwrap_or(own[0]),
+            }
+        }
     }
 }
 
-/// The CUDA ordinal (nvidia-smi index, PCI-bus order) with the largest `memory.total`. `None` if
-/// nvidia-smi is unavailable/unparseable → caller defaults to 0. Ties resolve to the lowest index.
-fn biggest_cuda_gpu() -> Option<usize> {
+/// The CUDA ordinals this process was told to mine on, read straight from its own argv
+/// (`--cuda-device 0,1` or `--cuda-device=0,1`). Empty means "all" (the flag's default) or a
+/// non-CUDA invocation. Argv is used rather than plumbing the value in from the CUDA plugin because
+/// that plugin cannot depend on this crate (it would be a Cargo cycle).
+fn cli_cuda_devices() -> Vec<usize> {
+    parse_cuda_devices(std::env::args())
+}
+
+fn parse_cuda_devices<I: IntoIterator<Item = String>>(args: I) -> Vec<usize> {
+    let args: Vec<String> = args.into_iter().collect();
+    let raw = args.iter().enumerate().find_map(|(i, a)| {
+        if let Some(v) = a.strip_prefix("--cuda-device=") {
+            return Some(v.to_string());
+        }
+        (a == "--cuda-device").then(|| args.get(i + 1).cloned()).flatten()
+    });
+    raw.map(|v| {
+        v.split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// The largest-VRAM CUDA ordinal, restricted to `pool` (empty = consider every visible GPU). `None`
+/// if VRAM cannot be read → caller defaults to the pool's first card. Ties resolve to the lowest
+/// ordinal. Logged ONCE per chosen ordinal: this is called from the staging retry loop, and logging
+/// unconditionally produced a line every second for as long as staging kept failing.
+fn biggest_cuda_gpu_within(pool: &[usize]) -> Option<usize> {
     let out = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
         .output()
@@ -1628,6 +1667,9 @@ fn biggest_cuda_gpu() -> Option<usize> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut best: Option<(usize, u64)> = None;
     for (i, line) in text.lines().enumerate() {
+        if !pool.is_empty() && !pool.contains(&i) {
+            continue;
+        }
         if let Ok(mib) = line.trim().parse::<u64>() {
             if best.map_or(true, |(_, m)| mib > m) {
                 best = Some((i, mib));
@@ -1636,7 +1678,16 @@ fn biggest_cuda_gpu() -> Option<usize> {
     }
     let (ord, _) = best?;
     if ord != 0 {
-        log::info!("OPoI inference will run on CUDA:{} (largest-VRAM GPU); other GPUs mine PoM only.", ord);
+        static LOGGED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
+            std::sync::OnceLock::new();
+        let seen = LOGGED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        if seen.lock().map(|mut s| s.insert(ord)).unwrap_or(false) {
+            log::info!(
+                "OPoI inference will run on CUDA:{} (largest-VRAM GPU of {}); other GPUs mine PoM only.",
+                ord,
+                if pool.is_empty() { "this host".to_string() } else { format!("{:?}", pool) }
+            );
+        }
     }
     Some(ord)
 }
@@ -2303,6 +2354,35 @@ pub fn pom_shared(
         ModelInner::QuantizedSplit(m) => Some((e.device.clone(), m.pom_quant_tensors())),
         ModelInner::QuantizedGemma3Split(m) => Some((e.device.clone(), m.pom_quant_tensors())),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod cuda_device_set_tests {
+    use super::parse_cuda_devices;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reads_the_processes_own_device_set_from_argv() {
+        assert_eq!(parse_cuda_devices(args(&["keryx-miner-supr", "--cuda-device", "0"])), vec![0]);
+        assert_eq!(
+            parse_cuda_devices(args(&["keryx-miner-supr", "--cuda-device", "1,2,3", "-s", "pool"])),
+            vec![1, 2, 3]
+        );
+        assert_eq!(parse_cuda_devices(args(&["keryx-miner-supr", "--cuda-device=2,0"])), vec![2, 0]);
+    }
+
+    #[test]
+    fn absent_or_malformed_means_all_devices() {
+        // No flag at all: the miner's default is every GPU, so the set is empty (= unrestricted).
+        assert!(parse_cuda_devices(args(&["keryx-miner-supr", "-s", "pool"])).is_empty());
+        // Flag present but with nothing after it — must not panic or index past the end.
+        assert!(parse_cuda_devices(args(&["keryx-miner-supr", "--cuda-device"])).is_empty());
+        // Junk entries are dropped rather than poisoning the whole set.
+        assert_eq!(parse_cuda_devices(args(&["m", "--cuda-device", "0,x,2"])), vec![0, 2]);
     }
 }
 
