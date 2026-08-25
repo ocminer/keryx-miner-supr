@@ -1,5 +1,74 @@
 # keryx-miner-supr — GPU benchmarks (Proof-of-Model)
 
+## v4 relaunch walk — measured 2026-08-25 on v0.11.13
+
+These are the numbers for the **current** PoM (the `pom_mine_v4` re-walk introduced with the keryxd
+v1.5.1 relaunch). They are NOT comparable to the pre-relaunch figures further down: that was a
+different walk over a different table, and its hashrates were an order of magnitude higher.
+
+Method — deliberately strict, because earlier numbers on this rig were quietly wrong:
+
+- **One card at a time.** Every other miner on the box was stopped and verified stopped
+  (`nvidia-smi --query-compute-apps` empty) before each run. Two cards benchmarking at once contend
+  for the host and skew both.
+- Each card ran ~7 minutes: model staging, then the v0.11.13 autotune, then steady state. Hashrate,
+  power and temperature are taken from the miner's own per-device line at steady state.
+- **Pool-verified**: every row accepted shares with **0 rejects and 0 GPU faults**. A hashrate that
+  does not produce shares is not a hashrate.
+- Stock clocks and power limits except where noted.
+
+| GPU | Arch | SMs | VRAM | Tier (AUTO) | Tuned batch | Hashrate | Power | Efficiency |
+|---|---|---|---|---|---|---|---|---|
+| RTX 5090 | Blackwell | 170 | 32 GB | Kimi-Linear-48B | 130,560 | **5.47 MH/s** | 601 W | 9.1 kH/s/W |
+| RTX 5090 (2nd card) | Blackwell | 170 | 32 GB | Kimi-Linear-48B | 130,560 | 5.29 MH/s | 575 W | 9.2 kH/s/W |
+| RTX 5080 | Blackwell | 84 | 16 GB | Gemma-4-12B | 64,512 | **3.00 MH/s** | 376 W | 8.0 kH/s/W |
+| RTX 5080 (2nd card) | Blackwell | 84 | 16 GB | Gemma-4-12B | 64,512 | 2.99 MH/s | 400 W | 7.5 kH/s/W |
+| RTX 5070 Ti | Blackwell | 70 | 16 GB | Gemma-4-12B | 53,760 | **2.69 MH/s** | 341 W | 7.9 kH/s/W |
+| RTX 4070 Ti SUPER | Ada | 66 | 16 GB | Gemma-4-12B | 50,688 | **2.15 MH/s** | 284 W | 7.6 kH/s/W |
+| CMP 170HX | Ampere | 70 | 64 GB | Kimi-Linear-48B | 53,760 | 1.76 MH/s | 213 W | 8.3 kH/s/W |
+| RTX 3070 | Ampere | 46 | 8 GB | Qwen3.5-9B | 17,664 | **1.35 MH/s** | 249 W | 5.4 kH/s/W |
+
+Caveats, so the numbers are not read for more than they are:
+
+- **The tier matters.** The walk is over the model, so a card on Kimi-Linear-48B is not doing the same
+  work as one on Gemma-4-12B. Compare cards within a tier, not across.
+- **Two rows are thermally limited, not compute limited.** The CMP 170HX sat at 85 °C and clocked down
+  to 1200 MHz; its own tuner measured **1.95 MH/s** on the same card before it heat-soaked. The second
+  RTX 5090 ran at 79 °C against the first card's 69 °C — same batch, ~3% less hashrate, and the better
+  efficiency of the two because it drew less power to do it.
+- The two RTX 3070s carry a **+250 MHz core offset**; everything else is stock.
+- Efficiency is steady-state hashrate over the miner's reported board power. The 3070 is the outlier:
+  8 GB forces it onto the smallest tier, and it burns ~249 W doing it.
+
+### What the autotune picked, and why it matters
+
+v0.11.13 benchmarks each card on its first grind and caches the result in `~/.keryx/v4tune.json`.
+The batch column above is measured, not derived — and it is the reason the table exists:
+
+| GPU | batch/2 | SM-derived (384/SM) | batch×2 | picked |
+|---|---|---|---|---|
+| RTX 5090 | 4.95 | 5.32 | **5.47** | 130,560 |
+| RTX 5080 | 2.74 | 2.90 | **3.00** | 64,512 |
+| RTX 5070 Ti | 2.57 | 2.69 | **2.70** | 53,760 |
+| RTX 4070 Ti SUPER | 2.09 | 2.12 | **2.15** | 50,688 |
+| CMP 170HX | 1.84 | 1.92 | **1.95** | 53,760 |
+| RTX 3070 | 1.30 | **1.35** | 1.32 | 17,664 |
+
+Every card from ~66 SMs up wants **more** than 384 nonces/SM; only the 46-SM RTX 3070 peaks at the
+SM-derived value and loses throughput above it. That is why the batch is measured per card instead of
+being a formula — a fixed 64K would starve the 3070, and 384/SM leaves ~4% on the table on an RTX 5080.
+
+Also measured: the **tensor-core walk is the right choice on every card tested**, not just Blackwell —
+an RTX 3070 does 1.35 MH/s on it against 0.84 MH/s on the classic dp4a walk (+61%).
+
+---
+
+# Pre-relaunch PoM (historical)
+
+Everything below predates the keryxd v1.5.1 relaunch walk and is kept for reference only. The
+hashrates are on the old walk and cannot be compared with the table above.
+
+
 Reference hashrates, clocks and power for the keryx miner's **Proof-of-Model (PoM)** algorithm, measured
 on our own hardware. **This file is open — please submit a PR** to add your card, correct a number, or fill
 in a blank. One row per card; keep it sorted roughly by hashrate.

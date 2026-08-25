@@ -13,28 +13,34 @@ Suprnova fork of the [keryx-labs/keryx-miner](https://github.com/keryx-labs/kery
 
 ## Performance
 
-Since the PoM hardfork the PoW is **Proof-of-Model** — a memory-bound random
-walk over the model weights — so hashrates are in **MH/s** and scale with a
-card's memory bandwidth, not its compute. (The pre-fork kHeavyHash GH/s numbers
-that used to live here are obsolete: kHeavyHash is no longer mined.)
+The PoW is **Proof-of-Model** — a data-dependent walk over the model weights — so hashrates are in
+**MH/s** and follow memory bandwidth far more than core clock.
 
-Measured live on the pool (v0.6.9.3, AUTO tier — each card loads the heaviest
-model that fits — **stock clocks and power limits**). Verified by pool share
-acceptance, 0 rejects. Re-benchmarked 2026-07-08:
+Measured **2026-08-25 on v0.11.13**, one card at a time on an otherwise idle rig (every other miner
+stopped and verified stopped), stock clocks unless noted, each row pool-verified with **0 rejects**:
 
-| GPU | Tier (AUTO) | Hashrate | Power |
-|---|---|---|---|
-| RTX 5090 | very-high (Llama-3.3-70B-Q2) | **~68 MH/s** | ~382 W of 600 W PL |
-| RTX 5080 | default (Dolphin-Llama3-8B) | **~34.8 MH/s** | ~190–200 W |
-| RTX 5070 Ti | default (Dolphin-Llama3-8B) | **~34 MH/s** | ~179 W |
-| CMP 170HX | light (Gemma-3-4B) | **~20 MH/s** | ~115 W |
-| RTX 3070 | light (Gemma-3-4B) | **~18.5 MH/s** | ~173 W |
+| GPU | Tier (AUTO) | Hashrate | Power | Efficiency |
+|---|---|---|---|---|
+| RTX 5090 | Kimi-Linear-48B | **5.47 MH/s** | 601 W | 9.1 kH/s/W |
+| RTX 5080 | Gemma-4-12B | **3.00 MH/s** | 376 W | 8.0 kH/s/W |
+| RTX 5070 Ti | Gemma-4-12B | **2.69 MH/s** | 341 W | 7.9 kH/s/W |
+| RTX 4070 Ti SUPER | Gemma-4-12B | **2.15 MH/s** | 284 W | 7.6 kH/s/W |
+| CMP 170HX | Kimi-Linear-48B | 1.76 MH/s | 213 W | 8.3 kH/s/W |
+| RTX 3070 | Qwen3.5-9B | **1.35 MH/s** | 249 W | 5.4 kH/s/W |
 
-⚠️ Measured **before the H4 hardfork**, on the pre-H4 model lineup named above. The PoM walk is
-memory-bandwidth bound, so per-card hashrate is broadly comparable on the current
-[H4 models](#model-tiers), but these exact figures have not been re-measured post-H4.
+The walk is over the model, so **cards on different tiers are not doing the same work** — compare
+within a tier. The CMP 170HX row is heat-limited (85 °C, clocked to 1200 MHz); the same card measured
+1.95 MH/s before it heat-soaked. The RTX 3070s carry a +250 MHz core offset.
 
-Full per-card data (H100/H200, AMD, power sweeps) and tuning guidance:
+Since v0.11.13 each card **benchmarks itself once** and caches the result in `~/.keryx/v4tune.json`,
+so it uses the walk kernel and grind batch that are actually fastest on that GPU rather than a
+one-size-fits-all default. It costs a few seconds on the first grind of a new card and is free after
+that (`KERYX_POM_V4_AUTOTUNE=0` disables it, `=force` re-measures). This is worth real hashrate: an
+RTX 5080 gains ~4% over the previous SM-derived batch, while a 46-SM RTX 3070 keeps the smaller batch
+that suits it. The tensor-core walk wins on every card tested, including Ampere (RTX 3070: 1.35 MH/s
+vs 0.84 MH/s on the classic walk).
+
+Per-card detail, the full batch sweeps behind those choices, and the historical pre-relaunch numbers:
 [BENCHMARKS.md](BENCHMARKS.md) — PRs with your own cards welcome.
 
 ## Build
