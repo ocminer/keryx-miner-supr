@@ -1823,6 +1823,34 @@ mod v4_kernel_tests {
     /// Throughput bench (no pool, synthetic blob): `--ignored v4_bench`. Blob size via
     /// KERYX_BENCH_TILES (default 6 GiB / 1KB tiles), duration via KERYX_BENCH_SECS (default 10).
     /// Impossible target => no winner => every batch runs to completion. Prints Mh/s.
+    /// The sibling memo must not change a single byte of any Merkle path: same index, same paths,
+    /// cold vs warm cache — and a built proof must still re-verify against R_T.
+    #[test]
+    #[ignore]
+    fn merkle_path_memo_is_byte_identical() {
+        let data = blob(2048);
+        let index = crate::pom::index_from_ram(data.clone());
+        let fresh = crate::pom::index_from_ram(data);
+        let n = index.n_chunks.min(4096);
+        let mut checked = 0u64;
+        for off in (0..n).step_by(7) {
+            // `index` warms its memo as we go; `fresh` is asked each offset exactly once, but its
+            // memo also warms — so also re-ask `index` a second time (warm) for the same offset.
+            let a = fresh.merkle_path(off);
+            let b = index.merkle_path(off);
+            let c = index.merkle_path(off); // warm hit
+            assert_eq!(a, b, "memo changed the path at off {off}");
+            assert_eq!(b, c, "warm memo differs from cold at off {off}");
+            checked += 1;
+        }
+        // end-to-end: a proof built with the memo must verify against the pinned root
+        let seed = crate::pom::pom_block_seed_v4(&PPH, TS, 42);
+        let (v4, fs) = crate::pom_v4::build_proof_v4(0, seed, &index).unwrap();
+        let re = crate::pom_v4::verify_proof_v4(seed, &v4, &index.r_t, index.n_chunks).unwrap();
+        assert_eq!(re, fs, "proof built with the memo failed re-verification");
+        println!("memo byte-identical over {checked} offsets + proof re-verifies");
+    }
+
     /// build_proof_v4 WITH the dense (resident) tree — isolates what --resident-tree buys per share.
     #[test]
     #[ignore]
@@ -1848,7 +1876,8 @@ mod v4_kernel_tests {
     #[ignore]
     fn v4_proof_parts_bench() {
         use crate::pom_v4::*;
-        let data = blob(2048);
+        let tiles: usize = std::env::var("KERYX_BENCH_TILES").ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
+        let data = blob(tiles);
         let index = crate::pom::index_from_ram(data);
         let n_tiles = index.n_chunks / POM_V4_TILE_CHUNKS;
         let seed = crate::pom::pom_block_seed_v4(&PPH, TS, 1);
@@ -1882,7 +1911,8 @@ mod v4_kernel_tests {
     #[test]
     #[ignore]
     fn v4_proof_build_bench() {
-        let data = blob(2048);
+        let tiles: usize = std::env::var("KERYX_BENCH_TILES").ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
+        let data = blob(tiles);
         let index = crate::pom::index_from_ram(data);
         let iters = 200u64;
         let t0 = std::time::Instant::now();
@@ -1891,14 +1921,18 @@ mod v4_kernel_tests {
             let (_p, _fs) = crate::pom_v4::build_proof_v4(0, seed, &index).unwrap();
         }
         let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
-        println!("build_proof_v4: {:.1} us/proof ({} iters)", us, iters);
+        println!("build_proof_v4: {:.1} us/proof ({} iters, {} tiles, N={} chunks)", us, iters, tiles, index.n_chunks);
+        println!("  sibling memo: {} entries (~{:.1} MB)", index.sibling_memo_len(), index.sibling_memo_len() as f64 * 44.0 / 1e6);
     }
 
     #[test]
     #[ignore]
     fn v4_bench() {
+        // Default 1 GiB: big enough to be DRAM-bound, small enough that the whole --ignored suite
+        // can run in ONE process without the allocations colliding. Raise with KERYX_BENCH_TILES
+        // (6*1024*1024 = the 6 GiB tier-0-ish blob used for the headline numbers).
         let n_tiles: usize = std::env::var("KERYX_BENCH_TILES").ok()
-            .and_then(|s| s.parse().ok()).unwrap_or(6 * 1024 * 1024);
+            .and_then(|s| s.parse().ok()).unwrap_or(1024 * 1024);
         let secs: u64 = std::env::var("KERYX_BENCH_SECS").ok()
             .and_then(|s| s.parse().ok()).unwrap_or(10);
         let data = blob(n_tiles);
