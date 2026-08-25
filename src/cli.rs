@@ -154,6 +154,32 @@ pub struct Opt {
     pub escrow_state_file: String,
 
     #[clap(
+        long = "intensity",
+        value_name = "CSV",
+        help = "Fixed grind batch per card, cgminer/sgminer style: batch = 2^intensity nonces. \
+                Comma-separated, mapped to CUDA device order like --force-model: \
+                --intensity 18,18,16 → GPU0 and GPU1 use 2^18 = 262144, GPU2 uses 2^16 = 65536. \
+                Range 1-21 (clamped); a listed card is NOT autotuned, unlisted cards keep autotuning. \
+                Higher is not automatically better: one launch must still finish well inside a ~100 ms \
+                block window, and past a card's plateau a bigger batch only risks landing on a stale job.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub intensity: Option<String>,
+
+    #[clap(
+        long = "only-inference",
+        visible_alias = "inference-only",
+        help = "Serve OPoI inference, barely mine. The walk runs at the smallest batch with a duty-cycle \
+                pause between launches (lowest power), and STOPS entirely while a request is being served \
+                so the card answers as fast as it can, then goes back to a trickle. For rigs that want \
+                inference rewards rather than PoW. Tune the idle duty with KERYX_ONLY_INFERENCE_DUTY_MS \
+                (default 250). Also relaxes the no-share wedge supervisor, which would otherwise restart \
+                the miner for not finding shares it is not trying to find.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub only_inference: bool,
+
+    #[clap(
         long = "escrow-dir",
         visible_alias = "escrow-cert-dir",
         help = "Directory holding escrow.key, escrow.cert and escrow_state.json — like --models-dir, \

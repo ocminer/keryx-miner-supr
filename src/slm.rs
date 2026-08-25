@@ -1632,7 +1632,7 @@ pub fn inference_gpu_ordinal() -> usize {
 /// (`--cuda-device 0,1` or `--cuda-device=0,1`). Empty means "all" (the flag's default) or a
 /// non-CUDA invocation. Argv is used rather than plumbing the value in from the CUDA plugin because
 /// that plugin cannot depend on this crate (it would be a Cargo cycle).
-fn cli_cuda_devices() -> Vec<usize> {
+pub fn cli_cuda_devices() -> Vec<usize> {
     parse_cuda_devices(std::env::args())
 }
 
@@ -2196,6 +2196,9 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
         }
         if crate::llama_engine::available_on(gpu) {
             let t0 = std::time::Instant::now();
+            // --only-inference: yield the card to the request. Returns None (no-op) on a normal rig,
+            // where mining continues through the generation as it always has.
+            let _serving = crate::pom_gpu::serving_now(gpu);
             if let Some(text) = crate::llama_engine::generate_on(gpu, prompt, max_tokens) {
                 let secs = t0.elapsed().as_secs_f64();
                 if secs > 0.0 {

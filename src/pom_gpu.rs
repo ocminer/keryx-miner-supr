@@ -1265,23 +1265,200 @@ fn v4_batch_for_sm_count(sm: u64) -> u64 {
     (sm * POM_V4_NONCES_PER_SM).max(POM_V4_BATCH_MIN)
 }
 
-/// The v4 grind batch to use on `device_id`. The autotune's measured batch wins when this card has
-/// been tuned; otherwise the SM-derived estimate. Logged once per device.
+/// The v4 grind batch to use on `device_id`, in precedence order:
+///
+///  1. `--intensity` for this card — a fixed, operator-chosen size (nothing measures over it);
+///  2. `--only-inference` — the smallest batch, because that mode wants the card idle for serving;
+///  3. the autotune's measured batch, once this card has been benchmarked;
+///  4. otherwise the STARTING batch, which is deliberately the high end of the sweep (see
+///     `v4_starting_batch`).
+///
+/// Logged once per device.
 pub fn v4_batch_for_device(device_id: u32) -> u64 {
+    if let Some(b) = intensity_batch_for(device_id) {
+        return log_batch_once(device_id, b, "--intensity");
+    }
+    if only_inference() {
+        return log_batch_once(device_id, POM_V4_BATCH_MIN, "--only-inference (minimum)");
+    }
     let (b, how) = match v4_tune_for(device_id) {
         Some(t) => (t.batch, "autotuned"),
         None => match gpu_sm_count(device_id) {
-            Some(sm) => (v4_batch_for_sm_count(sm), "SM-derived"),
+            Some(sm) => (v4_starting_batch(sm), "starting high, autotune may lower it"),
             None => (POM_V4_BATCH_FALLBACK, "fallback"),
         },
     };
+    log_batch_once(device_id, cap_batch_to_vram(device_id, b), how)
+}
+
+fn log_batch_once(device_id: u32, batch: u64, how: &str) -> u64 {
     static LOGGED: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    // Report the STEADY-STATE batch. The first call happens before the walk is installed, when the
+    // VRAM cap cannot be evaluated yet, so logging then printed a number the card never actually ran.
+    if !is_installed(device_id) {
+        return batch;
+    }
     if let Ok(mut seen) = LOGGED.get_or_init(|| Mutex::new(std::collections::HashSet::new())).lock() {
         if seen.insert(device_id) {
-            log::info!("PoM[gpu{}]: v4 grind batch = {} nonces ({}).", device_id, b, how);
+            log::info!("PoM[gpu{}]: v4 grind batch = {} nonces ({}).", device_id, batch, how);
         }
     }
-    b
+    batch
+}
+
+/// The batch a card runs BEFORE it has measured itself: the top of the sweep, not the middle.
+///
+/// Every card benchmarked from ~66 SMs up preferred 768 nonces/SM over 384, by up to ~4%, and only a
+/// small 46-SM card preferred less. Starting at the high end therefore means most cards are already
+/// at their best before the autotune has said anything, and the tuner's job is to walk a card DOWN
+/// if it turns out to want less — losing a little speed on the few small cards for the seconds the
+/// measurement takes, rather than leaving every big card slow until it finishes.
+fn v4_starting_batch(sm: u64) -> u64 {
+    v4_batch_for_sm_count(sm).saturating_mul(2)
+}
+
+// ── OPERATOR OVERRIDES: --intensity and --only-inference ───────────────────────────────────────
+/// sgminer/cgminer-style intensity per card: batch = 2^intensity nonces.
+///
+/// Set from `--intensity 18,18,16` (CSV position = CUDA ordinal, same convention as `--force-model`).
+/// A card with an intensity is NOT autotuned — the operator has taken the decision.
+static V4_INTENSITY: OnceLock<Vec<Option<u32>>> = OnceLock::new();
+
+/// Intensity is a power of two, so the usable window is narrow: below 13 the launch is too small to
+/// keep the card busy, and above 21 one launch overruns the ~100 ms block window on any card we have
+/// measured (an RTX 5090 does ~5.5 MH/s, so 2^21 nonces is already ~380 ms of work).
+pub const INTENSITY_MIN: u32 = 1;
+pub const INTENSITY_MAX: u32 = 21;
+
+pub fn set_intensity_map(v: Vec<Option<u32>>) {
+    let _ = V4_INTENSITY.set(v);
+}
+
+/// The fixed batch for `device_id` if `--intensity` named it, clamped to a launchable size AND to
+/// what the card's free VRAM can actually back.
+pub fn intensity_batch_for(device_id: u32) -> Option<u64> {
+    let i = (*V4_INTENSITY.get()?).get(device_id as usize).copied().flatten()?;
+    let want = (1u64 << i.clamp(INTENSITY_MIN, INTENSITY_MAX)).max(64);
+    Some(cap_batch_to_vram(device_id, want))
+}
+
+/// Bytes of VRAM the offset buffers need for a batch: K offsets per nonce, 4 bytes each, in TWO
+/// buffers (the walk reads one while the chase may fill the other).
+fn offsets_bytes_for(batch: u64) -> u64 {
+    batch.saturating_mul(crate::pom_v4::POM_V4_K as u64).saturating_mul(4).saturating_mul(2)
+}
+
+/// Caps `want` so the offset buffers stay inside a quarter of this card's free VRAM.
+///
+/// This is a HARD safety limit, not a tuning preference. An oversized batch does not merely run
+/// slowly: measured on an 8 GB RTX 3070 at `--intensity 18` (batch 262144 → 512 MiB of offsets on a
+/// card already holding a ~6.4 GB model), the card ended up with a POISONED CUDA context —
+/// `cudaMemGetInfo failed (an illegal memory access was encountered)` — after which llama could not
+/// allocate and inference died on that GPU. A knob the operator is invited to turn must not be able
+/// to do that, so an unattainable intensity is clamped with a loud warning instead of honoured.
+fn cap_batch_to_vram(device_id: u32, want: u64) -> u64 {
+    static CAP: OnceLock<Mutex<HashMap<u32, u64>>> = OnceLock::new();
+    let cache = CAP.get_or_init(|| Mutex::new(HashMap::new()));
+    // The reading is only meaningful once the model and walk are RESIDENT. The grind loop computes a
+    // batch before the first `ensure_installed`, when the card still looks almost empty — caching
+    // that reading produced a cap ~8x too generous and let an unattainable --intensity through,
+    // which is exactly the case this guard exists to stop (2196 illegal-access errors on an 8 GB
+    // card in testing). Until the walk is installed, cap from what is free right now and do not
+    // remember it.
+    let settled = is_installed(device_id);
+    let cap = {
+        let cached = if settled { cache.lock().ok().and_then(|g| g.get(&device_id).copied()) } else { None };
+        match cached {
+            Some(c) => c,
+            None => {
+                let free_mib = query_all_gpus_free_vram()
+                    .into_iter()
+                    .find(|(o, _, _)| *o == device_id)
+                    .map(|(_, free, _)| free)
+                    .unwrap_or(0);
+                // No reading (driver hiccup, or a card we cannot query) → do not cap.
+                let c = if free_mib == 0 {
+                    u64::MAX
+                } else {
+                    // A TENTH of what is free. The measured margin is thin on small cards: an 8 GB
+                    // RTX 3070 running the walk sits at ~7.2/8.2 GB, so ~0.9 GB is genuinely free,
+                    // and a batch whose offsets ran into that headroom collapsed the card by ~50x
+                    // (thrashing, then a poisoned context) rather than degrading gracefully. The
+                    // autotuned batch on that card needs ~34 MiB, well inside a tenth.
+                    let budget = (free_mib * 1024 * 1024) / 10;
+                    (budget / (crate::pom_v4::POM_V4_K as u64 * 4 * 2)).max(POM_V4_BATCH_MIN)
+                };
+                if settled {
+                    if let Ok(mut g) = cache.lock() {
+                        g.insert(device_id, c);
+                    }
+                }
+                c
+            }
+        }
+    };
+    if want <= cap {
+        return want;
+    }
+    static WARNED: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    let seen = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if seen.lock().map(|mut s| s.insert(device_id)).unwrap_or(false) {
+        log::warn!(
+            "PoM[gpu{}]: batch {} needs {} MiB of offset buffers, which does not fit this card's free \
+             VRAM — capped to {}. A batch this size starves the model and can poison the card's CUDA \
+             context; lower --intensity (or free VRAM) to use it.",
+            device_id, want, offsets_bytes_for(want) / (1024 * 1024), cap
+        );
+    }
+    cap
+}
+
+/// `--only-inference`: this rig is here to serve inference, not to hash. Mining runs at the smallest
+/// batch with a duty-cycle pause between launches, and stops entirely while a request is being
+/// served, so the card is free (and cool, and already clocked up) for the next one.
+static ONLY_INFERENCE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_only_inference(on: bool) {
+    ONLY_INFERENCE.store(on, Ordering::Relaxed);
+}
+
+pub fn only_inference() -> bool {
+    ONLY_INFERENCE.load(Ordering::Relaxed)
+}
+
+/// How long the walk sleeps between launches in `--only-inference` mode. The card spends most of its
+/// time idle, which is the whole point: low power, cool, and instantly available to serve.
+pub fn only_inference_duty_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("KERYX_ONLY_INFERENCE_DUTY_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(250)
+            .clamp(0, 10_000)
+    })
+}
+
+/// Marks `gpu` as actively serving an inference request, so the grind loop yields the card to it.
+/// RAII: the walk resumes when the returned guard drops, panic included.
+///
+/// Only used in `--only-inference` mode. On a normal rig the walk keeps running during generation —
+/// inference is short and the hashrate matters — but a rig that exists to serve should answer as fast
+/// as the card can, and a concurrent walk both steals bandwidth and holds the card at a lower clock.
+pub struct ServingGuard(usize);
+
+impl Drop for ServingGuard {
+    fn drop(&mut self) {
+        set_inference_paused_on(self.0, false);
+    }
+}
+
+pub fn serving_now(gpu: usize) -> Option<ServingGuard> {
+    if !only_inference() {
+        return None;
+    }
+    set_inference_paused_on(gpu, true);
+    Some(ServingGuard(gpu))
 }
 
 // ── PER-CARD LAUNCH AUTOTUNE ───────────────────────────────────────────────────────────────────
@@ -1409,6 +1586,11 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
     if mode == "0" {
         return true;
     }
+    // Nothing to measure when the operator has already decided the batch, and nothing worth
+    // measuring when the card is deliberately mining at a trickle to stay free for inference.
+    if intensity_batch_for(device_id).is_some() || only_inference() {
+        return true;
+    }
     // ONE CARD AT A TIME. Every device starts grinding at once, so without this the cards benchmark
     // on top of each other and contend for the host, PCIe and power budget — enough noise that two
     // identical 5080s in the same rig picked different batches from the same candidate set.
@@ -1506,7 +1688,12 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
     // big cards (an RTX 5080 measured 3.05 Mh/s at 64K vs 2.90 at its SM-derived 32K), so the sweep
     // looks one step either side. Requires a 2% win to move, so noise cannot flip the choice.
     let batches: Vec<u64> = {
-        let mut v = vec![(base / 2).max(POM_V4_BATCH_MIN), base, base * 2];
+        // Capped the same way the live batch is: a candidate that cannot fit its offset buffers must
+        // never be launched, not even once to measure it.
+        let mut v: Vec<u64> = [(base / 2).max(POM_V4_BATCH_MIN), base, base * 2]
+            .into_iter()
+            .map(|b| cap_batch_to_vram(device_id, b))
+            .collect();
         v.dedup();
         v
     };
@@ -1520,16 +1707,18 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
             m.map(|v| format!("{:.3} Mh/s", v)).unwrap_or_else(|| "failed".into())
         );
     }
-    // Pick the fastest, then break ties toward the LARGEST batch within 1% of it. The benchmark
-    // grinds back-to-back, so it cannot see the per-batch host work the live loop does between
-    // launches (job checks, share handling) — real mining amortizes that over the batch, which is
-    // why a batch that merely ties in here is worth more out there. Without the tie-break, two
-    // identical cards can disagree on a difference the benchmark cannot resolve.
+    // Pick the fastest, then take the LARGEST batch within 2% of it. Two reasons to lean big rather
+    // than pick the bare maximum: the benchmark grinds back-to-back, so it cannot see the per-batch
+    // host work the live loop does between launches (job checks, share handling) — real mining
+    // amortizes that over the batch, so a batch that merely ties here is worth more out there — and
+    // the measured fleet curve says bigger is right for everything above ~46 SMs. Erring large also
+    // means the tuner only ever walks a card DOWN from the high starting batch when it clearly wants
+    // less, instead of creeping up to it.
     let peak = batch_mhs.iter().flatten().copied().fold(0.0f64, f64::max);
     if peak > 0.0 {
         for (i, m) in batch_mhs.iter().enumerate() {
             if let Some(v) = *m {
-                if v >= peak * 0.99 && batches[i] >= best.batch {
+                if v >= peak * 0.98 && batches[i] >= best.batch {
                     best.batch = batches[i];
                     best_mhs = v;
                 }
@@ -2571,5 +2760,33 @@ mod v4_kernel_tests {
             }
         }
         std::env::remove_var("KERYX_POM_V4_TC");
+    }
+}
+
+
+#[cfg(test)]
+mod intensity_tests {
+    use super::*;
+
+    #[test]
+    fn intensity_maps_to_a_power_of_two_batch_and_clamps() {
+        // The mapping users know from cgminer/sgminer: batch = 2^intensity.
+        assert_eq!(1u64 << 18, 262_144);
+        assert_eq!(1u64 << 16, 65_536);
+        // Out-of-range values clamp instead of producing an unlaunchable or window-busting batch.
+        assert_eq!(INTENSITY_MAX.clamp(INTENSITY_MIN, INTENSITY_MAX), INTENSITY_MAX);
+        assert_eq!(99u32.clamp(INTENSITY_MIN, INTENSITY_MAX), INTENSITY_MAX);
+        assert_eq!(0u32.clamp(INTENSITY_MIN, INTENSITY_MAX), INTENSITY_MIN);
+    }
+
+    #[test]
+    fn the_starting_batch_is_the_top_of_the_sweep() {
+        // A card starts at the high end and the autotune may walk it down — the measured fleet curve
+        // says everything above ~46 SMs wants more than 384 nonces/SM.
+        for sm in [46u64, 66, 84, 170] {
+            assert_eq!(v4_starting_batch(sm), v4_batch_for_sm_count(sm) * 2);
+        }
+        // The floor still applies to tiny/unknown cards.
+        assert!(v4_starting_batch(1) >= POM_V4_BATCH_MIN);
     }
 }

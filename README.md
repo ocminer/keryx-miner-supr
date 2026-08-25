@@ -43,6 +43,76 @@ vs 0.84 MH/s on the classic walk).
 Per-card detail, the full batch sweeps behind those choices, and the historical pre-relaunch numbers:
 [BENCHMARKS.md](BENCHMARKS.md) — PRs with your own cards welcome.
 
+### Setting the batch by hand: `--intensity`
+
+If you would rather pin the grind batch than let the card measure itself, `--intensity` works the way
+cgminer and sgminer users expect — **batch = 2^intensity nonces** — and takes one value per card,
+comma-separated:
+
+```bash
+# GPU0 and GPU1 at 2^18 = 262144 nonces, GPU2 at 2^16 = 65536
+keryx-miner-supr -a <addr> -s <pool> --intensity 18,18,16
+```
+
+Positions follow the cards **this process mines**: with `--cuda-device 2,3` the first value is GPU2.
+An empty slot (`--intensity 18,,16`) leaves that card on autotune, and any card you do not list keeps
+autotuning. A card you *do* list is not benchmarked at all — you have made the decision.
+
+Higher is not automatically better. On an RTX 5080 the measured optimum is 64512 (intensity ~16);
+forcing intensity 17 gives 2.95 MH/s against the autotuned 2.99. One launch also has to finish well
+inside a ~100 ms block window, or the batch lands on a stale job.
+
+The batch is **capped to what the card's free VRAM can back** (the walk keeps two offset buffers of
+`batch × 256 × 4` bytes). An unattainable intensity is clamped with a warning rather than honoured:
+
+```
+PoM[gpu0]: batch 262144 needs 512 MiB of offset buffers, which does not fit this card's free VRAM
+           — capped to 37632. A batch this size starves the model and can poison the card's CUDA
+           context; lower --intensity (or free VRAM) to use it.
+```
+
+That guard is not cosmetic — on an 8 GB card, an oversized batch does not just run slowly, it can
+leave the GPU with a poisoned CUDA context that takes inference down with it.
+
+### Mining for inference only: `--only-inference`
+
+For rigs that want OPoI inference rewards and treat PoW as a formality. The walk drops to the
+smallest batch with an idle pause between launches, and **stops completely while a request is being
+served**, so the card answers at full speed and then goes back to a trickle:
+
+```bash
+keryx-miner-supr -a <addr> -s <pool> --only-inference
+```
+
+Measured on an RTX 5080 (same card, same model tier):
+
+| mode | hashrate | power | temp |
+|---|---|---|---|
+| normal | 2.99 MH/s | 400 W | 70 °C |
+| `--only-inference` | 32 kH/s | **58 W** | 41 °C |
+
+About 14% of the power, and the card sits cool and idle waiting to serve. Tune the idle share with
+`KERYX_ONLY_INFERENCE_DUTY_MS` (default 250 — raise it to mine even less, set 0 to mine flat out
+between requests). The no-share wedge supervisor is disabled in this mode, since a rig that is
+deliberately barely hashing would otherwise be restarted every 10 minutes for not finding shares.
+
+### Setting environment variables on Windows
+
+Any `KERYX_*` variable goes in the `.bat` file that starts the miner, one `set` line **before** the
+miner command (no spaces around the `=`):
+
+```bat
+@echo off
+set KERYX_POM_V4_AUTOTUNE=force
+set KERYX_ONLY_INFERENCE_DUTY_MS=500
+keryx-miner-supr.exe -a <addr> -s <pool>
+pause
+```
+
+In PowerShell (`.ps1`) the same thing is `$env:KERYX_POM_V4_AUTOTUNE = "force"` before the call.
+Setting a variable in a `cmd` window with `set` only affects that window, so put it in the start
+script rather than typing it once.
+
 ## Build
 
 ```bash

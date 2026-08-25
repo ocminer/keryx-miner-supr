@@ -1422,6 +1422,65 @@ async fn run() -> Result<(), Error> {
         info!("--low-ram: loading models onto GPUs one at a time (lower peak system RAM, slower startup).");
     }
 
+    // --intensity: fixed batch per card (batch = 2^intensity), CSV position = CUDA ordinal, the same
+    // mapping --force-model uses. A listed card is not autotuned.
+    #[cfg(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))))]
+    if let Some(raw) = opt.intensity.as_deref() {
+        let given: Vec<Option<u32>> = raw
+            .split(',')
+            .map(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    return None; // an empty slot leaves that card on autotune
+                }
+                s.parse::<u32>().ok()
+            })
+            .collect();
+        // Positions follow THIS PROCESS's card list: with `--cuda-device 2,3`, the first intensity is
+        // for GPU2. Without that flag the process mines every card and position == CUDA ordinal, so
+        // the common case is unchanged. (`--force-model` indexes by raw ordinal; matching it here
+        // would mean `--cuda-device 2 --intensity 17` silently applied to GPU0 and left GPU2 on auto,
+        // which is what happened the first time this was tested.)
+        let own = keryx_miner::slm::cli_cuda_devices();
+        let width = own.iter().copied().max().map(|m| m + 1).unwrap_or(given.len()).max(given.len());
+        let mut map: Vec<Option<u32>> = vec![None; width];
+        for (pos, val) in given.iter().enumerate() {
+            let dev = if own.is_empty() { pos } else { match own.get(pos) { Some(d) => *d, None => continue } };
+            if dev < map.len() {
+                map[dev] = *val;
+            }
+        }
+        let shown: Vec<String> = map
+            .iter()
+            .enumerate()
+            .map(|(dev, i)| match i {
+                Some(i) => {
+                    let c = (*i).clamp(
+                        keryx_miner::pom_gpu::INTENSITY_MIN,
+                        keryx_miner::pom_gpu::INTENSITY_MAX,
+                    );
+                    let note = if c != *i { format!(" (clamped from {})", i) } else { String::new() };
+                    format!("GPU{}={}{} → {} nonces", dev, c, note, 1u64 << c)
+                }
+                None => format!("GPU{}=auto", dev),
+            })
+            .collect();
+        info!("--intensity {}: {}", raw.trim(), shown.join(", "));
+        keryx_miner::pom_gpu::set_intensity_map(map);
+    }
+
+    // --only-inference: trickle-mine, and hand the card to inference the moment a request lands.
+    #[cfg(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))))]
+    if opt.only_inference {
+        keryx_miner::pom_gpu::set_only_inference(true);
+        info!(
+            "--only-inference: mining at the minimum batch with a {} ms idle duty cycle; the walk stops \
+             while a request is served so it is answered at full speed. Expect very low hashrate — that \
+             is the point — and note the no-share wedge supervisor is disabled in this mode.",
+            keryx_miner::pom_gpu::only_inference_duty_ms()
+        );
+    }
+
     // CPU inference is OFF by default: a card that can't run GPU inference withdraws from OPoI
     // rather than doing futile CPU work. Either flag opts in; --cpu-inference additionally forces
     // CPU from the start.
@@ -1548,11 +1607,16 @@ async fn run() -> Result<(), Error> {
     // wedge class. Arms only AFTER the first accepted share, so model download / pre-activation /
     // brief OPoI inference pauses never trip it.
     {
+        let only_inference_mode = opt.only_inference;
         let stall_secs: u64 = std::env::var("KERYX_STALL_RESTART_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&n| n >= 60)
             .unwrap_or(600);
+        // --only-inference trickle-mines on purpose, so long gaps between accepted shares are the
+        // expected steady state, not a wedge. Left armed it would restart a perfectly healthy rig
+        // every 10 minutes and interrupt the serving it exists to do.
+        let stall_armed = !only_inference_mode;
         tokio::spawn(async move {
             let mut last_acc: u64 = 0;
             let mut last_change = Instant::now();
@@ -1569,7 +1633,7 @@ async fn run() -> Result<(), Error> {
                     last_acc = acc;
                     last_change = Instant::now();
                     armed = true;
-                } else if armed && last_change.elapsed() >= Duration::from_secs(stall_secs) {
+                } else if armed && stall_armed && last_change.elapsed() >= Duration::from_secs(stall_secs) {
                     error!(
                         "WEDGE SUPERVISOR: no accepted share for {}s while mining — the miner is stuck; \
                          exiting (code 75) so the wrapper relaunches it and resets stuck workers.",
