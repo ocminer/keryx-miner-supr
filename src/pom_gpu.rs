@@ -1024,6 +1024,16 @@ fn wait_for_sole_owner<T>(item: &Arc<T>, timeout: std::time::Duration) -> bool {
 /// gather index (`ensure_installed_inner`'s own doc comment calls this reload "Heavy") even though
 /// nothing about them changed.
 pub fn uninstall(device_id: u32) {
+    let _ = uninstall_released(device_id);
+}
+
+/// `uninstall`, reporting whether the miner's VRAM was actually released.
+///
+/// `false` means a walk thread still holds the handle after the timeout, so the old table is STILL
+/// RESIDENT. That matters to the caller: rebuilding on top of it allocates a SECOND full table, and
+/// on a card whose model nearly fills it that fails as `CUBLAS_STATUS_NOT_INITIALIZED` — the
+/// restart loop reported from the field on 10 GB RTX 3080s.
+pub fn uninstall_released(device_id: u32) -> bool {
     let removed = match miners().lock() {
         Ok(mut g) => remove_device_entry(&mut g, device_id),
         Err(_) => None,
@@ -1034,9 +1044,108 @@ pub fn uninstall(device_id: u32) {
     // waiting for the last handle to drop is enough. Freeing under a live walk raises a sticky
     // CUDA_ERROR_ILLEGAL_ADDRESS that poisons the device's context for every user of it, inference
     // included.
-    if let Some(miner) = removed {
-        if !wait_for_sole_owner(&miner, std::time::Duration::from_secs(30)) {
-            log::error!("PoM[gpu{}]: a walk still holds the miner after 30s — releasing anyway", device_id);
+    let released = match removed {
+        Some(miner) => {
+            if wait_for_sole_owner(&miner, std::time::Duration::from_secs(30)) {
+                true
+            } else {
+                log::error!(
+                    "PoM[gpu{}]: a walk still holds the miner after 30s — its table stays resident, so \
+                     this card will NOT be rebuilt until the walk lets go (rebuilding now would need a \
+                     second copy of the model and fail with CUBLAS_STATUS_NOT_INITIALIZED).",
+                    device_id
+                );
+                // Keep the handle so the VRAM can be reclaimed the moment the stuck walk drops its
+                // own — otherwise the table would be orphaned for the life of the process and the
+                // card could never come back without a restart.
+                let q = QUARANTINE.get_or_init(|| Mutex::new(HashMap::new()));
+                if let Ok(mut g) = q.lock() {
+                    g.insert(device_id, miner);
+                }
+                false
+            }
+        }
+        None => true,
+    };
+    // The offset buffers belong to the walk that just went away. They were previously kept forever in
+    // per-device caches, so every rebuild had to fit a fresh table around them — 102 MiB per card at
+    // the current default batch. Only safe to drop once nothing holds the miner any more: a stuck
+    // walk may still be reading them.
+    if released {
+        v4_release_offsets(device_id as usize);
+    }
+    released
+}
+
+/// Cards whose previous walk table could not be released. Rebuilding one of these allocates a second
+/// full model copy and dies as CUBLAS_STATUS_NOT_INITIALIZED on any card without a spare model's
+/// worth of VRAM, so the rebuild is skipped until the stuck walk lets go.
+static TABLE_STUCK: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+
+/// Miners whose walk would not let go in time. Held here (not dropped) so that when the stuck walk
+/// finally returns, the last handle is ours and dropping it actually frees the table.
+static QUARANTINE: OnceLock<Mutex<HashMap<u32, Arc<PomGpuMiner>>>> = OnceLock::new();
+
+fn set_table_stuck(device_id: u32, stuck: bool) {
+    let m = TABLE_STUCK.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut g) = m.lock() {
+        if stuck {
+            g.insert(device_id);
+        } else {
+            g.remove(&device_id);
+        }
+    }
+}
+
+/// True while this card still holds a walk table nobody released. Re-checked cheaply: once the stuck
+/// walk finally drops its handle the table frees itself, so the card is allowed to rebuild again.
+fn table_stuck(device_id: u32) -> bool {
+    let Some(m) = TABLE_STUCK.get() else { return false };
+    let stuck = m.lock().map(|g| g.contains(&device_id)).unwrap_or(false);
+    if !stuck {
+        return false;
+    }
+    // Self-heal: if the stuck walk has finally dropped its handle, ours is the only one left — drop
+    // it, which frees the table, and let the card rebuild normally on the next pass.
+    let freed = {
+        let Some(q) = QUARANTINE.get() else { return true };
+        let Ok(mut g) = q.lock() else { return true };
+        match g.get(&device_id) {
+            Some(m) if Arc::strong_count(m) == 1 => {
+                g.remove(&device_id);
+                true
+            }
+            Some(_) => false,
+            None => true,
+        }
+    };
+    if freed {
+        v4_release_offsets(device_id as usize);
+        set_table_stuck(device_id, false);
+        log::info!(
+            "PoM[gpu{}]: the stuck walk finally released its table — VRAM reclaimed, rebuilding this card.",
+            device_id
+        );
+        return false;
+    }
+    true
+}
+
+/// Drops this device's cached offset buffers and any speculative chase result.
+fn v4_release_offsets(ord: usize) {
+    if let Some(m) = V4_OFFSETS.get() {
+        if let Ok(mut g) = m.lock() {
+            g.remove(&ord);
+        }
+    }
+    if let Some(m) = V4_OFFSETS_B.get() {
+        if let Ok(mut g) = m.lock() {
+            g.remove(&ord);
+        }
+    }
+    if let Some(m) = V4_PREFETCH.get() {
+        if let Ok(mut g) = m.lock() {
+            g.remove(&ord);
         }
     }
 }
@@ -1157,7 +1266,8 @@ fn reset_stale_gpu_state(device_id: u32) {
             None => true,
         }
     };
-    uninstall(device_id);
+    let released = uninstall_released(device_id);
+    set_table_stuck(device_id, !released);
     if healthy {
         crate::llama_engine::unload_for_gpu(device_id as usize);
     } else {
@@ -1284,7 +1394,10 @@ pub fn v4_batch_for_device(device_id: u32) -> u64 {
     let (b, how) = match v4_tune_for(device_id) {
         Some(t) => (t.batch, "autotuned"),
         None => match gpu_sm_count(device_id) {
-            Some(sm) => (v4_starting_batch(sm), "starting high, autotune may lower it"),
+            Some(sm) if v4_headroom_for_high_start(device_id) => {
+                (v4_starting_batch(sm), "starting high, autotune may lower it")
+            }
+            Some(sm) => (v4_batch_for_sm_count(sm), "SM-derived — too little free VRAM to start high"),
             None => (POM_V4_BATCH_FALLBACK, "fallback"),
         },
     };
@@ -1315,6 +1428,22 @@ fn log_batch_once(device_id: u32, batch: u64, how: &str) -> u64 {
 /// measurement takes, rather than leaving every big card slow until it finishes.
 fn v4_starting_batch(sm: u64) -> u64 {
     v4_batch_for_sm_count(sm).saturating_mul(2)
+}
+
+/// Whether this card has enough VRAM headroom to start at the doubled batch.
+///
+/// Starting high is a throughput win on cards with room, but it is not free: the offset buffers
+/// double (102 MiB instead of 51 MiB at 68 SMs) and each launch runs twice as long. On a card whose
+/// model nearly fills it — a 10 GB RTX 3080 runs at ~8.2/10.2 GB — that extra pressure showed up in
+/// the field as rebuild failures within minutes of starting. Cards with less than ~1.5 GB free keep
+/// the SM-derived batch; the autotune can still raise them later, having actually measured it.
+fn v4_headroom_for_high_start(device_id: u32) -> bool {
+    let free_mib = query_all_gpus_free_vram()
+        .into_iter()
+        .find(|(o, _, _)| *o == device_id)
+        .map(|(_, free, _)| free)
+        .unwrap_or(0);
+    free_mib == 0 || free_mib >= 1536
 }
 
 // ── OPERATOR OVERRIDES: --intensity and --only-inference ───────────────────────────────────────
@@ -1802,14 +1931,38 @@ pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_l
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
+    // TEST-ONLY fault injection. This knob existed but was never wired into the v4 walk — it was
+    // left behind when v4 replaced the v3 grind, so the recovery path it was written to validate
+    // (fault → uninstall → rebuild) had no way to be exercised on a healthy rig. That path is
+    // exactly what fails in the field, so it needs to be testable.
+    if take_injected_fault(device_id) {
+        log::warn!(
+            "PoM[gpu{}]: TRANSIENT GPU FAULT during the v4 walk (INJECTED by KERYX_FAULT_INJECT_GPU) \
+             — rebuilding next cycle.",
+            device_id
+        );
+        // Drop OUR handle before recovering — see the note on the error path below.
+        drop(miner);
+        reset_stale_gpu_state(device_id);
+        return None;
+    }
     // First grind on this card: measure its launch geometry (cached on disk, so this is a one-off).
     ensure_v4_autotuned(device_id, &miner);
-    match miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch) {
+    let outcome = miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch);
+    match outcome {
         Ok(w) => w,
         Err(e) => {
             let msg = e.to_string();
             if is_transient_gpu_runtime_fault(&msg) {
                 log::warn!("PoM[gpu{}]: TRANSIENT GPU FAULT during the v4 walk ({}) — rebuilding next cycle.", device_id, msg);
+                // RELEASE OUR OWN HANDLE FIRST. Recovery uninstalls the miner and waits for the last
+                // handle to drop before the table's VRAM comes back — but this function is holding
+                // one, cloned out of the map at the top. Recovering while it is alive made that wait
+                // impossible to satisfy: it burned its full 30 s timeout, gave up ("releasing
+                // anyway"), and left the old table RESIDENT. The rebuild then had to fit a second
+                // copy of the model on the card, which is the CUBLAS_STATUS_NOT_INITIALIZED restart
+                // loop reported from the field — worse on cards whose model nearly fills them.
+                drop(miner);
                 reset_stale_gpu_state(device_id);
             } else {
                 static WARNED: AtomicBool = AtomicBool::new(false);
@@ -1968,6 +2121,27 @@ fn load_lock() -> &'static Mutex<()> {
 pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
     if is_installed(device_id) {
         return true;
+    }
+    // Do not rebuild on top of a table that was never released — see `uninstall_released`. This turns
+    // a guaranteed-failing allocation loop (CUBLAS_STATUS_NOT_INITIALIZED every few seconds, which
+    // the wrapper then treats as a dead miner and restarts) into an idle card that recovers by itself
+    // if the walk lets go, while every other GPU in the rig keeps mining.
+    if table_stuck(device_id) {
+        static WARNED: OnceLock<Mutex<std::collections::HashMap<u32, u64>>> = OnceLock::new();
+        let m = WARNED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        if let Ok(mut g) = m.lock() {
+            let n = g.entry(device_id).or_insert(0);
+            if *n % 60 == 0 {
+                log::warn!(
+                    "PoM[gpu{}]: previous walk table still held by a stuck walk — not rebuilding (a \
+                     rebuild would need a second copy of the model). This card is idle; restart the \
+                     miner to recover it.",
+                    device_id
+                );
+            }
+            *n += 1;
+        }
+        return false;
     }
     // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
     LOADING.fetch_add(1, Ordering::Relaxed);
