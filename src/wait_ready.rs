@@ -36,6 +36,15 @@ fn started() -> &'static Instant {
     T.get_or_init(Instant::now)
 }
 
+/// Wall-clock of the FIRST worker registration. The pre-mining startup phase (config, pool
+/// connect, plugin init) can itself take a long time on the RAM-starved rigs this flag exists
+/// for, so the registration grace must anchor HERE — anchoring it at enable() made the gate
+/// give up before the workers even spawned on exactly the target hardware.
+fn first_reg() -> &'static OnceLock<Instant> {
+    static T: OnceLock<Instant> = OnceLock::new();
+    &T
+}
+
 /// (registered worker devices, devices with an installed walk)
 fn sets() -> &'static Mutex<(BTreeSet<u32>, BTreeSet<u32>)> {
     static S: OnceLock<Mutex<(BTreeSet<u32>, BTreeSet<u32>)>> = OnceLock::new();
@@ -47,6 +56,16 @@ fn timeout_secs() -> u64 {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(2700)
+}
+
+/// How long to hold with ZERO registered workers before concluding this backend never
+/// registers any (AMD/OpenCL until ported) and opening the gate. Generous on purpose: on a
+/// swap-thrashing low-RAM host, plugin init + worker spawn alone can take tens of seconds.
+fn noworker_secs() -> u64 {
+    std::env::var("KERYX_WAIT_READY_NOWORKER_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(120)
 }
 
 /// Turn the gate on (from the `--wait-ready` CLI flag, before workers spawn).
@@ -62,6 +81,7 @@ pub fn enabled() -> bool {
 /// A GPU worker announces itself (idempotent). Called at worker-thread start, so within the
 /// startup grace every card that will ever mine is known.
 pub fn register_device(device_id: u32) {
+    let _ = first_reg().set(Instant::now());
     if let Ok(mut g) = sets().lock() {
         g.0.insert(device_id);
     }
@@ -88,25 +108,32 @@ pub fn holds() -> bool {
         return false;
     }
     let elapsed = started().elapsed();
-    // Startup grace: worker threads register within milliseconds of spawn, staging takes
-    // minutes — 10 s guarantees the registered set is complete before the gate can open.
-    if elapsed.as_secs() < 10 {
-        return true;
-    }
     let (missing, total): (Vec<u32>, usize) = match sets().lock() {
         Ok(g) => (g.0.difference(&g.1).copied().collect(), g.0.len()),
         Err(_) => return false,
     };
-    // No worker ever registered (a backend that doesn't wire the gate yet, or no GPUs): the
-    // gate would be a 45-minute dead hold with nothing to wait for — open it, loudly.
+    // No worker registered YET. Startup itself (config, pool connect, plugin init) can take a
+    // long time on the RAM-starved rigs this flag targets, so HOLD — only after a generous
+    // window conclude this backend never registers workers at all (AMD/OpenCL until ported)
+    // and open, loudly. This must NOT latch before workers had a real chance to appear.
     if total == 0 {
-        if !OPENED.swap(true, Ordering::Relaxed) {
-            log::warn!(
-                "--wait-ready: no GPU workers registered on this backend — the flag has no \
-                 effect here; mining proceeds normally."
-            );
+        if elapsed.as_secs() >= noworker_secs() {
+            if !OPENED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "--wait-ready: no GPU workers registered after {}s — the flag has no \
+                     effect on this backend; mining proceeds normally.",
+                    noworker_secs()
+                );
+            }
+            return false;
         }
-        return false;
+        return true;
+    }
+    // Registration grace, anchored at the FIRST registration: all worker threads spawn in one
+    // loop within milliseconds of each other, so 10 s from the first guarantees the registered
+    // set is complete before the gate can open — regardless of how slow startup was before.
+    if first_reg().get().map_or(true, |t| t.elapsed().as_secs() < 10) {
+        return true;
     }
     if missing.is_empty() {
         if !OPENED.swap(true, Ordering::Relaxed) {
@@ -160,6 +187,10 @@ mod tests {
     fn gate_holds_then_latches_open() {
         assert!(!holds(), "gate must be inert while disabled");
         enable();
+        // Slow-startup regression (the 4 GB-rig race): with NO workers registered yet the gate
+        // must HOLD, not open — startup on the target hardware can take far longer than any
+        // small grace. (Default no-worker window is 120 s; we are well inside it.)
+        assert!(holds(), "no workers registered yet — must hold, never open early");
         register_device(0);
         register_device(1);
         mark_ready(0);
