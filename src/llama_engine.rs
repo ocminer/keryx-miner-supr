@@ -117,6 +117,37 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
         }
         // Optional (upstream aa29fd2): older builds lack it — the ownership gate then no-ops.
         let tensor_device = sym::<TensorDeviceFn>(lib, b"keryx_llama_tensor_device\0");
+        // VRAM PRE-CHECK: never ASK llama to load a model that cannot fit this card's free VRAM.
+        // A failed multi-GiB load is not harmless: ggml's per-device CUDA pool teardown on the
+        // failure path races the next engine load/generate on the same card, and that survivor
+        // dies with a sticky illegal memory access at its first sync (reproduced: the lineup's
+        // Gemma-4-12B forced onto an 8 GB card fails its 9.3 GiB weight alloc twice, then the
+        // Qwen engine that DOES fit aborts in its own self-test — the field "fresh-rig staging
+        // crash" / CUBLAS_STATUS_NOT_INITIALIZED restart loop). Skipping up front produces the
+        // exact outcome the failed load produced (model unavailable on this card, self-test
+        // fails cleanly, tier withdrawn) minus the crash trigger — and is instant instead of an
+        // ~9 GiB doomed allocation. The margin covers the minimum (1024-token) context + compute
+        // buffers. KERYX_LLAMA_VRAM_CHECK=0 disables (diagnostic only).
+        #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+        if std::env::var("KERYX_LLAMA_VRAM_CHECK").ok().as_deref() != Some("0") {
+            if let Ok(md) = std::fs::metadata(gguf) {
+                let need_mib = md.len() / (1024 * 1024) + 1200;
+                if let Some((_, free_mib, total_mib)) = crate::pom_gpu::query_all_gpus_free_vram()
+                    .into_iter()
+                    .find(|(o, _, _)| *o as usize == gpu)
+                {
+                    if free_mib < need_mib {
+                        log::warn!(
+                            "llama engine: '{}' needs ~{} MiB on GPU {} but only {} of {} MiB are free — \
+                             not attempting the load (a failed multi-GiB load can poison the card for the \
+                             next engine load; this model is simply unavailable on this card).",
+                            gguf, need_mib, gpu, free_mib, total_mib
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
         let cg = CString::new(gguf).ok()?;
         log::info!("llama engine: loading {} on GPU {} (in-process, zero-dup)…", gguf, gpu);
         let configured_ctx = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse::<c_int>().ok());
