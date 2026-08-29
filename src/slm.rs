@@ -1902,6 +1902,13 @@ pub fn record_serveable(model_id: &[u8; 32]) {
 /// AMD/OpenCL (CPU/vk inference) and macOS/Metal builds don't run it yet, so they keep the prior
 /// declaration semantics — gating them here would stop them declaring anything.
 pub fn serveable_model_ids() -> Vec<[u8; 32]> {
+    // --wait-ready: declare NOTHING until every card is set up — an early declaration is what
+    // invites OPoI challenges into the fragile bring-up window on low-RAM rigs. The pool sees
+    // no capabilities, so it has nothing to challenge; the full set is declared the moment the
+    // gate opens (declare_capabilities_if_changed re-sends on change and every 90 s anyway).
+    if crate::wait_ready::holds() {
+        return Vec::new();
+    }
     #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
     { loaded_model_ids().into_iter().filter(|m| model_serveable(m)).collect() }
     #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]

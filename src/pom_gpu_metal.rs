@@ -432,6 +432,8 @@ pub fn install(device_id: u32, m: PomGpuMiner) {
     if let Ok(mut g) = miners().lock() {
         g.insert(device_id, Arc::new(m));
     }
+    // --wait-ready: this card's walk is resident = the card is set up (idempotent, cheap).
+    crate::wait_ready::mark_ready(device_id);
 }
 
 fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) {
