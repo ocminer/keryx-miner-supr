@@ -691,7 +691,7 @@ impl PomGpuMiner {
         // A card whose autotune measured the classic walk faster takes it even though the
         // tensor-core kernel is available and correct here.
         let tune = v4_tune_for(self.stream.context().ordinal() as u32);
-        let ncf_wanted = tune.map_or(true, |t| t.ncf);
+        let ncf_wanted = tune.map_or_else(|| self.v4_ncf_default(), |t| t.ncf);
         let tc_wanted = tune.map_or(true, |t| t.tc);
         if ncf_wanted && self.v4_ncf_usable(n_tiles, k, &p, &s, timestamp) {
             // Chaseless tensor-core solver: ONE kernel, no chase pass, no offsets buffer. Each
@@ -1025,6 +1025,20 @@ dp4a kernel.", ord);
             V4NcfLut { t_count: self.t_count, n_chunks: self.n_total_chunks, lut: dev.clone(), sh },
         );
         Ok((dev, sh))
+    }
+
+    /// UNTUNED default for the chaseless solver. Fleet-measured 2026-08-29: chaseless wins on every
+    /// GDDR card (5090 +8%, 5080 +11%, 5070Ti +9%, 3070 +4-14%) but LOSES on HBM (170HX/sm_80:
+    /// -14% — the latency profile favours the decoupled chase pipeline). The autotune measures and
+    /// overrides this either way; the default only matters where tuning is skipped (--intensity,
+    /// --only-inference, busy tune slot), so HBM-class parts (CC 8.0 A100/170HX, 9.0 H100) default
+    /// to the chase+tc pipeline rather than sit on a known regression.
+    fn v4_ncf_default(&self) -> bool {
+        match self.stream.context().compute_capability() {
+            Ok((8, 0)) | Ok((9, 0)) => false,
+            Ok(_) => true,
+            Err(_) => false,
+        }
     }
 
     /// Whether the chaseless tensor-core solver may run here. Rides the same image/arch gate as the
@@ -1930,7 +1944,7 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
     // The pph/timestamp only seed the walk; any fixed pair times the same work.
     let pph = [0u8; 32];
     let ts = 0u64;
-    let defaults = V4Tune { ncf: true, tc: true, batch: base };
+    let defaults = V4Tune { ncf: miner.v4_ncf_default(), tc: true, batch: base };
 
     // Candidates are measured INTERLEAVED and reduced by median. A single timed window per candidate
     // is not able to resolve the ~4% differences that matter here: the first pass measured 2.93 for
