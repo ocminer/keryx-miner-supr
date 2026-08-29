@@ -58,7 +58,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // block launched with a different warp count silently walks the wrong nonces (or reads past
         // its shared-memory slice). Publish what the kernel was actually compiled with so the host
         // cannot drift from it.
-        for (name, var) in [("V4_TC_WARPS", "POM_V4_TC_WARPS"), ("V4_TC_PIPE", "POM_V4_TC_PIPE")] {
+        for (name, var) in [("V4_TC_WARPS", "POM_V4_TC_WARPS"), ("V4_TC_PIPE", "POM_V4_TC_PIPE"),
+                            ("V4_NCF_WARPS", "POM_V4_NCF_WARPS")] {
             let def = std::fs::read_to_string("src/pom_mine.cu")
                 .ok()
                 .and_then(|s| {
