@@ -647,7 +647,13 @@ impl PomGpuMiner {
         if bind_device_ctx(&self.stream).is_err() {
             return "classic";
         }
-        if self.v4_tc_usable(n_tiles, k, &p, &s, 0) { "tensor-core" } else { "classic" }
+        if self.v4_ncf_usable(n_tiles, k, &p, &s, 0) {
+            "chaseless"
+        } else if self.v4_tc_usable(n_tiles, k, &p, &s, 0) {
+            "tensor-core"
+        } else {
+            "classic"
+        }
     }
 
     /// Diagnostic: launch the tensor-core walk ONCE with an always-win target, bypassing the
@@ -684,8 +690,34 @@ impl PomGpuMiner {
 
         // A card whose autotune measured the classic walk faster takes it even though the
         // tensor-core kernel is available and correct here.
-        let tc_wanted = v4_tune_for(self.stream.context().ordinal() as u32).map_or(true, |t| t.tc);
-        if tc_wanted && self.v4_tc_usable(n_tiles, k, &p, &s, timestamp) {
+        let tune = v4_tune_for(self.stream.context().ordinal() as u32);
+        let ncf_wanted = tune.map_or(true, |t| t.ncf);
+        let tc_wanted = tune.map_or(true, |t| t.tc);
+        if ncf_wanted && self.v4_ncf_usable(n_tiles, k, &p, &s, timestamp) {
+            // Chaseless tensor-core solver: ONE kernel, no chase pass, no offsets buffer. Each
+            // warp derives its next tile offset from the snippet of the tile it just fetched (the
+            // offset chain never depends on the walk state), so the chase's serial ~7-9% of every
+            // batch and its duplicate snippet reads disappear. Measured +7-8% on a 5090 at a 64K
+            // batch and +24% at 8K (byte-exact, see pom_mine_v4_ncf). KERYX_POM_V4_NCF=0 falls
+            // back to the chase+tc pipeline below.
+            let walk = load_walk_func(&self.cuda, "pom_mine_v4_ncf")?;
+            let (lut, lut_sh) = self.v4_ncf_lut()?;
+            let inv_n = u64::MAX / n_tiles;
+            let warps = v4_ncf_warps();
+            let cfg = LaunchConfig {
+                grid_dim: (((batch + warps - 1) / warps) as u32, 1, 1),
+                block_dim: ((warps * 32) as u32, 1, 1),
+                shared_mem_bytes: (warps as u32) * 3 * 1024, // per warp: 1 KB state + 2 tile buffers
+            };
+            let mut b = walk.builder();
+            b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
+                .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
+                .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+                .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
+                .arg(&start).arg(&batch)
+                .arg(&*lut).arg(&lut_sh).arg(&inv_n).arg(&winner);
+            unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
+        } else if tc_wanted && self.v4_tc_usable(n_tiles, k, &p, &s, timestamp) {
             // Tensor-core solver: resolve the whole tile-offset chain first (it depends only on
             // tile snippets, never on the walk state), then walk with a depth-3 cp.async tile
             // pipeline + 8x mma.sync.m16n8k32.s8 per step. Byte-exact vs pom_mine_v4/the host;
@@ -946,6 +978,124 @@ dp4a kernel.", ord);
                 grid_dim: (1, 1, 1),
                 block_dim: ((TC_WARPS * 32) as u32, 1, 1),
                 shared_mem_bytes: (TC_WARPS as u32) * 4096,
+            }).map_err(candle_core::Error::wrap)?;
+        }
+        self.stream.synchronize().map_err(candle_core::Error::wrap)?;
+        let w = self.stream.clone_dtoh(&winner).map_err(candle_core::Error::wrap)?[0];
+        Ok(w != u64::MAX)
+    }
+
+    /// Device LUT + shift for the chaseless walk's segment resolve; built once per installed blob
+    /// (host-side from the prefix table), then served from the per-device cache.
+    fn v4_ncf_lut(&self) -> candle_core::Result<(Arc<CudaSlice<u16>>, u32)> {
+        if self.t_count as u64 > u16::MAX as u64 {
+            return Err(candle_core::Error::Msg(
+                "PoM v4 ncf: more segments than the u16 LUT can index".into(),
+            ));
+        }
+        let m = V4_NCF_LUT.get_or_init(|| Mutex::new(HashMap::new()));
+        let ord = self.stream.context().ordinal();
+        {
+            let g = m.lock().unwrap();
+            if let Some(e) = g.get(&ord) {
+                if e.t_count == self.t_count && e.n_chunks == self.n_total_chunks {
+                    return Ok((e.lut.clone(), e.sh));
+                }
+            }
+        }
+        let prefix: Vec<u64> =
+            self.stream.clone_dtoh(&self.prefix_dev).map_err(candle_core::Error::wrap)?;
+        let mut sh = 0u32;
+        while (self.n_total_chunks >> sh) > 16384 {
+            sh += 1;
+        }
+        let nbuck = (self.n_total_chunks >> sh) as usize + 1;
+        let mut lut = vec![0u16; nbuck];
+        let mut lo = 0usize;
+        for (bk, e) in lut.iter_mut().enumerate() {
+            let idx = (bk as u64) << sh;
+            while lo + 1 < prefix.len() && prefix[lo + 1] <= idx {
+                lo += 1;
+            }
+            *e = lo as u16;
+        }
+        let dev = Arc::new(self.stream.clone_htod(&lut).map_err(candle_core::Error::wrap)?);
+        m.lock().unwrap().insert(
+            ord,
+            V4NcfLut { t_count: self.t_count, n_chunks: self.n_total_chunks, lut: dev.clone(), sh },
+        );
+        Ok((dev, sh))
+    }
+
+    /// Whether the chaseless tensor-core solver may run here. Rides the same image/arch gate as the
+    /// tc solver (the kernel sits under the same `__CUDA_ARCH__ >= 800` guard), so `KERYX_POM_V4_TC=0`
+    /// (the "force classic" escape hatch) disables it too; `KERYX_POM_V4_NCF=0` disables ONLY the
+    /// chaseless solver, falling back to chase+tc.
+    fn v4_ncf_available(&self) -> bool {
+        if std::env::var("KERYX_POM_V4_NCF").ok().as_deref() == Some("0") {
+            return false;
+        }
+        self.v4_tc_available() && self.t_count as u64 <= u16::MAX as u64
+    }
+
+    /// Gate for the chaseless solver: availability AND a one-off 1-nonce always-win probe per
+    /// device (same rationale as `v4_tc_usable` — a stub or missing symbol mines nothing loudly
+    /// fast, so it must be caught before the first real batch).
+    fn v4_ncf_usable(&self, n_tiles: u64, k: u32, p: &[u64; 4], s: &[u64; 4], timestamp: u64) -> bool {
+        if !self.v4_ncf_available() {
+            return false;
+        }
+        static PROBED: OnceLock<Mutex<std::collections::HashMap<u32, bool>>> = OnceLock::new();
+        let cache = PROBED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        let ord = self.stream.context().ordinal() as u32;
+        if let Some(&ok) = cache.lock().unwrap().get(&ord) {
+            return ok;
+        }
+        let ok = match self.v4_ncf_probe(n_tiles, k, p, s, timestamp) {
+            Ok(true) => {
+                log::info!("PoM v4: chaseless solver PROBE OK on GPU {} (1-nonce known-win recorded).", ord);
+                true
+            }
+            Ok(false) => {
+                log::error!(
+                    "PoM v4: chaseless solver PROBE FAILED on GPU {} — no result for an always-win \
+target (stub image?). Falling back to the chase+tensor-core path.", ord);
+                false
+            }
+            Err(e) => {
+                log::error!(
+                    "PoM v4: chaseless solver PROBE ERROR on GPU {} ({e}) — falling back to the \
+chase+tensor-core path.", ord);
+                false
+            }
+        };
+        cache.lock().unwrap().insert(ord, ok);
+        ok
+    }
+
+    /// One-nonce chaseless walk with an always-win target. Ok(true) = a real kernel ran.
+    fn v4_ncf_probe(&self, n_tiles: u64, k: u32, p: &[u64; 4], s: &[u64; 4], timestamp: u64)
+        -> candle_core::Result<bool>
+    {
+        let walk = load_walk_func(&self.cuda, "pom_mine_v4_ncf")?; // missing symbol -> Err -> tc path
+        let (lut, lut_sh) = self.v4_ncf_lut()?;
+        let inv_n = u64::MAX / n_tiles;
+        let warps = v4_ncf_warps();
+        let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
+        let (start, batch) = (0u64, 1u64);
+        let t_max = [u64::MAX, u64::MAX, u64::MAX, u64::MAX];
+        let mut b = walk.builder();
+        b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
+            .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
+            .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+            .arg(&t_max[0]).arg(&t_max[1]).arg(&t_max[2]).arg(&t_max[3])
+            .arg(&start).arg(&batch)
+            .arg(&*lut).arg(&lut_sh).arg(&inv_n).arg(&winner);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: ((warps * 32) as u32, 1, 1),
+                shared_mem_bytes: (warps as u32) * 3 * 1024,
             }).map_err(candle_core::Error::wrap)?;
         }
         self.stream.synchronize().map_err(candle_core::Error::wrap)?;
@@ -1356,6 +1506,28 @@ fn v4_tc_pipe() -> u64 {
     v4_tc_compiled("KERYX_POM_V4_TC_PIPE", COMPILED)
 }
 
+fn v4_ncf_warps() -> u64 {
+    const COMPILED: u64 = match u64::from_str_radix(env!("POM_V4_NCF_WARPS"), 10) {
+        Ok(v) => v,
+        Err(_) => 4,
+    };
+    v4_tc_compiled("KERYX_POM_V4_NCF_WARPS", COMPILED)
+}
+
+/// Per-device bucket LUT for the chaseless walk's segment resolve (`pom_mine_v4_ncf`): maps
+/// `chunk_index >> sh` to the index of the segment containing that chunk, built host-side from the
+/// SAME prefix table the kernel's forward walk then refines against — so the resolved segment is
+/// identical to the binary search's by construction. Cached per device and keyed by the blob's
+/// identity (t_count + n_total_chunks); a model/tier change reinstalls the miner with a different
+/// blob and rebuilds. ~16K u16 entries = 32 KB device-resident, L1/L2-hot during the walk.
+struct V4NcfLut {
+    t_count: u32,
+    n_chunks: u64,
+    lut: Arc<CudaSlice<u16>>,
+    sh: u32,
+}
+static V4_NCF_LUT: OnceLock<Mutex<HashMap<usize, V4NcfLut>>> = OnceLock::new();
+
 const POM_V4_NONCES_PER_SM: u64 = 384;
 const POM_V4_BATCH_MIN: u64 = 8192;
 const POM_V4_BATCH_FALLBACK: u64 = 32768;
@@ -1610,6 +1782,8 @@ pub fn serving_now(gpu: usize) -> Option<ServingGuard> {
 /// quietly costing shares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct V4Tune {
+    /// Chaseless tensor-core walk (pom_mine_v4_ncf) — tried before the chase+tc pipeline.
+    pub ncf: bool,
     pub tc: bool,
     pub batch: u64,
 }
@@ -1654,7 +1828,7 @@ fn v4_tune_cache_path() -> Option<std::path::PathBuf> {
 /// Cache key: everything that can change the right answer. The walk-table size and K matter because
 /// they set how much of the card's memory system the walk actually touches.
 fn v4_tune_key(device_id: u32, sm: u64, n_tiles: u64, k: u32) -> String {
-    format!("{}|sm{}|tiles{}|k{}", gpu_name(device_id), sm, n_tiles, k)
+    format!("{}|sm{}|tiles{}|k{}|g2", gpu_name(device_id), sm, n_tiles, k)
 }
 
 fn v4_tune_load(key: &str) -> Option<V4Tune> {
@@ -1662,6 +1836,7 @@ fn v4_tune_load(key: &str) -> Option<V4Tune> {
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let e = v.get(key)?;
     Some(V4Tune {
+        ncf: e.get("ncf").and_then(|v| v.as_bool()).unwrap_or(false),
         tc: e.get("tc")?.as_bool()?,
         batch: e.get("batch")?.as_u64()?,
     })
@@ -1677,7 +1852,7 @@ fn v4_tune_save(key: &str, t: V4Tune, mhs: f64) {
         obj.insert(
             key.to_string(),
             serde_json::json!({
-                "tc": t.tc, "batch": t.batch,
+                "ncf": t.ncf, "tc": t.tc, "batch": t.batch,
                 "mhs": (mhs * 1000.0).round() / 1000.0,
             }),
         );
@@ -1755,7 +1930,7 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
     // The pph/timestamp only seed the walk; any fixed pair times the same work.
     let pph = [0u8; 32];
     let ts = 0u64;
-    let defaults = V4Tune { tc: true, batch: base };
+    let defaults = V4Tune { ncf: true, tc: true, batch: base };
 
     // Candidates are measured INTERLEAVED and reduced by median. A single timed window per candidate
     // is not able to resolve the ~4% differences that matter here: the first pass measured 2.93 for
@@ -1783,33 +1958,39 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
             .collect()
     };
 
-    // 1) Which walk? The tensor-core kernel is a large win on Blackwell AND on Ampere (measured
-    // 3070: 1.35 vs 0.84 Mh/s), but that is a claim about these cards, not about every card — so it
-    // is measured rather than assumed. Both kernels are byte-exact mirrors of the host walk, so
-    // either answer is correct; only the speed differs.
-    let kinds: Vec<V4Tune> = if miner.v4_tc_available() {
-        vec![defaults, V4Tune { tc: false, ..defaults }]
-    } else {
-        vec![V4Tune { tc: false, ..defaults }]
+    // 1) Which walk? Measured rather than assumed (the tc kernel is a large win on Blackwell AND
+    // on Ampere — 3070: 1.35 vs 0.84 Mh/s — and the chaseless kernel beat chase+tc on every card
+    // measured so far, but each card decides for itself). All kernels are byte-exact mirrors of
+    // the host walk, so any answer is correct; only the speed differs.
+    let p_words = crate::pom::pph_words_for_era(&pph, true);
+    let s_words = crate::pom::pph_words_v4(&pph);
+    let mut kinds: Vec<(&str, V4Tune)> =
+        vec![("classic", V4Tune { ncf: false, tc: false, ..defaults })];
+    if miner.v4_tc_available() {
+        kinds.push(("tensor-core", V4Tune { ncf: false, tc: true, ..defaults }));
+    }
+    if miner.v4_ncf_usable(n_tiles, k, &p_words, &s_words, ts) {
+        kinds.push(("chaseless", V4Tune { ncf: true, tc: true, ..defaults }));
+    }
+    let cand_tunes: Vec<V4Tune> = kinds.iter().map(|(_, t)| *t).collect();
+    let kind_mhs = bench_all(&cand_tunes, 3, 300);
+    for ((name, _), m) in kinds.iter().zip(&kind_mhs) {
+        log::info!(
+            "PoM[gpu{}]: autotune {} walk = {}",
+            device_id, name,
+            m.map(|v| format!("{:.3} Mh/s", v)).unwrap_or_else(|| "failed".into())
+        );
+    }
+    let Some((mut best, mut best_mhs)) = kinds
+        .iter()
+        .zip(&kind_mhs)
+        .filter_map(|((_, t), m)| m.map(|v| (*t, v)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+    else {
+        log::warn!("PoM[gpu{}]: autotune could not measure the walk — keeping defaults.", device_id);
+        set_v4_tune(device_id, defaults);
+        return true;
     };
-    let kind_mhs = bench_all(&kinds, 3, 300);
-    let (tc_mhs, classic_mhs) = if kinds.len() == 2 {
-        (kind_mhs[0], kind_mhs[1])
-    } else {
-        (None, kind_mhs[0])
-    };
-    let mut best = match (tc_mhs, classic_mhs) {
-        (Some(a), Some(b)) if a >= b => V4Tune { tc: true, ..defaults },
-        (Some(_), Some(_)) => V4Tune { tc: false, ..defaults },
-        (Some(_), None) => V4Tune { tc: true, ..defaults },
-        (None, Some(_)) => V4Tune { tc: false, ..defaults },
-        (None, None) => {
-            log::warn!("PoM[gpu{}]: autotune could not measure the walk — keeping defaults.", device_id);
-            set_v4_tune(device_id, defaults);
-            return true;
-        }
-    };
-    let mut best_mhs = tc_mhs.into_iter().chain(classic_mhs).fold(0.0f64, f64::max);
 
     // 2) Batch. A larger batch amortizes the launch and the offset chase over more nonces, but one
     // launch must still finish well inside a block interval (~100 ms at 10 BPS) or the whole batch
@@ -1872,12 +2053,11 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
     set_v4_tune(device_id, best);
     v4_tune_save(&key, best, best_mhs);
     log::info!(
-        "PoM[gpu{}]: autotuned {} → {} walk, batch {} = {:.2} Mh/s (measured: tensor-core {:.2}, classic {:.2}).",
+        "PoM[gpu{}]: autotuned {} → {} walk, batch {} = {:.2} Mh/s.",
         device_id,
         gpu_name(device_id),
-        if best.tc { "tensor-core" } else { "classic" },
+        if best.ncf { "chaseless" } else if best.tc { "tensor-core" } else { "classic" },
         best.batch, best_mhs,
-        tc_mhs.unwrap_or(0.0), classic_mhs.unwrap_or(0.0)
     );
     true
 }
@@ -1893,7 +2073,7 @@ fn v4_config_agrees_with_reference(device_id: u32, miner: &PomGpuMiner, cand: V4
     let ts = 7u64;
     let probe = 4096u64;
     let reference = {
-        set_v4_tune(device_id, V4Tune { tc: false, batch: probe });
+        set_v4_tune(device_id, V4Tune { ncf: false, tc: false, batch: probe });
         miner.mine_v4(&pph, ts, &target, 1, probe)
     };
     let candidate = {
