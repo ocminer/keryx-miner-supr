@@ -1422,6 +1422,14 @@ async fn run() -> Result<(), Error> {
         info!("--low-ram: loading models onto GPUs one at a time (lower peak system RAM, slower startup).");
     }
 
+    // --wait-ready: hold mining + the OPoI declaration until every card's walk is installed
+    // (see wait_ready.rs for the why — challenge starvation during multi-card bring-up on
+    // low-RAM rigs). Backend-neutral state; workers register + installs mark ready.
+    if opt.wait_ready {
+        keryx_miner::wait_ready::enable();
+        info!("--wait-ready: mining and OPoI declaration held until ALL cards are fully set up.");
+    }
+
     // --intensity: fixed batch per card (batch = 2^intensity), CSV position = CUDA ordinal, the same
     // mapping --force-model uses. A listed card is not autotuned.
     #[cfg(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))))]

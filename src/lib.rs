@@ -8,6 +8,7 @@ pub mod models;
 pub mod slm;
 /// Stratum miner-telemetry (mining.hello / mining.telemetry) — display/ops only, best-effort.
 pub mod telemetry;
+pub mod wait_ready;
 // Device-mapped quantized model forks (OPoI v2 archs) — used by slm inference and the
 // PoM zero-dup gather. Device-agnostic (candle Device = CPU or CUDA), so they build
 // regardless of the cuda feature.

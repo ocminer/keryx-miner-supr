@@ -325,6 +325,15 @@ impl MinerManager {
             let gpu_work = box_.as_mut();
             (|| {
                 info!("Spawned Thread for GPU {}", gpu_work.id());
+                // --wait-ready: announce this worker so the gate knows the full card set before
+                // the first card can finish staging (see wait_ready.rs).
+                #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
+                if let Some(d) = gpu_work.id().strip_prefix('#')
+                    .and_then(|s| s.split_whitespace().next())
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    keryx_miner::wait_ready::register_device(d);
+                }
                 let mut nonces = vec![0u64; 1];
 
                 let mut state = None;
@@ -472,6 +481,14 @@ impl MinerManager {
                                     std::thread::sleep(std::time::Duration::from_millis(1000));
                                     continue;
                                 }
+                            }
+                            // --wait-ready: this card is set up, but the rig as a whole is not —
+                            // idle honestly (no hashes counted) so staging gets the host to itself
+                            // and no share/challenge traffic starts early. No-op unless the flag
+                            // is on; latches permanently open once every card is ready.
+                            if keryx_miner::wait_ready::holds() {
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                continue;
                             }
                             pom_driver::mine_v4(wdid, &pph, time, &target_le, pom_nonce, batch)
                         };

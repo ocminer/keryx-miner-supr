@@ -80,6 +80,13 @@ pub struct Opt {
     pub low_ram: bool,
 
     #[clap(
+        long = "wait-ready",
+        help = "Do not mine or declare OPoI capabilities until EVERY card's model + walk table is fully set up. For RAM-constrained rigs (e.g. 4 GB hosts with many cards + --low-ram): without this, the first finished card declares its model, the pool immediately routes OPoI challenges, and they run starved while the remaining cards are still staging — missed deadlines, inference strikes, and stalled bring-up. Safety valve: after KERYX_WAIT_READY_TIMEOUT_SECS (default 2700) mining starts with whichever cards are ready.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub wait_ready: bool,
+
+    #[clap(
         long = "enable-cpu-inference",
         help = "Allow OPoI inference to FALL BACK to the CPU when GPU inference cannot load (OFF by default). CPU inference is very slow and rarely worthwhile; without this flag a card that cannot run GPU inference withdraws from OPoI instead of doing futile CPU work. NVIDIA/Windows: the fix for 'GPU inference failed' is to ship keryx-llama.dll + the CUDA runtime DLLs next to the miner, NOT this flag.",
         help_heading = "OPoI / Inference"
