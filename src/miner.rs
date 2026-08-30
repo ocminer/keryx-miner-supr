@@ -490,7 +490,7 @@ impl MinerManager {
                                 std::thread::sleep(std::time::Duration::from_millis(500));
                                 continue;
                             }
-                            pom_driver::mine_v4(wdid, &pph, time, &target_le, pom_nonce, batch)
+                            pom_driver::mine_v4(wdid, &pph, time, &target_le, pom_nonce, batch, daa)
                         };
                         // AMD (OpenCL): the thread is already bound to its card; the deviceless API is
                         // per-GPU via thread-local binding.

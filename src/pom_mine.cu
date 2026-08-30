@@ -21,6 +21,34 @@ __device__ __forceinline__ unsigned long long pom_seed_fold(
     return s;
 }
 
+// H10 one-way seed fold — PLACEHOLDER, byte-identical to src/pom.rs::pom_seed_fold_v4_h10.
+// 🔴 NOT the node's formula (not public until the afternoon release). The host guard
+// (pom::H10_SPEC_VERIFIED=false) refuses to launch any H10 job until this is replaced + verified,
+// so this code cannot mine rejected blocks. Replace this body AND the Rust mirror together.
+__device__ __forceinline__ unsigned long long pom_seed_fold_h10(
+    unsigned long long nonce, unsigned long long time_,
+    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3) {
+    const unsigned long long in[6] = { nonce, time_, p0, p1, p2, p3 };
+    unsigned long long s = 0x686B727848313053ULL; // domain tag, matches the Rust mirror exactly
+    #pragma unroll
+    for (int i = 0; i < 6; i++) {
+        s = ((s << 23) | (s >> 41)) ^ in[i];          // rotate_left(23) ^ w
+        s *= 0x9E3779B97F4A7C15ULL;
+        s ^= s >> 29;
+        s += 0xD6E8FEB86659FD93ULL * (unsigned long long)(i + 1);
+    }
+    s ^= s >> 32; s *= 0xBF58476D1CE4E5B9ULL; s ^= s >> 30;
+    return s;
+}
+
+// Select the seed fold for the era. h10 != 0 → one-way H10 fold; else the reversible v4 fold.
+__device__ __forceinline__ unsigned long long pom_seed_fold_era(
+    unsigned int h10, unsigned long long nonce, unsigned long long time_,
+    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3) {
+    return h10 ? pom_seed_fold_h10(nonce, time_, p0, p1, p2, p3)
+               : pom_seed_fold(nonce, time_, p0, p1, p2, p3);
+}
+
 __device__ __forceinline__ void pom_pow_fold(
     unsigned long long fin, unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
     unsigned long long out[4]) {
@@ -372,11 +400,12 @@ extern "C" __global__ void pom_mine_v4(
     unsigned long long time_,
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
+    unsigned int h10,
     unsigned long long* winner) {
     extern __shared__ unsigned int s_shared[];
     if ((unsigned long long)blockIdx.x >= n_nonces) return;
     const unsigned long long nonce = nonce_base + blockIdx.x;
-    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const unsigned long long seed = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
     const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared);
     if (threadIdx.x == 0) {
         unsigned long long pv[4];
@@ -422,11 +451,12 @@ extern "C" __global__ void pom_mine_v4_chase(
     unsigned long long n_tiles, unsigned int K,
     unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
     unsigned long long time_, unsigned long long nonce_base, unsigned long long n_nonces,
+    unsigned int h10,
     unsigned int* offsets /* [n_nonces][K] */) {
     const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     if (i >= n_nonces) return;
     const unsigned long long nonce = nonce_base + i;
-    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const unsigned long long seed = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
     unsigned long long off = mix64(seed ^ V4_OFFSET_FIRST_SALT) % n_tiles;
     unsigned int* my = offsets + i * (unsigned long long)K;
     for (unsigned int step = 1; step <= K; step++) {
@@ -516,7 +546,7 @@ extern "C" __global__ void pom_mine_v4_tc(
     unsigned long long time_,
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
-    const unsigned int* offsets, unsigned long long* winner) {
+    const unsigned int* offsets, unsigned int h10, unsigned long long* winner) {
     extern __shared__ unsigned int s_shared[];
     const unsigned int w = threadIdx.x >> 5;
     const unsigned long long i = (unsigned long long)blockIdx.x * V4_TC_WARPS + w;
@@ -525,7 +555,7 @@ extern "C" __global__ void pom_mine_v4_tc(
     unsigned int* s_buf = s_shared + w * (256u * (V4_TC_PIPE + 1));
     unsigned int* s_state = s_buf + 256u * V4_TC_PIPE;
     const unsigned long long nonce = nonce_base + i;
-    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const unsigned long long seed = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
     const unsigned int* my = offsets + i * (unsigned long long)K;
 
     // S_0 straight into the shared state (spec keystream, same packing as the host).
@@ -582,7 +612,7 @@ extern "C" __global__ void pom_mine_v4_tc(
     unsigned long long, unsigned long long, unsigned long long, unsigned long long,
     unsigned long long,
     unsigned long long, unsigned long long, unsigned long long, unsigned long long,
-    unsigned long long, unsigned long long, const unsigned int*, unsigned long long*) {}
+    unsigned long long, unsigned long long, const unsigned int*, unsigned int, unsigned long long*) {}
 #endif
 
 // ============================================================================
@@ -643,7 +673,7 @@ extern "C" __global__ void pom_mine_v4_ncf(
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
     const unsigned short* lut, unsigned int lut_sh, unsigned long long inv_n,
-    unsigned long long* winner) {
+    unsigned int h10, unsigned long long* winner) {
     extern __shared__ unsigned int s_shared[];
     const unsigned int w = threadIdx.x >> 5;
     const unsigned int x = threadIdx.x & 31u;
@@ -655,7 +685,7 @@ extern "C" __global__ void pom_mine_v4_ncf(
     unsigned int* s_tiles = s_warp + 256u;
 
     const unsigned long long nonce = nonce_base + i;
-    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const unsigned long long seed = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
     { unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)x));
       #pragma unroll
       for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); s_state[x * 8u + k4] = (unsigned int)h; } }
@@ -720,5 +750,5 @@ extern "C" __global__ void pom_mine_v4_ncf(
     unsigned long long, unsigned long long, unsigned long long, unsigned long long,
     unsigned long long, unsigned long long,
     const unsigned short*, unsigned int, unsigned long long,
-    unsigned long long*) {}
+    unsigned int, unsigned long long*) {}
 #endif
