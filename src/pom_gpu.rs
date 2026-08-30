@@ -2932,7 +2932,7 @@ mod v4_kernel_tests {
             assert_eq!(miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1, true).unwrap(), None,
                        "H10: GPU found nonce below host pow at {nonce} (lose check)");
         }
-        println!("H10 host↔GPU seed lockstep OK (placeholder formula; wiring validated)");
+        println!("H10 host↔GPU seed lockstep OK (real PowHash formula, golden-verified)");
     }
 
     /// Reports (visibly, with --nocapture) which walk kernel this GPU resolves to, and proves the
