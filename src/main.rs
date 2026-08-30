@@ -541,6 +541,12 @@ fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier, 
         };
     }
     vrams.sort_by_key(|(id, _)| *id);
+    if opt.force_model.is_some() {
+        // Forced models load verbatim: no VRAM pre-check ("we simply load it, regardless of
+        // what the card says — that is the reason we have it").
+        keryx_miner::llama_engine::set_vram_check_bypass(true);
+        info!("--force-model: VRAM pre-check disabled — forced models are loaded verbatim.");
+    }
     if let Some(raw) = opt.force_model.as_deref() {
         info!("--force-model: {} — per-card override (VRAM check bypassed; unlisted/extra cards use auto).", raw.trim());
     }

@@ -96,6 +96,17 @@ fn loaded_gpus() -> Vec<usize> {
 /// Actually dlopen the .so, resolve symbols, load the model for (gguf, gpu). Returns the Engine or
 /// None (caller falls back). Factored out of `ensure_loaded_on` so the load happens while the
 /// target slot's lock is held (per-card serialization) without duplicating the FFI plumbing.
+/// `--force-model` is honored VERBATIM: no VRAM pre-check, the load is attempted regardless of
+/// what the card reports (set once from main when the flag is present). The env escape
+/// KERYX_LLAMA_VRAM_CHECK=0 has the same effect for diagnosis.
+static FORCE_LOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_vram_check_bypass(on: bool) {
+    FORCE_LOAD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+fn vram_check_bypassed() -> bool {
+    FORCE_LOAD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
     let lib = engine_lib()?;
     unsafe {
@@ -117,6 +128,10 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
         }
         // Optional (upstream aa29fd2): older builds lack it — the ownership gate then no-ops.
         let tensor_device = sym::<TensorDeviceFn>(lib, b"keryx_llama_tensor_device\0");
+        // --force-model: NO safety check at all — the operator's contract is "load it verbatim,
+        // regardless of what the card says". The pre-check below exists to protect AUTO
+        // selection from the poisonous failed-load path; a forced rig opts out of that
+        // protection knowingly (set from main when --force-model is present).
         // VRAM PRE-CHECK: never ASK llama to load a model that cannot fit this card's free VRAM.
         // A failed multi-GiB load is not harmless: ggml's per-device CUDA pool teardown on the
         // failure path races the next engine load/generate on the same card, and that survivor
@@ -129,9 +144,14 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
         // ~9 GiB doomed allocation. The margin covers the minimum (1024-token) context + compute
         // buffers. KERYX_LLAMA_VRAM_CHECK=0 disables (diagnostic only).
         #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
-        if std::env::var("KERYX_LLAMA_VRAM_CHECK").ok().as_deref() != Some("0") {
+        if !vram_check_bypassed() && std::env::var("KERYX_LLAMA_VRAM_CHECK").ok().as_deref() != Some("0") {
             if let Ok(md) = std::fs::metadata(gguf) {
-                let need_mib = md.len() / (1024 * 1024) + 1200;
+                // Margin guards WEIGHT-level allocation failures only (the reproduced poison
+                // class: 9.3 GiB weights forced onto an 8 GB card). Context-size failures are
+                // handled by llama's own benign 4096->1024 retry below, so a borderline fit
+                // (12B model on a 10 GB card, ~200-400 MB slack) must be ATTEMPTED, not
+                // refused — a 1200 MiB margin here broke exactly that working config.
+                let need_mib = md.len() / (1024 * 1024) + 128;
                 if let Some((_, free_mib, total_mib)) = crate::pom_gpu::query_all_gpus_free_vram()
                     .into_iter()
                     .find(|(o, _, _)| *o as usize == gpu)
