@@ -1160,8 +1160,62 @@ pub fn install(device_id: u32, m: PomGpuMiner) {
     if let Ok(mut g) = miners().lock() {
         g.insert(device_id, Arc::new(m));
     }
+    // This card just came online — clear any prior "sat out" latch so a future genuine sit-out
+    // re-logs, and it is no longer counted among the halted cards.
+    clear_sat_out(device_id);
     // --wait-ready: this card's walk is resident = the card is set up (idempotent, cheap).
     crate::wait_ready::mark_ready(device_id);
+}
+
+/// Cards that exhausted every tier they could fit/serve and are sitting this run out. Tracked ONLY
+/// to (a) log each card's sit-out once, not every retry, and (b) decide when the LAST card has
+/// fallen so the halt becomes a genuine rig-wide staging error. Never gates a mining card.
+fn sat_out_devices() -> &'static Mutex<std::collections::HashSet<u32>> {
+    static SAT_OUT: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    SAT_OUT.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+fn clear_sat_out(device_id: u32) {
+    if let Ok(mut s) = sat_out_devices().lock() {
+        s.remove(&device_id);
+    }
+}
+/// Returns true the FIRST time `device_id` is recorded as sat-out (so callers log once per card).
+fn record_sat_out(device_id: u32) -> bool {
+    sat_out_devices().lock().map(|mut s| s.insert(device_id)).unwrap_or(false)
+}
+
+/// Halt THIS card's staging without falsely suspending the whole rig. A per-card condition (this
+/// card can't fit/serve any tier) must NOT raise the process-wide staging error while OTHER cards
+/// are mining — that error is what the hashrate logger prints as "MODEL STAGING FAILED — mining is
+/// suspended", which on a mixed rig hides the fact that the fitting cards ARE mining. So: if any
+/// other card currently has a resident walk, sit this card out (log once) and leave the rig-wide
+/// error clear. Only when NO other card is mining does this become a genuine rig-wide error the
+/// operator must see (single-card rig, or every card exhausted). `install()` clears the latch when
+/// a card recovers, and the existing clear-on-install unsets a rig-wide error raised during a
+/// startup race where this card halted moments before a bigger card came up.
+/// True when any device OTHER than `device_id` is in the installed set. Pure (no globals) so the
+/// mixed-rig sit-out decision is unit-testable without CUDA-backed miners.
+fn any_other_device(installed: &[u32], device_id: u32) -> bool {
+    installed.iter().any(|&d| d != device_id)
+}
+fn halt_device_staging(device_id: u32, msg: String) {
+    let installed: Vec<u32> = miners()
+        .lock()
+        .map(|g| g.keys().copied().collect())
+        .unwrap_or_default();
+    let others_mining = any_other_device(&installed, device_id);
+    if others_mining {
+        if record_sat_out(device_id) {
+            log::warn!(
+                "PoM[gpu{}]: sitting this card out — {} Other GPU(s) are mining, so the rig keeps \
+                 running; this card idles (0 h/s, not counted) until a fitting/serveable model exists.",
+                device_id, msg
+            );
+        }
+    } else {
+        // No other card is mining — this is a real rig-wide stall the operator must see.
+        crate::slm::set_staging_error(msg);
+    }
 }
 
 /// Removes only `device_id`'s entry from a `device -> miner` map, leaving every other device's
@@ -2552,7 +2606,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         let vram_mb = query_all_gpus_vram().into_iter()
             .find(|(d, _)| *d == device_id).map(|(_, m)| m).unwrap_or(0);
         if is_device_forced(device_id) {
-            crate::slm::set_staging_error(format!(
+            halt_device_staging(device_id, format!(
                 "GPU {} could not SERVE the FORCED model (inference self-test failed on GPU {}) — \
                  --force-model is honored without a fallback. Choose a smaller --force-model or a serving \
                  card with more free VRAM. Not demoting (forced).",
@@ -2580,7 +2634,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 crate::slm::clear_staging_error();
             }
             None => {
-                crate::slm::set_staging_error(format!(
+                halt_device_staging(device_id, format!(
                     "GPU {} could not SERVE this model (inference self-test failed on GPU {}) and NO smaller \
                      staged tier is serveable — this card cannot mine any available tier. Use a card with more \
                      VRAM, stage a lighter model, or force a smaller tier (--very-light / --light).",
@@ -2684,7 +2738,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                         set_device_model(device_id, smaller.model_id, gguf);
                     }
                     None => {
-                        crate::slm::set_staging_error(format!(
+                        halt_device_staging(device_id, format!(
                             "GPU {} ({} MB VRAM) ran OUT OF MEMORY loading the model and no smaller staged tier \
                              fits — this card cannot mine any available tier. Use a card with more VRAM, or \
                              force a lighter tier (--very-light Qwen3.5-9B / --light GLM-4-9B).",
@@ -2705,7 +2759,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 return false;
             }
             log::error!("PoM[gpu{}]: device miner build failed: {}", device_id, e);
-            crate::slm::set_staging_error(format!(
+            halt_device_staging(device_id, format!(
                 "GPU {} failed to LOAD the model onto the card: {}. Check the GPU/driver (nvidia-smi), VRAM, \
                  and that the model file is valid; mining on this card is suspended until the load succeeds.",
                 device_id, e
@@ -2739,6 +2793,35 @@ mod tests {
         assert_eq!(map.get(&1), Some(&"gpu1-miner"));
         assert_eq!(map.get(&2), Some(&"gpu2-miner"));
         assert_eq!(map.len(), 2);
+    }
+
+    // Mixed-rig sit-out: a card that can't fit/serve any tier must NOT raise the rig-wide staging
+    // error while OTHER cards are mining — otherwise the fitting cards' work is hidden behind a
+    // false "mining suspended". `any_other_device` is the pure decision behind that.
+    #[test]
+    fn any_other_device_detects_a_mining_peer() {
+        // Other cards mining → this card sits out (no rig-wide error).
+        assert!(any_other_device(&[0, 1, 2], 2), "cards 0,1 mining besides card 2");
+        assert!(any_other_device(&[0], 2), "card 0 mining besides card 2");
+        // This card is the ONLY installed one (or none) → its halt IS the rig-wide condition.
+        assert!(!any_other_device(&[2], 2), "only this card installed → rig-wide");
+        assert!(!any_other_device(&[], 0), "no card installed → rig-wide");
+    }
+
+    // The sat-out latch logs each card's sit-out exactly once, and `install()`/recovery re-arms it.
+    #[test]
+    fn sat_out_latch_is_once_per_card_and_rearms_on_clear() {
+        // Use high device ids unlikely to collide with any other test touching the global set.
+        let (a, b) = (900u32, 901u32);
+        clear_sat_out(a);
+        clear_sat_out(b);
+        assert!(record_sat_out(a), "first sit-out of a → log");
+        assert!(!record_sat_out(a), "second sit-out of a → already latched, no re-log");
+        assert!(record_sat_out(b), "a's latch must not swallow b's first sit-out");
+        clear_sat_out(a); // card a recovered (install)
+        assert!(record_sat_out(a), "after recovery, a's next sit-out logs again");
+        clear_sat_out(a);
+        clear_sat_out(b);
     }
 
     // Upstream aa29fd2: the drain barrier in `uninstall`.
