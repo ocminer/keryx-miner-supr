@@ -455,7 +455,11 @@ extern "C" __global__ void pom_mine_v4(
     extern __shared__ unsigned int s_shared[];
     if ((unsigned long long)blockIdx.x >= n_nonces) return;
     const unsigned long long nonce = nonce_base + blockIdx.x;
-    const unsigned long long seed = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
+    // Compute the (post-H10 keccak) seed ONCE on lane 0 and broadcast — every thread needs the
+    // identical value, so this replaces 32x redundant keccak/mix64 with 1x + a warp shuffle.
+    unsigned long long seed = ((threadIdx.x & 31u) == 0u)
+        ? pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3) : 0ULL;
+    seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
     const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared);
     if (threadIdx.x == 0) {
         unsigned long long pv[4];
@@ -506,7 +510,11 @@ extern "C" __global__ void pom_mine_v4_chase(
     const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     if (i >= n_nonces) return;
     const unsigned long long nonce = nonce_base + i;
-    const unsigned long long seed = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
+    // Compute the (post-H10 keccak) seed ONCE on lane 0 and broadcast — every thread needs the
+    // identical value, so this replaces 32x redundant keccak/mix64 with 1x + a warp shuffle.
+    unsigned long long seed = ((threadIdx.x & 31u) == 0u)
+        ? pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3) : 0ULL;
+    seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
     unsigned long long off = mix64(seed ^ V4_OFFSET_FIRST_SALT) % n_tiles;
     unsigned int* my = offsets + i * (unsigned long long)K;
     for (unsigned int step = 1; step <= K; step++) {
@@ -605,7 +613,11 @@ extern "C" __global__ void pom_mine_v4_tc(
     unsigned int* s_buf = s_shared + w * (256u * (V4_TC_PIPE + 1));
     unsigned int* s_state = s_buf + 256u * V4_TC_PIPE;
     const unsigned long long nonce = nonce_base + i;
-    const unsigned long long seed = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
+    // Compute the (post-H10 keccak) seed ONCE on lane 0 and broadcast — every thread needs the
+    // identical value, so this replaces 32x redundant keccak/mix64 with 1x + a warp shuffle.
+    unsigned long long seed = ((threadIdx.x & 31u) == 0u)
+        ? pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3) : 0ULL;
+    seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
     const unsigned int* my = offsets + i * (unsigned long long)K;
 
     // S_0 straight into the shared state (spec keystream, same packing as the host).
@@ -735,7 +747,11 @@ extern "C" __global__ void pom_mine_v4_ncf(
     unsigned int* s_tiles = s_warp + 256u;
 
     const unsigned long long nonce = nonce_base + i;
-    const unsigned long long seed = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
+    // Compute the (post-H10 keccak) seed ONCE on lane 0 and broadcast — every thread needs the
+    // identical value, so this replaces 32x redundant keccak/mix64 with 1x + a warp shuffle.
+    unsigned long long seed = ((threadIdx.x & 31u) == 0u)
+        ? pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3) : 0ULL;
+    seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
     { unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)x));
       #pragma unroll
       for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); s_state[x * 8u + k4] = (unsigned int)h; } }
