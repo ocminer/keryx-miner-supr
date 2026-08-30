@@ -507,7 +507,7 @@ impl MinerManager {
                                 }
                                 let _ = pom_driver::ensure_installed();
                             }
-                            pom_driver::mine_v4(&pph, time, &target_le, pom_nonce, batch)
+                            pom_driver::mine_v4(&pph, time, &target_le, pom_nonce, batch, daa)
                         };
                         pom_nonce = pom_nonce.wrapping_add(batch);
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);

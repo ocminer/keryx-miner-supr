@@ -1777,11 +1777,11 @@ mod tests {
         let pph = blake(b"bench-llama-vk");
         let target = [0u8; 32]; // impossible target -> full grind
         let batch: u64 = 1 << 21;
-        let _ = crate::pom_opencl::mine_v4(&pph, 1_700_000_000, &target, 0, batch); // warmup
+        let _ = crate::pom_opencl::mine_v4(&pph, 1_700_000_000, &target, 0, batch, 0); // warmup
         let start = std::time::Instant::now();
         let rounds: u64 = 8;
         for i in 0..rounds {
-            let _ = crate::pom_opencl::mine_v4(&pph, 1_700_000_000, &target, i * batch, batch);
+            let _ = crate::pom_opencl::mine_v4(&pph, 1_700_000_000, &target, i * batch, batch, 0);
         }
         let secs = start.elapsed().as_secs_f64();
         eprintln!(

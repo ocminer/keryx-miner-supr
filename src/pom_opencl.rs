@@ -58,7 +58,7 @@ enum V4Mode { SingleDp4a, SingleWmma, TwoPhaseDp4a, TwoPhaseWmma }
 #[allow(clippy::too_many_arguments)]
 fn enqueue_v4(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>], slab_tiles: u64,
               winner: &Buffer<cl_ulong>, n_tiles: u64, k: u32, pph: [u64; 4], seed: [u64; 4],
-              time: u64, target: [u64; 4], base: u64, n_nonces: u64, lds_bytes: usize) -> Option<()> {
+              time: u64, target: [u64; 4], base: u64, n_nonces: u64, h10: u32, lds_bytes: usize) -> Option<()> {
     const V4_LOCAL: usize = 256;
     const V4_NPG: u64 = 8;                       // sub-nonces per workgroup (kernel mirror)
     // 4 slab args; absent slabs repeat slab 0 (never selected: off/slab_tiles bounds to real slabs).
@@ -74,7 +74,7 @@ fn enqueue_v4(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>
         .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
         .set_arg(&time)
         .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
-        .set_arg(&base).set_arg(&n_nonces)
+        .set_arg(&base).set_arg(&n_nonces).set_arg(&h10)
         .set_arg(winner)
         .set_arg_local_buffer(lds_bytes)
         .set_global_work_size(global)
@@ -91,7 +91,7 @@ fn enqueue_v4(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>
 fn enqueue_v4_tp(queue: &CommandQueue, chase: &Kernel, walk: &Kernel, weights: &[Buffer<cl_ulong>],
                  slab_tiles: u64, offsets: &Buffer<cl_uint>, winner: &Buffer<cl_ulong>, n_tiles: u64,
                  k: u32, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], base: u64,
-                 n_nonces: u64, walk_lds_bytes: usize) -> Option<()> {
+                 n_nonces: u64, h10: u32, walk_lds_bytes: usize) -> Option<()> {
     const V4_LOCAL: usize = 256;
     const V4_NPG: u64 = 8;
     const CHASE_LOCAL: usize = 64;               // plain 1D latency-bound pointer chase
@@ -105,7 +105,7 @@ fn enqueue_v4_tp(queue: &CommandQueue, chase: &Kernel, walk: &Kernel, weights: &
         .set_arg(&k)
         .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
         .set_arg(&time)
-        .set_arg(&base).set_arg(&n_nonces)
+        .set_arg(&base).set_arg(&n_nonces).set_arg(&h10)
         .set_arg(offsets)
         .set_global_work_size(chase_global)
         .set_local_work_size(CHASE_LOCAL)
@@ -123,7 +123,7 @@ fn enqueue_v4_tp(queue: &CommandQueue, chase: &Kernel, walk: &Kernel, weights: &
         .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
         .set_arg(&time)
         .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
-        .set_arg(&base).set_arg(&n_nonces)
+        .set_arg(&base).set_arg(&n_nonces).set_arg(&h10)
         .set_arg(offsets)
         .set_arg(winner)
         .set_arg_local_buffer(walk_lds_bytes)
@@ -362,7 +362,7 @@ impl PomMiner {
     /// walk on the resident blob (32 threads/nonce, 8 nonces per 256-thread workgroup). Returns the
     /// lowest winning nonce (host re-walks it byte-exact to build the witness), or None. Multi-slab
     /// aware — slabs are tile-aligned so each step's 1 KB tile lives in one slab (v4_slab picks it).
-    pub fn mine_v4(&mut self, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64) -> Option<u64> {
+    pub fn mine_v4(&mut self, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64, h10: u32) -> Option<u64> {
         let n_tiles = self.n_chunks / POM_V4_TILE_CHUNKS;
         if n_tiles == 0 {
             log::error!("PoM v4: blob too small ({} chunks < one 32-chunk tile).", self.n_chunks);
@@ -403,17 +403,17 @@ impl PomMiner {
             match self.mode {
                 V4Mode::SingleWmma => enqueue_v4(&self.queue,
                     self.kernel_wmma_sp.as_ref().unwrap_or(&self.kernel_v4),
-                    &self.weights, slab_tiles, &self.winner, n_tiles, k, pph, seed, time, target, base, sub,
+                    &self.weights, slab_tiles, &self.winner, n_tiles, k, pph, seed, time, target, base, sub, h10,
                     if self.kernel_wmma_sp.is_some() { SP_WMMA_LDS } else { SP_DP4A_LDS })?,
                 V4Mode::TwoPhaseWmma => enqueue_v4_tp(&self.queue, &self.kernel_chase,
                     self.kernel_wmma.as_ref().unwrap_or(&self.kernel_v4_tp), &self.weights, slab_tiles,
-                    self.offsets.as_ref().unwrap(), &self.winner, n_tiles, k, pph, seed, time, target, base, sub,
+                    self.offsets.as_ref().unwrap(), &self.winner, n_tiles, k, pph, seed, time, target, base, sub, h10,
                     if self.kernel_wmma.is_some() { TP_WMMA_LDS } else { TP_DP4A_LDS })?,
                 V4Mode::TwoPhaseDp4a => enqueue_v4_tp(&self.queue, &self.kernel_chase, &self.kernel_v4_tp,
                     &self.weights, slab_tiles, self.offsets.as_ref().unwrap(), &self.winner, n_tiles, k,
-                    pph, seed, time, target, base, sub, TP_DP4A_LDS)?,
+                    pph, seed, time, target, base, sub, h10, TP_DP4A_LDS)?,
                 V4Mode::SingleDp4a => enqueue_v4(&self.queue, &self.kernel_v4, &self.weights, slab_tiles,
-                    &self.winner, n_tiles, k, pph, seed, time, target, base, sub, SP_DP4A_LDS)?,
+                    &self.winner, n_tiles, k, pph, seed, time, target, base, sub, h10, SP_DP4A_LDS)?,
             }
             done += sub;
         }
@@ -936,14 +936,18 @@ pub fn ensure_installed() {
 /// Word sets mirror `pom_gpu::mine_v4` / `pom_v4.rs`: the POW fold uses the H3-salted pph words
 /// ("v4 pow uses the h3 fold") and the SEED fold uses the v4-salted words. Both are pure host-side
 /// derivations, so the kernel is era-agnostic — only the uploaded words differ.
-pub fn mine_v4(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64) -> Option<u64> {
+pub fn mine_v4(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64, daa: u64) -> Option<u64> {
     let id = target_dev()?;
+    // H10 hardfork (DAA 87,360,000): at/after the gate the SEED becomes the one-way cSHAKE256
+    // PowHash of the RAW pph words; below it, the reversible v4 fold over the v4-salted words.
+    // Byte-identical dispatch to pom::pom_block_seed_v4_era. The POW fold (p) is unchanged (H3 words).
+    let h10_era = daa >= crate::pom::h10_activation_daa();
     let p = crate::pom::pph_words_for_era(pph, true);
-    let s = crate::pom::pph_words_v4(pph);
+    let s = if h10_era { crate::pom::pph_words(pph) } else { crate::pom::pph_words_v4(pph) };
     let t = words(target_le);
     let miner = miner_for(id)?;
     let mut g = miner.lock().unwrap();
-    g.mine_v4(p, s, time, t, nonce_base, batch)
+    g.mine_v4(p, s, time, t, nonce_base, batch, if h10_era { 1 } else { 0 })
 }
 
 /// Build the resident tier from a GGUF (shared proof WeightIndex, streamed to VRAM) and make it
@@ -977,10 +981,11 @@ mod v4_byte_exact {
     //! OpenCL GPU (skips if none).
     use super::*;
 
-    // CPU reference pow-value (256-bit LE) for one nonce over `index`. v4 seed = pom_block_seed_v4;
-    // pow fold uses the H3-salted words ("v4 pow uses the h3 fold").
-    fn cpu_pow(index: &crate::pom::WeightIndex, pph: &[u8; 32], time: u64, nonce: u64) -> [u8; 32] {
-        let seed = crate::pom::pom_block_seed_v4(pph, time, nonce);
+    // CPU reference pow-value (256-bit LE) for one nonce over `index`. v4 seed = era-selected
+    // (h10=false → reversible v4 fold; h10=true → one-way cSHAKE256 PowHash). Pow fold uses the
+    // H3-salted words ("v4 pow uses the h3 fold").
+    fn cpu_pow(index: &crate::pom::WeightIndex, pph: &[u8; 32], time: u64, nonce: u64, h10: bool) -> [u8; 32] {
+        let seed = crate::pom::pom_block_seed_v4_era(pph, time, nonce, h10);
         let (_proof, fin) = crate::pom_v4::build_proof_v4(0, seed, index).unwrap();
         crate::pom::pom_pow_value(fin, pph, true)
     }
@@ -1009,47 +1014,48 @@ mod v4_byte_exact {
         const NN: u64 = 2048; // matches the CUDA gate: a mapping/ordering bug in either kernel or
                               // the two-phase offset chain shows up as an argmin mismatch here
 
-        // CPU: find the argmin pow over 0..NN; target = that min → only the argmin passes.
-        let mut best = ([0xFFu8; 32], u64::MAX);
-        for nonce in 0..NN {
-            let pv = cpu_pow(&index, &pph, time, nonce);
-            let le_le = |a: &[u8; 32], b: &[u8; 32]| {
-                for k in (0..4).rev() {
-                    let (wa, wb) = (
-                        u64::from_le_bytes(a[k * 8..k * 8 + 8].try_into().unwrap()),
-                        u64::from_le_bytes(b[k * 8..k * 8 + 8].try_into().unwrap()),
-                    );
-                    if wa != wb { return wa < wb; }
-                }
-                true
-            };
-            if best.1 == u64::MAX || le_le(&pv, &best.0) { best = (pv, nonce); }
-        }
-        let (target, w_cpu) = best;
-        eprintln!("cpu argmin nonce = {w_cpu}");
-
-        // GPU: grind 0..NN with target = the argmin's pow. Expect it to return w_cpu. Validate BOTH
-        // the single-phase kernel AND the (default-off) two-phase chase+pipeline path — regardless
-        // of the KERYX_POM_V4_TP env default — so neither can silently diverge from consensus.
         let mut miner = PomMiner::new(dev, &index, n_chunks).expect("PomMiner::new");
-        let p = crate::pom::pph_words_for_era(&pph, true);
-        let s = crate::pom::pph_words_v4(&pph);
-        let t = words(&target);
-        // Validate every walk mode against the CPU argmin — a mapping bug in any kernel or the
-        // two-phase offset chain shows up as a winner mismatch here.
         let modes: &[(V4Mode, &str)] = &[
             (V4Mode::SingleDp4a, "single dp4a"),
             (V4Mode::TwoPhaseDp4a, "two-phase dp4a"),
             (V4Mode::SingleWmma, "single WMMA"),
             (V4Mode::TwoPhaseWmma, "two-phase WMMA"),
         ];
-        for &(m, name) in modes {
-            // Skip WMMA modes if the kernels didn't build (non-RDNA3).
-            if matches!(m, V4Mode::SingleWmma) && miner.kernel_wmma_sp.is_none() { continue; }
-            if matches!(m, V4Mode::TwoPhaseWmma) && miner.kernel_wmma.is_none() { continue; }
-            miner.mode = m;
-            assert_eq!(miner.mine_v4(p, s, time, t, 0, NN), Some(w_cpu), "{name} v4 winner mismatch");
-            eprintln!("{name}: OK");
+        // Validate BOTH consensus eras: h10=false (reversible v4 fold) AND h10=true (H10 one-way
+        // cSHAKE256 seed — the v0.12.0 hardfork). A keccak/absorb bug shows up as an argmin mismatch.
+        for &h10 in &[false, true] {
+            // CPU argmin pow over 0..NN with the era-correct seed; target = that min.
+            let mut best = ([0xFFu8; 32], u64::MAX);
+            for nonce in 0..NN {
+                let pv = cpu_pow(&index, &pph, time, nonce, h10);
+                let le_le = |a: &[u8; 32], b: &[u8; 32]| {
+                    for k in (0..4).rev() {
+                        let (wa, wb) = (
+                            u64::from_le_bytes(a[k * 8..k * 8 + 8].try_into().unwrap()),
+                            u64::from_le_bytes(b[k * 8..k * 8 + 8].try_into().unwrap()),
+                        );
+                        if wa != wb { return wa < wb; }
+                    }
+                    true
+                };
+                if best.1 == u64::MAX || le_le(&pv, &best.0) { best = (pv, nonce); }
+            }
+            let (target, w_cpu) = best;
+            eprintln!("[h10={h10}] cpu argmin nonce = {w_cpu}");
+
+            let p = crate::pom::pph_words_for_era(&pph, true);
+            // Seed words match the era: raw pph for H10 (keccak absorbs them), v4-salted otherwise.
+            let s = if h10 { crate::pom::pph_words(&pph) } else { crate::pom::pph_words_v4(&pph) };
+            let t = words(&target);
+            let hf: u32 = if h10 { 1 } else { 0 };
+            for &(m, name) in modes {
+                if matches!(m, V4Mode::SingleWmma) && miner.kernel_wmma_sp.is_none() { continue; }
+                if matches!(m, V4Mode::TwoPhaseWmma) && miner.kernel_wmma.is_none() { continue; }
+                miner.mode = m;
+                assert_eq!(miner.mine_v4(p, s, time, t, 0, NN, hf), Some(w_cpu),
+                    "{name} v4 winner mismatch (h10={h10})");
+                eprintln!("[h10={h10}] {name}: OK");
+            }
         }
     }
 
@@ -1085,10 +1091,10 @@ mod v4_byte_exact {
 
         let mut miner = PomMiner::new(dev, &index, n_chunks).expect("PomMiner::new");
         let bench = |m: &mut PomMiner, label: &str| {
-            m.mine_v4(p, s, 1_700_000_000, t, 0, batch); // warmup
+            m.mine_v4(p, s, 1_700_000_000, t, 0, batch, 0); // warmup
             let rounds = 6u64;
             let start = std::time::Instant::now();
-            for r in 0..rounds { m.mine_v4(p, s, 1_700_000_000, t, r * batch, batch); }
+            for r in 0..rounds { m.mine_v4(p, s, 1_700_000_000, t, r * batch, batch, 0); }
             let secs = start.elapsed().as_secs_f64();
             let mhs = (rounds * batch) as f64 / secs / 1e6;
             eprintln!("{label}: {mhs:.3} Mh/s ({} nonces in {secs:.2}s)", rounds * batch);

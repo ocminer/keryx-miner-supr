@@ -58,12 +58,70 @@ inline u64 pom_mix64(u64 x) {
     return x;
 }
 
-// Block seed fold — identical to pom.rs pom_block_seed_v4 (host passes the v4-salted pph words).
+// Block seed fold (pre-H10) — identical to pom.rs pom_block_seed_v4 (host passes the v4-salted words).
 inline u64 pom_seed_fold(u64 nonce, u64 time_, u64 p0, u64 p1, u64 p2, u64 p3) {
     u64 s = pom_mix64(nonce ^ 0x4B65727978531UL);
     s = pom_mix64(s ^ time_);
     s = pom_mix64(s ^ p0); s = pom_mix64(s ^ p1); s = pom_mix64(s ^ p2); s = pom_mix64(s ^ p3);
     return s;
+}
+
+// ---- H10 one-way seed (hardfork DAA 87,360,000): seed = leading 64 b of PowHash(pph,ts,nonce) =
+// cSHAKE256("ProofOfWorkHash"). Byte-identical to pom.rs pom_block_seed_h10 + cuda pom_seed_fold_h10.
+// Keccak-f[1600] permutation (24 rounds).
+inline u64 keccak_rotl64(u64 x, uint n) { return (x << n) | (x >> (64u - n)); }
+inline void keccak_f1600(u64* st) {
+    const u64 RC[24] = {
+        0x0000000000000001UL, 0x0000000000008082UL, 0x800000000000808aUL, 0x8000000080008000UL,
+        0x000000000000808bUL, 0x0000000080000001UL, 0x8000000080008081UL, 0x8000000000008009UL,
+        0x000000000000008aUL, 0x0000000000000088UL, 0x0000000080008009UL, 0x000000008000000aUL,
+        0x000000008000808bUL, 0x800000000000008bUL, 0x8000000000008089UL, 0x8000000000008003UL,
+        0x8000000000008002UL, 0x8000000000000080UL, 0x000000000000800aUL, 0x800000008000000aUL,
+        0x8000000080008081UL, 0x8000000000008080UL, 0x0000000080000001UL, 0x8000000080008008UL };
+    const uint RHO[24] = {1,3,6,10,15,21,28,36,45,55,2,14,27,41,56,8,25,43,62,18,39,61,20,44};
+    const uint PI[24]  = {10,7,11,17,18,3,5,16,8,21,24,4,15,23,19,13,12,2,20,14,22,9,6,1};
+    u64 bc[5];
+    for (int round = 0; round < 24; round++) {
+        for (int i = 0; i < 5; i++) bc[i] = st[i] ^ st[i+5] ^ st[i+10] ^ st[i+15] ^ st[i+20];
+        for (int i = 0; i < 5; i++) {
+            const u64 t = bc[(i+4)%5] ^ keccak_rotl64(bc[(i+1)%5], 1);
+            for (int j = 0; j < 25; j += 5) st[j+i] ^= t;
+        }
+        u64 t = st[1];
+        for (int i = 0; i < 24; i++) {
+            const uint j = PI[i];
+            const u64 tmp = st[j];
+            st[j] = keccak_rotl64(t, RHO[i]);
+            t = tmp;
+        }
+        for (int j = 0; j < 25; j += 5) {
+            for (int i = 0; i < 5; i++) bc[i] = st[j+i];
+            for (int i = 0; i < 5; i++) st[j+i] ^= (~bc[(i+1)%5]) & bc[(i+2)%5];
+        }
+        st[0] ^= RC[round];
+    }
+}
+// cSHAKE256("ProofOfWorkHash") initial sponge state — MUST equal pom.rs POW_HASH_INITIAL_STATE.
+__constant u64 POW_HASH_INITIAL_STATE[25] = {
+    1242148031264380989UL, 3008272977830772284UL, 2188519011337848018UL, 1992179434288343456UL, 8876506674959887717UL,
+    5399642050693751366UL, 1745875063082670864UL, 8605242046444978844UL, 17936695144567157056UL, 3343109343542796272UL,
+    1123092876221303306UL, 4963925045340115282UL, 17037383077651887893UL, 16629644495023626889UL, 12833675776649114147UL,
+    3784524041015224902UL, 1082795874807940378UL, 13952716920571277634UL, 13411128033953605860UL, 15060696040649351053UL,
+    9928834659948351306UL, 5237849264682708699UL, 12825353012139217522UL, 6706187291358897596UL, 196324915476054915UL };
+// H10 seed for one nonce. r0..r3 = RAW pph words (NOT v4-salted). pph→[0..3], ts→[4], nonce→[9].
+inline u64 pom_seed_fold_h10(u64 nonce, u64 time_, u64 r0, u64 r1, u64 r2, u64 r3) {
+    u64 st[25];
+    for (int i = 0; i < 25; i++) st[i] = POW_HASH_INITIAL_STATE[i];
+    st[0] ^= r0; st[1] ^= r1; st[2] ^= r2; st[3] ^= r3;
+    st[4] ^= time_;
+    st[9] ^= nonce;
+    keccak_f1600(st);
+    return st[0];
+}
+// Era select: h10!=0 → one-way H10 PowHash (r0..r3 = RAW pph words); else the reversible v4 fold.
+inline u64 pom_seed_fold_era(uint h10, u64 nonce, u64 time_, u64 p0, u64 p1, u64 p2, u64 p3) {
+    return h10 ? pom_seed_fold_h10(nonce, time_, p0, p1, p2, p3)
+              : pom_seed_fold(nonce, time_, p0, p1, p2, p3);
 }
 
 // pow_value fold — identical to pom.rs pom_pow_value (host passes the H3-salted pph words:
@@ -198,6 +256,7 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4(
     const u64 time_,
     const u64 t0, const u64 t1, const u64 t2, const u64 t3,   // target (4 LE u64)
     const u64 nonce_base, const u64 n_nonces,
+    const uint h10,                          // 0 = reversible v4 fold; 1 = one-way H10 PowHash seed
     volatile __global u64* winner,
     __local uint* scratch)                   // V4_NPG * V4_STRIP_U32 u32 = 16 KB (host sets size)
 {
@@ -209,7 +268,7 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4(
     // every lane must reach every workgroup barrier); they just never submit.
     const bool live  = gsub < n_nonces;
     const u64  nonce = nonce_base + (live ? gsub : 0UL);
-    const u64  seed  = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const u64  seed  = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
     __local uint* strip = scratch + sub * V4_STRIP_U32;   // this sub-nonce's tile + merkle scratch
 
     // S_0 row `lane`: mix64 keystream (identical to pom_v4::v4_initial_state).
@@ -313,12 +372,13 @@ __kernel void pom_mine_v4_chase(
     const u64 s0, const u64 s1, const u64 s2, const u64 s3,   // SEED-fold pph words (v4-salted)
     const u64 time_,
     const u64 nonce_base, const u64 n_nonces,
+    const uint h10,                          // 0 = reversible v4 fold; 1 = one-way H10 PowHash seed
     __global uint* restrict offsets)                          // [n_nonces][K]
 {
     const u64 i = (u64)get_global_id(0);
     if (i >= n_nonces) return;
     const u64 nonce = nonce_base + i;
-    const u64 seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const u64 seed = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
     __global uint* my = offsets + i * (u64)K;
     u64 off = pom_mix64(seed ^ V4_OFFSET_FIRST_SALT) % V4_NT(n_tiles);
     for (uint step = 1; step <= K; step++) {
@@ -352,6 +412,7 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_tp(
     const u64 time_,
     const u64 t0, const u64 t1, const u64 t2, const u64 t3,
     const u64 nonce_base, const u64 n_nonces,
+    const uint h10,                          // 0 = reversible v4 fold; 1 = one-way H10 PowHash seed
     __global const uint* restrict offsets,                    // [n_nonces][K] from phase 1
     volatile __global u64* winner,
     __local uint* scratch)                                    // V4_NPG * V4_STRIP_U32 u32 = 16 KB
@@ -363,7 +424,7 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_tp(
     const bool live  = gsub < n_nonces;
     const u64  idx   = live ? gsub : 0UL;      // dummy sub-nonces read nonce 0's offsets (in-bounds)
     const u64  nonce = nonce_base + idx;
-    const u64  seed  = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const u64  seed  = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
     __local uint* strip = scratch + sub * V4_STRIP_U32;
     __local uint* buf0 = strip;                // tile double-buffer A
     __local uint* buf1 = strip + V4_TILE_U32;  // tile double-buffer B
@@ -483,6 +544,7 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma(
     const u64 time_,
     const u64 t0, const u64 t1, const u64 t2, const u64 t3,
     const u64 nonce_base, const u64 n_nonces,
+    const uint h10,                          // 0 = reversible v4 fold; 1 = one-way H10 PowHash seed
     __global const uint* restrict offsets,
     volatile __global u64* winner,
     __local uint* scratch)                     // V4_NPG * V4W_STRIP_U32 u32 = 32 KB
@@ -494,7 +556,7 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma(
     const bool live  = gsub < n_nonces;
     const u64  idx   = live ? gsub : 0UL;
     const u64  nonce = nonce_base + idx;
-    const u64  seed  = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const u64  seed  = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
     __local uint* strip = scratch + sub * V4W_STRIP_U32;
     __local uint* sA = strip;                  // state buffer A (256 u32 = 32x32 int8)
     __local uint* sB = strip + 256;            // state buffer B
@@ -621,6 +683,7 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma_
     const u64 time_,
     const u64 t0, const u64 t1, const u64 t2, const u64 t3,
     const u64 nonce_base, const u64 n_nonces,
+    const uint h10,                          // 0 = reversible v4 fold; 1 = one-way H10 PowHash seed
     volatile __global u64* winner,
     __local uint* scratch)                     // V4_NPG * V4WSP_STRIP_U32 u32 = 24 KB
 {
@@ -630,7 +693,7 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma_
     const u64  gsub = (u64)get_group_id(0) * V4_NPG + sub;
     const bool live  = gsub < n_nonces;
     const u64  nonce = nonce_base + (live ? gsub : 0UL);
-    const u64  seed  = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const u64  seed  = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
     __local uint* strip = scratch + sub * V4WSP_STRIP_U32;
     __local uint* sA = strip;
     __local uint* sB = strip + 256;
