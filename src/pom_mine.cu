@@ -21,27 +21,77 @@ __device__ __forceinline__ unsigned long long pom_seed_fold(
     return s;
 }
 
-// H10 one-way seed fold — PLACEHOLDER, byte-identical to src/pom.rs::pom_seed_fold_v4_h10.
-// 🔴 NOT the node's formula (not public until the afternoon release). The host guard
-// (pom::H10_SPEC_VERIFIED=false) refuses to launch any H10 job until this is replaced + verified,
-// so this code cannot mine rejected blocks. Replace this body AND the Rust mirror together.
-__device__ __forceinline__ unsigned long long pom_seed_fold_h10(
-    unsigned long long nonce, unsigned long long time_,
-    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3) {
-    const unsigned long long in[6] = { nonce, time_, p0, p1, p2, p3 };
-    unsigned long long s = 0x686B727848313053ULL; // domain tag, matches the Rust mirror exactly
-    #pragma unroll
-    for (int i = 0; i < 6; i++) {
-        s = ((s << 23) | (s >> 41)) ^ in[i];          // rotate_left(23) ^ w
-        s *= 0x9E3779B97F4A7C15ULL;
-        s ^= s >> 29;
-        s += 0xD6E8FEB86659FD93ULL * (unsigned long long)(i + 1);
+// ── H10 one-way seed = leading 64 bits of PowHash (cSHAKE256 "ProofOfWorkHash"). ──
+// Keccak-f[1600] permutation, byte-identical to the host keccak::f1600 and to
+// miner-upstream v0.5.3's cuda/keccak_f1600.cuh. Verified vs the node's pinned golden vectors.
+__device__ __forceinline__ unsigned long long keccak_rotl64(unsigned long long x, unsigned int n) {
+    return (x << n) | (x >> (64u - n));
+}
+__device__ __forceinline__ void keccak_f1600(unsigned long long st[25]) {
+    const unsigned long long RC[24] = {
+        0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL, 0x8000000080008000ULL,
+        0x000000000000808bULL, 0x0000000080000001ULL, 0x8000000080008081ULL, 0x8000000000008009ULL,
+        0x000000000000008aULL, 0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000aULL,
+        0x000000008000808bULL, 0x800000000000008bULL, 0x8000000000008089ULL, 0x8000000000008003ULL,
+        0x8000000000008002ULL, 0x8000000000000080ULL, 0x000000000000800aULL, 0x800000008000000aULL,
+        0x8000000080008081ULL, 0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL};
+    const unsigned int RHO[24] = {1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44};
+    const unsigned int PI[24] = {10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1};
+    unsigned long long bc[5];
+    #pragma unroll 1
+    for (int round = 0; round < 24; round++) {
+        #pragma unroll
+        for (int i = 0; i < 5; i++) bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
+        #pragma unroll
+        for (int i = 0; i < 5; i++) {
+            const unsigned long long t = bc[(i + 4) % 5] ^ keccak_rotl64(bc[(i + 1) % 5], 1);
+            #pragma unroll
+            for (int j = 0; j < 25; j += 5) st[j + i] ^= t;
+        }
+        unsigned long long t = st[1];
+        #pragma unroll
+        for (int i = 0; i < 24; i++) {
+            const unsigned int j = PI[i];
+            const unsigned long long tmp = st[j];
+            st[j] = keccak_rotl64(t, RHO[i]);
+            t = tmp;
+        }
+        #pragma unroll
+        for (int j = 0; j < 25; j += 5) {
+            #pragma unroll
+            for (int i = 0; i < 5; i++) bc[i] = st[j + i];
+            #pragma unroll
+            for (int i = 0; i < 5; i++) st[j + i] ^= (~bc[(i + 1) % 5]) & bc[(i + 2) % 5];
+        }
+        st[0] ^= RC[round];
     }
-    s ^= s >> 32; s *= 0xBF58476D1CE4E5B9ULL; s ^= s >> 30;
-    return s;
 }
 
-// Select the seed fold for the era. h10 != 0 → one-way H10 fold; else the reversible v4 fold.
+// Initial sponge state of cSHAKE256("ProofOfWorkHash") — MUST equal src/pom.rs POW_HASH_INITIAL_STATE.
+__device__ __constant__ unsigned long long POW_HASH_INITIAL_STATE[25] = {
+    1242148031264380989ULL, 3008272977830772284ULL, 2188519011337848018ULL, 1992179434288343456ULL, 8876506674959887717ULL,
+    5399642050693751366ULL, 1745875063082670864ULL, 8605242046444978844ULL, 17936695144567157056ULL, 3343109343542796272ULL,
+    1123092876221303306ULL, 4963925045340115282ULL, 17037383077651887893ULL, 16629644495023626889ULL, 12833675776649114147ULL,
+    3784524041015224902ULL, 1082795874807940378ULL, 13952716920571277634ULL, 13411128033953605860ULL, 15060696040649351053ULL,
+    9928834659948351306ULL, 5237849264682708699ULL, 12825353012139217522ULL, 6706187291358897596ULL, 196324915476054915ULL};
+
+// H10 seed for one nonce. r0..r3 = RAW pre_pow_hash LE u64 words (NOT v4-salted). Absorbs
+// pph→[0..3], timestamp→[4], nonce→[9] into the pre-padded sponge, one f1600, returns lane 0.
+__device__ __forceinline__ unsigned long long pom_seed_fold_h10(
+    unsigned long long nonce, unsigned long long time_,
+    unsigned long long r0, unsigned long long r1, unsigned long long r2, unsigned long long r3) {
+    unsigned long long st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; i++) st[i] = POW_HASH_INITIAL_STATE[i];
+    st[0] ^= r0; st[1] ^= r1; st[2] ^= r2; st[3] ^= r3;
+    st[4] ^= time_;
+    st[9] ^= nonce;
+    keccak_f1600(st);
+    return st[0];
+}
+
+// Select the seed fold for the era. h10 != 0 → one-way H10 PowHash (p0..p3 = RAW pph words); else
+// the reversible v4 fold (p0..p3 = v4-salted words). The host supplies the correct words per era.
 __device__ __forceinline__ unsigned long long pom_seed_fold_era(
     unsigned int h10, unsigned long long nonce, unsigned long long time_,
     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3) {

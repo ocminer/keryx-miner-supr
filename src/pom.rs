@@ -171,7 +171,7 @@ pub fn le_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 }
 
 #[inline]
-fn pph_words(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
+pub fn pph_words(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
     let mut w = [0u64; 4];
     for (i, wi) in w.iter_mut().enumerate() {
         *wi = u64::from_le_bytes(pre_pow_hash[i * 8..i * 8 + 8].try_into().unwrap());
@@ -301,69 +301,83 @@ pub fn pom_block_seed_v4(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) ->
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
-// H10 — ONE-WAY SEED DERIVATION (hardfork DAA 87_440_000, ~2026-08-30 20:00 UTC).
+// H10 — ONE-WAY SEED DERIVATION (hardfork DAA 87_360_000, node v1.5.7 / miner-upstream v0.5.3).
 //
 // WHY: the v4 seed above folds (nonce,timestamp,pph) through a chain of `mix64`, and mix64 is a
 // BIJECTION — so `nonce → seed` is invertible. A miner inverts it to STEER the seed toward a cheap
 // walk (a seed whose offset chain stays inside a tiny resident sub-table, or reaches a precomputed
 // final_state): valid proof, a fraction of the real work. Observed since 27/08 (~22% of blocks).
-// H10 replaces the reversible fold with a ONE-WAY (cryptographic) derivation over the SAME inputs;
-// proof format and the memory walk are UNCHANGED (per the hardfork announcement) — only `seed`
-// changes. Gated at DAA `POM_H10_SEED_ACTIVATION_DAA`.
-//
-// 🔴🔴🔴 THE EXACT ONE-WAY FORMULA + BYTE LAYOUT IS NOT YET PUBLIC (node ships it this afternoon).
-// `pom_seed_fold_v4_h10` below is an UNVERIFIED PLACEHOLDER. It is byte-identical to the GPU mirror
-// `pom_mine.cu::pom_seed_fold_h10` (proven by the h10 host↔GPU lockstep test), so the WIRING is
-// validated — but it is almost certainly NOT what the node ships. DO NOT flip `H10_SPEC_VERIFIED`
-// to true until this function reproduces the node's golden vectors byte-for-byte. While it is
-// false the miner REFUSES to grind any H10-era job (see pom_gpu::mine_v4) — it can never mine
-// rejected blocks. See docs/H10_PORT.md for the finalize checklist.
+// H10 replaces the reversible fold with a ONE-WAY derivation: the H10 seed = leading 64 bits of
+// `PowHash(pre_pow_hash, timestamp, nonce)` = cSHAKE256("ProofOfWorkHash"). Proof format and the
+// memory walk are UNCHANGED — only `seed` changes. Gated at DAA `POM_H10_SEED_ACTIVATION_DAA`.
+// The H10 seed uses the RAW pre_pow_hash (NOT the v4-salted words). BYTE-IDENTICAL to the node's
+// consensus/core/src/pom.rs::pom_block_seed_h10 and to miner-upstream v0.5.3 (verified against the
+// pinned cross-impl golden vectors — see seed_h10_tests). GPU mirror: pom_mine.cu::pom_seed_h10.
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// H10 activation DAA. MUST equal the node's gate constant when the release lands (announced
-/// 87_440_000). Placeholder-verified against the announcement only.
-pub const POM_H10_SEED_ACTIVATION_DAA: u64 = 87_440_000;
+/// H10 activation DAA (mainnet). MUST equal the node's `H10_ACTIVATION_DAA` (v1.5.7 = 87_360_000)
+/// and miner-upstream v0.5.3's `h10_activation_daa()`. Overridable via `KERYX_POM_H10_ACTIVATION_DAA`
+/// for STAGING / pre-fork live-path testing ONLY (same pattern as `activation_daa()`).
+pub const POM_H10_SEED_ACTIVATION_DAA: u64 = 87_360_000;
 
-/// HARD SAFETY LATCH. `false` = the H10 seed formula below is an unverified placeholder, so the
-/// miner refuses to grind the H10 era (no phantom hashrate, no rejected blocks). Flip to `true`
-/// ONLY after `pom_seed_fold_v4_h10` reproduces the node's official golden vectors byte-for-byte.
-pub const H10_SPEC_VERIFIED: bool = false;
-
-/// PLACEHOLDER one-way v4 seed fold (H10). Byte-identical to `pom_mine.cu::pom_seed_fold_h10`.
-/// Structure — an avalanche/absorb over (nonce,timestamp,pph_words) with no invertible tail — is a
-/// stand-in for the node's cryptographic derivation; the REAL formula replaces this body verbatim
-/// in BOTH mirrors when the spec lands. Inputs are the v4-salted pph words, same as pre-H10.
-#[inline]
-pub fn pom_seed_fold_v4_h10(p: &[u64; 4], timestamp: u64, nonce: u64) -> u64 {
-    // NOTE: placeholder cascade (NOT the node formula). Absorbs each input with a distinct odd
-    // multiplier + rotate so no single mix64-inverse recovers the nonce. Domain-separated by a
-    // constant so it can never collide with the pre-H10 fold.
-    let mut s: u64 = 0x686B_7278_4831_3053; // "hkrxH10S"-ish domain tag
-    for (i, &w) in [nonce, timestamp, p[0], p[1], p[2], p[3]].iter().enumerate() {
-        s = s.rotate_left(23) ^ w;
-        s = s.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        s ^= s >> 29;
-        s = s.wrapping_add(0xD6E8_FEB8_6659_FD93_u64.wrapping_mul(i as u64 + 1));
-    }
-    s ^= s >> 32; s = s.wrapping_mul(0xBF58_476D_1CE4_E5B9); s ^= s >> 30;
-    s
+pub fn h10_activation_daa() -> u64 {
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("KERYX_POM_H10_ACTIVATION_DAA")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(POM_H10_SEED_ACTIVATION_DAA)
+    })
 }
 
-/// v4 block seed for the era selected by `h10`. Below the gate = the reversible v4 fold; at/after =
-/// the one-way H10 fold. Both use the v4-salted pph words.
+/// Real formula shipped and golden-verified (node v1.5.7 + miner-upstream v0.5.3).
+pub const H10_SPEC_VERIFIED: bool = true;
+
+/// Initial sponge state of `cSHAKE256("ProofOfWorkHash")` — domain + cSHAKE padding pre-absorbed.
+/// MUST equal the node's `PowHash::INITIAL_STATE`. (Copied verbatim from the node / miner-upstream.)
+#[rustfmt::skip]
+const POW_HASH_INITIAL_STATE: [u64; 25] = [
+    1242148031264380989, 3008272977830772284, 2188519011337848018, 1992179434288343456, 8876506674959887717,
+    5399642050693751366, 1745875063082670864, 8605242046444978844, 17936695144567157056, 3343109343542796272,
+    1123092876221303306, 4963925045340115282, 17037383077651887893, 16629644495023626889, 12833675776649114147,
+    3784524041015224902, 1082795874807940378, 13952716920571277634, 13411128033953605860, 15060696040649351053,
+    9928834659948351306, 5237849264682708699, 12825353012139217522, 6706187291358897596, 196324915476054915,
+];
+
+/// Sponge state with `pre_pow_hash` (RAW, 4 LE u64) and `timestamp` absorbed, before the nonce.
+/// The GPU kernels build the equivalent state and absorb the nonce per candidate.
+pub fn pom_seed_h10_state(pre_pow_hash: &[u8; 32], timestamp: u64) -> [u64; 25] {
+    let mut st = POW_HASH_INITIAL_STATE;
+    for (i, w) in pph_words(pre_pow_hash).iter().enumerate() {
+        st[i] ^= w;
+    }
+    st[4] ^= timestamp;
+    st
+}
+
+/// H10 block seed: leading 64 bits of `PowHash(pre_pow_hash, timestamp, nonce)`.
+/// BYTE-IDENTICAL to the node's `pom_block_seed_h10`. Mirror: `pom_mine.cu::pom_seed_h10`.
+pub fn pom_block_seed_h10(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    let mut st = pom_seed_h10_state(pre_pow_hash, timestamp);
+    st[9] ^= nonce;
+    crate::keccak::f1600(&mut st);
+    st[0]
+}
+
+/// v4 block seed for the era selected by `h10`. Below the gate = the reversible v4 fold (v4-salted
+/// words); at/after = the one-way H10 PowHash over the RAW pre_pow_hash.
 pub fn pom_block_seed_v4_era(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h10: bool) -> u64 {
-    let p = pph_words_v4(pre_pow_hash);
     if h10 {
-        pom_seed_fold_v4_h10(&p, timestamp, nonce)
+        pom_block_seed_h10(pre_pow_hash, timestamp, nonce)
     } else {
-        pom_block_seed_from_words(&p, timestamp, nonce)
+        pom_block_seed_v4(pre_pow_hash, timestamp, nonce)
     }
 }
 
 /// Whether a block at `daa` is in the H10 one-way-seed era.
 #[inline]
 pub fn is_h10_seed_era(daa: u64) -> bool {
-    daa >= POM_H10_SEED_ACTIVATION_DAA
+    daa >= h10_activation_daa()
 }
 
 pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
@@ -1893,32 +1907,27 @@ mod tests {
     /// test becomes the byte-for-byte gate that authorizes flipping `H10_SPEC_VERIFIED`.
     #[test]
     fn h10_seed_properties_and_golden() {
-        // Determinism + domain separation from the reversible fold (holds for the placeholder AND
-        // for any real one-way fold, so this stays valid after the formula is swapped in).
+        // OFFICIAL cross-implementation golden vectors — pinned in the node's `pom::seed_h10_tests`
+        // AND miner-upstream v0.5.3, produced by the GPU keccak too (cuda/tests/seed_h10_check.cu).
+        assert_eq!(super::pom_block_seed_h10(&[0u8; 32], 0, 0), 0x1fadaf72b089e024);
         let pph = [0x5au8; 32];
-        let a = super::pom_block_seed_v4_era(&pph, 123, 456, true);
-        let b = super::pom_block_seed_v4_era(&pph, 123, 456, true);
-        assert_eq!(a, b, "H10 seed must be deterministic");
-        assert_ne!(a, super::pom_block_seed_v4_era(&pph, 123, 456, false),
-                   "H10 seed must differ from the reversible v4 seed");
+        let (ts, nonce) = (1_788_000_000_000u64, 0x0123_4567_89ab_cdefu64);
+        let h10 = super::pom_block_seed_h10(&pph, ts, nonce);
+        assert_eq!(h10, 0xcec7e2d9fce5bda6);
+        assert_eq!(super::pom_block_seed_h10(&[0xa5u8; 32], ts, u64::MAX), 0x60977326f8e922ab);
+        // state-level identity: seed == keccak(state; nonce@9)[0]
+        let mut st = super::pom_seed_h10_state(&pph, ts);
+        st[9] ^= nonce;
+        crate::keccak::f1600(&mut st);
+        assert_eq!(h10, st[0]);
+        // era dispatch + properties
+        assert_eq!(super::pom_block_seed_v4_era(&pph, ts, nonce, true), h10);
+        assert_ne!(h10, super::pom_block_seed_v4(&pph, ts, nonce), "H10 must differ from reversible v4");
+        assert_ne!(h10, super::pom_block_seed_h10(&pph, ts, nonce ^ 1));
+        assert_ne!(h10, super::pom_block_seed_h10(&pph, ts + 1, nonce));
         assert!(super::is_h10_seed_era(super::POM_H10_SEED_ACTIVATION_DAA));
         assert!(!super::is_h10_seed_era(super::POM_H10_SEED_ACTIVATION_DAA - 1));
-
-        // OFFICIAL GOLDEN VECTORS — fill from the node release, then this asserts byte-equality.
-        const GOLDEN: &[(u64, u64, [u8; 32], u64)] = &[
-            // (nonce, timestamp, pre_pow_hash, expected_seed) — EMPTY until the node spec lands.
-        ];
-        for &(nonce, ts, pph, want) in GOLDEN {
-            assert_eq!(super::pom_block_seed_v4_era(&pph, ts, nonce, true), want,
-                       "H10 golden mismatch at nonce {nonce}: seed formula != node");
-        }
-        if GOLDEN.is_empty() && !super::H10_SPEC_VERIFIED {
-            eprintln!("H10: golden vectors EMPTY, H10_SPEC_VERIFIED=false — placeholder formula, \
-                       miner refuses H10-era mining (expected until the node spec lands).");
-        }
-        // Guard against shipping a verified flag with no golden vectors backing it.
-        assert!(!(super::H10_SPEC_VERIFIED && GOLDEN.is_empty()),
-                "H10_SPEC_VERIFIED must not be true while the golden vectors are empty");
+        assert_eq!(super::POM_H10_SEED_ACTIVATION_DAA, 87_360_000, "H10 gate must equal the node's");
     }
 
 }

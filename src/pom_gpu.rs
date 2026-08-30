@@ -683,9 +683,15 @@ impl PomGpuMiner {
         if n_tiles == 0 {
             return Err(candle_core::Error::Msg("PoM GPU: blob too small for the v4 walk".into()));
         }
-        // POW fold words = H3-salted pph ("v4 pow uses the h3 fold"); SEED words = v4-salted pph.
+        // POW fold words = H3-salted pph ("v4 pow uses the h3 fold"). SEED words depend on the era:
+        // pre-H10 = v4-salted pph (reversible fold); H10 = RAW pph words (the kernel's keccak absorbs
+        // them into the cSHAKE256 PowHash sponge). The `h10` flag below tells the kernel which fold.
         let p = crate::pom::pph_words_for_era(pre_pow_hash, true);
-        let s = crate::pom::pph_words_v4(pre_pow_hash);
+        let s = if h10_era {
+            crate::pom::pph_words(pre_pow_hash)
+        } else {
+            crate::pom::pph_words_v4(pre_pow_hash)
+        };
         let t = words4(target_le);
         let k = crate::pom_v4::POM_V4_K as u32;
         bind_device_ctx(&self.stream)?; // multi-GPU: bind this device's context before the raw launch
