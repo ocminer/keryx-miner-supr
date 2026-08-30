@@ -312,6 +312,9 @@ pub struct EscrowWatcher {
     validation_pending: HashSet<String>,
     /// Entries purged by boot-time validation, for the completion log line.
     validation_purged: u64,
+    /// Blocks the node could not return during boot-time validation (pruned or not yet
+    /// synced): their entries are kept, the claim path decides.
+    validation_unknown: u64,
 }
 
 /// A claim TX submitted to the node, awaiting its SubmitTransactionResponse.
@@ -371,6 +374,7 @@ impl EscrowWatcher {
             blocks_since_status: 0,
             validation_pending: HashSet::new(),
             validation_purged: 0,
+            validation_unknown: 0,
         };
         watcher.rebuild_indexes();
         Ok(watcher)
@@ -632,6 +636,7 @@ impl EscrowWatcher {
         }
         self.validation_pending = hashes.clone();
         self.validation_purged = 0;
+        self.validation_unknown = 0;
         if !self.validation_pending.is_empty() {
             info!(
                 "EscrowWatcher: validating {} block(s) against the node before claiming — ghost entries will be purged",
@@ -660,14 +665,20 @@ impl EscrowWatcher {
             }
             self.mark_dirty();
         }
-        if self.validation_pending.is_empty() {
-            info!(
-                "EscrowWatcher: state validation complete — {} ghost entr{} purged, claiming enabled",
-                self.validation_purged,
-                if self.validation_purged == 1 { "y" } else { "ies" }
-            );
-            self.maybe_flush();
+        self.finish_validation_if_done();
+    }
+
+    fn finish_validation_if_done(&mut self) {
+        if !self.validation_pending.is_empty() {
+            return;
         }
+        info!(
+            "EscrowWatcher: state validation complete — {} ghost entr{} purged, {} block(s) unknown to the node (entries kept), claiming enabled",
+            self.validation_purged,
+            if self.validation_purged == 1 { "y" } else { "ies" },
+            self.validation_unknown
+        );
+        self.maybe_flush();
     }
 
     /// True while boot-time validation is still awaiting node answers.
@@ -676,14 +687,19 @@ impl EscrowWatcher {
     }
 
     /// Match a GetBlock error message against the pending validation set (the node's
-    /// "cannot find header <hash>" text embeds the hash). Returns true when consumed:
-    /// the block does not exist on this chain, its entries are ghosts and get purged.
+    /// "cannot find header <hash>" text embeds the hash). Returns true when consumed.
+    /// A block the node cannot return is unknown, not a ghost: a pruned node forgets
+    /// coinbases whose outputs are still unspent. The entries stay; a real ghost is
+    /// rejected at claim time and retired by the orphan path.
     pub fn on_block_validation_error(&mut self, message: &str) -> bool {
         let hash = match self.validation_pending.iter().find(|h| message.contains(h.as_str())) {
             Some(h) => h.clone(),
             None => return false,
         };
-        self.on_block_validated(&hash, false);
+        self.validation_pending.remove(&hash);
+        self.validation_unknown += 1;
+        debug!("EscrowWatcher: block {} unknown to the node at boot — entries kept", hash);
+        self.finish_validation_if_done();
         true
     }
 

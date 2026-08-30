@@ -549,7 +549,7 @@ impl KeryxdHandler {
 
         let ipfs_url = self.ipfs_url.clone();
         let result_clone = result.clone();
-        let cid = match tokio::task::spawn_blocking(move || crate::ipfs::upload(&result_clone, &ipfs_url)).await {
+        let cid = match tokio::task::spawn_blocking(move || crate::ipfs::upload_with_recovery(&result_clone, &ipfs_url)).await {
             Ok(Ok(cid)) => cid,
             Ok(Err(e)) => { warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e); return true; }
             Err(e) => { warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e); return true; }
@@ -761,8 +761,8 @@ impl KeryxdHandler {
             Payload::GetBlockResponse(msg) => {
                 let mut was_validation = false;
                 if let Some(e) = msg.error {
-                    // Validation answer: "cannot find header <hash>" — the block never
-                    // existed on this chain, its escrow entries are ghosts.
+                    // Validation answer: "cannot find header <hash>" — unknown to this
+                    // node (pruned or not yet synced), the entries are kept.
                     was_validation = self
                         .escrow_watcher
                         .as_mut()
