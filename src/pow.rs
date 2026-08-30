@@ -230,7 +230,9 @@ impl State {
         // Merkle range proof each against R_T. A GPU false-positive is caught by the target re-check
         // below and dropped, never submitted. The header carries `final_state` (the pool fills
         // `pomFinalState` on submitBlock; the solo `FullBlock` path fills it in `assemble_pom_block`).
-        let seed = pom::pom_block_seed_v4(&pph, timestamp, nonce);
+        // H10 (DAA >= gate): the host proof MUST be rebuilt with the SAME one-way seed the GPU
+        // walk used, or the tile paths mismatch the verifier's H10 walk (BadTilePath rejection).
+        let seed = pom::pom_block_seed_v4_era(&pph, timestamp, nonce, pom::is_h10_seed_era(self.daa_score));
         let (v4, final_state) = pom_v4::build_proof_v4(tier, seed, index)
             .map_err(|e| info!("PoM v4 proof build failed: {e}"))
             .ok()?;
