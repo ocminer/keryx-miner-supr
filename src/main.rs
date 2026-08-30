@@ -690,6 +690,18 @@ fn tokio_blocking_threads() -> Option<usize> {
 }
 
 fn main() -> Result<(), Error> {
+    // Force CUDA's device enumeration to PCI-bus order BEFORE any CUDA library initializes. The whole
+    // codebase assumes CUDA's ordinal == nvidia-smi's ordinal (see the CUDA_VISIBLE_DEVICES handling
+    // below and gpu_health.rs) — an assumption that only holds under CUDA_DEVICE_ORDER=PCI_BUS_ID.
+    // Without it CUDA defaults to FASTEST_FIRST, so on a MIXED-VRAM rig the runtime/ggml layer and the
+    // keryxcuda PoM plugin enumerate the cards in DIFFERENT orders: auto-tier then sizes a model for
+    // one physical card but the PoM walk binds it to another, the oversized model OOMs the smaller
+    // card, and that card's staging failure suspends the WHOLE rig — zero shares. The launcher used to
+    // export this, but a user running the binary directly got none of it. Guarantee it in-process;
+    // an explicit operator setting still wins. (No effect on single-model / homogeneous rigs.)
+    if std::env::var_os("CUDA_DEVICE_ORDER").is_none() {
+        std::env::set_var("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
+    }
     // AMD OpenCL caps a SINGLE cl_mem buffer at CL_DEVICE_MAX_MEM_ALLOC_SIZE. On Polaris (RX 580 and
     // kin) that cap is often ~25% of VRAM (or a hard ~4 GB), which was fine for the old ≤2.5 GB tier
     // blobs (Gemma/EXAONE) but is TOO SMALL for the post-H5 tier-0 model: the Qwen3-8B possession
