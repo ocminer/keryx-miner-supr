@@ -675,8 +675,11 @@ impl PomGpuMiner {
     /// Byte-exact mirror of `pom_v4::v4_walk` on the GPU. Returns the lowest winning nonce
     /// (`era_pow_fold(fold64(v4_state_root(S_K))) <= target`), or None. Dynamic shared = 2 KB
     /// (one 1 KB tile + fold scratch). The v4 SEED uses the v4 pph salt; the POW fold stays H3.
-    pub fn mine_v4(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> candle_core::Result<Option<u64>> {
+    pub fn mine_v4(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h10_era: bool) -> candle_core::Result<Option<u64>> {
         let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        // H10 one-way seed selector, passed verbatim to every walk/chase kernel (byte-identical
+        // dispatch to pom.rs::pom_block_seed_v4_era). 0 = reversible v4 fold; 1 = one-way H10 fold.
+        let h10: u32 = if h10_era { 1 } else { 0 };
         if n_tiles == 0 {
             return Err(candle_core::Error::Msg("PoM GPU: blob too small for the v4 walk".into()));
         }
@@ -715,7 +718,7 @@ impl PomGpuMiner {
                 .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
                 .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
                 .arg(&start).arg(&batch)
-                .arg(&*lut).arg(&lut_sh).arg(&inv_n).arg(&winner);
+                .arg(&*lut).arg(&lut_sh).arg(&inv_n).arg(&h10).arg(&winner);
             unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
         } else if tc_wanted && self.v4_tc_usable(n_tiles, k, &p, &s, timestamp) {
             // Tensor-core solver: resolve the whole tile-offset chain first (it depends only on
@@ -787,7 +790,7 @@ impl PomGpuMiner {
                 let mut b = chase.builder();
                 b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
                     .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
-                    .arg(&start).arg(&batch).arg(&view);
+                    .arg(&start).arg(&batch).arg(&h10).arg(&view);
                 unsafe { b.launch(chase_cfg(batch)).map_err(candle_core::Error::wrap)?; }
             }
 
@@ -805,7 +808,7 @@ impl PomGpuMiner {
                     .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
                     .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
                     .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
-                    .arg(&start).arg(&batch).arg(&view).arg(&winner);
+                    .arg(&start).arg(&batch).arg(&view).arg(&h10).arg(&winner);
                 unsafe { b.launch(walk_cfg).map_err(candle_core::Error::wrap)?; }
             }
 
@@ -820,7 +823,7 @@ impl PomGpuMiner {
                 let mut b = cs.launch_builder(&func);
                 b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
                     .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
-                    .arg(&next_start).arg(&batch).arg(&view);
+                    .arg(&next_start).arg(&batch).arg(&h10).arg(&view);
                 unsafe { b.launch(chase_cfg(batch)).map_err(candle_core::Error::wrap)?; }
                 // The next walk runs on the main stream, so it must not start before this chase
                 // finishes — record the dependency now, honoured at the top of the next call.
@@ -841,7 +844,7 @@ impl PomGpuMiner {
                 .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
                 .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
                 .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
-                .arg(&start).arg(&batch).arg(&winner);
+                .arg(&start).arg(&batch).arg(&h10).arg(&winner);
             unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
         }
         self.stream.synchronize().map_err(candle_core::Error::wrap)?;
@@ -958,10 +961,11 @@ dp4a kernel.", ord);
         let view = offsets
             .try_slice(0..k as usize)
             .ok_or_else(|| candle_core::Error::Msg("PoM v4 probe: offsets slice".into()))?;
+        let h0: u32 = 0; // probes always exercise the pre-H10 (reversible) seed fold
         let mut b = chase.builder();
         b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
             .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
-            .arg(&start).arg(&batch).arg(&view);
+            .arg(&start).arg(&batch).arg(&h0).arg(&view);
         unsafe {
             b.launch(LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
                 .map_err(candle_core::Error::wrap)?;
@@ -972,7 +976,7 @@ dp4a kernel.", ord);
             .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
             .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
             .arg(&t_max[0]).arg(&t_max[1]).arg(&t_max[2]).arg(&t_max[3])
-            .arg(&start).arg(&batch).arg(&view).arg(&winner);
+            .arg(&start).arg(&batch).arg(&view).arg(&h0).arg(&winner);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (1, 1, 1),
@@ -1104,7 +1108,7 @@ chase+tensor-core path.", ord);
             .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
             .arg(&t_max[0]).arg(&t_max[1]).arg(&t_max[2]).arg(&t_max[3])
             .arg(&start).arg(&batch)
-            .arg(&*lut).arg(&lut_sh).arg(&inv_n).arg(&winner);
+            .arg(&*lut).arg(&lut_sh).arg(&inv_n).arg(&0u32).arg(&winner);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (1, 1, 1),
@@ -1887,11 +1891,11 @@ fn v4_tune_save(key: &str, t: V4Tune, mhs: f64) {
 fn v4_bench_cfg(device_id: u32, miner: &PomGpuMiner, pph: &[u8; 32], ts: u64, t: V4Tune, ms: u64) -> Option<f64> {
     let never = [0u8; 32];
     set_v4_tune(device_id, t);
-    miner.mine_v4(pph, ts, &never, 1, t.batch).ok()?; // warm-up: JIT, buffer alloc, clocks
+    miner.mine_v4(pph, ts, &never, 1, t.batch, false).ok()?; // warm-up: JIT, buffer alloc, clocks
     let started = std::time::Instant::now();
     let mut n: u64 = 0;
     while started.elapsed() < std::time::Duration::from_millis(ms) {
-        miner.mine_v4(pph, ts, &never, 1 + n, t.batch).ok()?;
+        miner.mine_v4(pph, ts, &never, 1 + n, t.batch, false).ok()?;
         n += t.batch;
     }
     let secs = started.elapsed().as_secs_f64();
@@ -2090,11 +2094,11 @@ fn v4_config_agrees_with_reference(device_id: u32, miner: &PomGpuMiner, cand: V4
     let probe = 4096u64;
     let reference = {
         set_v4_tune(device_id, V4Tune { ncf: false, tc: false, batch: probe });
-        miner.mine_v4(&pph, ts, &target, 1, probe)
+        miner.mine_v4(&pph, ts, &target, 1, probe, false)
     };
     let candidate = {
         set_v4_tune(device_id, V4Tune { batch: probe, ..cand });
-        miner.mine_v4(&pph, ts, &target, 1, probe)
+        miner.mine_v4(&pph, ts, &target, 1, probe, false)
     };
     match (reference, candidate) {
         (Ok(a), Ok(b)) => a == b,
@@ -2122,7 +2126,26 @@ fn ensure_v4_autotuned(device_id: u32, miner: &PomGpuMiner) {
     }
 }
 
-pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
+pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, daa: u64) -> Option<u64> {
+    // H10 (DAA >= POM_H10_SEED_ACTIVATION_DAA): one-way seed derivation.
+    let h10_era = crate::pom::is_h10_seed_era(daa);
+    // 🔴 HARD SAFETY GUARD: the H10 seed formula is an UNVERIFIED PLACEHOLDER until the node's
+    // spec lands and pom::pom_seed_fold_v4_h10 is confirmed byte-for-byte. Mining the H10 era with
+    // a wrong seed = 100% rejected blocks + service-bond strikes. So while the spec is unverified,
+    // REFUSE to grind any H10-era job: no launch, no phantom hashrate (returns None → the worker
+    // idles honestly and retries; nothing is counted). Pre-H10 mining is unaffected.
+    if h10_era && !crate::pom::H10_SPEC_VERIFIED {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log::error!(
+                "PoM[gpu{}]: block DAA {} is in the H10 one-way-seed era but this build's H10 seed \
+                 formula is an UNVERIFIED PLACEHOLDER — NOT mining (would produce rejected blocks). \
+                 Update to the release whose seed is verified against the node's golden vectors.",
+                device_id, daa
+            );
+        }
+        return None;
+    }
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
@@ -2144,7 +2167,7 @@ pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_l
     }
     // First grind on this card: measure its launch geometry (cached on disk, so this is a one-off).
     ensure_v4_autotuned(device_id, &miner);
-    let outcome = miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch);
+    let outcome = miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch, h10_era);
     match outcome {
         Ok(w) => w,
         Err(e) => {
@@ -2877,6 +2900,35 @@ mod v4_kernel_tests {
         v
     }
 
+    /// H10 one-way seed: proves the GPU kernel's `pom_seed_fold_h10` is BYTE-IDENTICAL to the host
+    /// `pom::pom_seed_fold_v4_h10` — i.e. the h10 dispatch is wired correctly through the launch.
+    /// This validates the WIRING against the placeholder formula (host and GPU agree); it does NOT
+    /// validate the formula against the node — that is the golden-vector step, gated on the real
+    /// spec. The bracket: build the proof from the host H10 seed, then the GPU must WIN at the host
+    /// pow target and LOSE one below it, with h10_era=true.
+    #[test]
+    #[ignore]
+    fn v4_h10_seed_host_gpu_lockstep() {
+        let data = blob(2048);
+        let index = crate::pom::index_from_ram(data.clone());
+        let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
+        for &nonce in &[7u64, 42, 1000, 65535] {
+            // Host reference: the H10-era seed (one-way fold), then the standard v4 proof/pow.
+            let seed = crate::pom::pom_block_seed_v4_era(&PPH, TS, nonce, true);
+            // Sanity: the H10 seed must actually differ from the reversible one (formula changed).
+            assert_ne!(seed, crate::pom::pom_block_seed_v4_era(&PPH, TS, nonce, false),
+                       "H10 seed equals the reversible seed — the fold did not change");
+            let (_v4, fs) = crate::pom_v4::build_proof_v4(0, seed, &index).unwrap();
+            let pow = crate::pom::pom_pow_value(fs, &PPH, true);
+            // GPU with h10_era=true must reproduce the SAME final_state → win at pow, lose below it.
+            assert_eq!(miner.mine_v4(&PPH, TS, &pow, nonce, 1, true).unwrap(), Some(nonce),
+                       "H10: GPU seed fold != host at nonce {nonce} (win check)");
+            assert_eq!(miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1, true).unwrap(), None,
+                       "H10: GPU found nonce below host pow at {nonce} (lose check)");
+        }
+        println!("H10 host↔GPU seed lockstep OK (placeholder formula; wiring validated)");
+    }
+
     /// Reports (visibly, with --nocapture) which walk kernel this GPU resolves to, and proves the
     /// resolved kernel is BIT-EXACT vs the host walk. Run per card / per package to verify that an
     /// Ampere+ card really gets the tensor-core walk (modern package) and that a stub-only image
@@ -2898,9 +2950,9 @@ mod v4_kernel_tests {
         let re = crate::pom_v4::verify_proof_v4(seed, &v4, &index.r_t, index.n_chunks).unwrap();
         assert_eq!(re, fs);
         let pow = crate::pom::pom_pow_value(fs, &PPH, true);
-        assert_eq!(miner.mine_v4(&PPH, TS, &pow, nonce, 1).unwrap(), Some(nonce),
+        assert_eq!(miner.mine_v4(&PPH, TS, &pow, nonce, 1, false).unwrap(), Some(nonce),
                    "[{kind}] GPU did not find the nonce at the host pow target — divergence");
-        assert_eq!(miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1).unwrap(), None,
+        assert_eq!(miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1, false).unwrap(), None,
                    "[{kind}] GPU found the nonce below the host pow — divergence");
         println!("BIT-EXACT OK on the {kind} walk");
     }
@@ -2924,7 +2976,7 @@ mod v4_kernel_tests {
         let pow = crate::pom::pom_pow_value(fs, &PPH, true);
         let sweep = |prefetch: &str| -> Vec<Option<u64>> {
             std::env::set_var("KERYX_POM_V4_CHASE_PREFETCH", prefetch);
-            (0..6).map(|i| miner.mine_v4(&PPH, TS, &pow, i * B, B).unwrap()).collect()
+            (0..6).map(|i| miner.mine_v4(&PPH, TS, &pow, i * B, B, false).unwrap()).collect()
         };
         let on = sweep("1");
         let off = sweep("0");
@@ -3081,11 +3133,11 @@ mod v4_kernel_tests {
         let batch: u64 = std::env::var("KERYX_POM_V4_BATCH").ok()
             .and_then(|s| s.parse().ok()).unwrap_or(1 << 16);
         // warmup
-        let _ = miner.mine_v4(&PPH, TS, &target, 0, batch).unwrap();
+        let _ = miner.mine_v4(&PPH, TS, &target, 0, batch, false).unwrap();
         let t0 = std::time::Instant::now();
         let mut nonces = 0u64;
         while t0.elapsed().as_secs() < secs {
-            let _ = miner.mine_v4(&PPH, TS, &target, nonces, batch).unwrap();
+            let _ = miner.mine_v4(&PPH, TS, &target, nonces, batch, false).unwrap();
             nonces += batch;
         }
         let el = t0.elapsed().as_secs_f64();
@@ -3117,13 +3169,13 @@ mod v4_kernel_tests {
                 let pow = crate::pom::pom_pow_value(fs, &PPH, true);
                 // GPU wins at target == host pow_value ...
                 assert_eq!(
-                    miner.mine_v4(&PPH, TS, &pow, nonce, 1).unwrap(),
+                    miner.mine_v4(&PPH, TS, &pow, nonce, 1, false).unwrap(),
                     Some(nonce),
                     "[{tag}] GPU did NOT find nonce {nonce} at host pow target — GPU pow > host pow (divergence)"
                 );
                 // ... and LOSES one below it -> GPU pow == host pow exactly (byte-exact final_state).
                 assert_eq!(
-                    miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1).unwrap(),
+                    miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1, false).unwrap(),
                     None,
                     "[{tag}] GPU found nonce {nonce} below host pow — GPU pow < host pow (divergence)"
                 );
