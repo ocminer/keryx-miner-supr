@@ -273,10 +273,68 @@ fn so_path() -> Option<std::path::PathBuf> {
 /// picks the right OS primitive (dlopen / LoadLibrary), so this works on Linux, macOS AND Windows.
 /// The handle is never dropped (never dlclose/FreeLibrary'd), so fn pointers copied out via `sym`
 /// stay valid for the whole run — matching the old leak-the-dlopen-handle behavior.
+/// Preload the CUDA runtime libs that ship in the `lib/` folder NEXT TO `libkeryx-llama.so`, by
+/// ABSOLUTE PATH into the GLOBAL symbol namespace, BEFORE the engine itself is dlopen'd.
+///
+/// Why this exists: the prebuilt `libkeryx-llama.so` has a DT_NEEDED on `libcudart.so.12`,
+/// `libcublas.so.12`, etc. but carries NO rpath — so the dynamic loader finds those bundled libs
+/// only when `LD_LIBRARY_PATH` happens to include the `lib/` dir. A user who runs the binary
+/// directly (no wrapper exporting that variable) gets `libcudart.so.12: cannot open shared object
+/// file`, the engine load fails, OPoI reports "no models ready", and the miner SUSPENDS ALL MINING
+/// — zero shares found, zero accepted. Requiring the user to set an env var is not acceptable.
+///
+/// dlopen'ing each dep by absolute path with RTLD_GLOBAL publishes its soname into the process's
+/// global namespace; the subsequent `Library::new(libkeryx-llama.so)` then satisfies its NEEDED
+/// entries from those already-resident libs WITHOUT any filesystem search — no rpath, no env var.
+/// Best-effort: a system-wide CUDA install (no bundled `lib/`) resolves the deps the normal way, so
+/// a missing folder or file is skipped silently. Handles are leaked (never dlclose'd) so the
+/// symbols stay live for the whole run.
+#[cfg(target_os = "linux")]
+fn preload_bundled_cuda_deps(so: &std::path::Path) {
+    use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
+    let Some(lib_dir) = so.parent().map(|d| d.join("lib")) else {
+        return;
+    };
+    if !lib_dir.is_dir() {
+        return; // no bundled libs (e.g. a system-wide CUDA install) — nothing to preload
+    }
+    // Dependency order matters: load each lib AFTER everything it itself NEEDs, so its own
+    // DT_NEEDED entries resolve against the already-global earlier ones. cudart is the leaf;
+    // cublas needs cublasLt + cudart; curand needs cudart.
+    const DEPS: [&str; 4] = [
+        "libcudart.so.12",
+        "libcublasLt.so.12",
+        "libcublas.so.12",
+        "libcurand.so.10",
+    ];
+    for name in DEPS {
+        let p = lib_dir.join(name);
+        if !p.exists() {
+            continue;
+        }
+        // SAFETY: loading a trusted, self-shipped CUDA runtime lib by absolute path; none of its
+        // init code runs Rust. RTLD_GLOBAL publishes its soname so the engine's NEEDED resolves here.
+        match unsafe { UnixLibrary::open(Some(&p), RTLD_NOW | RTLD_GLOBAL) } {
+            Ok(l) => {
+                std::mem::forget(l); // keep resident for the whole process (never dlclose)
+                log::debug!("llama engine: preloaded bundled {}", p.display());
+            }
+            Err(e) => {
+                // Non-fatal: if this dep was truly required the engine load below surfaces the error.
+                log::debug!("llama engine: could not preload {} ({e}) — continuing.", p.display());
+            }
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn preload_bundled_cuda_deps(_so: &std::path::Path) {}
+
 fn engine_lib() -> Option<&'static Library> {
     static LIB: OnceLock<Option<Library>> = OnceLock::new();
     LIB.get_or_init(|| {
         let so = so_path()?;
+        // Make the bundled CUDA runtime (lib/ next to the .so) resolvable WITHOUT LD_LIBRARY_PATH.
+        preload_bundled_cuda_deps(&so);
         // SAFETY: loading a trusted, self-shipped library next to our own binary; no init routine
         // of it runs Rust code. Any load error (missing dep DLL, arch mismatch) is caught below.
         match unsafe { Library::new(&so) } {
