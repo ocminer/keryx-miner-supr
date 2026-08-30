@@ -79,6 +79,27 @@ pub fn is_running(api_url: &str) -> bool {
 
 /// Ensure the IPFS daemon is running. If not, download kubo and start it.
 /// Non-fatal: logs warnings on failure so the miner can still work (without inference rewards).
+/// Upload with recovery: on a LOCAL upload failure, (re)start the daemon and retry exactly once.
+/// Remote endpoints are never auto-managed — their failures propagate unchanged. Captures the
+/// v0.5.3 IPFS reliability fix ("auto-retries failed local uploads once") to protect service bonds
+/// (a dropped inference upload = a missed answer = a service-bond penalty).
+pub fn upload_with_recovery(data: &str, api_url: &str) -> anyhow::Result<[u8; 34]> {
+    match upload(data, api_url) {
+        Ok(cid) => Ok(cid),
+        Err(first_err) => {
+            let local = api_url.contains("127.0.0.1") || api_url.contains("localhost") || api_url.contains("::1");
+            if !local {
+                return Err(first_err);
+            }
+            log::warn!("IPFS upload failed ({}); restarting local daemon and retrying once", first_err);
+            ensure_daemon(api_url); // best-effort (re)start of the local kubo daemon
+            upload(data, api_url).map_err(|e| {
+                anyhow::anyhow!("IPFS upload failed after daemon recovery (original error: {}): {}", first_err, e)
+            })
+        }
+    }
+}
+
 pub fn ensure_daemon(api_url: &str) {
     if is_running(api_url) {
         log::info!("IPFS daemon reachable at {}", api_url);
