@@ -2101,21 +2101,22 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                 record_serveable(model_id); // a live answer is proof this rig can serve the tier
                 return Some(strip_think_tags(&text));
             }
-            // UPSTREAM PARITY (Keryx-Labs slm.rs::load_and_run_inference): the in-process llama
-            // engine IS the host for this model — it is resident on this card (the zero-dup mining
-            // tier) and proved serveable at bring-up. If a single generation fails or comes back
-            // empty, DROP this OPoI response and return None; do NOT fall through to the
-            // llama-server / candle path. That fallback tries to LOAD the model in ANOTHER engine,
-            // and for an H4 arch (Kimi-Linear / GLM-4 / Qwen3.5-SSM — served ONLY by
-            // libkeryx-llama.so) that load fails with "served only by the in-process llama engine",
-            // which used to CASCADE: withdraw the mining model + evict/rebuild the walk → OOM →
-            // the whole rig wedged on a single dropped answer. The model stays declared; the pool
-            // re-challenges and the next generation (a fresh, un-raced call) answers normally.
-            log::warn!(
-                "SlmEngine: in-process llama generate on GPU {} returned nothing for '{}' — dropping this OPoI response (model stays declared; no engine fallback, matching upstream).",
-                gpu, spec.name
-            );
-            return None;
+            // REVERTED in v0.12.6 — do NOT return early here.
+            //
+            // v0.12.4 made this path terminal ("upstream parity") to stop a rare cascade that
+            // wedged a rig. That fix caused a MUCH worse regression: on every MULTI-GPU rig the
+            // cards sat at "preparing" forever with "OPoI: no models ready — mining suspended".
+            // A/B on rig08 (2x 3070 + 1x 5080, same config, healthy cards):
+            //   v0.12.3 -> all three cards mine (1.31 + 1.31 + 3.26 MH/s), probes PASS on GPU 2
+            //   v0.12.5 -> all three stall, self-test FAILS on GPU 1 (a 3070)
+            // Failing fast here makes the self-test probe fail, which fires the inference-host
+            // FAILOVER onto a small card that cannot hold the 12 GB tier; the model is then
+            // withdrawn from ai:cap, loaded_model_ids() goes empty, and EVERY card stalls.
+            // Falling through gives the probe the second chance it needs. The cascade this was
+            // meant to fix hit once in hours; this broke every multi-GPU rig, so the trade is
+            // clear. A safer cascade fix must distinguish the SELF-TEST probe from real OPoI
+            // serving instead of making both terminal.
+            log::warn!("SlmEngine: in-process llama generate failed on GPU {} — trying the next engine.", gpu);
         } else {
             // The in-process engine could not come up for this model on this card (e.g. the .so is
             // absent). Withdraw it from ai:cap so the pool stops routing challenges we cannot answer
