@@ -3300,6 +3300,122 @@ mod v4_kernel_tests {
         println!("BIT-EXACT OK on the {kind} walk");
     }
 
+    /// Little-endian 256-bit compare, matching the kernel's `pom_le_leq` ordering.
+    fn le_cmp(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
+        for i in (0..32).rev() {
+            match a[i].cmp(&b[i]) {
+                std::cmp::Ordering::Equal => continue,
+                other => return other,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    /// REGRESSION GUARD for the warp-once seed bug (`aee3089`, shipped in v0.12.2 … v0.12.7).
+    ///
+    /// "Compute the seed in lane 0 and `__shfl_sync` it across the warp" is only valid where a
+    /// whole warp shares one nonce. `pom_mine_v4` is block-per-nonce and `pom_mine_v4_tc` /
+    /// `pom_mine_v4_ncf` are warp-per-nonce, so those three were correct — but
+    /// `pom_mine_v4_chase` assigns ONE NONCE PER THREAD, so 31 of every 32 chase threads built
+    /// their offset chain from lane 0's seed, i.e. from a *different* nonce. The walk then
+    /// produced a PoW no verifier can reproduce: wasted work, and any hit that did clear the
+    /// target came back from the pool as BadTilePath.
+    ///
+    /// `v4_walk_kind_and_exactness` cannot catch this, for two independent reasons:
+    ///   1. it mines a batch of exactly ONE nonce — that lone chase thread *is* lane 0, so the
+    ///      broadcast is trivially correct at batch size 1; and
+    ///   2. it only exercises the kernel THIS card resolves to, and every GDDR card resolves to
+    ///      `chaseless`, which has no chase phase at all. Only CC 8.0/9.0 defaults to chase+tc.
+    ///
+    /// So: force EVERY walk kind the card can supply, in BOTH seed eras, and place the single
+    /// qualifying nonce at a batch index that is deliberately NOT lane 0 of its warp. Using the
+    /// batch's *minimum* PoW as the target leaves exactly one winner, so `atomicMin` cannot mask
+    /// a wrong answer by returning an earlier nonce that also happened to clear a loose target.
+    ///
+    /// Mutates process-wide kernel-selection env vars, so run it single-threaded:
+    ///   cargo test --features pom-cuda v4_all_kinds -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore]
+    fn v4_all_kinds_exact_with_winner_off_lane_zero() {
+        const BATCH: u64 = 64;
+        let data = blob(2048);
+        let index = crate::pom::index_from_ram(data.clone());
+        let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
+
+        let saved = (
+            std::env::var("KERYX_POM_V4_TC").ok(),
+            std::env::var("KERYX_POM_V4_NCF").ok(),
+        );
+        let dev = miner.stream.context().ordinal() as u32;
+        let mut checked = 0usize;
+
+        for h10 in [false, true] {
+            // Find a base whose unique best nonce sits off lane 0, so a lane-0 broadcast cannot
+            // accidentally produce the right answer.
+            let mut chosen: Option<(u64, u64, [u8; 32])> = None;
+            for base in (1000u64..).step_by(BATCH as usize).take(16) {
+                let pows: Vec<[u8; 32]> = (0..BATCH)
+                    .map(|i| {
+                        let seed = crate::pom::pom_block_seed_v4_era(&PPH, TS, base + i, h10);
+                        let (_v4, fs) = crate::pom_v4::build_proof_v4(0, seed, &index).unwrap();
+                        crate::pom::pom_pow_value(fs, &PPH, true)
+                    })
+                    .collect();
+                let k = (0..BATCH as usize)
+                    .min_by(|&a, &b| le_cmp(&pows[a], &pows[b]))
+                    .unwrap();
+                if k % 32 != 0 {
+                    chosen = Some((base, base + k as u64, pows[k]));
+                    break;
+                }
+            }
+            let (base, want, target) =
+                chosen.expect("no base in the sweep put the best nonce off lane 0");
+            assert_ne!((want - base) % 32, 0, "winner must not be lane 0");
+
+            // (label, KERYX_POM_V4_TC, KERYX_POM_V4_NCF)
+            for (label, tc, ncf) in
+                [("chaseless", "1", "1"), ("tensor-core", "1", "0"), ("classic", "0", "0")]
+            {
+                std::env::set_var("KERYX_POM_V4_TC", tc);
+                std::env::set_var("KERYX_POM_V4_NCF", ncf);
+                // The env vars alone do NOT pin the kernel. `mine_v4` takes `ncf_wanted` from the
+                // cached autotune result, falling back to `v4_ncf_default()` — which is FALSE on
+                // CC 8.0/9.0. On an HBM card that makes `v4_walk_kind()` report "chaseless" while
+                // `mine_v4` actually dispatches chase+tc, so an unpinned test mislabels which
+                // kernel it exercised (observed on a CC 8.0 card). Pin the tune to match.
+                set_v4_tune(dev, V4Tune { ncf: ncf == "1", tc: tc == "1", batch: BATCH });
+                let kind = miner.v4_walk_kind();
+                if kind != label {
+                    // This image/card cannot supply that kernel (e.g. tc/ncf on a PTX-only
+                    // legacy image); the kinds it *can* supply are still covered.
+                    println!("skip {label} (h10={h10}): card resolved to {kind}");
+                    continue;
+                }
+                let got = miner.mine_v4(&PPH, TS, &target, base, BATCH, h10).unwrap();
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "[{kind}, h10={h10}] winner at batch index {} (lane {}) not found — the walk \
+                     disagrees with the host for nonces that are not lane 0 of their warp",
+                    want - base,
+                    (want - base) % 32
+                );
+                println!("OK {kind} h10={h10}: winner {want} at lane {}", (want - base) % 32);
+                checked += 1;
+            }
+        }
+
+        for (k, v) in [("KERYX_POM_V4_TC", &saved.0), ("KERYX_POM_V4_NCF", &saved.1)] {
+            match v {
+                Some(s) => std::env::set_var(k, s),
+                None => std::env::remove_var(k),
+            }
+        }
+        set_v4_tune(dev, V4Tune { ncf: miner.v4_ncf_default(), tc: true, batch: BATCH });
+        assert!(checked > 0, "no walk kind was exercised");
+    }
+
     /// Exercise the CROSS-BATCH CHASE PREFETCH hit path: consecutive batches of the same job, so
     /// batch N+1's offsets come from the prefetch buffer rather than an inline chase. A key/buffer
     /// mix-up here would feed the walk another range's offsets — the walk would still "run", just
