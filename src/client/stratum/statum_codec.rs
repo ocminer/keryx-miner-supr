@@ -42,6 +42,21 @@ pub(crate) enum MiningNotify {
     // `Value`; a legacy double-encoded JSON string still deserializes as `Value::String` and is
     // unwrapped at the call site. Typing this as `String` (the old assumption) made the whole
     // `mining.notify` line fail untagged deserialization when the pool sent an object.
+    // ── keryx-stratum-v3 ─────────────────────────────────────────────────────
+    // V3 = V2 plus `block_bits: u32` (the block's own compact target) after the
+    // daa_score. The miner takes max(pool_target, block_target) so it never
+    // discards a solution that IS a valid block just because the pool handed it
+    // a harder share target — at 10 bps the network target can dip below it.
+    //
+    // These MUST stay ABOVE the V2 variants. `serde(untagged)` tries variants in
+    // declaration order, and our 5-element V2 arm ends in `Value`, which matches
+    // ANY JSON type including the V3 integer — so a V2-first ordering swallows
+    // every V3 notify and then fails downstream with
+    // "failed to parse task JSON: invalid type: integer". (Upstream ends theirs
+    // in `String`, so they never hit this.) V3 first = the u32 is tried first and
+    // a real task object still falls through to the V2 arm.
+    MiningNotifyWithTaskV3((String, [u64; 4], u64, u64, u32, Value)),
+    MiningNotifyShortV3((String, [u64; 4], u64, u64, u32)),
     MiningNotifyWithTask((String, [u64; 4], u64, u64, Value)),
     MiningNotifyShortV2((String, [u64; 4], u64, u64)),
     MiningNotifyShort((String, [u64; 4], u64)),

@@ -36,7 +36,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 //const DIFFICULTY_1_TARGET: Uint256 = Uint256([0x00000000ffff0000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000]);
 const DIFFICULTY_1_TARGET: (u64, i16) = (0xffffu64, 208); // 0xffff 2^208
-const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v2";
+const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v3";
 const LOG_RATE: Duration = Duration::from_secs(30);
 const CHALLENGE_MAX_TOKENS: usize = 128;
 
@@ -237,6 +237,9 @@ pub struct StratumHandler {
 
     target_pool: Uint256,
     target_real: Uint256,
+    /// keryx-stratum-v3: the current job's own compact block target, when the pool sends
+    /// one. `None` on a v2 pool, which keeps the pool target verbatim (see effective_target).
+    block_bits: Option<u32>,
     nonce_mask: u64,
     nonce_fixed: u64,
     extranonce: Option<String>,
@@ -615,6 +618,7 @@ impl StratumHandler {
             block_template_ctr: block_template_ctr
                 .unwrap_or_else(|| Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16))),
             target_pool: Default::default(),
+            block_bits: None,
             target_real: Default::default(),
             nonce_mask: u64::MAX, // full nonce space until set_extranonce assigns a sub-range
             nonce_fixed: 0,
@@ -845,7 +849,36 @@ impl StratumHandler {
             .await;
     }
 
+    /// keryx-stratum-v3 → v2 normalisation. Absorbs the job's `block_bits` into `self` and
+    /// rewrites the line into its v2 shape, so the (large) job-handling arms below stay
+    /// version-agnostic and the v2 path is byte-identical to before on a v2 pool.
+    fn absorb_v3_notify(&mut self, msg: StratumLine) -> StratumLine {
+        use StratumCommand::MiningNotify as Notify;
+        let StratumLine { id, payload: StratumLinePayload::StratumCommand(cmd), jsonrpc, error } = msg else {
+            return msg;
+        };
+        let cmd = match cmd {
+            Notify(MiningNotify::MiningNotifyWithTaskV3((jid, hash, time, daa, bits, task))) => {
+                self.block_bits = Some(bits);
+                Notify(MiningNotify::MiningNotifyWithTask((jid, hash, time, daa, task)))
+            }
+            Notify(MiningNotify::MiningNotifyShortV3((jid, hash, time, daa, bits))) => {
+                self.block_bits = Some(bits);
+                Notify(MiningNotify::MiningNotifyShortV2((jid, hash, time, daa)))
+            }
+            // A v2 job carries no block target — drop any stale one so we never apply a
+            // previous job's bits to this one.
+            other @ Notify(_) => {
+                self.block_bits = None;
+                other
+            }
+            other => other,
+        };
+        StratumLine { id, payload: StratumLinePayload::StratumCommand(cmd), jsonrpc, error }
+    }
+
     async fn handle_message(&mut self, msg: StratumLine, miner: &mut MinerManager) -> Result<(), Error> {
+        let msg = self.absorb_v3_notify(msg);
         match msg.clone() {
             StratumLine { id, payload, error: None, .. } => {
                 match payload {
@@ -941,7 +974,7 @@ impl StratumHandler {
                                         timestamp,
                                         daa_score,
                                         nonce: 0,
-                                        target: self.target_pool,
+                                        target: self.effective_target(),
                                         nonce_mask: self.nonce_mask,
                                         nonce_fixed: self.nonce_fixed,
                                         hash: None,
@@ -984,7 +1017,7 @@ impl StratumHandler {
                                     timestamp,
                                     daa_score,
                                     nonce: 0,
-                                    target: self.target_pool,
+                                    target: self.effective_target(),
                                     nonce_mask: self.nonce_mask,
                                     nonce_fixed: self.nonce_fixed,
                                     hash: None,
@@ -1056,7 +1089,7 @@ impl StratumHandler {
                                     timestamp,
                                     daa_score,
                                     nonce: 0,
-                                    target: self.target_pool,
+                                    target: self.effective_target(),
                                     nonce_mask: self.nonce_mask,
                                     nonce_fixed: self.nonce_fixed,
                                     hash: None,
@@ -1171,6 +1204,36 @@ impl StratumHandler {
             }
             _ => Err(format!("Unhandled stratum response: {:?}", msg).into()),
         }
+    }
+
+    /// The target this job is actually mined against (keryx-stratum-v3).
+    ///
+    /// v2 pools send only a share target, so we mine that verbatim. v3 pools also send the block's
+    /// own compact target (`block_bits`); we then mine `max(pool_target, block_target)`.
+    ///
+    /// A LARGER Uint256 is an EASIER target, so `max` picks whichever is easier. That matters when
+    /// the pool's share difficulty is HARDER than the live network difficulty — at 10 bps the
+    /// network target can dip below the assigned share target, and without this the miner would
+    /// discard nonces that are valid BLOCKS simply because they missed the share target. It can
+    /// only ever loosen the target we grind against, never tighten it, so it cannot make us submit
+    /// something the pool would reject as low-difficulty.
+    ///
+    /// Malformed bits are ignored (fall back to the pool target) rather than fatal: a bad target
+    /// from the pool must not take the miner down mid-job.
+    fn effective_target(&self) -> Uint256 {
+        let Some(bits) = self.block_bits else { return self.target_pool };
+        let size = bits >> 24;
+        let mantissa = bits & 0x007f_ffff;
+        if bits & 0x0080_0000 != 0 || size > 34 || (size > 33 && mantissa > 0xff) || (size > 32 && mantissa > 0xffff) {
+            warn!("stratum-v3: ignoring malformed block_bits 0x{:08x} — mining the pool target", bits);
+            return self.target_pool;
+        }
+        let block_target = crate::target::u256_from_compact_target(bits);
+        if block_target == Uint256::default() {
+            warn!("stratum-v3: block_bits 0x{:08x} decoded to a zero target — mining the pool target", bits);
+            return self.target_pool;
+        }
+        std::cmp::max(self.target_pool, block_target)
     }
 
     fn set_difficulty(&mut self, difficulty: &f32) -> Result<(), Error> {
