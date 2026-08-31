@@ -2216,10 +2216,26 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                 record_serveable(model_id); // a live answer is proof this rig can serve the tier
                 return Some(strip_think_tags(&text));
             }
-            log::warn!("SlmEngine: in-process llama generate failed on GPU {} — trying the next engine.", gpu);
+            // UPSTREAM PARITY (Keryx-Labs slm.rs::load_and_run_inference): the in-process llama
+            // engine IS the host for this model — it is resident on this card (the zero-dup mining
+            // tier) and proved serveable at bring-up. If a single generation fails or comes back
+            // empty, DROP this OPoI response and return None; do NOT fall through to the
+            // llama-server / candle path. That fallback tries to LOAD the model in ANOTHER engine,
+            // and for an H4 arch (Kimi-Linear / GLM-4 / Qwen3.5-SSM — served ONLY by
+            // libkeryx-llama.so) that load fails with "served only by the in-process llama engine",
+            // which used to CASCADE: withdraw the mining model + evict/rebuild the walk → OOM →
+            // the whole rig wedged on a single dropped answer. The model stays declared; the pool
+            // re-challenges and the next generation (a fresh, un-raced call) answers normally.
+            log::warn!(
+                "SlmEngine: in-process llama generate on GPU {} returned nothing for '{}' — dropping this OPoI response (model stays declared; no engine fallback, matching upstream).",
+                gpu, spec.name
+            );
+            return None;
         } else {
-            // Upstream 0795e92: this card is the only one that can serve the model and its engine
-            // failed to come up — withdraw it from ai:cap so the pool stops routing us requests.
+            // The in-process engine could not come up for this model on this card (e.g. the .so is
+            // absent). Withdraw it from ai:cap so the pool stops routing challenges we cannot answer
+            // (upstream 0795e92). Fall through to the legacy llama-server / candle path below, which
+            // still serves the candle-loadable archs on a host without libkeryx-llama.so.
             mark_model_unavailable(model_id, "llama_load_failed");
         }
     }
