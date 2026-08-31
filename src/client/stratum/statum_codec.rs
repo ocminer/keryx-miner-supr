@@ -445,4 +445,53 @@ mod tests {
         assert_eq!(v["params"]["error"], "model not ready");
         assert!(v["params"].get("text").is_none()); // omitted when None
     }
+
+    /// keryx-stratum-v3 notify dispatch — guards the `serde(untagged)` DECLARATION ORDER.
+    ///
+    /// This is the exact bug that made v0.12.7 fail against a v3 pool: our 5-element V2 arm ends in
+    /// `Value`, which matches ANY JSON type including the V3 integer, so a V2-first ordering
+    /// swallowed every V3 notify and then died downstream with
+    /// "failed to parse task JSON: invalid type: integer". These cases fail if anyone reorders the
+    /// enum (or retypes the task field) in a way that reintroduces it.
+    #[test]
+    fn mining_notify_v3_and_v2_dispatch_by_shape() {
+        let hash = "[1,2,3,4]";
+        let parse = |params: String| -> MiningNotify {
+            serde_json::from_str::<MiningNotify>(&params).expect("notify must deserialize")
+        };
+
+        // 6 elements, numeric 5th + task object -> V3 with task
+        match parse(format!(r#"["job1",{hash},111,222,490707704,{{"m":"x"}}]"#)) {
+            MiningNotify::MiningNotifyWithTaskV3((id, _, ts, daa, bits, task)) => {
+                assert_eq!((id.as_str(), ts, daa, bits), ("job1", 111, 222, 490707704));
+                assert!(task.is_object(), "task must survive as an object");
+            }
+            other => panic!("6-element notify must be WithTaskV3, got {other:?}"),
+        }
+
+        // 5 elements, NUMERIC 5th -> V3 short (this is the one V2-first ordering steals)
+        match parse(format!(r#"["job2",{hash},333,444,490707704]"#)) {
+            MiningNotify::MiningNotifyShortV3((id, _, ts, daa, bits)) => {
+                assert_eq!((id.as_str(), ts, daa, bits), ("job2", 333, 444, 490707704));
+            }
+            other => panic!("5-element NUMERIC notify must be ShortV3, got {other:?}"),
+        }
+
+        // 5 elements, OBJECT 5th -> V2 with task (must still fall through past the V3 arms)
+        match parse(format!(r#"["job3",{hash},555,666,{{"m":"y"}}]"#)) {
+            MiningNotify::MiningNotifyWithTask((id, _, ts, daa, task)) => {
+                assert_eq!((id.as_str(), ts, daa), ("job3", 555, 666));
+                assert!(task.is_object());
+            }
+            other => panic!("5-element OBJECT notify must be WithTask, got {other:?}"),
+        }
+
+        // 4 elements -> V2 short, unchanged
+        match parse(format!(r#"["job4",{hash},777,888]"#)) {
+            MiningNotify::MiningNotifyShortV2((id, _, ts, daa)) => {
+                assert_eq!((id.as_str(), ts, daa), ("job4", 777, 888));
+            }
+            other => panic!("4-element notify must be ShortV2, got {other:?}"),
+        }
+    }
 }
