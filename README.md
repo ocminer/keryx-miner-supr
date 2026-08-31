@@ -131,8 +131,13 @@ export PATH=/usr/local/cuda-13.0/bin:$PATH   # Turing+ build; cuda-12.x for Volt
 # kernel's arch (default compute_75). Set BOTH to your OLDEST card:
 #   Turing+ fleet (CUDA 13.0): CUDA_COMPUTE_CAP=75              (walk default 75)
 #   incl. Volta   (CUDA 12.x): CUDA_COMPUTE_CAP=70 POM_CUDA_ARCH=compute_70
-#   Pascal        (CUDA 12.4): CUDA_COMPUTE_CAP=60 POM_CUDA_ARCH=compute_60
-#     (Pascal can't run candle GPU inference — pair with --cpu-inference.)
+#   Pascal        (CUDA 12.4): CUDA_COMPUTE_CAP=61 POM_CUDA_ARCH=compute_61
+#     compute_61, NOT compute_60: the v4 walk uses __dp4a, which is sm_61+, so a
+#     compute_60 (P100) build fails outright. GTX 10-series (1080 Ti) = sm_61.
+#     Use CUDA 12.4 specifically: 12.5+ emits PTX ISA 8.5 and driver 550 then
+#     rejects it with CUDA_ERROR_UNSUPPORTED_PTX_VERSION.
+#     Pascal no longer needs --cpu-inference: the in-process llama.cpp engine
+#     (libkeryx-llama.so) is built for sm_61 and serves OPoI on the GPU.
 export CUDA_HOME=/usr/local/cuda-13.0 CUDA_PATH=/usr/local/cuda-13.0 CUDA_COMPUTE_CAP=75
 
 # Workspace build — this also produces libkeryxcuda.so + libkeryxopencl.so.
@@ -143,9 +148,18 @@ cargo build --release
 
 The binary lands at `target/release/keryx-miner-supr` (~26 MB). Copy alongside `target/release/libkeryxcuda.so` + `target/release/libkeryxopencl.so` into a single run directory.
 
-Or skip building entirely — the release page ships three prebuilt lines: **modern** (sm_75+, native
-sm_120 for RTX 50xx; driver 575+), **legacy** (sm_70+ — Tesla V100/Volta, CMP 100-210, Turing and
-newer; driver 550+), **pascal** (sm_60/61 — GTX 10-series; driver 550+, runs `--cpu-inference`).
+Or skip building entirely — the release page ships two prebuilt lines:
+
+- **modern** — sm_75+, native sm_120 for RTX 50xx; driver 575+.
+- **legacy** — sm_61+ : **GTX 10-series (1080 Ti)**, Tesla V100/Volta, CMP 100-210, Turing and
+  newer; driver 550+. Pascal is covered by this line, so there is no separate `pascal` download.
+
+**GTX 1080 Ti / Pascal notes.** Validated on a real 1080 Ti (sm_61, driver 550): the PoM walk is
+byte-exact (host↔GPU lockstep + H10 seed tests pass), pool shares are accepted, and solo mining
+against keryxd v1.5.7 produced blocks the node accepted. Measured ~0.457 MH/s at ~249 W on the
+tier-0 model. An 11 GB 1080 Ti fits tier 0 (`qwen3.5-9b`, 8 GB) with room for the walk; it cannot
+hold the larger tiers, so pin it with `--tier very-light` if auto-select picks something too big.
+P100 (sm_60) is NOT supported — the walk needs `__dp4a` (sm_61+).
 
 ## Run
 
