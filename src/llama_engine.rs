@@ -41,7 +41,6 @@ struct Engine {
     free: FreeFn,
     /// Optional: absent on older `libkeryx-llama.so` builds (looked up soft, gate no-ops if None).
     tensor_device: Option<TensorDeviceFn>,
-    gpu: usize,
     gguf: String,
 }
 // The wrapper serializes generation internally; tensor info is read-only after load.
@@ -185,7 +184,7 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             return None;
         }
         log::info!("llama engine: ✓ active on GPU {} — llama.cpp hosts the model + serves OPoI inference in-process.", gpu);
-        Some(Engine { model, count, info, generate: gen, free, tensor_device, gpu, gguf: gguf.to_string() })
+        Some(Engine { model, count, info, generate: gen, free, tensor_device, gguf: gguf.to_string() })
     }
 }
 

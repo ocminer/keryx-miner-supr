@@ -938,18 +938,7 @@ impl MinerManager {
         }
     }
 
-    fn log_single_hashrate(
-        counter: &Arc<AtomicU64>,
-        prefix: String,
-        warn_message: &str,
-        duration: f64,
-        keep_prefix: bool,
-        challenge_active: bool,
-    ) -> f64 {
-        Self::log_single_hashrate_with(counter, prefix, warn_message, duration, keep_prefix, challenge_active, "", None, false)
-    }
-
-    /// `log_single_hashrate` + an optional health suffix and power figure: prints
+    /// Log one hashrate line, with an optional health suffix and power figure: prints
     /// `<prefix> <rate> <unit> | <health> | eff <x.xxx> MH/s/W` on one line. The
     /// stall-warning and OPoI-pause branches are unchanged.
     #[allow(clippy::too_many_arguments)]

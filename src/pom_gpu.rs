@@ -2453,15 +2453,6 @@ pub fn current_tier(device_id: u32, daa: u64) -> Option<u8> {
     crate::models::pom_tier_index(&model_id, daa)
 }
 
-/// CUDA ordinal of a candle device (None if not CUDA) — used to check whether the inference
-/// engine's resident model lives on the same GPU as the PoM miner we're about to install, before
-/// sharing its tensors in place.
-fn cuda_gpu_id(d: &Device) -> Option<usize> {
-    match d.location() {
-        candle_core::DeviceLocation::Cuda { gpu_id } => Some(gpu_id),
-        _ => None,
-    }
-}
 
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // This device's model: its own (mixed rig / --force-model) or the process-wide default.

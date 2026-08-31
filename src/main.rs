@@ -333,7 +333,7 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
         vram_mb,
         picked.pom_model_name(),
         picked,
-        models::pom_tier_index(&picked.pom_spec().model_id, keryx_miner::pom::h4_activation_daa()).unwrap_or(0),
+        models::pom_tier_index(&picked.pom_spec().model_id, keryx_miner::pom::pom_v3_activation_daa()).unwrap_or(0),
         need,
         AUTO_TIER_HEADROOM_MB,
     );
@@ -437,7 +437,7 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
         vram_mb,
         picked.pom_model_name(),
         picked,
-        models::pom_tier_index(&picked.pom_spec().model_id, keryx_miner::pom::h4_activation_daa()).unwrap_or(0),
+        models::pom_tier_index(&picked.pom_spec().model_id, keryx_miner::pom::pom_v3_activation_daa()).unwrap_or(0),
         need,
         AUTO_TIER_HEADROOM_MB,
     );
@@ -465,7 +465,7 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
                  ({} will download in the background; restart to use it.)",
                 tier.pom_model_name(),
                 tier,
-                models::pom_tier_index(&tier.pom_spec().model_id, keryx_miner::pom::h4_activation_daa()).unwrap_or(0),
+                models::pom_tier_index(&tier.pom_spec().model_id, keryx_miner::pom::pom_v3_activation_daa()).unwrap_or(0),
                 picked.pom_model_name(),
             );
             return tier;
@@ -1090,30 +1090,12 @@ async fn run() -> Result<(), Error> {
         use keryx_miner::models::Tier;
         check_gpu_power_limit(matches!(tier, Tier::High | Tier::VeryHigh), matches!(tier, Tier::VeryHigh));
     }
-    // Stage the FINAL (post-H2) lineup ONLY. The legacy pre-OPoI-v2 lineup (TinyLlama/DeepSeek) is
-    // DEAD — OPoI-v2 is permanently in the past, so `specs_for(0, ..)` would just download an
-    // obsolete model nobody serves (the "why is it downloading tinyllama" bug reports). Upstream
-    // dropped it for the same reason; we mirror that here.
-    // The FINAL (post-H2) lineup: `specs_for` is DAA-gated, and H2 (VERY_LIGHT_ACTIVATION_DAA)
-    // is a frozen frontier the network is permanently past. Using OPOI_V2_ACTIVATION_DAA (pre-H2)
-    // wrongly staged `--very-light` as Gemma (pre-H2 fallback) instead of Qwen3-1.7B, and
-    // `--very-high` as the 48 GB Q4 instead of the 32 GB-servable Q2_K_L. Must match the mining
-    // model (`Tier::pom_spec`) and the node's `POM_TIERS_H2`.
     // --force-model contract: the forced model loads REGARDLESS of VRAM fit (power-user knob), so
     // the capability gate is skipped for it — otherwise filter_specs_by_vram silently drops the
     // forced spec and PoM never configures (the "--force-model ignored" bug class, issue #7).
-    // Stage the CURRENT-era lineup. H5 is normally live, so resolve at the H5 gate (tier-0 =
-    // Qwen3-8B). Using the H4 gate here wrongly staged `--very-light` as the retired EXAONE (h4 <
-    // h5). Higher tiers are unchanged across H5, so h5 gives the same models for them. BUT once H6
-    // (PoM v3) is ARMED (`pom_v3_activation_daa() != u64::MAX` — testnet/staging or a scheduled
-    // mainnet fork) the mining tier-0 model becomes the H6 anchor (Qwen3.5-9B, whose R_T pins
-    // POM_TIERS_H6), so resolve at the H6 gate then — matching `Tier::pom_spec()`. Without this the
-    // miner stages+mines the H5 model on an H6 pool and every v3 proof fails possession.
-    let lineup_daa = if keryx_miner::pom::pom_v3_activation_daa() != u64::MAX {
-        keryx_miner::pom::pom_v3_activation_daa()
-    } else {
-        keryx_miner::pom::h5_activation_daa()
-    };
+    // Stage the CURRENT-era lineup: resolve at the H6 gate, whose anchors (tier-0 Qwen3.5-9B) pin
+    // POM_TIERS_H6 — matching `Tier::pom_spec()`. The pre-H6 lineups were retired with their models.
+    let lineup_daa = keryx_miner::pom::pom_v3_activation_daa();
     let specs_all = keryx_miner::models::specs_for(lineup_daa, tier);
     let specs_v2 = if tier_forced {
         info!("--force-model: VRAM capability gate skipped for the forced model — it will load regardless of fit (may OOM an undersized card).");
