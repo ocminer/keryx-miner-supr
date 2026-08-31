@@ -339,6 +339,16 @@ fn llama_gather_blocker(gguf: &str, device_id: usize) -> Option<String> {
     None
 }
 
+/// A `load_llama` failure that a RAW canonical upload can recover from. The llama-resident layout
+/// can't back the zero-dup gather (the tier's tensors aren't resident — e.g. the shared inference
+/// card swapped models on a mixed rig), so this tier reports ~100% foreign bytes. `load_raw` reads
+/// the canonical GGUF bytes directly, independent of what llama holds, so it always produces a
+/// correct walk. NOT a GPU fault (OOM / illegal address / poisoned context) — those must NOT
+/// re-upload (the fault/OOM paths handle them); only the pure layout mismatch is recoverable here.
+fn is_llama_layout_fallback(msg: &str) -> bool {
+    msg.contains("llama-resident layout too foreign")
+}
+
 impl PomGpuMiner {
     /// Load the mining model's GGUF into candle on a specific CUDA device, build the gather
     /// index, load the kernel.
@@ -2661,7 +2671,27 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     let m = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if use_llama {
             info!("PoM[gpu{}]: zero-dup — walking the llama.cpp engine's resident weights (candle dormant)", device_id);
-            PomGpuMiner::load_llama(&gguf, device_id as usize)
+            match PomGpuMiner::load_llama(&gguf, device_id as usize) {
+                Ok(gm) => Ok(gm),
+                Err(e) if is_llama_layout_fallback(&e.to_string()) => {
+                    // The llama-resident layout can't back the zero-dup gather HERE — most often on a
+                    // MIXED rig where the shared inference card SWAPPED to a smaller tier's model to
+                    // self-test another card, so this tier's tensors are no longer resident and the
+                    // gather sees ~100% foreign bytes. The pre-check (llama_gather_blocker) can't catch
+                    // that: the swap happens between it and this load. A raw canonical upload reads the
+                    // GGUF bytes directly, INDEPENDENT of what llama holds, so it always yields a
+                    // correct walk (the N-guard below still validates it). Fall back instead of sitting
+                    // the card out. llama stays loaded for SERVING — the raw copy is a separate walk
+                    // source; the only cost is one extra resident copy, and if THAT OOMs the OOM path
+                    // below demotes/sits-out gracefully.
+                    log::warn!(
+                        "PoM[gpu{}]: {e} — falling back to a raw canonical upload (walk works, inference stays up; costs one extra resident copy).",
+                        device_id
+                    );
+                    PomGpuMiner::load_raw(&gguf, device_id as usize)
+                }
+                Err(e) => Err(e),
+            }
         } else {
             info!("PoM[gpu{}]: raw gather — standalone canonical GGUF upload (mining-only card)", device_id);
             PomGpuMiner::load_raw(&gguf, device_id as usize)
@@ -2822,6 +2852,19 @@ mod tests {
         assert!(record_sat_out(a), "after recovery, a's next sit-out logs again");
         clear_sat_out(a);
         clear_sat_out(b);
+    }
+
+    // The llama→raw fallback must fire on a pure layout mismatch, but NEVER on a GPU fault (OOM /
+    // illegal address) — re-uploading over a poisoned context or a full card would make it worse.
+    #[test]
+    fn llama_layout_fallback_matches_only_the_layout_mismatch() {
+        assert!(is_llama_layout_fallback(
+            "PoM GPU: llama-resident layout too foreign — 9770184896 of 9770197184 bytes need a canonical upload"
+        ));
+        // GPU faults must fall through to the fault/OOM paths, not the raw re-upload.
+        assert!(!is_llama_layout_fallback("DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"));
+        assert!(!is_llama_layout_fallback("an illegal memory access was encountered"));
+        assert!(!is_llama_layout_fallback("PoM GPU: canonical GGUF tensor list unreadable"));
     }
 
     // Upstream aa29fd2: the drain barrier in `uninstall`.
