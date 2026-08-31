@@ -1486,23 +1486,6 @@ mod tests {
         }
     }
 
-    /// H4 v2 proof (recompute-from-chunks) builds, self-verifies, and wire round-trips — for BOTH
-    /// walk eras (v1 fold in [H4,H5), v2 mix64-chain at/after H5), and the cross-era boundary holds.
-    #[test]
-    /// A pre-H4 proof MUST wire-encode byte-identically to the 7-field `PomProofPreH4` layout —
-    /// the invariant that keeps the currently-running (pre-H4) node accepting new-miner blocks.
-    #[test]
-    /// GGUF-backed `read_chunk`: lay the canonical chunks across 3 "tensors" with header + inter-
-    /// tensor padding (so file offset != off*32), build the per-tensor offset table, and assert
-    /// `read_chunk` (pread) returns the exact canonical chunks AND that a proof verifies — same as
-    /// the RAM path, with no host copy of the weights.
-    #[test]
-    /// H3 hardfork salt: the pph words feeding BOTH PoM folds are XOR-salted with POM_H3_PPH_SALT
-    /// at/after the gate. Proves (a) the salt equals the node's sha256 derivation, (b) it changes
-    /// the walk seed + pow value, and (c) proofs are era-bound — an H3 proof verifies under h3=true
-    /// and is REJECTED under h3=false. That rejection IS the forced-update guarantee: a pre-H3
-    /// binary's proof verifies false post-gate.
-    #[test]
     /// Real-GGUF byte-identity: build the index from a downloaded model and prove that chunks
     /// read by `pread` (GGUF) verify against the model's own `R_T` (whose leaves were hashed from
     /// candle's `qt.data()`). Confirms `pread(tensor_data_offset + offset)` == `qt.data()` for real
@@ -1518,54 +1501,6 @@ mod tests {
         assert_eq!(idx.r_t, merkle_root(&leaves));
     }
 
-    #[test]
-    #[test]
-    #[test]
-    // Validates the canonical layout against the consensus-pinned R_T. Needs the Gemma GGUF.
-    // Run: cargo test --lib pom -- --ignored --nocapture
-    #[test]
-    #[ignore = "needs Gemma-3-4B GGUF on disk"]
-    // End-to-end H3 test on the REAL Gemma tier — this is exactly what generate_block_if_pom does
-    // at runtime post-fork: pph from a "block header", nonce, h3=true, build_proof, then locally
-    // verify_proof. If our local verify_proof PASSES, the miner is submitting proofs that satisfy
-    // the same math the node uses; any pool `PowValueMismatch` rejection is on the pool/node side.
-    #[test]
-    #[ignore = "needs Gemma-3-4B GGUF on disk"]
-    // Emit POM_SAMPLE_submit.json for the CANONICAL VECTOR that the node-built `pom-verify-test`
-    // expects (pph=4d27ef7d…, ts=1_700_000_000, nonce=1366), so we can run the chain-exact
-    // `verify_pom_proof` on a proof OUR build_proof produces over the real Gemma tier.
-    // Run: KERYX_GEMMA_GGUF=…/Gemma-3-4B/model.gguf cargo test --lib emit_canonical_pom_sample -- --ignored --nocapture
-    #[test]
-    #[ignore = "needs Gemma-3-4B GGUF on disk; emits /home/marcel/POM_SAMPLE_submit.json"]
-    /// ZERO-DUP AMD path on the REAL tier: the in-process llama engine hosts the model
-    /// (libkeryx-llama-vk.so via KERYX_LLAMA_VK_SO or next to the test binary), the walk gathers
-    /// over its resident VRAM tensors -> must find the SAME lowest winner the OpenCL blob walk
-    /// finds (same fixed pph/target search) -> proof verifies vs the pinned R_T. Needs an AMD
-    /// GPU + the .so + KERYX_GEMMA_GGUF.
-    #[test]
-    #[ignore]
-    #[cfg(all(feature = "pom-opencl", unix))]
-    /// H5 on-hardware correctness: the OpenCL blob kernel with walk_v2=1 must find a nonce whose v2
-    /// walk the CPU `transition_v2` (via `walk_final(.., true)`) independently confirms passes the
-    /// target — proving `pom_mine.cl`'s mix64-chain branch is byte-exact with `pom.rs`. The winner
-    /// must ALSO differ from the v1 winner (9559 for this pph/target), i.e. the eras really diverge.
-    #[test]
-    #[ignore]
-    #[cfg(all(feature = "pom-opencl", unix))]
-    /// H5 on-hardware correctness for the ZERO-DUP Vulkan shader: same oracle as
-    /// gpu_walk_v2_opencl_matches_cpu but through `pom_walk_vk.comp`'s walk_v2 branch. Needs the .so
-    /// (KERYX_LLAMA_VK_SO) + a Vulkan GPU (KERYX_LLAMA_VK_DEVICE).
-    #[test]
-    #[ignore]
-    #[cfg(all(feature = "pom-opencl", unix))]
-    /// H5.1 on-hardware correctness: mining with h5_1=1 (realistic H5.1 = walk_v2=1 too) must find a
-    /// nonce whose SEED derives from the H5.1-salted pph words — the CPU `pom_block_seed(.., h5_1=true)`
-    /// + v2 walk independently confirms it passes target. Proves both GPU backends thread the seed
-    /// words s0..s3 correctly. The H5.1 winner MUST differ from the h5_1=false v2 winner (1053), since
-    /// a different seed = a different walk trajectory. OpenCL blob leg.
-    #[test]
-    #[ignore]
-    #[cfg(all(feature = "pom-opencl", unix))]
     /// Engine unload frees the model + VRAM and a fresh ensure_loaded works after it — the rescue
     /// path for "byte gate failed on a small card" (unload the engine, give the VRAM to the blob).
     #[test]
@@ -1584,22 +1519,6 @@ mod tests {
         eprintln!("engine unload -> VRAM freed -> reload OK ✅");
     }
 
-    /// H5.1 seed correctness for the ZERO-DUP Vulkan shader (s0..s3 push-constants). Same oracle as
-    /// gpu_h5_1_seed_opencl_matches_cpu, through pom_walk_vk.comp. Needs KERYX_LLAMA_VK_SO + a Vulkan GPU.
-    #[test]
-    #[ignore]
-    #[cfg(all(feature = "pom-opencl", unix))]
-    /// H5.2 on-hardware correctness (OpenCL blob): mining with h5_2=1 must find a nonce whose SEED
-    /// derives from the H5.2-salted pph words — the CPU `pom_block_seed(.., h5_2=true)` + v2 walk
-    /// confirms it. The GPU kernel is byte-identical to the H5.1 build (a seed salt is host-side),
-    /// so this proves the host salt-selection path; the winner must differ from the H5.1 winner too.
-    #[test]
-    #[ignore]
-    #[cfg(all(feature = "pom-opencl", unix))]
-    /// H5.2 seed correctness for the ZERO-DUP Vulkan shader. Same oracle, through pom_walk_vk.comp.
-    #[test]
-    #[ignore]
-    #[cfg(all(feature = "pom-opencl", unix))]
     /// Wall-clock throughput bench for the OPENCL blob walk on a chosen card — the apples-to-
     /// apples baseline for bench_llama_vk_walk (the miner's own hashrate accounting is not a
     /// wall-clock measure). KERYX_BENCH_CL_DEV picks the OpenCL device index (default 0).

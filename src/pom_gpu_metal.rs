@@ -545,7 +545,29 @@ pub fn mine_v4(
     target_le: &[u8; 32],
     start: u64,
     batch: u64,
+    daa: u64,
 ) -> Option<u64> {
+    // 🔴 H10 HARD SAFETY GUARD (mirrors the CUDA backend). At/after the H10 gate the walk seed is
+    // the one-way cSHAKE256 PowHash (keccak-f1600 absorbing RAW pph words + timestamp + nonce),
+    // which is computed INSIDE the walk kernel because the nonce varies per thread. The Metal
+    // shader only implements the pre-H10 reversible v4 fold, so grinding an H10-era job here would
+    // walk the wrong tiles and every share would be rejected (BadTilePath) while still burning the
+    // GPU. Refuse instead: return None so the worker idles honestly (no phantom hashrate, nothing
+    // counted) and log once with the reason. Pre-H10 / testnet jobs below the gate are unaffected.
+    // Lifting this needs keccak-f1600 + the H10 seed fold ported into the .metal shader and
+    // validated against pom.rs's golden vectors (see `h10_seed_properties_and_golden`).
+    if crate::pom::is_h10_seed_era(daa) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::error!(
+                "PoM[metal{}]: block DAA {} is in the H10 one-way-seed era, which the Metal walk \
+                 shader does not implement — NOT mining (it would produce 100% rejected shares). \
+                 Use the CUDA build for H10-era mining.",
+                device_id, daa
+            );
+        }
+        return None;
+    }
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
