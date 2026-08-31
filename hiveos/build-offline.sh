@@ -8,8 +8,15 @@
 #   HOST_CUDA_DIR: optional host path to a CUDA toolkit to mount at /opt/cuda and
 #   build against (e.g. an extracted 12.4 toolkit) instead of the image's CUDA.
 # Per-line arch overrides (env): BOFF_POM_CUDA_ARCH (walk PTX; default compute_75 via
-# build.rs; legacy=compute_70, pascal=compute_60) and BOFF_CUDA_COMPUTE_CAP (candle
-# inference PTX; default 70; pascal=60).
+# build.rs; legacy=compute_70, pascal=compute_61) and BOFF_CUDA_COMPUTE_CAP (candle
+# inference PTX; default 70; pascal=61).
+#
+# PASCAL MUST BE compute_61, NOT compute_60: the v4 walk uses __dp4a (src/pom_mine.cu),
+# which is sm_61+. compute_60 (P100) fails to compile outright:
+#   src/pom_mine.cu(303): error: identifier "__dp4a" is undefined
+# So the pascal line covers GTX 10-series (1080 Ti = sm_61), not P100. It also needs a
+# CUDA 12.x toolkit mounted via HOST_CUDA_DIR — CUDA 13 dropped Pascal entirely
+# ("nvcc fatal: Unsupported gpu architecture 'compute_61'").
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="$1"; OUTDIR="$2"; SUF="$3"; CUDADIR="${4:-}"
