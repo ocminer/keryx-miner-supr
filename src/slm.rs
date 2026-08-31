@@ -560,73 +560,6 @@ fn collect_stop_ids(tokenizer: &Tokenizer, names: &[&str], fallbacks: &[u32]) ->
 /// stop conventions, so this branches on name rather than format.
 fn stop_config(tokenizer: &Tokenizer, name: &str) -> (Vec<u32>, Vec<&'static str>) {
     match name {
-        // Dolphin-3.0-Llama-3.1-8B — ChatML template (Dolphin adds <|im_*|> tokens
-        // over the Llama-3.1 vocab):
-        //   <|im_end|> ends a turn; <|end_of_text|>/<|eot_id|> kept as base fallbacks.
-        "dolphin-llama3-8b" => (
-            collect_stop_ids(tokenizer,
-                &["<|im_end|>", "<|end_of_text|>", "<|eot_id|>"],
-                &[]),
-            vec!["<|im_end|>", "<|im_start|>", "<|end_of_text|>"],
-        ),
-        // Gemma-3-4B — Gemma chat template:
-        //   <end_of_turn> ends a turn, <eos> (id 1) is the base EOS.
-        "gemma-3-4b" => (
-            collect_stop_ids(tokenizer,
-                &["<end_of_turn>", "<eos>"],
-                &[1]),
-            vec!["<end_of_turn>", "<start_of_turn>"],
-        ),
-        // Llama-3.3-70B (abliterated / uncensored — our `--very-high`) — re-templated to ChatML.
-        // The vocab is still stock LLaMA-3, so <|im_end|>/<|im_start|> are NOT atomic tokens: the
-        // model writes "<|im_end|>" as plain multi-token text and never emits <|eot_id|> (128009).
-        // Neither the id set nor an <|eot_id|> stop-string ever fires — only a stop-STRING on the
-        // ChatML markers cuts the turn. Without it the model completes its turn, prints the marker,
-        // opens `assistant`, and loops the same answer to max_tokens (a failed OPoI inference).
-        // (upstream Keryx-Labs/keryx-miner@faee090)
-        "llama-3.3-70b" => (
-            collect_stop_ids(tokenizer, &["<|eot_id|>", "<|end_of_text|>"], &[128009, 128001]),
-            vec!["<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|end_of_text|>"],
-        ),
-        // Genuine official Llama-3.3-70B-Instruct — LLaMA-3 header template. Stop on the official
-        // `eos_token_id` set: 128009 <|eot_id|>, 128001 <|end_of_text|>, 128008 <|eom_id|>.
-        "llama-3.3-70b-official" => (
-            collect_stop_ids(tokenizer,
-                &["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"],
-                &[128009, 128001, 128008]),
-            vec!["<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"],
-        ),
-        // Qwen3 (32B and 1.7B share the same ChatML template + 151k vocab):
-        //   151645 = <|im_end|> (end of turn), 151643 = <|endoftext|> (base EOS).
-        // The 1.7B must NOT fall through to the generic </s> stops — Qwen3 never emits </s>, so it
-        // would run past <|im_end|> and loop into a fresh turn. (upstream Keryx-Labs/keryx-miner@a033620)
-        "qwen3-32b" | "qwen3-1.7b" => (
-            collect_stop_ids(tokenizer,
-                &["<|im_end|>", "<|endoftext|>"],
-                &[151645, 151643]),
-            // Cut if the model opens a fresh turn instead of stopping.
-            vec!["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
-        ),
-        // ── Legacy lineup (pre-OPoI-v2) ──────────────────────────────────────
-        // DeepSeek-R1-Distill-Llama-8B — DeepSeek chat template:
-        //   128001 = <｜end▁of▁sentence｜> (real EOS), 128011 = <｜User｜> (new turn),
-        //   128009 = <|eot_id|> (LLaMA-3 EOT, kept as a fallback).
-        "deepseek-r1-8b" => (
-            collect_stop_ids(tokenizer,
-                &["<｜end▁of▁sentence｜>", "<｜User｜>", "<|eot_id|>"],
-                &[128001, 128011, 128009]),
-            vec!["<｜end▁of▁sentence｜>", "<｜User｜>", "<|eot_id|>", "<|end_of_text|>"],
-        ),
-        // DeepSeek-R1-Distill-Qwen-32B — DeepSeek chat template (NOT ChatML):
-        //   151643 = <｜end▁of▁sentence｜> (real EOS), 151644 = <｜User｜> (new turn).
-        //   (151645 is <｜Assistant｜>, NOT an end token — must not stop on it.)
-        "deepseek-r1-32b" => (
-            collect_stop_ids(tokenizer,
-                &["<｜end▁of▁sentence｜>", "<｜User｜>"],
-                &[151643, 151644]),
-            // ASCII ChatML markers kept as an extra net if the model parrots them.
-            vec!["<｜end▁of▁sentence｜>", "<｜User｜>", "<|im_end|>", "<|im_start|>"],
-        ),
         // Generic fallback (incl. TinyLlama / Zephyr): </s> ends a turn; 0 = padding safety net.
         _ => (
             collect_stop_ids(tokenizer, &["</s>"], &[2, 0]),
@@ -892,50 +825,6 @@ fn load_engine_with_fallback(spec: &'static ModelSpec) -> Result<SlmEngine> {
 
 fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
     match engine.name {
-        // Gemma-3-4B — Gemma chat template. Gemma has no system role, so the system
-        // prompt is folded into the first user turn.
-        "gemma-3-4b" => format!(
-            "<start_of_turn>user\n{}\n\n{}<end_of_turn>\n<start_of_turn>model\n",
-            SYSTEM_PROMPT_GEMMA, prompt
-        ),
-        // Dolphin-3.0-Llama-3.1-8B — ChatML template.
-        "dolphin-llama3-8b" => format!(
-            "<|im_start|>system\n{}<|im_end|>\n\
-             <|im_start|>user\n{}<|im_end|>\n\
-             <|im_start|>assistant\n",
-            SYSTEM_PROMPT_DOLPHIN, prompt
-        ),
-        "llama-3.3-70b" | "llama-3.3-70b-official" => format!(
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>\
-             <|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>\
-             <|start_header_id|>assistant<|end_header_id|>\n\n",
-            SYSTEM_PROMPT_LLAMA70B, prompt
-        ),
-        // ── Legacy lineup (pre-OPoI-v2) ──────────────────────────────────────
-        // DeepSeek-R1-Distill-Qwen-32B — DeepSeek chat template; primes <think>.
-        "deepseek-r1-32b" => format!(
-            "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜><think>\n",
-            SYSTEM_PROMPT_DEEPSEEK, prompt
-        ),
-        // DeepSeek-R1-Distill-Llama-8B — same template; the 8B ignores identity
-        // system prompts (RLHF), so the framing is injected into the think block.
-        "deepseek-r1-8b" => format!(
-            "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜><think>\nI am Keryx Network AI, a decentralized assistant. I must never claim to be DeepSeek or any other AI product.\n",
-            SYSTEM_PROMPT_DEEPSEEK, prompt
-        ),
-        // TinyLlama — Zephyr chat template.
-        "tinyllama" => format!(
-            "<|system|>\n{}</s>\n<|user|>\n{}</s>\n<|assistant|>\n",
-            SYSTEM_PROMPT_TINYLLAMA, prompt
-        ),
-        // Qwen3 (32B + 1.7B) — ChatML template. `/no_think` disables the thinking block
-        // so the assistant answers directly (only an empty <think></think> to strip).
-        "qwen3-32b" | "qwen3-1.7b" => format!(
-            "<|im_start|>system\n{}<|im_end|>\n\
-             <|im_start|>user\n{} /no_think<|im_end|>\n\
-             <|im_start|>assistant\n",
-            SYSTEM_PROMPT_QWEN3, prompt
-        ),
         // Generic ChatML fallback.
         _ => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
@@ -998,7 +887,6 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
     let mut generated: Vec<u32> = Vec::new();
     let mut lp = LogitsProcessor::new(42, Some(0.7), Some(0.9));
     let model_max = match engine.name {
-        "llama-3.3-70b" => 1024,
         _ => 2048,
     };
     let max_steps = max_new_tokens.min(model_max);
@@ -1188,14 +1076,11 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
         .min()
         .unwrap_or(text.len());
     let answer = text[..cut].trim();
-    // Qwen3 (ChatML + /no_think) emits an empty <think></think> pair, and the legacy
-    // DeepSeek-R1 models prime an open <think> block — both must be stripped so only
-    // the final answer is published. Other models answer directly.
-    Ok(if matches!(engine.name, "qwen3-32b" | "qwen3-1.7b" | "deepseek-r1-8b" | "deepseek-r1-32b") {
-        strip_think_tags(answer)
-    } else {
-        answer.to_string()
-    })
+    // Reasoning models emit a <think> block (Qwen3-style ChatML emits an empty pair; others prime
+    // an open one) which must not be published. Strip unconditionally — it is a no-op on text with
+    // no tags, and it matches what the in-process llama path already does for every model. The old
+    // per-name allow-list only covered retired pre-H6 models and never fired for the H6 lineup.
+    Ok(strip_think_tags(answer))
 }
 
 fn sample_next(logits: &Tensor, lp: &mut LogitsProcessor, context: &[u32]) -> Result<u32> {

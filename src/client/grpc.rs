@@ -495,7 +495,9 @@ impl KeryxdHandler {
             return None;
         }
         let v: serde_json::Value = serde_json::from_slice(&raw[PREFIX.len()..]).ok()?;
-        let model = v["m"].as_str().unwrap_or("tinyllama").to_string();
+        // No default model name: TinyLlama was retired with the pre-H6 lineup, and naming any
+        // model here would just fail the registry lookup later. A payload without "m" is invalid.
+        let model = v["m"].as_str()?.to_string();
         let prompt = v["p"].as_str()?.to_string();
         let max_tokens = v["n"].as_u64().unwrap_or(128) as usize;
         Some((model, prompt, max_tokens))
