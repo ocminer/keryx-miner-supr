@@ -62,6 +62,109 @@ pub const CHUNK_WORDS: usize = 4; // 32 B chunk
 pub const POM_WALK_STEPS: u32 = 256;
 pub const POM_OPENINGS: usize = 32;
 
+/// A fully synchronized accelerator batch. Only this result authorizes the caller to advance its
+/// nonce cursor and report work; `winner == None` means the batch really ran but found no share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrindCompleted {
+    pub winner: Option<u64>,
+    pub hashes_done: u64,
+}
+
+/// A batch that did not complete. Conflating either error with a valid `Ok(None)` used to advance
+/// the cursor and report phantom hashrate after unsupported-era, absent-miner, and launch failures.
+#[derive(Debug)]
+pub enum GrindError {
+    Paused(&'static str),
+    Backend(String),
+}
+
+pub type GrindResult = Result<GrindCompleted, GrindError>;
+
+/// A numerically contiguous, non-wrapping part of one Stratum-assigned nonce domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonceRange {
+    pub start: u64,
+    pub len: u64,
+}
+
+/// Enumerates every unique result of the legacy Stratum transform
+/// `(raw_nonce & mask) | fixed`, exactly once. Accelerator kernels accept contiguous physical
+/// nonces, so `peek` splits the rank space only where a masked-out bit creates a numeric gap or at
+/// the `u64` endpoint. Ordinary pool masks have contiguous low variable bits and therefore retain
+/// full-sized GPU batches except for the single wrap fragment.
+#[derive(Debug, Clone)]
+pub struct MaskedNonceCursor {
+    fixed: u64,
+    variable: u64,
+    rank: u128,
+    remaining: u128,
+    domain: u128,
+}
+
+impl MaskedNonceCursor {
+    pub fn new(mask: u64, fixed: u64, seed: u64) -> Self {
+        // A bit set in `fixed` cannot vary even if a malformed assignment also sets it in `mask`.
+        let variable = mask & !fixed;
+        let domain = 1u128 << variable.count_ones(); // deliberately supports a 2^64 domain
+        Self {
+            fixed,
+            variable,
+            rank: (seed as u128) & (domain - 1),
+            remaining: domain,
+            domain,
+        }
+    }
+
+    #[inline]
+    fn deposit(mut rank: u64, mut mask: u64) -> u64 {
+        let mut out = 0u64;
+        while mask != 0 {
+            let bit = mask & mask.wrapping_neg();
+            if rank & 1 != 0 {
+                out |= bit;
+            }
+            rank >>= 1;
+            mask &= mask - 1;
+        }
+        out
+    }
+
+    /// Return the next launch without consuming it. The caller commits only after a backend
+    /// confirms completion, so a failed launch can safely retry the exact same candidate range.
+    pub fn peek(&self, requested: u64) -> Option<NonceRange> {
+        if requested == 0 || self.remaining == 0 {
+            return None;
+        }
+
+        let low_width = self.variable.trailing_ones();
+        let period = 1u128 << low_width;
+        let to_low_wrap = period - (self.rank & (period - 1));
+        let to_domain_wrap = self.domain - self.rank;
+        let len = (requested as u128)
+            .min(self.remaining)
+            .min(to_low_wrap)
+            .min(to_domain_wrap);
+        let start = self.fixed | Self::deposit(self.rank as u64, self.variable);
+        debug_assert!(start as u128 + len - 1 <= u64::MAX as u128);
+        Some(NonceRange { start, len: len as u64 })
+    }
+
+    pub fn commit(&mut self, len: u64) {
+        let len = len as u128;
+        assert!(len <= self.remaining, "nonce cursor commit exceeds assigned domain");
+        assert!(self.rank + len <= self.domain, "nonce cursor commit crosses a launch boundary");
+        self.rank += len;
+        if self.rank == self.domain {
+            self.rank = 0;
+        }
+        self.remaining -= len;
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
 // --- wire struct (field order == node's PomProof at keryxd v1.5.1) ---
 
 /// PoM proof container — mirror of the node's `PomProof`. Post-relaunch the miner only ever emits a
@@ -204,8 +307,6 @@ pub fn pph_words_for_era(pre_pow_hash: &[u8; 32], h3: bool) -> [u64; 4] {
 /// pph words feeding the SEED fold for the era selected by (`h3`, `h5_1`, `h5_2`). Each seed-salt
 /// era uses RAW pph XOR its own salt (NO stacking — the v0.9.0 bug); the pow fold keeps using
 /// `pph_words_for_era` (H3) in every era.
-#[inline]
-
 #[inline]
 fn pom_block_seed_from_words(p: &[u64; 4], timestamp: u64, nonce: u64) -> u64 {
     let mut s = mix64(nonce ^ 0x4B65727978531);
@@ -981,7 +1082,11 @@ impl WeightIndex {
         }
         let end = (start + span).min(source_count);
         let nodes: Vec<[u8; 32]> = if src_level == 0 {
-            (start..end).map(|i| blake(&self.read_chunk_bytes(i))).collect()
+            // Leaf sibling subtrees are contiguous. Read the whole span in one operation per
+            // tensor boundary instead of issuing a 32-byte pread for every leaf.
+            let mut bytes = vec![0u8; ((end - start) * 32) as usize];
+            self.read_chunks_into(start, &mut bytes);
+            bytes.chunks_exact(32).map(blake).collect()
         } else {
             let cp = self.find_checkpoint(src_level);
             (start..end)
@@ -1025,10 +1130,19 @@ impl WeightIndex {
     /// intermediate levels recomputed on the fly from the nearest checkpoint / the GGUF leaves.
     /// Byte-identical to the dense full-tree path: an out-of-range sibling is the node itself.
     pub fn merkle_path(&self, off: u64) -> Vec<[u8; 32]> {
+        self.merkle_path_from_level(off, 0)
+    }
+
+    /// Inclusion path beginning at `first_level`. This is not merely a post-build slice: levels
+    /// below `first_level` are never read or hashed. A v4 proof supplies the complete 32-leaf tile,
+    /// so its path starts at level 5 and can skip all within-tile sibling work.
+    pub(crate) fn merkle_path_from_level(&self, off: u64, first_level: u32) -> Vec<[u8; 32]> {
+        assert!(off < self.n_chunks, "PoM merkle path offset out of range");
+        assert!(first_level < self.total_levels, "PoM merkle path level out of range");
         if let Some(dense) = &self.dense {
-            let mut path = Vec::with_capacity(dense.len().saturating_sub(1));
-            let mut idx = off as usize;
-            for level in &dense[..dense.len() - 1] {
+            let mut path = Vec::with_capacity(dense.len().saturating_sub(1 + first_level as usize));
+            let mut idx = (off >> first_level) as usize;
+            for level in &dense[first_level as usize..dense.len() - 1] {
                 let sib = idx ^ 1;
                 path.push(if sib < level.len() { level[sib] } else { level[idx] });
                 idx >>= 1;
@@ -1036,9 +1150,9 @@ impl WeightIndex {
             return path;
         }
         let total_levels = self.total_levels;
-        let mut path = Vec::with_capacity(total_levels as usize);
-        let mut idx: u64 = off;
-        for level in 0..total_levels {
+        let mut path = Vec::with_capacity((total_levels - first_level - 1) as usize);
+        let mut idx: u64 = off >> first_level;
+        for level in first_level..total_levels {
             if level == total_levels - 1 {
                 break; // root has no sibling
             }
@@ -1317,20 +1431,30 @@ pub fn active_index() -> Option<&'static (WeightIndex, u8)> {
     POM_INDEX.get()
 }
 
-/// Per-CUDA-device possession index (mixed-rig per-card models). Entries are `Box::leak`'d →
-/// `&'static`, matching the OnceLock "lives forever" semantics. Empty on single-model rigs.
-fn pom_indices() -> &'static std::sync::Mutex<std::collections::HashMap<u32, &'static (WeightIndex, u8)>> {
-    static POM_INDICES: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, &'static (WeightIndex, u8)>>> =
+/// Per-device possession index plus the model identity it was built from. Keeping the identity next
+/// to the leaked index is correctness-critical: an OOM/serveability demotion can replace a device's
+/// model with another model having the same chunk count, for which the old Merkle tree would pass an
+/// N-only check but produce invalid paths.
+struct DevicePomIndex {
+    model_id: [u8; 32],
+    index: &'static (WeightIndex, u8),
+}
+
+/// Per-CUDA-device possession indices (mixed-rig per-card models). Index values are `Box::leak`'d →
+/// `&'static`, matching the OnceLock "lives forever" semantics and allowing detached proof builders
+/// to finish safely while a demotion installs a replacement entry.
+fn pom_indices() -> &'static std::sync::Mutex<std::collections::HashMap<u32, DevicePomIndex>> {
+    static POM_INDICES: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, DevicePomIndex>>> =
         OnceLock::new();
     POM_INDICES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Install a possession index for one device (per-card model). Leaked to `&'static` (models live
 /// for the whole process, same as the global `POM_INDEX`).
-pub fn set_index_for(device_id: u32, index: WeightIndex, tier: u8) {
+pub fn set_index_for(device_id: u32, model_id: [u8; 32], index: WeightIndex, tier: u8) {
     let leaked: &'static (WeightIndex, u8) = Box::leak(Box::new((index, tier)));
     if let Ok(mut m) = pom_indices().lock() {
-        m.insert(device_id, leaked);
+        m.insert(device_id, DevicePomIndex { model_id, index: leaked });
     }
 }
 
@@ -1338,7 +1462,7 @@ pub fn set_index_for(device_id: u32, index: WeightIndex, tier: u8) {
 pub fn active_index_for(device_id: u32) -> Option<&'static (WeightIndex, u8)> {
     if let Ok(m) = pom_indices().lock() {
         if let Some(v) = m.get(&device_id) {
-            return Some(*v);
+            return Some(v.index);
         }
     }
     active_index()
@@ -1347,6 +1471,14 @@ pub fn active_index_for(device_id: u32) -> Option<&'static (WeightIndex, u8)> {
 /// Whether this device has its own per-device index installed (vs falling back to the global one).
 pub fn has_device_index(device_id: u32) -> bool {
     pom_indices().lock().map(|m| m.contains_key(&device_id)).unwrap_or(false)
+}
+
+/// Whether the per-device index is for this exact model, not merely a model of the same size.
+pub fn device_index_matches(device_id: u32, model_id: &[u8; 32]) -> bool {
+    pom_indices()
+        .lock()
+        .map(|m| m.get(&device_id).map(|v| &v.model_id == model_id).unwrap_or(false))
+        .unwrap_or(false)
 }
 
 /// Test-only WeightIndex over arbitrary RAM chunks (`data` = chunk-aligned canonical bytes) — real
@@ -1400,6 +1532,125 @@ pub(crate) fn index_from_ram(data: Vec<u8>) -> WeightIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Production chunk storage is split across independently aligned GGUF tensors. Bulk reads
+    /// must advance both the canonical chunk index and each tensor's unrelated file offset without
+    /// copying gap/alignment bytes into a proof tile or Merkle leaf span.
+    #[test]
+    fn bulk_gguf_read_crosses_tensor_boundaries() {
+        use std::sync::atomic::{AtomicU64, Ordering as O};
+        static UNIQ: AtomicU64 = AtomicU64::new(0);
+        let uid = UNIQ.fetch_add(1, O::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "keryx-pom-bulk-gguf-{}-{uid}.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let expected: Vec<u8> = (0..8 * 32)
+            .map(|i| (mix64(i as u64 + 1) >> 24) as u8)
+            .collect();
+        let layout = [(0u64, 17u64, 2u64), (2, 173, 3), (5, 401, 3)];
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        for &(first, file_off, count) in &layout {
+            file.seek(SeekFrom::Start(file_off)).unwrap();
+            file.write_all(&expected[(first * 32) as usize..((first + count) * 32) as usize])
+                .unwrap();
+        }
+        file.flush().unwrap();
+
+        let chunks_file = file.try_clone().unwrap();
+        let index = WeightIndex {
+            n_chunks: 8,
+            r_t: [0; 32],
+            chunks: ChunkSource::Gguf {
+                file: chunks_file,
+                table: layout.iter().map(|&(first, off, _)| (first, off)).collect(),
+            },
+            tree_file: file,
+            tree_path: path,
+            checkpoints: Vec::new(),
+            total_levels: 4,
+            persistent: false,
+            dense: None,
+            sibling_memo: Mutex::new(HashMap::new()),
+        };
+
+        let mut across = vec![0u8; 6 * 32];
+        index.read_chunks_into(1, &mut across);
+        assert_eq!(across, expected[32..7 * 32]);
+        for chunk in 0..8u64 {
+            assert_eq!(index.read_chunk_bytes(chunk).as_slice(), &expected[(chunk * 32) as usize..((chunk + 1) * 32) as usize]);
+        }
+    }
+
+    #[test]
+    fn masked_nonce_cursor_exhaustive_low_byte() {
+        for mask8 in 0u16..=255 {
+            for fixed8 in 0u16..=255 {
+                let mask = mask8 as u64;
+                let fixed = fixed8 as u64;
+                let mut cursor = MaskedNonceCursor::new(mask, fixed, 0xa5);
+                let mut seen = [false; 256];
+                let mut produced = 0usize;
+                while let Some(range) = cursor.peek(7) {
+                    assert!(range.len > 0);
+                    assert!(range.start.checked_add(range.len - 1).is_some());
+                    for nonce in range.start..range.start + range.len {
+                        assert!(nonce < 256);
+                        assert!(!seen[nonce as usize], "duplicate for mask={mask:#x}, fixed={fixed:#x}");
+                        seen[nonce as usize] = true;
+                        produced += 1;
+                    }
+                    cursor.commit(range.len);
+                }
+                assert!(cursor.exhausted());
+
+                let mut expected = [false; 256];
+                for raw in 0u64..=255 {
+                    expected[((raw & mask) | fixed) as usize] = true;
+                }
+                assert_eq!(seen, expected, "domain mismatch for mask={mask:#x}, fixed={fixed:#x}");
+                assert_eq!(produced, 1usize << (mask & !fixed).count_ones());
+            }
+        }
+    }
+
+    #[test]
+    fn masked_nonce_cursor_splits_wraps_and_sparse_masks() {
+        let mut full = MaskedNonceCursor::new(u64::MAX, 0, u64::MAX - 2);
+        assert_eq!(full.peek(5), Some(NonceRange { start: u64::MAX - 2, len: 3 }));
+        full.commit(3);
+        assert_eq!(full.peek(5), Some(NonceRange { start: 0, len: 5 }));
+
+        let mut standard = MaskedNonceCursor::new(0xffff_ffff, 0x1234_5678_0000_0000, 0xffff_fffe);
+        assert_eq!(
+            standard.peek(8),
+            Some(NonceRange { start: 0x1234_5678_ffff_fffe, len: 2 })
+        );
+        standard.commit(2);
+        assert_eq!(
+            standard.peek(8),
+            Some(NonceRange { start: 0x1234_5678_0000_0000, len: 8 })
+        );
+
+        let mut sparse = MaskedNonceCursor::new(0b1_0111, 0, 6);
+        assert_eq!(sparse.peek(8), Some(NonceRange { start: 6, len: 2 }));
+        sparse.commit(2);
+        assert_eq!(sparse.peek(8), Some(NonceRange { start: 16, len: 8 }));
+
+        let mut fixed_only = MaskedNonceCursor::new(0, 0xfeed, 123);
+        assert_eq!(fixed_only.peek(64), Some(NonceRange { start: 0xfeed, len: 1 }));
+        fixed_only.commit(1);
+        assert!(fixed_only.exhausted());
+        assert_eq!(fixed_only.peek(1), None);
+    }
 
     fn synth_chunk(off: u64) -> [u64; CHUNK_WORDS] {
         let mut c = [0u64; CHUNK_WORDS];
@@ -1466,13 +1717,43 @@ mod tests {
             let step = (n as usize / 37).max(1);
             let offs: Vec<u64> = (0..n).step_by(step).collect();
             let sparse: Vec<Vec<[u8; 32]>> = offs.iter().map(|&o| idx.merkle_path(o)).collect();
+            let first_level = 5u32.min(idx.total_levels - 1);
+            let sparse_suffix: Vec<Vec<[u8; 32]>> = offs
+                .iter()
+                .map(|&o| idx.merkle_path_from_level(o, first_level))
+                .collect();
+            for (k, path) in sparse.iter().enumerate() {
+                assert_eq!(sparse_suffix[k], path[first_level as usize..]);
+            }
             idx.build_dense();
             for (k, &o) in offs.iter().enumerate() {
                 assert_eq!(idx.merkle_path(o), sparse[k], "path mismatch n={n} off={o}");
+                assert_eq!(
+                    idx.merkle_path_from_level(o, first_level),
+                    sparse_suffix[k],
+                    "suffix path mismatch n={n} off={o}",
+                );
             }
             let dense = idx.dense.as_ref().unwrap();
             assert_eq!(dense.last().unwrap()[0], idx.r_t, "dense root != r_t, n={n}");
         }
+    }
+
+    /// The optimized witness path (bulk tile reads plus a level-5 Merkle suffix) must still build
+    /// a proof accepted by the independent verifier. This exercises all 256 data-dependent steps,
+    /// including repeated tiles and both sparse checkpoint recompute and range-proof indexing.
+    #[test]
+    fn v4_bulk_proof_path_roundtrip() {
+        // Deliberately non-power-of-two: three complete 32-chunk tiles plus a four-leaf tail.
+        // This exercises duplicate-last carries above the optimized level-5 path boundary.
+        let idx = synth_index(100);
+        let seed = 0x6b65_7279_782d_7634;
+        let (proof, built_final) = crate::pom_v4::build_proof_v4(2, seed, &idx).unwrap();
+        let verified_final =
+            crate::pom_v4::verify_proof_v4(seed, &proof, &idx.r_t, idx.n_chunks).unwrap();
+        assert_eq!(verified_final, built_final);
+        assert_eq!(proof.tiles.len(), crate::pom_v4::POM_V4_K);
+        assert_eq!(proof.merkle.len(), crate::pom_v4::POM_V4_K);
     }
 
     #[test]
@@ -1492,7 +1773,6 @@ mod tests {
     /// quant types. Ignored (needs the GGUF); run: `cargo test -p keryx-miner -- --ignored gguf_real`.
     #[test]
     #[ignore]
-    #[test]
     fn weight_index_root_matches_standalone() {
         // The prebuilt-tree root equals the standalone merkle_root over the same leaves.
         let n = 1000u64;

@@ -58,7 +58,8 @@ enum V4Mode { SingleDp4a, SingleWmma, TwoPhaseDp4a, TwoPhaseWmma }
 #[allow(clippy::too_many_arguments)]
 fn enqueue_v4(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>], slab_tiles: u64,
               winner: &Buffer<cl_ulong>, n_tiles: u64, k: u32, pph: [u64; 4], seed: [u64; 4],
-              time: u64, target: [u64; 4], base: u64, n_nonces: u64, h10: u32, lds_bytes: usize) -> Option<()> {
+              time: u64, target: [u64; 4], base: u64, n_nonces: u64, winner_base: u64,
+              h10: u32, lds_bytes: usize) -> Result<(), String> {
     const V4_LOCAL: usize = 256;
     const V4_NPG: u64 = 8;                       // sub-nonces per workgroup (kernel mirror)
     // 4 slab args; absent slabs repeat slab 0 (never selected: off/slab_tiles bounds to real slabs).
@@ -74,14 +75,14 @@ fn enqueue_v4(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>
         .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
         .set_arg(&time)
         .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
-        .set_arg(&base).set_arg(&n_nonces).set_arg(&h10)
+        .set_arg(&base).set_arg(&n_nonces).set_arg(&winner_base).set_arg(&h10)
         .set_arg(winner)
         .set_arg_local_buffer(lds_bytes)
         .set_global_work_size(global)
         .set_local_work_size(V4_LOCAL)
         .enqueue_nd_range(queue)
-        .ok()?;
-    Some(())
+        .map_err(|e| format!("single-phase enqueue failed: {e}"))?;
+    Ok(())
 }
 
 /// Two-phase v4 sub-dispatch: phase 1 (chase) resolves all K offsets into `offsets`, then phase 2
@@ -91,7 +92,7 @@ fn enqueue_v4(queue: &CommandQueue, kernel: &Kernel, weights: &[Buffer<cl_ulong>
 fn enqueue_v4_tp(queue: &CommandQueue, chase: &Kernel, walk: &Kernel, weights: &[Buffer<cl_ulong>],
                  slab_tiles: u64, offsets: &Buffer<cl_uint>, winner: &Buffer<cl_ulong>, n_tiles: u64,
                  k: u32, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], base: u64,
-                 n_nonces: u64, h10: u32, walk_lds_bytes: usize) -> Option<()> {
+                 n_nonces: u64, winner_base: u64, h10: u32, walk_lds_bytes: usize) -> Result<(), String> {
     const V4_LOCAL: usize = 256;
     const V4_NPG: u64 = 8;
     const CHASE_LOCAL: usize = 64;               // plain 1D latency-bound pointer chase
@@ -110,7 +111,7 @@ fn enqueue_v4_tp(queue: &CommandQueue, chase: &Kernel, walk: &Kernel, weights: &
         .set_global_work_size(chase_global)
         .set_local_work_size(CHASE_LOCAL)
         .enqueue_nd_range(queue)
-        .ok()?;
+        .map_err(|e| format!("two-phase chase enqueue failed: {e}"))?;
     // Phase 2: pipelined walk.
     let groups = n_nonces.div_ceil(V4_NPG);
     let global = (groups * V4_LOCAL as u64) as usize;
@@ -123,15 +124,15 @@ fn enqueue_v4_tp(queue: &CommandQueue, chase: &Kernel, walk: &Kernel, weights: &
         .set_arg(&seed[0]).set_arg(&seed[1]).set_arg(&seed[2]).set_arg(&seed[3])
         .set_arg(&time)
         .set_arg(&target[0]).set_arg(&target[1]).set_arg(&target[2]).set_arg(&target[3])
-        .set_arg(&base).set_arg(&n_nonces).set_arg(&h10)
+        .set_arg(&base).set_arg(&n_nonces).set_arg(&winner_base).set_arg(&h10)
         .set_arg(offsets)
         .set_arg(winner)
         .set_arg_local_buffer(walk_lds_bytes)
         .set_global_work_size(global)
         .set_local_work_size(V4_LOCAL)
         .enqueue_nd_range(queue)
-        .ok()?;
-    Some(())
+        .map_err(|e| format!("two-phase walk enqueue failed: {e}"))?;
+    Ok(())
 }
 
 /// Staging window for the VRAM upload: 2^22 chunks × 32 B = 128 MiB. The blob is streamed
@@ -237,16 +238,28 @@ impl PomMiner {
         // divisor divisions in the hot paths; baking them strength-reduces each to a multiply-high
         // (byte-exact — the compiler's own constant-division transform). Falls back to runtime
         // args if the define build fails. Native int8 dot: RDNA3+/gfx11-12 use `sudot4`
-        // (dot9-insts); GCN/CDNA gfx906/908/90a use `sdot4` (dot1-insts); both byte-identical to
-        // the scalar unpack; everything else (Polaris/RDNA1-2/Windows Adrenalin) keeps scalar.
+        // (dot9-insts); dot1-capable GCN/CDNA/RDNA targets use `sdot4`; both are byte-identical to
+        // the scalar unpack. The exact allowlist avoids gfx1010, which lacks dot1-insts. If a
+        // vendor compiler rejects a nominally capable target, the existing define-less retry keeps
+        // correctness and availability.
         // KERYX_NO_AMD_DOT4 forces scalar; failed builds retry define-less.
         let allow_dot = std::env::var("KERYX_NO_AMD_DOT4").is_err();
+        let dev_name_lc = dev_name.to_ascii_lowercase();
+        let has_sdot4 = [
+            "gfx906", "gfx908", "gfx90a", // Vega/CDNA 1-2
+            "gfx1011", "gfx1012",          // Navi 12/14 (gfx1010 is intentionally excluded)
+            "gfx1030", "gfx1031", "gfx1032", "gfx1033", // RDNA2 family
+            "gfx1034", "gfx1035", "gfx1036",
+            "gfx940", "gfx941", "gfx942", // CDNA3
+        ]
+        .iter()
+        .any(|arch| dev_name_lc.contains(arch));
         let dot_def = if !allow_dot {
             None
-        } else if dev_name.contains("gfx11") || dev_name.contains("gfx12") {
+        } else if dev_name_lc.contains("gfx11") || dev_name_lc.contains("gfx12") {
             Some(("sudot4 (RDNA3+ dot9-insts)", "-D USE_AMD_DOT4=1"))
-        } else if dev_name.contains("gfx906") || dev_name.contains("gfx908") || dev_name.contains("gfx90a") {
-            Some(("sdot4 (GCN/CDNA dot1-insts)", "-D USE_AMD_SDOT4=1"))
+        } else if has_sdot4 {
+            Some(("sdot4 (dot1-insts)", "-D USE_AMD_SDOT4=1"))
         } else {
             None
         };
@@ -255,7 +268,7 @@ impl PomMiner {
         // RDNA3/RDNA4 (gfx11/gfx12) also get -D USE_AMD_WMMA=1, which compiles the matrix-core
         // v4 walk (V_WMMA_I32_16X16X16_IU8); the kernel is #ifdef'd out elsewhere (the builtin
         // needs the wmma target feature). `have_wmma` gates kernel creation below.
-        let have_wmma = dev_name.contains("gfx11") || dev_name.contains("gfx12");
+        let have_wmma = dev_name_lc.contains("gfx11") || dev_name_lc.contains("gfx12");
         let base = {
             let b = format!("-D POM_NT={}UL -D POM_SLABT={}UL", n_chunks / V3_TILE, slab_chunks / V3_TILE);
             if have_wmma { format!("{b} -D USE_AMD_WMMA=1") } else { b }
@@ -264,7 +277,7 @@ impl PomMiner {
         let program = match Program::create_and_build_from_source(&context, POM_SRC, &opts) {
             Ok(p) => {
                 if let Some((desc, _)) = dot_def {
-                    log::info!("PoM: v3 int8 matmul using native v_dot4_i32_i8 ({desc}) on {dev_name}.");
+                    log::info!("PoM: v4 int8 matmul using native v_dot4_i32_i8 ({desc}) on {dev_name}.");
                 }
                 p
             }
@@ -362,11 +375,19 @@ impl PomMiner {
     /// walk on the resident blob (32 threads/nonce, 8 nonces per 256-thread workgroup). Returns the
     /// lowest winning nonce (host re-walks it byte-exact to build the witness), or None. Multi-slab
     /// aware — slabs are tile-aligned so each step's 1 KB tile lives in one slab (v4_slab picks it).
-    pub fn mine_v4(&mut self, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64, h10: u32) -> Option<u64> {
+    pub fn mine_v4(&mut self, pph: [u64; 4], seed: [u64; 4], time: u64, target: [u64; 4], nonce_base: u64, batch: u64, h10: u32) -> Result<Option<u64>, String> {
+        if batch == 0 {
+            return Ok(None);
+        }
+        if batch > u32::MAX as u64 {
+            return Err("batch exceeds u32 launch domain".into());
+        }
+        if nonce_base.checked_add(batch - 1).is_none() {
+            return Err("nonce range crosses u64::MAX; split it before launch".into());
+        }
         let n_tiles = self.n_chunks / POM_V4_TILE_CHUNKS;
         if n_tiles == 0 {
-            log::error!("PoM v4: blob too small ({} chunks < one 32-chunk tile).", self.n_chunks);
-            return None;
+            return Err(format!("blob too small ({} chunks < one 32-chunk tile)", self.n_chunks));
         }
         let k = POM_V4_K as u32;
         let slab_tiles = self.slab_chunks / POM_V4_TILE_CHUNKS;
@@ -374,11 +395,14 @@ impl PomMiner {
         // the Windows TDR limit but there is NO finish between them, so the GPU never drains its queue
         // mid-batch — the boost clock stays pinned), then finish + read once. The kernel's atomic-min
         // makes the single winner buffer hold the batch's lowest winning nonce.
-        self.queue.enqueue_write_buffer(&mut self.winner, CL_BLOCKING, 0, &[u64::MAX], &[]).ok()?;
+        self.queue
+            .enqueue_write_buffer(&mut self.winner, CL_BLOCKING, 0, &[u64::MAX], &[])
+            .map_err(|e| format!("winner reset failed: {e}"))?;
         let sub_dispatch = v4_sub_dispatch_nonces();
-        // LDS per mode (8 sub-nonces × strip): single dp4a 512 u32 (16 KB), single WMMA 768 (24 KB),
+        // LDS per mode (8 sub-nonces × strip): single dp4a needs only 384 u32 (12 KB: 256-word
+        // tile/leaves + the 128-word largest Merkle level), single WMMA 768 (24 KB),
         // two-phase dp4a 512 (16 KB), two-phase WMMA 1024 (32 KB).
-        const SP_DP4A_LDS: usize = 8 * 512 * 4;
+        const SP_DP4A_LDS: usize = 8 * 384 * 4;
         const SP_WMMA_LDS: usize = 8 * 768 * 4;
         const TP_DP4A_LDS: usize = 8 * 512 * 4;
         const TP_WMMA_LDS: usize = 8 * 1024 * 4;
@@ -390,8 +414,16 @@ impl PomMiner {
             match Buffer::<cl_uint>::create(cref, CL_MEM_READ_WRITE, n as usize, ptr::null_mut()) {
                 Ok(b) => self.offsets = Some(b),
                 Err(e) => {
-                    log::warn!("PoM v4: offsets buffer alloc failed ({e}) — falling back to single-phase.");
-                    self.mode = V4Mode::SingleDp4a;
+                    // A two-phase WMMA request still has a fully independent single-phase WMMA
+                    // kernel; preserve matrix-core acceleration when only the offsets allocation
+                    // failed. The dp4a mode falls back to its own single-phase counterpart.
+                    self.mode = if self.mode == V4Mode::TwoPhaseWmma && self.kernel_wmma_sp.is_some() {
+                        V4Mode::SingleWmma
+                    } else {
+                        V4Mode::SingleDp4a
+                    };
+                    log::warn!("PoM v4: offsets buffer alloc failed ({e}) — falling back to {}.",
+                        if self.mode == V4Mode::SingleWmma { "single-phase WMMA" } else { "single-phase dp4a" });
                 }
             }
         }
@@ -403,24 +435,29 @@ impl PomMiner {
             match self.mode {
                 V4Mode::SingleWmma => enqueue_v4(&self.queue,
                     self.kernel_wmma_sp.as_ref().unwrap_or(&self.kernel_v4),
-                    &self.weights, slab_tiles, &self.winner, n_tiles, k, pph, seed, time, target, base, sub, h10,
+                    &self.weights, slab_tiles, &self.winner, n_tiles, k, pph, seed, time, target, base, sub,
+                    nonce_base, h10,
                     if self.kernel_wmma_sp.is_some() { SP_WMMA_LDS } else { SP_DP4A_LDS })?,
                 V4Mode::TwoPhaseWmma => enqueue_v4_tp(&self.queue, &self.kernel_chase,
                     self.kernel_wmma.as_ref().unwrap_or(&self.kernel_v4_tp), &self.weights, slab_tiles,
-                    self.offsets.as_ref().unwrap(), &self.winner, n_tiles, k, pph, seed, time, target, base, sub, h10,
+                    self.offsets.as_ref().unwrap(), &self.winner, n_tiles, k, pph, seed, time, target, base, sub,
+                    nonce_base, h10,
                     if self.kernel_wmma.is_some() { TP_WMMA_LDS } else { TP_DP4A_LDS })?,
                 V4Mode::TwoPhaseDp4a => enqueue_v4_tp(&self.queue, &self.kernel_chase, &self.kernel_v4_tp,
                     &self.weights, slab_tiles, self.offsets.as_ref().unwrap(), &self.winner, n_tiles, k,
-                    pph, seed, time, target, base, sub, h10, TP_DP4A_LDS)?,
+                    pph, seed, time, target, base, sub, nonce_base, h10, TP_DP4A_LDS)?,
                 V4Mode::SingleDp4a => enqueue_v4(&self.queue, &self.kernel_v4, &self.weights, slab_tiles,
-                    &self.winner, n_tiles, k, pph, seed, time, target, base, sub, h10, SP_DP4A_LDS)?,
+                    &self.winner, n_tiles, k, pph, seed, time, target, base, sub, nonce_base, h10,
+                    SP_DP4A_LDS)?,
             }
             done += sub;
         }
-        self.queue.finish().ok()?;
+        self.queue.finish().map_err(|e| format!("queue finish failed: {e}"))?;
         let mut w = [u64::MAX];
-        self.queue.enqueue_read_buffer(&self.winner, CL_BLOCKING, 0, &mut w, &[]).ok()?;
-        if w[0] != u64::MAX { Some(w[0]) } else { None }
+        self.queue
+            .enqueue_read_buffer(&self.winner, CL_BLOCKING, 0, &mut w, &[])
+            .map_err(|e| format!("winner read failed: {e}"))?;
+        Ok(if w[0] != u64::MAX { Some(nonce_base + w[0]) } else { None })
     }
 }
 
@@ -936,8 +973,10 @@ pub fn ensure_installed() {
 /// Word sets mirror `pom_gpu::mine_v4` / `pom_v4.rs`: the POW fold uses the H3-salted pph words
 /// ("v4 pow uses the h3 fold") and the SEED fold uses the v4-salted words. Both are pure host-side
 /// derivations, so the kernel is era-agnostic — only the uploaded words differ.
-pub fn mine_v4(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64, daa: u64) -> Option<u64> {
-    let id = target_dev()?;
+pub fn mine_v4(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64, batch: u64, daa: u64) -> crate::pom::GrindResult {
+    let Some(id) = target_dev() else {
+        return Err(crate::pom::GrindError::Paused("no OpenCL GPU bound"));
+    };
     // H10 hardfork (DAA 87,360,000): at/after the gate the SEED becomes the one-way cSHAKE256
     // PowHash of the RAW pph words; below it, the reversible v4 fold over the v4-salted words.
     // Byte-identical dispatch to pom::pom_block_seed_v4_era. The POW fold (p) is unchanged (H3 words).
@@ -945,9 +984,20 @@ pub fn mine_v4(pph: &[u8; 32], time: u64, target_le: &[u8; 32], nonce_base: u64,
     let p = crate::pom::pph_words_for_era(pph, true);
     let s = if h10_era { crate::pom::pph_words(pph) } else { crate::pom::pph_words_v4(pph) };
     let t = words(target_le);
-    let miner = miner_for(id)?;
-    let mut g = miner.lock().unwrap();
-    g.mine_v4(p, s, time, t, nonce_base, batch, if h10_era { 1 } else { 0 })
+    let Some(miner) = miner_for(id) else {
+        return Err(crate::pom::GrindError::Paused("OpenCL walk not installed"));
+    };
+    let Ok(mut g) = miner.lock() else {
+        log::error!("PoM[opencl]: resident miner mutex poisoned — batch aborted and not counted");
+        return Err(crate::pom::GrindError::Backend("resident OpenCL miner mutex poisoned".into()));
+    };
+    match g.mine_v4(p, s, time, t, nonce_base, batch, if h10_era { 1 } else { 0 }) {
+        Ok(winner) => Ok(crate::pom::GrindCompleted { winner, hashes_done: batch }),
+        Err(e) => {
+            log::warn!("PoM[opencl]: v4 batch failed ({e}) — batch aborted and not counted");
+            Err(crate::pom::GrindError::Backend(e))
+        }
+    }
 }
 
 /// Build the resident tier from a GGUF (shared proof WeightIndex, streamed to VRAM) and make it
@@ -1052,7 +1102,7 @@ mod v4_byte_exact {
                 if matches!(m, V4Mode::SingleWmma) && miner.kernel_wmma_sp.is_none() { continue; }
                 if matches!(m, V4Mode::TwoPhaseWmma) && miner.kernel_wmma.is_none() { continue; }
                 miner.mode = m;
-                assert_eq!(miner.mine_v4(p, s, time, t, 0, NN, hf), Some(w_cpu),
+                assert_eq!(miner.mine_v4(p, s, time, t, 0, NN, hf).expect("OpenCL v4 grind"), Some(w_cpu),
                     "{name} v4 winner mismatch (h10={h10})");
                 eprintln!("[h10={h10}] {name}: OK");
             }
@@ -1091,10 +1141,10 @@ mod v4_byte_exact {
 
         let mut miner = PomMiner::new(dev, &index, n_chunks).expect("PomMiner::new");
         let bench = |m: &mut PomMiner, label: &str| {
-            m.mine_v4(p, s, 1_700_000_000, t, 0, batch, 0); // warmup
+            let _ = m.mine_v4(p, s, 1_700_000_000, t, 0, batch, 0); // warmup
             let rounds = 6u64;
             let start = std::time::Instant::now();
-            for r in 0..rounds { m.mine_v4(p, s, 1_700_000_000, t, r * batch, batch, 0); }
+            for r in 0..rounds { let _ = m.mine_v4(p, s, 1_700_000_000, t, r * batch, batch, 0); }
             let secs = start.elapsed().as_secs_f64();
             let mhs = (rounds * batch) as f64 / secs / 1e6;
             eprintln!("{label}: {mhs:.3} Mh/s ({} nonces in {secs:.2}s)", rounds * batch);

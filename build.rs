@@ -4,13 +4,22 @@ use time::{format_description, OffsetDateTime};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build stamp for field diagnosis: every 0.9.5 asset repack printed the same bare "0.9.5"
     // banner, making it impossible to tell WHICH build a user's log came from. git hash + UTC time.
-    let git = std::process::Command::new("git")
+    let mut git = std::process::Command::new("git")
         .args(["rev-parse", "--short=9", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".into());
+    if git != "unknown"
+        && std::process::Command::new("git")
+            .args(["diff", "--quiet", "--ignore-submodules", "--"])
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(false)
+    {
+        git.push_str("-dirty");
+    }
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     println!("cargo:rustc-env=KERYX_BUILD_STAMP={git} @{secs}");
     println!("cargo:rerun-if-changed=.git/HEAD");
@@ -38,12 +47,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // PoM CUDA walk image. TWO shapes, selected below:
-    //  - MODERN (default): ship the prebuilt NATIVE-SASS fatbin `cuda/pom_mine.fatbin` (sm_75;80;86;
-    //    89;90;120 + compute_75 PTX fallback). Native sm_120 SASS means the walk runs DIRECTLY on
+    //  - MODERN (default): ship the prebuilt native-SASS fatbin `cuda/pom_mine.fatbin` (all CUDA
+    //    13.3 targets from sm_75 through sm_121, plus compute_75 and tensor-capable compute_80 PTX).
+    //    Native sm_120 SASS means the walk runs DIRECTLY on
     //    Blackwell (5070Ti/5080/5090) with NO driver JIT. The old path shipped only compute_75 PTX;
     //    on Windows the driver's JIT of that to sm_120 was ~5x slower than upstream's native fatbin
-    //    ("limited on power"). The fatbin is prebuilt with CUDA 12.9 and committed, so even a build
-    //    toolkit that predates sm_120 (Windows CI = CUDA 12.5) still ships native Blackwell SASS.
+    //    ("limited on power"). The CUDA 13.3 fatbin is committed, so even a build toolkit that
+    //    predates sm_120 can still package native Blackwell SASS; see the kernel audit document for
+    //    its exact architecture list.
     //  - LEGACY/PASCAL (POM_CUDA_ARCH set, e.g. compute_70/compute_60): compile PTX from source with
     //    the build's nvcc, as before (those old cards aren't the Blackwell-JIT case). Also the dev
     //    fallback when the committed fatbin is absent.
@@ -77,7 +88,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-env-changed=POM_WALK_IMAGE");
         println!("cargo:rerun-if-env-changed=POM_CUDA_ARCH");
         println!("cargo:rerun-if-env-changed=NVCC");
-        println!("cargo:rerun-if-env-changed=POM_CUDA_ARCH");
         let arch_override = env::var("POM_CUDA_ARCH").ok();
         let committed_fatbin = "cuda/pom_mine.fatbin";
         // MODERN ships the committed native-SASS fatbin on EVERY OS since the v4 tensor-core
@@ -99,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::copy(committed_fatbin, &image)
                 .unwrap_or_else(|e| panic!("pom-cuda: copy {committed_fatbin} -> {image}: {e}"));
             println!("cargo:rustc-env=POM_WALK_IMAGE_KIND=fatbin");
-            println!("cargo:rustc-env=POM_PTX_ARCH=sm_75..120-native"); // for the load-error message
+            println!("cargo:rustc-env=POM_PTX_ARCH=sm_75..121-native+compute_80-tc"); // diagnostic
         } else {
             // LEGACY/PASCAL or no committed fatbin: compile from source.
             //
@@ -112,29 +122,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // to know these arches.
             let nvcc = env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
             let arch = arch_override.unwrap_or_else(|| "compute_75".to_string());
-            let tc_sms = ["80", "86", "89", "90"];
-            let mut args: Vec<String> = vec!["-fatbin".into(), format!("-gencode=arch={arch},code={arch}")];
-            for sm in tc_sms {
-                args.push(format!("-gencode=arch=compute_{sm},code=sm_{sm}"));
-            }
-            args.extend(["-o".to_string(), image.clone(), "src/pom_mine.cu".to_string()]);
-            let fat = std::process::Command::new(&nvcc).args(&args).status();
-            let fat_ok = matches!(fat, Ok(st) if st.success());
-            if fat_ok {
-                println!("cargo:rustc-env=POM_WALK_IMAGE_KIND=fatbin");
-                println!("cargo:rustc-env=POM_PTX_ARCH={}+sm_80..90-native", arch.replace("compute_", "sm_"));
-            } else {
-                println!("cargo:warning=pom-cuda: fatbin build failed — falling back to {arch} PTX; \
-tensor-core walk will be unavailable (classic kernel only) on Ampere and newer.");
-                println!("cargo:rustc-env=POM_PTX_ARCH={}", arch.replace("compute_", "sm_"));
+            if !want_fatbin {
+                // Honour the explicit override literally. Previously `POM_WALK_IMAGE=ptx` still
+                // entered the mixed-fatbin branch and silently produced a fatbin.
                 let status = std::process::Command::new(&nvcc)
-                    .args(["-ptx", &format!("-arch={}", arch), "-o", &image, "src/pom_mine.cu"])
+                    .args(["-O3", "-ptx", &format!("-arch={}", arch), "-o", &image, "src/pom_mine.cu"])
                     .status()
                     .expect("pom-cuda: failed to run nvcc (CUDA toolkit required)");
                 if !status.success() {
                     panic!("pom-cuda: nvcc -ptx src/pom_mine.cu failed");
                 }
                 println!("cargo:rustc-env=POM_WALK_IMAGE_KIND=ptx");
+                println!("cargo:rustc-env=POM_PTX_ARCH={}", arch.replace("compute_", "sm_"));
+            } else {
+                // Add every native target this nvcc actually knows. This gives source-fallback
+                // builds the same broad coverage as the committed image without making an older
+                // toolkit fail the entire fatbin on one unknown architecture.
+                let candidates = ["80", "86", "87", "88", "89", "90", "100", "103", "110", "120", "121"];
+                let listed = std::process::Command::new(&nvcc)
+                    .arg("--list-gpu-code")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+                let tc_sms: Vec<&str> = match listed {
+                    Some(ref codes) => candidates
+                        .iter()
+                        .copied()
+                        .filter(|sm| codes.split_whitespace().any(|code| code == format!("sm_{sm}")))
+                        .collect(),
+                    None => vec!["80", "86", "89", "90"],
+                };
+                let mut args: Vec<String> = vec![
+                    "-O3".into(),
+                    "-fatbin".into(),
+                    format!("-gencode=arch={arch},code={arch}"),
+                ];
+                // A compute_75 fallback can only contain the empty tensor-core stubs because the
+                // source guards IMMA at __CUDA_ARCH__ >= 800. Carry compute_80 PTX as well so an
+                // unlisted/future Ampere-or-newer architecture JITs real seeded TC/NCF kernels.
+                if arch != "compute_80" {
+                    args.push("-gencode=arch=compute_80,code=compute_80".into());
+                }
+                for sm in &tc_sms {
+                    args.push(format!("-gencode=arch=compute_{sm},code=sm_{sm}"));
+                }
+                args.extend(["-o".to_string(), image.clone(), "src/pom_mine.cu".to_string()]);
+                let fat = std::process::Command::new(&nvcc).args(&args).status();
+                let fat_ok = matches!(fat, Ok(st) if st.success());
+                if fat_ok {
+                    println!("cargo:rustc-env=POM_WALK_IMAGE_KIND=fatbin");
+                    println!(
+                        "cargo:rustc-env=POM_PTX_ARCH={}+sm_{}-native+compute_80-tc",
+                        arch.replace("compute_", "sm_"),
+                        tc_sms.join(",")
+                    );
+                } else {
+                    println!("cargo:warning=pom-cuda: fatbin build failed — falling back to {arch} PTX; \
+tensor-core walk will be unavailable (classic kernel only) on Ampere and newer.");
+                    println!("cargo:rustc-env=POM_PTX_ARCH={}", arch.replace("compute_", "sm_"));
+                    let status = std::process::Command::new(&nvcc)
+                        .args(["-O3", "-ptx", &format!("-arch={}", arch), "-o", &image, "src/pom_mine.cu"])
+                        .status()
+                        .expect("pom-cuda: failed to run nvcc (CUDA toolkit required)");
+                    if !status.success() {
+                        panic!("pom-cuda: nvcc -ptx src/pom_mine.cu failed");
+                    }
+                    println!("cargo:rustc-env=POM_WALK_IMAGE_KIND=ptx");
+                }
             }
         }
     }

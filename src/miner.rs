@@ -355,7 +355,7 @@ impl MinerManager {
                 // keeping the per-launch time modest (~33 ms on an H100, ~230 ms on a 3070) so job
                 // switching stays responsive. Bumped 2^20 -> 2^22.
                 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
-                let mut pom_nonce: u64 = thread_rng().next_u64();
+                let mut pom_cursor: Option<(usize, keryx_miner::pom::MaskedNonceCursor)> = None;
                 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
                 // Apple Silicon: at M-class PoM rates (~0.8 MH/s on an M2) the 2^22 batch above is a
                 // ~5 s blocking launch — new jobs are only picked up at batch boundaries (see the
@@ -397,6 +397,19 @@ impl MinerManager {
                             }
                         };
                     }
+                    // Poll commands at the top of every retry, not only after a successful PoM
+                    // batch. Paused/failed backends have several early `continue` paths; without
+                    // this seam a permanent error (or Metal's deliberate H10 pause) could pin a
+                    // stale job and ignore WorkerCommand::Close indefinitely.
+                    if state.is_some() {
+                        if let Some(new_cmd) = block_channel.get_changed()? {
+                            state = match new_cmd {
+                                Some(WorkerCommand::Job(s)) => Some(s),
+                                Some(WorkerCommand::Close) => return Ok(()),
+                                None => None,
+                            };
+                        }
+                    }
                     // PoM possession mining (post-fork): grind the data-dependent walk on the GPU
                     // over the resident tier weights instead of kHeavyHash. On a winning nonce we
                     // build the proof (host) and submit; the legacy plugin path below is skipped.
@@ -406,11 +419,19 @@ impl MinerManager {
                     // running kHeavyHash on an H6 pool and never build a v3 proof.
                     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
                     if let Some(s0) = state.as_ref() { let _ = s0;
-                        let (pph, time, target_le, daa) = {
+                        let (job_id, pph, time, target_le, daa, nonce_mask, nonce_fixed) = {
                             let s = state.as_ref().unwrap();
                             let mut pph = [0u8; 32];
                             pph.copy_from_slice(&s.pow_hash_header[0..32]);
-                            (pph, u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap()), s.target.to_le_bytes(), s.daa_score)
+                            (
+                                s.id,
+                                pph,
+                                u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap()),
+                                s.target.to_le_bytes(),
+                                s.daa_score,
+                                s.nonce_mask,
+                                s.nonce_fixed,
+                            )
                         };
                         // PoM v4 (relaunch, keryxd v1.5.1): ONE entry, no era flags, no gating.
                         // The GPU grinds the D=32 int8 matrix re-walk (pom_mine_v4); the host rebuilds
@@ -438,8 +459,47 @@ impl MinerManager {
                         let batch = std::env::var("KERYX_POM_V4_BATCH").ok()
                             .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0)
                             .unwrap_or(1 << 16);
+                        // Stratum assigns each worker a nonce sub-domain as
+                        // `(raw & nonce_mask) | nonce_fixed`. PoM kernels accept physical contiguous
+                        // ranges, so enumerate the unique assigned values by rank and split only at
+                        // a numeric gap/wrap. Normal low-bit pool masks retain full-sized batches.
+                        if pom_cursor.as_ref().map(|(id, _)| *id) != Some(job_id) {
+                            pom_cursor = Some((
+                                job_id,
+                                keryx_miner::pom::MaskedNonceCursor::new(
+                                    nonce_mask,
+                                    nonce_fixed,
+                                    thread_rng().next_u64(),
+                                ),
+                            ));
+                        }
+                        let Some(range) = pom_cursor.as_ref().and_then(|(_, c)| c.peek(batch)) else {
+                            log::warn!(
+                                "PoM: Stratum nonce domain exhausted for job {} — waiting for a new template",
+                                job_id
+                            );
+                            state = None;
+                            continue;
+                        };
                         #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
-                        let found = {
+                        let grind = {
+                            // Metal has not ported the H10 cSHAKE seed yet. Its backend reports a
+                            // paused batch, and this earlier guard avoids a pointless call/log loop
+                            // while keeping the nonce cursor and accounting untouched.
+                            #[cfg(all(target_os = "macos", feature = "pom-metal"))]
+                            if keryx_miner::pom::is_h10_seed_era(daa) {
+                                static H10_UNSUPPORTED_WARNED: std::sync::atomic::AtomicBool =
+                                    std::sync::atomic::AtomicBool::new(false);
+                                if !H10_UNSUPPORTED_WARNED.swap(true, Ordering::Relaxed) {
+                                    log::error!(
+                                        "PoM[metal{}]: H10 one-way seeds are not implemented by the \
+                                         Metal shader — mining paused honestly at 0 H/s.",
+                                        wdid
+                                    );
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(1000));
+                                continue;
+                            }
                             // CRASH GUARD (see pom_gpu::inference_paused_for): while THIS card is
                             // swapping its llama model, neither run a walk nor rebuild one — the
                             // zero-dup walk addresses the engine's weights, so touching them mid
@@ -476,7 +536,7 @@ impl MinerManager {
                                     let n = PAUSED_WARN.fetch_add(1, Ordering::Relaxed);
                                     if n % 60 == 0 {
                                         log::warn!(
-                                            "PoM[gpu{}]: no walk installed (staging failed/pending) — grinding                                              PAUSED on this card, hashrate 0 (not counted). Retrying staging…", wdid);
+                                            "PoM[gpu{}]: no walk installed (staging failed/pending) — grinding PAUSED on this card, hashrate 0 (not counted). Retrying staging…", wdid);
                                     }
                                     std::thread::sleep(std::time::Duration::from_millis(1000));
                                     continue;
@@ -490,12 +550,12 @@ impl MinerManager {
                                 std::thread::sleep(std::time::Duration::from_millis(500));
                                 continue;
                             }
-                            pom_driver::mine_v4(wdid, &pph, time, &target_le, pom_nonce, batch, daa)
+                            pom_driver::mine_v4(wdid, &pph, time, &target_le, range.start, range.len, daa)
                         };
                         // AMD (OpenCL): the thread is already bound to its card; the deviceless API is
                         // per-GPU via thread-local binding.
                         #[cfg(feature = "pom-opencl")]
-                        let found = {
+                        let grind = {
                             if !pom_driver::is_installed() {
                                 if let Some(new_cmd) = block_channel.get_changed()? {
                                     state = match new_cmd {
@@ -506,12 +566,58 @@ impl MinerManager {
                                     continue;
                                 }
                                 let _ = pom_driver::ensure_installed();
+                                if !pom_driver::is_installed() {
+                                    // The backend reports this as Paused; retry staging here without
+                                    // launching or reporting fake work.
+                                    static PAUSED_WARN: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if PAUSED_WARN.fetch_add(1, Ordering::Relaxed) % 60 == 0 {
+                                        log::warn!(
+                                            "PoM[opencl]: no walk installed after staging — grinding \
+                                             PAUSED, hashrate 0 (not counted). Retrying…"
+                                        );
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                                    continue;
+                                }
                             }
-                            pom_driver::mine_v4(&pph, time, &target_le, pom_nonce, batch, daa)
+                            pom_driver::mine_v4(&pph, time, &target_le, range.start, range.len, daa)
                         };
-                        pom_nonce = pom_nonce.wrapping_add(batch);
-                        hashes_tried.fetch_add(batch, Ordering::AcqRel);
-                        worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);
+                        // A failed/paused backend has done no accountable work. Keep the cursor on
+                        // the same range so recovery cannot silently skip candidates or manufacture
+                        // hashrate. OpenCL may have enqueued a partial sub-batch before an error; it
+                        // deliberately reports that as failed/zero and safely retries the range.
+                        let completed = match grind {
+                            Ok(done)
+                                if done.hashes_done > 0
+                                    && done.hashes_done <= range.len
+                                    && done.winner.map_or(true, |winner| {
+                                        winner
+                                            .checked_sub(range.start)
+                                            .map_or(false, |delta| delta < done.hashes_done)
+                                    }) => done,
+                            Ok(done) => {
+                                warn!(
+                                    "PoM backend returned an invalid completion (start={}, requested={}, done={}, winner={:?}); range not counted",
+                                    range.start, range.len, done.hashes_done, done.winner
+                                );
+                                continue;
+                            }
+                            Err(keryx_miner::pom::GrindError::Paused(_reason)) => {
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                continue;
+                            }
+                            Err(keryx_miner::pom::GrindError::Backend(_error)) => {
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                continue;
+                            }
+                        };
+                        if let Some((_, cursor)) = pom_cursor.as_mut() {
+                            cursor.commit(completed.hashes_done);
+                        }
+                        hashes_tried.fetch_add(completed.hashes_done, Ordering::Relaxed);
+                        worker_hashes_tried.fetch_add(completed.hashes_done, Ordering::Relaxed);
+                        let found = completed.winner;
                         // --only-inference duty cycle: idle the card between launches so it draws
                         // almost nothing and is instantly available to serve. No-op otherwise.
                         #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
@@ -541,21 +647,24 @@ impl MinerManager {
                             #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                             if overlap_pool_proof {
                                 if let Some(s) = state.as_ref() {
-                                    if let Some(tier) = keryx_miner::pom_gpu::current_tier(wdid, s.daa_score) {
+                                    if let (Some((proof_index, _)), Some(tier)) = (
+                                        keryx_miner::pom::active_index_for(wdid),
+                                        keryx_miner::pom_gpu::current_tier(wdid, s.daa_score),
+                                    ) {
                                         inflight_proofs.fetch_add(1, Ordering::AcqRel);
                                         let s_clone = s.clone();
                                         let tx = send_channel.clone();
                                         let counter = std::sync::Arc::clone(&inflight_proofs);
                                         std::thread::spawn(move || {
-                                            if let Some((idx, _)) = keryx_miner::pom::active_index_for(wdid) {
-                                                if let Some(mut block_seed) = s_clone.generate_block_if_pom(nonce, idx, tier) {
-                                                    if let crate::pow::BlockSeed::PartialBlock { device_id, .. } = &mut block_seed {
-                                                        *device_id = wdid;
-                                                    }
-                                                    match tx.blocking_send(block_seed.clone()) {
-                                                        Ok(()) => block_seed.report_block(),
-                                                        Err(e) => warn!("Could not submit PoM block — pool connection dropped ({}); reconnecting", e),
-                                                    }
+                                            if let Some(mut block_seed) =
+                                                s_clone.generate_block_if_pom(nonce, proof_index, tier)
+                                            {
+                                                if let crate::pow::BlockSeed::PartialBlock { device_id, .. } = &mut block_seed {
+                                                    *device_id = wdid;
+                                                }
+                                                match tx.blocking_send(block_seed.clone()) {
+                                                    Ok(()) => block_seed.report_block(),
+                                                    Err(e) => warn!("Could not submit PoM block — pool connection dropped ({}); reconnecting", e),
                                                 }
                                             }
                                             counter.fetch_sub(1, Ordering::AcqRel);
@@ -595,7 +704,7 @@ impl MinerManager {
                             // dropped there — never submitted.
                             #[cfg(feature = "pom-opencl")]
                             if let Some(s) = state.as_ref() {
-                                if let Some((_idx, tier)) = keryx_miner::pom::active_index() {
+                                if let Some((proof_index, tier)) = keryx_miner::pom::active_index() {
                                     if inflight_proofs.load(Ordering::Acquire) < MAX_INFLIGHT_PROOFS {
                                         inflight_proofs.fetch_add(1, Ordering::AcqRel);
                                         let s_clone = s.clone();
@@ -603,12 +712,12 @@ impl MinerManager {
                                         let tx = send_channel.clone();
                                         let counter = std::sync::Arc::clone(&inflight_proofs);
                                         std::thread::spawn(move || {
-                                            if let Some((idx, _)) = keryx_miner::pom::active_index() {
-                                                if let Some(block_seed) = s_clone.generate_block_if_pom(nonce, idx, tier) {
-                                                    match tx.blocking_send(block_seed.clone()) {
-                                                        Ok(()) => block_seed.report_block(),
-                                                        Err(e) => warn!("Could not submit PoM block — pool connection dropped ({}); reconnecting", e),
-                                                    }
+                                            if let Some(block_seed) =
+                                                s_clone.generate_block_if_pom(nonce, proof_index, tier)
+                                            {
+                                                match tx.blocking_send(block_seed.clone()) {
+                                                    Ok(()) => block_seed.report_block(),
+                                                    Err(e) => warn!("Could not submit PoM block — pool connection dropped ({}); reconnecting", e),
                                                 }
                                             }
                                             counter.fetch_sub(1, Ordering::AcqRel);

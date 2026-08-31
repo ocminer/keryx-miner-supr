@@ -274,12 +274,15 @@ pub fn build_proof_v4(tier: u8, seed: u64, index: &WeightIndex) -> Result<(PomPr
     let mut tiles = Vec::with_capacity(POM_V4_K);
     let mut merkle = Vec::with_capacity(POM_V4_K);
     for step in 1..=POM_V4_K as u64 {
-        let mut tile = Vec::with_capacity(POM_V4_TILE_BYTES);
-        for c in 0..POM_V4_TILE_CHUNKS {
-            tile.extend_from_slice(&index.read_chunk_bytes(off * POM_V4_TILE_CHUNKS + c));
-        }
+        // One contiguous read per tensor overlap instead of 32 separate 32-byte preads. A proof
+        // carries 256 tiles, so this removes up to 7,936 tiny syscalls from every winning share.
+        let mut tile = vec![0u8; POM_V4_TILE_BYTES];
+        index.read_chunks_into(off * POM_V4_TILE_CHUNKS, &mut tile);
         let snippet: [u8; 32] = tile[..POM_V4_SNIPPET_BYTES].try_into().unwrap();
-        let path = index.merkle_path(off * POM_V4_TILE_CHUNKS)[POM_V4_TILE_SUBTREE_DEPTH as usize..].to_vec();
+        let path = index.merkle_path_from_level(
+            off * POM_V4_TILE_CHUNKS,
+            POM_V4_TILE_SUBTREE_DEPTH,
+        );
         merkle.push(PomV4RangeProof { path });
         v4_transition_into(&mut scratch, &state, &tile, step as u32);
         std::mem::swap(&mut state, &mut scratch);

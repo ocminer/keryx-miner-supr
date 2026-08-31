@@ -40,6 +40,36 @@ const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v3";
 const LOG_RATE: Duration = Duration::from_secs(30);
 const CHALLENGE_MAX_TOKENS: usize = 128;
 
+/// Validate a Stratum extranonce assignment before mutating connection state. Returns
+/// `(nonce_mask, nonce_fixed)` for the legacy transform `(raw & mask) | fixed`.
+fn extranonce_assignment(extranonce: &str, nonce_size: u32) -> Result<(u64, u64), Error> {
+    let invalid = |message: String| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+    let bits = nonce_size
+        .checked_mul(8)
+        .ok_or_else(|| invalid("Stratum nonce_size overflow".into()))?;
+    if bits > 64 {
+        return Err(invalid(format!("Stratum nonce_size {} exceeds 8 bytes", nonce_size)).into());
+    }
+    let extra = if extranonce.is_empty() {
+        0
+    } else {
+        u64::from_str_radix(extranonce, 16)?
+    };
+    let fixed = if bits == 64 {
+        if extra != 0 {
+            return Err(invalid("non-zero Stratum extranonce cannot fit above an 8-byte mutable nonce".into()).into());
+        }
+        0
+    } else {
+        if extra > (u64::MAX >> bits) {
+            return Err(invalid("Stratum extranonce does not fit above the mutable nonce field".into()).into());
+        }
+        extra << bits
+    };
+    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    Ok((mask, fixed))
+}
+
 // ── Phase 2 OPoI — inference cache & task types ─────────────────────────────
 
 /// AiRequest task dispatched by the bridge in a `mining.notify` 5th parameter (JSON).
@@ -668,7 +698,11 @@ impl StratumHandler {
                 let msg_id = last_stratum_id.fetch_add(1, Ordering::SeqCst);
                 // Store the finding GPU alongside the job id so the accept/reject response (matched by
                 // msg_id) can be attributed per-card.
-                share_stats.shares_pending.try_lock().unwrap().insert(msg_id, (job_id.clone(), device_id));
+                share_stats
+                    .shares_pending
+                    .lock()
+                    .await
+                    .insert(msg_id, (job_id.clone(), device_id));
                 let nonce_hex = format!("{:016x}", nonce);
                 let opoi_tag = keryx_inference::tag_fixed(nonce);
 
@@ -890,13 +924,8 @@ impl StratumHandler {
                                 if self.telemetry_req_ids.remove(&rid) {
                                     return Ok(());
                                 }
-                                if let Some((_jobid, device_id)) = self
-                                    .shares_stats
-                                    .shares_pending
-                                    .try_lock()
-                                    .unwrap()
-                                    .remove(&rid)
-                                {
+                                let pending = self.shares_stats.shares_pending.lock().await.remove(&rid);
+                                if let Some((_jobid, device_id)) = pending {
                                     self.shares_stats.accepted.fetch_add(1, Ordering::SeqCst);
                                     crate::pow::record_share_accepted(device_id);
                                     info!("Share accepted (GPU {})", device_id);
@@ -1140,7 +1169,7 @@ impl StratumHandler {
                     }
                     return Ok(());
                 }
-                let pending = { self.shares_stats.shares_pending.try_lock().unwrap().remove(&id) };
+                let pending = self.shares_stats.shares_pending.lock().await.remove(&id);
                 // Any error code here means this submitted share was NOT accepted — attribute the
                 // rejection to the GPU that found it (the R: column).
                 if let Some((_, device_id)) = &pending {
@@ -1206,20 +1235,19 @@ impl StratumHandler {
         }
     }
 
-    /// The target this job is actually mined against (keryx-stratum-v3).
+    /// The target this Stratum job is actually mined against.
     ///
-    /// v2 pools send only a share target, so we mine that verbatim. v3 pools also send the block's
-    /// own compact target (`block_bits`); we then mine `max(pool_target, block_target)`.
+    /// The assigned pool share target is authoritative. Stratum-v3 also carries the network block
+    /// target, but it must never *loosen* the search target: Suprnova applies its assigned share-
+    /// difficulty check before treating a submission as a block candidate. Mining
+    /// `max(pool_target, block_target)` therefore produced valid PoM proofs that the pool rejected
+    /// as low-difficulty whenever the live block target was easier. This was reproduced on the
+    /// two-RTX-5090 validation rig (9 low-difficulty rejects in a 180-second candidate run versus
+    /// 0/113 on the pool-target-only baseline). In the problematic case the network target is
+    /// easier, so every hit under the stricter pool target also satisfies the block target.
     ///
-    /// A LARGER Uint256 is an EASIER target, so `max` picks whichever is easier. That matters when
-    /// the pool's share difficulty is HARDER than the live network difficulty — at 10 bps the
-    /// network target can dip below the assigned share target, and without this the miner would
-    /// discard nonces that are valid BLOCKS simply because they missed the share target. It can
-    /// only ever loosen the target we grind against, never tighten it, so it cannot make us submit
-    /// something the pool would reject as low-difficulty.
-    ///
-    /// Malformed bits are ignored (fall back to the pool target) rather than fatal: a bad target
-    /// from the pool must not take the miner down mid-job.
+    /// We still decode/validate v3 `block_bits` for a one-time diagnostic. Malformed bits are
+    /// non-fatal and the pool target remains in force.
     fn effective_target(&self) -> Uint256 {
         let Some(bits) = self.block_bits else { return self.target_pool };
         let size = bits >> 24;
@@ -1233,7 +1261,16 @@ impl StratumHandler {
             warn!("stratum-v3: block_bits 0x{:08x} decoded to a zero target — mining the pool target", bits);
             return self.target_pool;
         }
-        std::cmp::max(self.target_pool, block_target)
+        if block_target > self.target_pool {
+            static LOOSER_BLOCK_TARGET_WARNED: AtomicBool = AtomicBool::new(false);
+            if !LOOSER_BLOCK_TARGET_WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "stratum-v3: network block target is easier than the assigned share target; \
+                     keeping the pool target to prevent low-difficulty share rejects"
+                );
+            }
+        }
+        self.target_pool
     }
 
     fn set_difficulty(&mut self, difficulty: &f32) -> Result<(), Error> {
@@ -1281,11 +1318,13 @@ impl StratumHandler {
     }
 
     fn set_extranonce(&mut self, extranonce: &str, nonce_size: &u32) -> Result<(), Error> {
+        let (mask, fixed) = extranonce_assignment(extranonce, *nonce_size)?;
+
+        // Commit only after every field validates, leaving the previous assignment intact on error.
         self.extranonce = Some(extranonce.to_string());
-        info!("Extra! {:?}", extranonce);
-        self.nonce_fixed = u64::from_str_radix(extranonce, 16)? << (nonce_size * 8);
-        info!("Extra Done!");
-        self.nonce_mask = (1 << (nonce_size * 8)) - 1;
+        self.nonce_fixed = fixed;
+        self.nonce_mask = mask;
+        info!("Stratum extranonce assigned: {} mutable nonce bytes", nonce_size);
         Ok(())
     }
 
@@ -1673,7 +1712,19 @@ fn do_inference_and_upload(
 
 #[cfg(test)]
 mod job_id_daa_tests {
-    use super::job_id_daa;
+    use super::{extranonce_assignment, job_id_daa};
+
+    #[test]
+    fn extranonce_assignment_validates_edges_without_shifting_by_64() {
+        assert_eq!(extranonce_assignment("ab", 0).unwrap(), (0, 0xab));
+        assert_eq!(extranonce_assignment("ab", 1).unwrap(), (0xff, 0xab00));
+        assert_eq!(extranonce_assignment("12345678", 4).unwrap(), (0xffff_ffff, 0x1234_5678_0000_0000));
+        assert_eq!(extranonce_assignment("", 8).unwrap(), (u64::MAX, 0));
+        assert_eq!(extranonce_assignment("0", 8).unwrap(), (u64::MAX, 0));
+        assert!(extranonce_assignment("1", 8).is_err());
+        assert!(extranonce_assignment("1", 9).is_err());
+        assert!(extranonce_assignment("100000000000000", 1).is_err());
+    }
 
     #[test]
     fn v4_relaunch_three_field_reads_middle_as_daa() {

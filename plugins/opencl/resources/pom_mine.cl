@@ -28,7 +28,8 @@ typedef ulong u64;
 #define V4_D4 8                    // uints per row/column (32 bytes)
 #define V4_TILE_CHUNKS 32
 #define V4_TILE_U32 256            // 1 KB tile as u32 words
-#define V4_STRIP_U32 512           // per-sub-nonce LDS strip: tile (256) + merkle scratch (256)
+#define V4_SP_STRIP_U32 384        // tile/leaves [0..255] + largest Merkle level [256..383]
+#define V4_TP_STRIP_U32 512        // two-phase tile double-buffer; Merkle reuses the same region
 #define V4_NPG 8                   // sub-nonces per 256-thread workgroup
 
 #define V4_S0_ROW_SALT       0x03421325594C3C51UL
@@ -118,6 +119,7 @@ inline u64 pom_seed_fold_h10(u64 nonce, u64 time_, u64 r0, u64 r1, u64 r2, u64 r
     keccak_f1600(st);
     return st[0];
 }
+
 // Era select: h10!=0 → one-way H10 PowHash (r0..r3 = RAW pph words); else the reversible v4 fold.
 inline u64 pom_seed_fold_era(uint h10, u64 nonce, u64 time_, u64 p0, u64 p1, u64 p2, u64 p3) {
     return h10 ? pom_seed_fold_h10(nonce, time_, p0, p1, p2, p3)
@@ -143,8 +145,9 @@ inline bool pom_le_leq(const u64 a[4], u64 b0, u64 b1, u64 b2, u64 b3) {
 
 // Signed int8×int8 dot of 4 packed bytes — byte-exact with CUDA __dp4a.s32 and pom_v4::dot_i8.
 // USE_AMD_DOT4: RDNA3+/gfx11-12 native v_dot4_i32_i8 (sudot4, dot9-insts).
-// USE_AMD_SDOT4: GCN/CDNA gfx906/908/90a native dot (sdot4, dot1-insts) — ~6x on MI50.
-// Fallback: scalar unpack (Polaris/RDNA1-2/Windows Adrenalin). All three are byte-identical
+// USE_AMD_SDOT4: dot1-capable GCN/RDNA/CDNA native dot (gfx906/908/90a, gfx1011/12,
+// gfx1030-36, gfx940-42; exact host allowlist) — ~6x on MI50.
+// Fallback: scalar unpack (Polaris, gfx1010/1013, and drivers without the builtin). All are byte-identical
 // (int8 dots cannot overflow i32 at these depths, so clamp/saturation never triggers).
 inline int v4_dp4(uint a, uint b, int acc) {
 #if defined(USE_AMD_DOT4)
@@ -241,8 +244,8 @@ inline void b3_hash_pair(__local const uint* m, __local uint* out) {
 #define V4_UNROLL __attribute__((opencl_unroll_hint))
 
 // v4 grind: 256-thread workgroups of V4_NPG(8) sub-nonces × 32 lanes; lane x owns state row x.
-// Winner = lowest passing nonce via CAS-min (host re-walks + re-checks, so a kernel false
-// positive is dropped there, never submitted).
+// Winner = lowest passing batch-relative index via CAS-min. Keeping the physical nonce out of the
+// sentinel slot makes a legitimate nonce of U64_MAX representable; the host adds winner_base.
 __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4(
     __global const uint* restrict b0,        // blob slab 0 as u32 (single-slab rigs: the whole blob)
     __global const uint* restrict b1,        // absent slabs = slab 0 repeated (never selected)
@@ -255,10 +258,10 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4(
     const u64 s0, const u64 s1, const u64 s2, const u64 s3,   // SEED-fold pph words (v4-salted)
     const u64 time_,
     const u64 t0, const u64 t1, const u64 t2, const u64 t3,   // target (4 LE u64)
-    const u64 nonce_base, const u64 n_nonces,
+    const u64 nonce_base, const u64 n_nonces, const u64 winner_base,
     const uint h10,                          // 0 = reversible v4 fold; 1 = one-way H10 PowHash seed
     volatile __global u64* winner,
-    __local uint* scratch)                   // V4_NPG * V4_STRIP_U32 u32 = 16 KB (host sets size)
+    __local uint* scratch)                   // V4_NPG * V4_SP_STRIP_U32 u32 = 12 KB (host sets size)
 {
     const uint lid  = get_local_id(0);
     const uint sub  = lid >> 5;              // sub-nonce 0..7 within the group
@@ -269,7 +272,7 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4(
     const bool live  = gsub < n_nonces;
     const u64  nonce = nonce_base + (live ? gsub : 0UL);
     const u64  seed  = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
-    __local uint* strip = scratch + sub * V4_STRIP_U32;   // this sub-nonce's tile + merkle scratch
+    __local uint* strip = scratch + sub * V4_SP_STRIP_U32; // tile/leaves + 128-word Merkle level
 
     // S_0 row `lane`: mix64 keystream (identical to pom_v4::v4_initial_state).
     uint row4[V4_D4];
@@ -292,8 +295,8 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // Next offset from THIS tile's snippet (first 32 B = 8 u32), derived by every lane.
-        {
+        // The final transition has no successor tile. Skip its serial snippet fold and modulo.
+        if (step < K) {
             u64 sf = 0;
             V4_UNROLL for (int w = 0; w < 8; w++) sf = pom_mix64(sf ^ (u64)strip[w]);
             off = pom_mix64(seed ^ (u64)(step + 1) * V4_OFFSET_STEP_SALT ^ sf) % V4_NT(n_tiles);
@@ -333,10 +336,11 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4(
         u64 pv[4];
         pom_pow_fold(fin, p0, p1, p2, p3, pv);
         if (pom_le_leq(pv, t0, t1, t2, t3)) {
+            const u64 candidate = nonce - winner_base;
             // CAS-min: needs only cl_khr_int64_base_atomics (64-bit atom_min is the extended ext).
             u64 old = *winner;
-            while (nonce < old) {
-                u64 prev = atom_cmpxchg(winner, old, nonce);
+            while (candidate < old) {
+                u64 prev = atom_cmpxchg(winner, old, candidate);
                 if (prev == old) break;
                 old = prev;
             }
@@ -383,6 +387,7 @@ __kernel void pom_mine_v4_chase(
     u64 off = pom_mix64(seed ^ V4_OFFSET_FIRST_SALT) % V4_NT(n_tiles);
     for (uint step = 1; step <= K; step++) {
         my[step - 1] = (uint)off;
+        if (step == K) break; // K offsets are consumed; offset K+1 is dead
         // chunk 0 of tile `off` = 8 u32 (the snippet).
         u64 tin;
         const __global uint* sb = v4_slab(b0, b1, b2, b3, off, slab_tiles, &tin);
@@ -411,11 +416,11 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_tp(
     const u64 s0, const u64 s1, const u64 s2, const u64 s3,   // SEED-fold pph words (v4-salted)
     const u64 time_,
     const u64 t0, const u64 t1, const u64 t2, const u64 t3,
-    const u64 nonce_base, const u64 n_nonces,
+    const u64 nonce_base, const u64 n_nonces, const u64 winner_base,
     const uint h10,                          // 0 = reversible v4 fold; 1 = one-way H10 PowHash seed
     __global const uint* restrict offsets,                    // [n_nonces][K] from phase 1
     volatile __global u64* winner,
-    __local uint* scratch)                                    // V4_NPG * V4_STRIP_U32 u32 = 16 KB
+    __local uint* scratch)                                    // V4_NPG * V4_TP_STRIP_U32 u32 = 16 KB
 {
     const uint lid  = get_local_id(0);
     const uint sub  = lid >> 5;
@@ -425,7 +430,7 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_tp(
     const u64  idx   = live ? gsub : 0UL;      // dummy sub-nonces read nonce 0's offsets (in-bounds)
     const u64  nonce = nonce_base + idx;
     const u64  seed  = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
-    __local uint* strip = scratch + sub * V4_STRIP_U32;
+    __local uint* strip = scratch + sub * V4_TP_STRIP_U32;
     __local uint* buf0 = strip;                // tile double-buffer A
     __local uint* buf1 = strip + V4_TILE_U32;  // tile double-buffer B
     __global const uint* my = offsets + idx * (u64)K;
@@ -504,9 +509,10 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_tp(
         u64 pv[4];
         pom_pow_fold(fin, p0, p1, p2, p3, pv);
         if (pom_le_leq(pv, t0, t1, t2, t3)) {
+            const u64 candidate = nonce - winner_base;
             u64 old = *winner;
-            while (nonce < old) {
-                u64 prev = atom_cmpxchg(winner, old, nonce);
+            while (candidate < old) {
+                u64 prev = atom_cmpxchg(winner, old, candidate);
                 if (prev == old) break;
                 old = prev;
             }
@@ -543,7 +549,7 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma(
     const u64 s0, const u64 s1, const u64 s2, const u64 s3,
     const u64 time_,
     const u64 t0, const u64 t1, const u64 t2, const u64 t3,
-    const u64 nonce_base, const u64 n_nonces,
+    const u64 nonce_base, const u64 n_nonces, const u64 winner_base,
     const uint h10,                          // 0 = reversible v4 fold; 1 = one-way H10 PowHash seed
     __global const uint* restrict offsets,
     volatile __global u64* winner,
@@ -604,11 +610,12 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma(
             V4_UNROLL for (uint jb = 0; jb < 2; jb++) {
                 int8v acc = (int8v)(0);
                 V4_UNROLL for (uint kb = 0; kb < 2; kb++) {
-                    int4v a, b; char* ap = (char*)&a; char* bp = (char*)&b;
-                    V4_UNROLL for (int ki = 0; ki < 16; ki++) {
-                        ap[ki] = Sc[(16u*xb + xi) * 32 + 16u*kb + ki];
-                        bp[ki] = Tc[(16u*jb + ji) * 32 + 16u*kb + ki];   // T^T (col-major B)
-                    }
+                    // Every row is 32-byte aligned and kb selects a 16-byte half-row. Load each
+                    // WMMA fragment as one aligned vector instead of sixteen scalar LDS bytes.
+                    const uint ao = (16u*xb + xi) * 32 + 16u*kb;
+                    const uint bo = (16u*jb + ji) * 32 + 16u*kb;
+                    const int4v a = *(__local const int4v*)(Sc + ao);
+                    const int4v b = *(__local const int4v*)(Tc + bo); // T^T (col-major B)
                     acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, acc, false);
                 }
                 V4_UNROLL for (int vv = 0; vv < 8; vv++) {
@@ -651,9 +658,10 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma(
         u64 pv[4];
         pom_pow_fold(fin, p0, p1, p2, p3, pv);
         if (pom_le_leq(pv, t0, t1, t2, t3)) {
+            const u64 candidate = nonce - winner_base;
             u64 old = *winner;
-            while (nonce < old) {
-                u64 prev = atom_cmpxchg(winner, old, nonce);
+            while (candidate < old) {
+                u64 prev = atom_cmpxchg(winner, old, candidate);
                 if (prev == old) break;
                 old = prev;
             }
@@ -682,7 +690,7 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma_
     const u64 s0, const u64 s1, const u64 s2, const u64 s3,
     const u64 time_,
     const u64 t0, const u64 t1, const u64 t2, const u64 t3,
-    const u64 nonce_base, const u64 n_nonces,
+    const u64 nonce_base, const u64 n_nonces, const u64 winner_base,
     const uint h10,                          // 0 = reversible v4 fold; 1 = one-way H10 PowHash seed
     volatile __global u64* winner,
     __local uint* scratch)                     // V4_NPG * V4WSP_STRIP_U32 u32 = 24 KB
@@ -722,8 +730,8 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma_
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // Next offset from this tile's snippet (chunk 0 = tile[0..8]).
-        {
+        // The final transition has no successor tile. Skip its serial snippet fold and modulo.
+        if (step < K) {
             u64 sf = 0;
             V4_UNROLL for (int w = 0; w < 8; w++) sf = pom_mix64(sf ^ (u64)tile[w]);
             off = pom_mix64(seed ^ (u64)(step + 1) * V4_OFFSET_STEP_SALT ^ sf) % V4_NT(n_tiles);
@@ -738,11 +746,10 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma_
             V4_UNROLL for (uint jb = 0; jb < 2; jb++) {
                 int8v acc = (int8v)(0);
                 V4_UNROLL for (uint kb = 0; kb < 2; kb++) {
-                    int4v a, b; char* ap = (char*)&a; char* bp = (char*)&b;
-                    V4_UNROLL for (int ki = 0; ki < 16; ki++) {
-                        ap[ki] = Sc[(16u*xb + xi) * 32 + 16u*kb + ki];
-                        bp[ki] = Tc[(16u*jb + ji) * 32 + 16u*kb + ki];
-                    }
+                    const uint ao = (16u*xb + xi) * 32 + 16u*kb;
+                    const uint bo = (16u*jb + ji) * 32 + 16u*kb;
+                    const int4v a = *(__local const int4v*)(Sc + ao);
+                    const int4v b = *(__local const int4v*)(Tc + bo);
                     acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, acc, false);
                 }
                 V4_UNROLL for (int vv = 0; vv < 8; vv++) {
@@ -775,9 +782,10 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma_
         u64 pv[4];
         pom_pow_fold(fin, p0, p1, p2, p3, pv);
         if (pom_le_leq(pv, t0, t1, t2, t3)) {
+            const u64 candidate = nonce - winner_base;
             u64 old = *winner;
-            while (nonce < old) {
-                u64 prev = atom_cmpxchg(winner, old, nonce);
+            while (candidate < old) {
+                u64 prev = atom_cmpxchg(winner, old, candidate);
                 if (prev == old) break;
                 old = prev;
             }

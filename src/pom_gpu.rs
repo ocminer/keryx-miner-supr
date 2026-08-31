@@ -16,13 +16,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use log::info;
 
 use candle_core::cuda_backend::cudarc::driver::{
-    CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchArgs, LaunchConfig, PushKernelArg,
+    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtrMut, LaunchArgs, LaunchConfig,
+    PushKernelArg,
 };
 use candle_core::quantized::{gguf_file, QTensor};
 use candle_core::{CudaDevice, Device};
 
 /// The walk kernel image, embedded at build time (build.rs). Either a native-SASS FATBIN
-/// (sm_75..120 + compute_75 PTX fallback — modern; runs on Blackwell with NO driver JIT) or
+/// (native SASS plus compute_75/80 PTX fallbacks — modern; runs on Blackwell with NO driver JIT) or
 /// compute_XX PTX text (legacy/pascal). `POM_WALK_IMAGE_KIND` says which.
 const WALK_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_mine.image"));
 const WALK_IMAGE_KIND: &str = env!("POM_WALK_IMAGE_KIND"); // "fatbin" | "ptx"
@@ -120,6 +121,43 @@ fn v4_offsets_buf_b(stream: &Arc<CudaStream>, len: usize) -> candle_core::Result
         }
     }
     let s = Arc::new(unsafe { stream.alloc::<u32>(len) }.map_err(candle_core::Error::wrap)?);
+    g.insert(ord, s.clone());
+    Ok(s)
+}
+
+/// Per-device H10 seed array. The dedicated seed kernel writes one u64 per nonce before the walk,
+/// keeping Keccak's 25-lane state out of the latency-sensitive walk kernels. Grows monotonically to
+/// the largest batch used by the card and is released with the other walk scratch buffers.
+static V4_H10_SEEDS: OnceLock<Mutex<HashMap<usize, Arc<CudaSlice<u64>>>>> = OnceLock::new();
+
+fn v4_h10_seeds_buf(stream: &Arc<CudaStream>, len: usize) -> candle_core::Result<Arc<CudaSlice<u64>>> {
+    let m = V4_H10_SEEDS.get_or_init(|| Mutex::new(HashMap::new()));
+    let ord = stream.context().ordinal();
+    let mut g = m.lock().unwrap();
+    if let Some(s) = g.get(&ord) {
+        if s.len() >= len {
+            return Ok(s.clone());
+        }
+    }
+    let s = Arc::new(unsafe { stream.alloc::<u64>(len) }.map_err(candle_core::Error::wrap)?);
+    g.insert(ord, s.clone());
+    Ok(s)
+}
+
+/// Persistent one-word winner slot per device. The old hot path performed a device allocation,
+/// upload, readback, and free for every batch even though only the value changes.
+static V4_WINNER: OnceLock<Mutex<HashMap<usize, Arc<Mutex<CudaSlice<u64>>>>>> = OnceLock::new();
+
+fn v4_winner_buf(stream: &Arc<CudaStream>) -> candle_core::Result<Arc<Mutex<CudaSlice<u64>>>> {
+    let m = V4_WINNER.get_or_init(|| Mutex::new(HashMap::new()));
+    let ord = stream.context().ordinal();
+    let mut g = m.lock().unwrap();
+    if let Some(s) = g.get(&ord) {
+        return Ok(s.clone());
+    }
+    let s = Arc::new(Mutex::new(
+        unsafe { stream.alloc::<u64>(1) }.map_err(candle_core::Error::wrap)?,
+    ));
     g.insert(ord, s.clone());
     Ok(s)
 }
@@ -222,6 +260,9 @@ pub struct PomGpuMiner {
     prefix_dev: CudaSlice<u64>,
     t_count: u32,
     n_total_chunks: u64,
+    /// Segment bucket table belongs to this exact prefix layout. Keeping it on the miner prevents
+    /// a same-sized replacement model from inheriting stale lower bounds from a device-global LUT.
+    v4_ncf_lut: OnceLock<(Arc<CudaSlice<u16>>, u32)>,
     _tensors: Vec<QTensor>, // raw-loaded tensors kept alive so the gather pointers stay valid
     _shared: Vec<Arc<QTensor>>, // shared-with-inference tensors kept alive (zero-dup, Option C)
     _uploads: Vec<CudaSlice<u8>>, // our own device copies of llama-engine host-resident tensors
@@ -391,9 +432,10 @@ impl PomGpuMiner {
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
         // Warm the module cache so mine() never compiles on the hot path.
-        let _ = load_walk_func(&cuda, "pom_mine_v4")?;
+        let _ = load_walk_func(&cuda, "pom_mine_v4_seeded")?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: tensors, _shared: Vec::new(), _uploads: Vec::new() })
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks,
+                  v4_ncf_lut: OnceLock::new(), _tensors: tensors, _shared: Vec::new(), _uploads: Vec::new() })
     }
 
     /// Standalone walk source: upload the mining model's RAW GGUF bytes to `device_id` (canonical
@@ -445,9 +487,10 @@ impl PomGpuMiner {
 
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
-        let _ = load_walk_func(&cuda, "pom_mine_v4")?;
+        let _ = load_walk_func(&cuda, "pom_mine_v4_seeded")?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks,
+                  v4_ncf_lut: OnceLock::new(), _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
     }
 
     /// Zero-dup load (Option C): build the gather over the SAME canonical name-sorted layout as
@@ -511,9 +554,10 @@ impl PomGpuMiner {
 
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
-        let _ = load_walk_func(&cuda, "pom_mine_v4")?;
+        let _ = load_walk_func(&cuda, "pom_mine_v4_seeded")?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: raw, _shared: kept_shared, _uploads: Vec::new() })
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks,
+                  v4_ncf_lut: OnceLock::new(), _tensors: raw, _shared: kept_shared, _uploads: Vec::new() })
     }
 
     /// Phase-2 canonical gather over the IN-PROCESS llama.cpp engine (candle hosts nothing): walk
@@ -636,8 +680,9 @@ impl PomGpuMiner {
         }
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
-        let _ = load_walk_func(&cuda, "pom_mine_v4")?;
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
+        let _ = load_walk_func(&cuda, "pom_mine_v4_seeded")?;
+        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks,
+                  v4_ncf_lut: OnceLock::new(), _tensors: Vec::new(), _shared: Vec::new(), _uploads: uploads })
     }
 
     pub fn n_chunks(&self) -> u64 {
@@ -671,7 +716,7 @@ impl PomGpuMiner {
 
     /// Diagnostic: launch the tensor-core walk ONCE with an always-win target, bypassing the
     /// capability/image gate, and report whether it produced a result. `false` means the loaded
-    /// image's `pom_mine_v4_tc` is the empty sub-sm_80 stub (or absent) on this card — the exact
+    /// image's tensor-core entry point is the empty sub-sm_80 stub (or absent) on this card — the exact
     /// condition that used to mine nothing at a hugely inflated hashrate.
     pub fn v4_tc_kernel_is_real(&self) -> bool {
         let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
@@ -689,6 +734,17 @@ impl PomGpuMiner {
     /// (`era_pow_fold(fold64(v4_state_root(S_K))) <= target`), or None. Dynamic shared = 2 KB
     /// (one 1 KB tile + fold scratch). The v4 SEED uses the v4 pph salt; the POW fold stays H3.
     pub fn mine_v4(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h10_era: bool) -> candle_core::Result<Option<u64>> {
+        if batch == 0 {
+            return Ok(None);
+        }
+        if batch > u32::MAX as u64 {
+            return Err(candle_core::Error::Msg("PoM GPU: batch exceeds u32 launch domain".into()));
+        }
+        if start.checked_add(batch - 1).is_none() {
+            return Err(candle_core::Error::Msg(
+                "PoM GPU: nonce range crosses u64::MAX; split it before launch".into(),
+            ));
+        }
         let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
         // H10 one-way seed selector, passed verbatim to every walk/chase kernel (byte-identical
         // dispatch to pom.rs::pom_block_seed_v4_era). 0 = reversible v4 fold; 1 = one-way H10 fold.
@@ -708,7 +764,38 @@ impl PomGpuMiner {
         let t = words4(target_le);
         let k = crate::pom_v4::POM_V4_K as u32;
         bind_device_ctx(&self.stream)?; // multi-GPU: bind this device's context before the raw launch
-        let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
+        let winner_slot = v4_winner_buf(&self.stream)?;
+        let mut winner = winner_slot
+            .lock()
+            .map_err(|_| candle_core::Error::Msg("PoM v4 winner slot mutex poisoned".into()))?;
+        // Stream-ordered byte memset to all ones is u64::MAX on every byte order and avoids both a
+        // host transfer and a reset-kernel launch. DevicePtrMut records the write dependency.
+        {
+            use candle_core::cuda_backend::cudarc::driver::result;
+            let (ptr, _record) = winner.device_ptr_mut(&self.stream);
+            unsafe { result::memset_d8_async(ptr, 0xff, std::mem::size_of::<u64>(), self.stream.cu_stream()) }
+                .map_err(candle_core::Error::wrap)?;
+        }
+        // H10 used to inline one Keccak-f1600 into every walk kernel and execute it with only lane 0
+        // active. Besides wasting 31 lanes, ptxas charged every lane 24-40 extra registers and a
+        // 192-byte stack frame, cutting the occupancy that hides the walk's dependent DRAM latency.
+        // Produce the batch densely (one thread/nonce) and let every walk variant consume the same
+        // seed array. Pre-H10 still passes a valid one-element pointer but never dereferences it.
+        let h10_seeds = v4_h10_seeds_buf(&self.stream, if h10_era { batch as usize } else { 1 })?;
+        if h10_era {
+            const SEED_THREADS: u64 = 128;
+            let seed_fn = load_walk_func(&self.cuda, "pom_seed_h10_batch")?;
+            let mut b = seed_fn.builder();
+            b.arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
+                .arg(&start).arg(&batch).arg(&*h10_seeds);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (((batch + SEED_THREADS - 1) / SEED_THREADS) as u32, 1, 1),
+                    block_dim: (SEED_THREADS as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                }).map_err(candle_core::Error::wrap)?;
+            }
+        }
 
         // A card whose autotune measured the classic walk faster takes it even though the
         // tensor-core kernel is available and correct here.
@@ -722,7 +809,7 @@ impl PomGpuMiner {
             // batch and its duplicate snippet reads disappear. Measured +7-8% on a 5090 at a 64K
             // batch and +24% at 8K (byte-exact, see pom_mine_v4_ncf). KERYX_POM_V4_NCF=0 falls
             // back to the chase+tc pipeline below.
-            let walk = load_walk_func(&self.cuda, "pom_mine_v4_ncf")?;
+            let walk = load_walk_func(&self.cuda, "pom_mine_v4_ncf_seeded")?;
             let (lut, lut_sh) = self.v4_ncf_lut()?;
             let inv_n = u64::MAX / n_tiles;
             let warps = v4_ncf_warps();
@@ -737,7 +824,8 @@ impl PomGpuMiner {
                 .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
                 .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
                 .arg(&start).arg(&batch)
-                .arg(&*lut).arg(&lut_sh).arg(&inv_n).arg(&h10).arg(&winner);
+                .arg(&*lut).arg(&lut_sh).arg(&inv_n)
+                .arg(&*h10_seeds).arg(&h10).arg(&*winner);
             unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
         } else if tc_wanted && self.v4_tc_usable(n_tiles, k, &p, &s, timestamp) {
             // Tensor-core solver: resolve the whole tile-offset chain first (it depends only on
@@ -763,20 +851,40 @@ impl PomGpuMiner {
             // job / resized batch / nonce jump misses the key and falls back to chasing inline —
             // stale offsets can never reach the walk.
             let need = (batch as usize) * (k as usize);
-            let buf_a = v4_offsets_buf(&self.stream, need)?;
-            let buf_b = v4_offsets_buf_b(&self.stream, need)?;
             let tc_warps: u64 = v4_tc_warps();
             let tc_pipe: u64 = v4_tc_pipe();
             let tc_smem: u32 = (tc_warps * 256 * (tc_pipe + 1) * 4) as u32;
-            let chase = load_walk_func(&self.cuda, "pom_mine_v4_chase")?;
-            let walk = load_walk_func(&self.cuda, "pom_mine_v4_tc")?;
+            let chase = load_walk_func(&self.cuda, "pom_mine_v4_chase_seeded")?;
+            let walk = load_walk_func(&self.cuda, "pom_mine_v4_tc_seeded")?;
             // MEASURED NEGATIVE — default OFF. Cross-batch prefetch is sound (see
             // v4_chase_prefetch_matches_serial) but SLOWER on a 5090: 5.92 vs 5.99 Mh/s. The walk
             // already runs at ~91% of DRAM peak, so the chase's bytes cannot be hidden — running it
             // concurrently only adds memory contention, plus every job change throws away a
             // speculative chase. Kept behind the knob because a future card with bandwidth headroom
             // (or a heavier chase) could flip the sign. `=1` enables it.
-            let pipelined = std::env::var("KERYX_POM_V4_CHASE_PREFETCH").ok().as_deref() == Some("1");
+            let prefetch_requested =
+                std::env::var("KERYX_POM_V4_CHASE_PREFETCH").ok().as_deref() == Some("1");
+            // The speculative chase targets batch N+1 while `h10_seeds` contains batch N. Supporting
+            // that needs a second seed buffer and a cross-stream dependency; this feature is a measured
+            // loss and default-off, so disable it in H10 rather than ever consume stale seeds.
+            let pipelined = prefetch_requested && !h10_era;
+            if prefetch_requested && h10_era {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "KERYX_POM_V4_CHASE_PREFETCH=1 ignored in the H10 era: the speculative chase \
+                         needs next-batch seed buffering and was already measured slower than serial."
+                    );
+                }
+            }
+            // Serial chase+TC needs one offsets array. Allocate the second (~64-128 MiB at common
+            // batches) only for the measured-negative, explicitly requested cross-batch prefetch.
+            let buf_a = v4_offsets_buf(&self.stream, need)?;
+            let buf_b = if pipelined {
+                Some(v4_offsets_buf_b(&self.stream, need)?)
+            } else {
+                None
+            };
             let ord = self.stream.context().ordinal();
             // Is there a prefetch for exactly THIS work, and in which buffer?
             let hit: Option<u8> = if pipelined {
@@ -793,7 +901,20 @@ impl PomGpuMiner {
             // The walk reads the buffer that actually holds this batch's offsets; the other one
             // takes the next prefetch. Roles alternate every batch, so nothing is ever copied.
             let cur_idx: u8 = hit.unwrap_or(0);
-            let (cur, spare) = if cur_idx == 1 { (buf_b.clone(), buf_a.clone()) } else { (buf_a.clone(), buf_b.clone()) };
+            let cur = if cur_idx == 1 {
+                buf_b.as_ref().expect("prefetch hit requires buffer B").clone()
+            } else {
+                buf_a.clone()
+            };
+            let spare = if pipelined {
+                Some(if cur_idx == 1 {
+                    buf_a.clone()
+                } else {
+                    buf_b.as_ref().expect("prefetch requires buffer B").clone()
+                })
+            } else {
+                None
+            };
             let spare_idx: u8 = 1 - cur_idx;
 
             let chase_cfg = |n: u64| LaunchConfig {
@@ -809,7 +930,7 @@ impl PomGpuMiner {
                 let mut b = chase.builder();
                 b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
                     .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
-                    .arg(&start).arg(&batch).arg(&h10).arg(&view);
+                    .arg(&start).arg(&batch).arg(&*h10_seeds).arg(&h10).arg(&view);
                 unsafe { b.launch(chase_cfg(batch)).map_err(candle_core::Error::wrap)?; }
             }
 
@@ -827,7 +948,8 @@ impl PomGpuMiner {
                     .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
                     .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
                     .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
-                    .arg(&start).arg(&batch).arg(&view).arg(&h10).arg(&winner);
+                    .arg(&start).arg(&batch).arg(&view)
+                    .arg(&*h10_seeds).arg(&h10).arg(&*winner);
                 unsafe { b.launch(walk_cfg).map_err(candle_core::Error::wrap)?; }
             }
 
@@ -836,13 +958,13 @@ impl PomGpuMiner {
             if pipelined {
                 let next_start = start.wrapping_add(batch);
                 let cs = v4_chase_stream(&self.stream)?;
-                let view = spare.try_slice(0..need)
+                let view = spare.as_ref().expect("pipelined chase requires spare buffer").try_slice(0..need)
                     .ok_or_else(|| candle_core::Error::Msg("PoM v4: prefetch slice out of range".into()))?;
                 let func = chase.func.clone();
                 let mut b = cs.launch_builder(&func);
                 b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
                     .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
-                    .arg(&next_start).arg(&batch).arg(&h10).arg(&view);
+                    .arg(&next_start).arg(&batch).arg(&*h10_seeds).arg(&h10).arg(&view);
                 unsafe { b.launch(chase_cfg(batch)).map_err(candle_core::Error::wrap)?; }
                 // The next walk runs on the main stream, so it must not start before this chase
                 // finishes — record the dependency now, honoured at the top of the next call.
@@ -857,18 +979,18 @@ impl PomGpuMiner {
                 block_dim: (crate::pom_v4::POM_V4_D as u32, 1, 1),
                 shared_mem_bytes: 2048,
             };
-            let func = load_walk_func(&self.cuda, "pom_mine_v4")?;
+            let func = load_walk_func(&self.cuda, "pom_mine_v4_seeded")?;
             let mut b = func.builder();
             b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
                 .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
                 .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
                 .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
-                .arg(&start).arg(&batch).arg(&h10).arg(&winner);
+                .arg(&start).arg(&batch).arg(&*h10_seeds).arg(&h10).arg(&*winner);
             unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
         }
         self.stream.synchronize().map_err(candle_core::Error::wrap)?;
-        let w = self.stream.clone_dtoh(&winner).map_err(candle_core::Error::wrap)?[0];
-        Ok(if w == u64::MAX { None } else { Some(w) })
+        let w = self.stream.clone_dtoh(&*winner).map_err(candle_core::Error::wrap)?[0];
+        Ok(if w == u64::MAX { None } else { Some(start + w) })
     }
 
     /// Whether the tensor-core v4 solver can run on this device: needs real int8
@@ -971,11 +1093,13 @@ dp4a kernel.", ord);
     fn v4_tc_probe(&self, n_tiles: u64, k: u32, p: &[u64; 4], s: &[u64; 4], timestamp: u64)
         -> candle_core::Result<bool>
     {
-        const TC_WARPS: u64 = 4;
-        let chase = load_walk_func(&self.cuda, "pom_mine_v4_chase")?;
-        let walk = load_walk_func(&self.cuda, "pom_mine_v4_tc")?;   // missing symbol -> Err -> classic
+        let tc_warps = v4_tc_warps();
+        let tc_pipe = v4_tc_pipe();
+        let chase = load_walk_func(&self.cuda, "pom_mine_v4_chase_seeded")?;
+        let walk = load_walk_func(&self.cuda, "pom_mine_v4_tc_seeded")?; // missing symbol -> Err -> classic
         let offsets = v4_offsets_buf(&self.stream, k as usize)?;
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
+        let h10_seeds = v4_h10_seeds_buf(&self.stream, 1)?;
         let (start, batch) = (0u64, 1u64);
         let view = offsets
             .try_slice(0..k as usize)
@@ -984,7 +1108,7 @@ dp4a kernel.", ord);
         let mut b = chase.builder();
         b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&n_tiles).arg(&k)
             .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
-            .arg(&start).arg(&batch).arg(&h0).arg(&view);
+            .arg(&start).arg(&batch).arg(&*h10_seeds).arg(&h0).arg(&view);
         unsafe {
             b.launch(LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
                 .map_err(candle_core::Error::wrap)?;
@@ -995,12 +1119,13 @@ dp4a kernel.", ord);
             .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3])
             .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
             .arg(&t_max[0]).arg(&t_max[1]).arg(&t_max[2]).arg(&t_max[3])
-            .arg(&start).arg(&batch).arg(&view).arg(&h0).arg(&winner);
+            .arg(&start).arg(&batch).arg(&view)
+            .arg(&*h10_seeds).arg(&h0).arg(&winner);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (1, 1, 1),
-                block_dim: ((TC_WARPS * 32) as u32, 1, 1),
-                shared_mem_bytes: (TC_WARPS as u32) * 4096,
+                block_dim: ((tc_warps * 32) as u32, 1, 1),
+                shared_mem_bytes: (tc_warps * 256 * (tc_pipe + 1) * 4) as u32,
             }).map_err(candle_core::Error::wrap)?;
         }
         self.stream.synchronize().map_err(candle_core::Error::wrap)?;
@@ -1008,23 +1133,16 @@ dp4a kernel.", ord);
         Ok(w != u64::MAX)
     }
 
-    /// Device LUT + shift for the chaseless walk's segment resolve; built once per installed blob
-    /// (host-side from the prefix table), then served from the per-device cache.
+    /// Device LUT + shift for the chaseless walk's segment resolve; built once from this miner's
+    /// exact prefix table and owned by this miner for the same lifetime as that table.
     fn v4_ncf_lut(&self) -> candle_core::Result<(Arc<CudaSlice<u16>>, u32)> {
         if self.t_count as u64 > u16::MAX as u64 {
             return Err(candle_core::Error::Msg(
                 "PoM v4 ncf: more segments than the u16 LUT can index".into(),
             ));
         }
-        let m = V4_NCF_LUT.get_or_init(|| Mutex::new(HashMap::new()));
-        let ord = self.stream.context().ordinal();
-        {
-            let g = m.lock().unwrap();
-            if let Some(e) = g.get(&ord) {
-                if e.t_count == self.t_count && e.n_chunks == self.n_total_chunks {
-                    return Ok((e.lut.clone(), e.sh));
-                }
-            }
+        if let Some((lut, sh)) = self.v4_ncf_lut.get() {
+            return Ok((lut.clone(), *sh));
         }
         let prefix: Vec<u64> =
             self.stream.clone_dtoh(&self.prefix_dev).map_err(candle_core::Error::wrap)?;
@@ -1043,11 +1161,11 @@ dp4a kernel.", ord);
             *e = lo as u16;
         }
         let dev = Arc::new(self.stream.clone_htod(&lut).map_err(candle_core::Error::wrap)?);
-        m.lock().unwrap().insert(
-            ord,
-            V4NcfLut { t_count: self.t_count, n_chunks: self.n_total_chunks, lut: dev.clone(), sh },
-        );
-        Ok((dev, sh))
+        // A second caller can race the first build harmlessly; keep the first installed table and
+        // let the losing temporary allocation drop. Production currently has one mining thread.
+        let _ = self.v4_ncf_lut.set((dev, sh));
+        let (lut, sh) = self.v4_ncf_lut.get().expect("NCF LUT set or raced");
+        Ok((lut.clone(), *sh))
     }
 
     /// UNTUNED default for the chaseless solver. Fleet-measured 2026-08-29: chaseless wins on every
@@ -1114,11 +1232,12 @@ chase+tensor-core path.", ord);
     fn v4_ncf_probe(&self, n_tiles: u64, k: u32, p: &[u64; 4], s: &[u64; 4], timestamp: u64)
         -> candle_core::Result<bool>
     {
-        let walk = load_walk_func(&self.cuda, "pom_mine_v4_ncf")?; // missing symbol -> Err -> tc path
+        let walk = load_walk_func(&self.cuda, "pom_mine_v4_ncf_seeded")?; // missing symbol -> Err -> tc path
         let (lut, lut_sh) = self.v4_ncf_lut()?;
         let inv_n = u64::MAX / n_tiles;
         let warps = v4_ncf_warps();
         let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
+        let h10_seeds = v4_h10_seeds_buf(&self.stream, 1)?;
         let (start, batch) = (0u64, 1u64);
         let t_max = [u64::MAX, u64::MAX, u64::MAX, u64::MAX];
         let mut b = walk.builder();
@@ -1127,7 +1246,8 @@ chase+tensor-core path.", ord);
             .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp)
             .arg(&t_max[0]).arg(&t_max[1]).arg(&t_max[2]).arg(&t_max[3])
             .arg(&start).arg(&batch)
-            .arg(&*lut).arg(&lut_sh).arg(&inv_n).arg(&0u32).arg(&winner);
+            .arg(&*lut).arg(&lut_sh).arg(&inv_n)
+            .arg(&*h10_seeds).arg(&0u32).arg(&winner);
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (1, 1, 1),
@@ -1391,6 +1511,16 @@ fn v4_release_offsets(ord: usize) {
             g.remove(&ord);
         }
     }
+    if let Some(m) = V4_H10_SEEDS.get() {
+        if let Ok(mut g) = m.lock() {
+            g.remove(&ord);
+        }
+    }
+    if let Some(m) = V4_WINNER.get() {
+        if let Ok(mut g) = m.lock() {
+            g.remove(&ord);
+        }
+    }
 }
 
 /// Whether the GPU miner is currently installed for `device_id`.
@@ -1607,20 +1737,6 @@ fn v4_ncf_warps() -> u64 {
     v4_tc_compiled("KERYX_POM_V4_NCF_WARPS", COMPILED)
 }
 
-/// Per-device bucket LUT for the chaseless walk's segment resolve (`pom_mine_v4_ncf`): maps
-/// `chunk_index >> sh` to the index of the segment containing that chunk, built host-side from the
-/// SAME prefix table the kernel's forward walk then refines against — so the resolved segment is
-/// identical to the binary search's by construction. Cached per device and keyed by the blob's
-/// identity (t_count + n_total_chunks); a model/tier change reinstalls the miner with a different
-/// blob and rebuilds. ~16K u16 entries = 32 KB device-resident, L1/L2-hot during the walk.
-struct V4NcfLut {
-    t_count: u32,
-    n_chunks: u64,
-    lut: Arc<CudaSlice<u16>>,
-    sh: u32,
-}
-static V4_NCF_LUT: OnceLock<Mutex<HashMap<usize, V4NcfLut>>> = OnceLock::new();
-
 const POM_V4_NONCES_PER_SM: u64 = 384;
 const POM_V4_BATCH_MIN: u64 = 8192;
 const POM_V4_BATCH_FALLBACK: u64 = 32768;
@@ -1736,10 +1852,19 @@ pub fn intensity_batch_for(device_id: u32) -> Option<u64> {
     Some(cap_batch_to_vram(device_id, want))
 }
 
-/// Bytes of VRAM the offset buffers need for a batch: K offsets per nonce, 4 bytes each, in TWO
-/// buffers (the walk reads one while the chase may fill the other).
+/// Number of offset arrays the selected host policy may allocate. Serial chase+TC needs one; the
+/// optional cross-batch prefetch needs a second array while the walk reads the first.
+fn offset_buffer_count() -> u64 {
+    if std::env::var("KERYX_POM_V4_CHASE_PREFETCH").ok().as_deref() == Some("1") { 2 } else { 1 }
+}
+
+/// Bytes of VRAM the offset arrays need for a batch (NCF/classic use none, so this is a conservative
+/// cap until the per-card solver has been selected).
 fn offsets_bytes_for(batch: u64) -> u64 {
-    batch.saturating_mul(crate::pom_v4::POM_V4_K as u64).saturating_mul(4).saturating_mul(2)
+    batch
+        .saturating_mul(crate::pom_v4::POM_V4_K as u64)
+        .saturating_mul(4)
+        .saturating_mul(offset_buffer_count())
 }
 
 /// Caps `want` so the offset buffers stay inside a quarter of this card's free VRAM.
@@ -1780,7 +1905,8 @@ fn cap_batch_to_vram(device_id: u32, want: u64) -> u64 {
                     // (thrashing, then a poisoned context) rather than degrading gracefully. The
                     // autotuned batch on that card needs ~34 MiB, well inside a tenth.
                     let budget = (free_mib * 1024 * 1024) / 10;
-                    (budget / (crate::pom_v4::POM_V4_K as u64 * 4 * 2)).max(POM_V4_BATCH_MIN)
+                    (budget / (crate::pom_v4::POM_V4_K as u64 * 4 * offset_buffer_count()))
+                        .max(POM_V4_BATCH_MIN)
                 };
                 if settled {
                     if let Ok(mut g) = cache.lock() {
@@ -1920,8 +2046,10 @@ fn v4_tune_cache_path() -> Option<std::path::PathBuf> {
 
 /// Cache key: everything that can change the right answer. The walk-table size and K matter because
 /// they set how much of the card's memory system the walk actually touches.
-fn v4_tune_key(device_id: u32, sm: u64, n_tiles: u64, k: u32) -> String {
-    format!("{}|sm{}|tiles{}|k{}|g2", gpu_name(device_id), sm, n_tiles, k)
+fn v4_tune_key(device_id: u32, sm: u64, n_tiles: u64, k: u32, h10_era: bool) -> String {
+    // g3 = dedicated dense H10 seed pass. Keep pre-H10/H10 results separate because only H10 pays
+    // that pass, and invalidate g2: its inline-Keccak register footprint changed the walk occupancy.
+    format!("{}|sm{}|tiles{}|k{}|h10{}|g3", gpu_name(device_id), sm, n_tiles, k, u8::from(h10_era))
 }
 
 fn v4_tune_load(key: &str) -> Option<V4Tune> {
@@ -1961,14 +2089,22 @@ fn v4_tune_save(key: &str, t: V4Tune, mhs: f64) {
 /// Measures one candidate geometry: grinds a never-winning target for ~`ms` and returns Mh/s.
 /// A zero target can never be met, so every nonce in the batch runs the full walk — this times the
 /// real kernel, not an early exit.
-fn v4_bench_cfg(device_id: u32, miner: &PomGpuMiner, pph: &[u8; 32], ts: u64, t: V4Tune, ms: u64) -> Option<f64> {
+fn v4_bench_cfg(
+    device_id: u32,
+    miner: &PomGpuMiner,
+    pph: &[u8; 32],
+    ts: u64,
+    t: V4Tune,
+    ms: u64,
+    h10_era: bool,
+) -> Option<f64> {
     let never = [0u8; 32];
     set_v4_tune(device_id, t);
-    miner.mine_v4(pph, ts, &never, 1, t.batch, false).ok()?; // warm-up: JIT, buffer alloc, clocks
+    miner.mine_v4(pph, ts, &never, 1, t.batch, h10_era).ok()?; // warm-up: JIT, buffer alloc, clocks
     let started = std::time::Instant::now();
     let mut n: u64 = 0;
     while started.elapsed() < std::time::Duration::from_millis(ms) {
-        miner.mine_v4(pph, ts, &never, 1 + n, t.batch, false).ok()?;
+        miner.mine_v4(pph, ts, &never, 1 + n, t.batch, h10_era).ok()?;
         n += t.batch;
     }
     let secs = started.elapsed().as_secs_f64();
@@ -1978,7 +2114,7 @@ fn v4_bench_cfg(device_id: u32, miner: &PomGpuMiner, pph: &[u8; 32], ts: u64, t:
 /// Tunes `device_id` once per process. Staged rather than exhaustive (kind → warps → batch) so the
 /// whole thing costs seconds, not minutes: the axes are close to independent in the measurements.
 /// Returns whether tuning actually completed (false = the slot was busy, try again later).
-fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
+fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> bool {
     let mode = v4_autotune_mode();
     if mode == "0" {
         return true;
@@ -2005,7 +2141,7 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
     let k = crate::pom_v4::POM_V4_K as u32;
     let sm = gpu_sm_count(device_id).unwrap_or(0);
     let base = if sm > 0 { v4_batch_for_sm_count(sm) } else { POM_V4_BATCH_FALLBACK };
-    let key = v4_tune_key(device_id, sm, n_tiles, k);
+    let key = v4_tune_key(device_id, sm, n_tiles, k, h10_era);
 
     if mode != "force" {
         if let Some(t) = v4_tune_load(&key) {
@@ -2034,7 +2170,7 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
         let mut samples: Vec<Vec<f64>> = vec![Vec::new(); cands.len()];
         for _ in 0..reps {
             for (i, c) in cands.iter().enumerate() {
-                if let Some(m) = v4_bench_cfg(device_id, miner, &pph, ts, *c, ms) {
+                if let Some(m) = v4_bench_cfg(device_id, miner, &pph, ts, *c, ms, h10_era) {
                     samples[i].push(m);
                 }
             }
@@ -2056,7 +2192,11 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
     // measured so far, but each card decides for itself). All kernels are byte-exact mirrors of
     // the host walk, so any answer is correct; only the speed differs.
     let p_words = crate::pom::pph_words_for_era(&pph, true);
-    let s_words = crate::pom::pph_words_v4(&pph);
+    let s_words = if h10_era {
+        crate::pom::pph_words(&pph)
+    } else {
+        crate::pom::pph_words_v4(&pph)
+    };
     let mut kinds: Vec<(&str, V4Tune)> =
         vec![("classic", V4Tune { ncf: false, tc: false, ..defaults })];
     if miner.v4_tc_available() {
@@ -2133,7 +2273,7 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
     // and kernel choice are not supposed to change results at all, so a mismatch means the candidate
     // is not walking what it claims to — the failure mode that looks like free speed and quietly
     // costs shares. Fall back to defaults rather than mine on it.
-    if !v4_config_agrees_with_reference(device_id, miner, best) {
+    if !v4_config_agrees_with_reference(device_id, miner, best, h10_era) {
         log::error!(
             "PoM[gpu{}]: autotune result {:?} did NOT reproduce the reference walk's winner — \
              discarding it and keeping the defaults.",
@@ -2157,7 +2297,12 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner) -> bool {
 
 /// Verifies a candidate configuration against the classic walk at the stock batch: same seed, same
 /// nonce range, a target loose enough that a winner exists, and the winner must be identical.
-fn v4_config_agrees_with_reference(device_id: u32, miner: &PomGpuMiner, cand: V4Tune) -> bool {
+fn v4_config_agrees_with_reference(
+    device_id: u32,
+    miner: &PomGpuMiner,
+    cand: V4Tune,
+    h10_era: bool,
+) -> bool {
     // Loose target: top byte 0x0f leaves roughly 1-in-16 nonces winning, so a few thousand nonces
     // are certain to contain one, and the LOWEST winner is a strict function of the walk.
     let mut target = [0xffu8; 32];
@@ -2167,11 +2312,11 @@ fn v4_config_agrees_with_reference(device_id: u32, miner: &PomGpuMiner, cand: V4
     let probe = 4096u64;
     let reference = {
         set_v4_tune(device_id, V4Tune { ncf: false, tc: false, batch: probe });
-        miner.mine_v4(&pph, ts, &target, 1, probe, false)
+        miner.mine_v4(&pph, ts, &target, 1, probe, h10_era)
     };
     let candidate = {
         set_v4_tune(device_id, V4Tune { batch: probe, ..cand });
-        miner.mine_v4(&pph, ts, &target, 1, probe, false)
+        miner.mine_v4(&pph, ts, &target, 1, probe, h10_era)
     };
     match (reference, candidate) {
         (Ok(a), Ok(b)) => a == b,
@@ -2180,33 +2325,35 @@ fn v4_config_agrees_with_reference(device_id: u32, miner: &PomGpuMiner, cand: V4
     }
 }
 
-/// Runs the autotune the first time this device grinds, and never again in this process.
-fn ensure_v4_autotuned(device_id: u32, miner: &PomGpuMiner) {
-    static DONE: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+/// Runs the autotune once per device and seed era. The era belongs in this process-local key because
+/// a miner can remain alive across activation and the dense H10 seed pass changes the measured cost.
+fn ensure_v4_autotuned(device_id: u32, miner: &PomGpuMiner, h10_era: bool) {
+    static DONE: OnceLock<Mutex<std::collections::HashSet<(u32, bool)>>> = OnceLock::new();
     let done = DONE.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let era_key = (device_id, h10_era);
     {
         let Ok(g) = done.lock() else { return };
-        if g.contains(&device_id) {
+        if g.contains(&era_key) {
             return;
         }
     }
     // Marked only when tuning actually ran, so a card that found the slot busy retries on a later
     // batch. A tune that ran and failed still counts as done — it must not retry every batch.
-    if v4_autotune(device_id, miner) {
+    if v4_autotune(device_id, miner, h10_era) {
         if let Ok(mut g) = done.lock() {
-            g.insert(device_id);
+            g.insert(era_key);
         }
     }
 }
 
-pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, daa: u64) -> Option<u64> {
+pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, daa: u64) -> crate::pom::GrindResult {
     // H10 (DAA >= POM_H10_SEED_ACTIVATION_DAA): one-way seed derivation.
     let h10_era = crate::pom::is_h10_seed_era(daa);
     // 🔴 HARD SAFETY GUARD: the H10 seed formula is an UNVERIFIED PLACEHOLDER until the node's
     // spec lands and pom::pom_seed_fold_v4_h10 is confirmed byte-for-byte. Mining the H10 era with
     // a wrong seed = 100% rejected blocks + service-bond strikes. So while the spec is unverified,
-    // REFUSE to grind any H10-era job: no launch, no phantom hashrate (returns None → the worker
-    // idles honestly and retries; nothing is counted). Pre-H10 mining is unaffected.
+    // REFUSE to grind any H10-era job: no launch, no phantom hashrate (returns Paused so the
+    // worker idles honestly and retries; nothing is counted). Pre-H10 mining is unaffected.
     if h10_era && !crate::pom::H10_SPEC_VERIFIED {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
@@ -2217,11 +2364,15 @@ pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_l
                 device_id, daa
             );
         }
-        return None;
+        return Err(crate::pom::GrindError::Paused("H10 seed specification is unverified"));
     }
     let miner = {
-        let g = miners().lock().ok()?;
-        g.get(&device_id)?.clone()
+        let g = miners()
+            .lock()
+            .map_err(|_| crate::pom::GrindError::Backend("resident CUDA miner mutex poisoned".into()))?;
+        g.get(&device_id)
+            .cloned()
+            .ok_or(crate::pom::GrindError::Paused("CUDA walk not installed"))?
     };
     // TEST-ONLY fault injection. This knob existed but was never wired into the v4 walk — it was
     // left behind when v4 replaced the v3 grind, so the recovery path it was written to validate
@@ -2236,13 +2387,13 @@ pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_l
         // Drop OUR handle before recovering — see the note on the error path below.
         drop(miner);
         reset_stale_gpu_state(device_id);
-        return None;
+        return Err(crate::pom::GrindError::Backend("injected CUDA runtime fault".into()));
     }
     // First grind on this card: measure its launch geometry (cached on disk, so this is a one-off).
-    ensure_v4_autotuned(device_id, &miner);
+    ensure_v4_autotuned(device_id, &miner, h10_era);
     let outcome = miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch, h10_era);
     match outcome {
-        Ok(w) => w,
+        Ok(winner) => Ok(crate::pom::GrindCompleted { winner, hashes_done: batch }),
         Err(e) => {
             let msg = e.to_string();
             if is_transient_gpu_runtime_fault(&msg) {
@@ -2262,7 +2413,7 @@ pub fn mine_v4(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_l
                     log::error!("PoM[gpu{}]: v4 walk failed with a NON-transient error ({}). Logged once.", device_id, msg);
                 }
             }
-            None
+            Err(crate::pom::GrindError::Backend(msg))
         }
     }
 }
@@ -2465,7 +2616,11 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     };
     let per_device = has_device_override(device_id);
     // Single-model rigs share ONE host index (built once); per-card rigs build one index PER device.
-    let index_ready = if per_device { crate::pom::has_device_index(device_id) } else { crate::pom::active_index().is_some() };
+    let index_ready = if per_device {
+        crate::pom::device_index_matches(device_id, &model_id)
+    } else {
+        crate::pom::active_index().is_some()
+    };
     // Build the possession index (host, heavy) the first time PoM activates — deferred from boot so
     // the pre-PoM legacy phase starts immediately and keeps host/GPU free.
     if !index_ready {
@@ -2473,7 +2628,11 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let still_missing = if per_device { !crate::pom::has_device_index(device_id) } else { crate::pom::active_index().is_none() };
+        let still_missing = if per_device {
+            !crate::pom::device_index_matches(device_id, &model_id)
+        } else {
+            crate::pom::active_index().is_none()
+        };
         if still_missing {
             // The background prefetch may still be downloading this device's model (slow IPFS
             // link / small HiveOS system disk). Building the index from a missing/partial GGUF
@@ -2512,7 +2671,11 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                         info!("PoM[gpu{}]: resident tree ready in {:.1}s", device_id, t0.elapsed().as_secs_f32());
                     }
                     info!("PoM[gpu{}]: host index ready — N={} chunks", device_id, idx.n_chunks);
-                    if per_device { crate::pom::set_index_for(device_id, idx, tier); } else { crate::pom::set_index(idx, tier); }
+                    if per_device {
+                        crate::pom::set_index_for(device_id, model_id, idx, tier);
+                    } else {
+                        crate::pom::set_index(idx, tier);
+                    }
                 }
                 Err(e) => {
                     // The build is retried on every job while the index is missing (e.g. disk too
@@ -2977,7 +3140,7 @@ impl PomGpuMiner {
         let n_total_chunks = *prefix.last().unwrap();
         let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
-        let _ = load_walk_func(&cuda, "pom_mine_v4")?;
+        let _ = load_walk_func(&cuda, "pom_mine_v4_seeded")?;
         Ok(Self {
             cuda,
             stream,
@@ -2985,6 +3148,7 @@ impl PomGpuMiner {
             prefix_dev,
             t_count: bases.len() as u32,
             n_total_chunks,
+            v4_ncf_lut: OnceLock::new(),
             _tensors: Vec::new(),
             _shared: Vec::new(),
             _uploads: uploads,
@@ -3026,12 +3190,19 @@ mod v4_kernel_tests {
         v
     }
 
-    /// H10 one-way seed: proves the GPU kernel's `pom_seed_fold_h10` is BYTE-IDENTICAL to the host
-    /// `pom::pom_seed_fold_v4_h10` — i.e. the h10 dispatch is wired correctly through the launch.
-    /// This validates the WIRING against the placeholder formula (host and GPU agree); it does NOT
-    /// validate the formula against the node — that is the golden-vector step, gated on the real
-    /// spec. The bracket: build the proof from the host H10 seed, then the GPU must WIN at the host
-    /// pow target and LOSE one below it, with h10_era=true.
+    fn pow_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+        for k in (0..32).rev() {
+            if a[k] != b[k] {
+                return a[k] < b[k];
+            }
+        }
+        true
+    }
+
+    /// H10 one-way seed: proves the GPU seed pre-pass is BYTE-IDENTICAL to the host
+    /// `pom::pom_seed_fold_v4_h10` and is wired through the walk. The host formula is separately
+    /// locked to the node's golden vectors in `pom` tests. Build the proof from the host H10 seed,
+    /// then require the GPU to WIN at the exact host target and LOSE one below it.
     #[test]
     #[ignore]
     fn v4_h10_seed_host_gpu_lockstep() {
@@ -3053,6 +3224,52 @@ mod v4_kernel_tests {
                        "H10: GPU found nonce below host pow at {nonce} (lose check)");
         }
         println!("H10 host↔GPU seed lockstep OK (real PowHash formula, golden-verified)");
+    }
+
+    /// Batch-level H10 gate. The old chase optimization accidentally broadcast one thread's seed to
+    /// 31 different nonces; batch=1 lockstep could not expose it. Pick a later nonce whose host pow is
+    /// a new record low (therefore it is the batch's unambiguous lowest winner at that target), then
+    /// require classic, chase+TC, and chaseless dispatch choices to return that same nonce.
+    #[test]
+    #[ignore]
+    fn v4_h10_batched_seeds_match_host() {
+        const BASE: u64 = 10_000;
+        const BATCH: u64 = 128;
+        let data = blob(2048);
+        let index = crate::pom::index_from_ram(data.clone());
+        let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
+
+        let mut best_pow = [0xffu8; 32];
+        let mut chosen = None;
+        for i in 0..BATCH {
+            let nonce = BASE + i;
+            let seed = crate::pom::pom_block_seed_v4_era(&PPH, TS, nonce, true);
+            let (_proof, fin) = crate::pom_v4::build_proof_v4(0, seed, &index).unwrap();
+            let pow = crate::pom::pom_pow_value(fin, &PPH, true);
+            if pow_leq(&pow, &best_pow) {
+                best_pow = pow;
+                // Lane 0 was the only correct nonce in each broken 32-thread chase warp, so select
+                // a record winner from another lane to make the regression deterministic.
+                if i > 0 && i % 32 != 0 {
+                    chosen = Some((nonce, pow));
+                    break;
+                }
+            }
+        }
+        let (expected, target) = chosen.expect("failed to find a non-lane0 record pow in test batch");
+
+        let device_id = 0;
+        let variants = [
+            ("classic", V4Tune { ncf: false, tc: false, batch: BATCH }),
+            ("chase+tc", V4Tune { ncf: false, tc: true, batch: BATCH }),
+            ("chaseless", V4Tune { ncf: true, tc: true, batch: BATCH }),
+        ];
+        for (name, tune) in variants {
+            set_v4_tune(device_id, tune);
+            let got = miner.mine_v4(&PPH, TS, &target, BASE, BATCH, true).unwrap();
+            assert_eq!(got, Some(expected), "{name}: batched H10 seeds diverged from host");
+        }
+        println!("batched H10 host↔GPU seeds OK; expected nonce {expected}");
     }
 
     /// Reports (visibly, with --nocapture) which walk kernel this GPU resolves to, and proves the
@@ -3095,6 +3312,9 @@ mod v4_kernel_tests {
         let index = crate::pom::index_from_ram(data.clone());
         let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
         const B: u64 = 64;
+        // Force the chase+TC path. On GDDR cards the default is chaseless, which never touches the
+        // prefetch machinery and previously let this test pass without exercising its subject.
+        set_v4_tune(0, V4Tune { ncf: false, tc: true, batch: B });
         // A nonce in the FOURTH batch, so at least two prefetch hits precede it.
         let nonce = 3 * B + 17;
         let seed = crate::pom::pom_block_seed_v4(&PPH, TS, nonce);

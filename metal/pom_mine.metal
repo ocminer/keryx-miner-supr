@@ -185,8 +185,8 @@ kernel void pom_mine_v4(
         v4_load_tile(prefix, tensor_addrs, u.n_tensors, off, s_tile, x);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Next offset from the CURRENT tile's snippet (first 32 bytes = 8 words).
-        {
+        // The final transition has no successor tile. Skip its serial snippet fold and modulo.
+        if (step < u.k_steps) {
             ulong sf = 0;
             for (int w = 0; w < 8; w++) sf = mix64(sf ^ (ulong)s_tile[w]);
             off = mix64(seed ^ ((ulong)(step + 1) * 0x89050E78D34609EFUL) ^ sf) % u.n_tiles; // V4_OFFSET_STEP_SALT
@@ -256,7 +256,7 @@ kernel void pom_walk_states_v4(
     for (uint step = 1; step <= u.k_steps; step++) {
         v4_load_tile(prefix, tensor_addrs, u.n_tensors, off, s_tile, x);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        {
+        if (step < u.k_steps) {
             ulong sf = 0;
             for (int w = 0; w < 8; w++) sf = mix64(sf ^ (ulong)s_tile[w]);
             off = mix64(seed ^ ((ulong)(step + 1) * 0x89050E78D34609EFUL) ^ sf) % u.n_tiles;

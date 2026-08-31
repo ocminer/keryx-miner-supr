@@ -36,11 +36,12 @@ use log::info;
 
 use candle_core::quantized::gguf_file;
 use candle_metal_kernels::metal::{
-    create_command_buffer, Buffer, CommandQueue, CommandSemaphore, ComputePipeline,
+    create_command_buffer, Buffer, CommandBuffer, CommandQueue, CommandSemaphore, ComputePipeline,
     Device as MtlDevice, MTLResourceOptions,
 };
 use objc2_metal::{
-    MTLBuffer as _, MTLResourceOptions as ObjcMTLResourceOptions, MTLResourceUsage, MTLSize,
+    MTLBuffer as _, MTLCommandBufferStatus, MTLResourceOptions as ObjcMTLResourceOptions,
+    MTLResourceUsage, MTLSize,
 };
 
 const METAL_SRC: &str = include_str!("../metal/pom_mine.metal");
@@ -53,6 +54,24 @@ const POM_V4_THREADS: usize = 32;
 /// reads the winner with no blit — the same choice candle makes for its own transient buffers.
 const SHARED_STORAGE: MTLResourceOptions =
     ObjcMTLResourceOptions(ObjcMTLResourceOptions::StorageModeShared.bits());
+
+/// A synchronous wait alone does not mean Metal executed the buffer successfully: it also returns
+/// after an aborted/error completion. Never read a shared output buffer or account the batch until
+/// the command status is explicitly Completed.
+fn wait_for_command(cmd: &CommandBuffer, context: &str) -> candle_core::Result<()> {
+    cmd.wait_until_completed();
+    let status = cmd.status();
+    if status == MTLCommandBufferStatus::Completed {
+        return Ok(());
+    }
+    let detail = cmd
+        .error()
+        .map(|e| e.into_owned())
+        .unwrap_or_else(|| "Metal supplied no NSError detail".to_string());
+    Err(candle_core::Error::Msg(format!(
+        "{context}: command buffer ended with status {status:?}: {detail}"
+    )))
+}
 
 fn words4(b: &[u8; 32]) -> [u64; 4] {
     let mut w = [0u64; 4];
@@ -290,6 +309,11 @@ impl PomGpuMiner {
         if batch == 0 {
             return Ok(None);
         }
+        if start.checked_add(batch - 1).is_none() {
+            return Err(candle_core::Error::Msg(
+                "PoM Metal: nonce range crosses u64::MAX; split it before launch".into(),
+            ));
+        }
         let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
         if n_tiles == 0 {
             return Err(candle_core::Error::Msg("PoM Metal: blob too small for the v4 walk".into()));
@@ -326,9 +350,11 @@ impl PomGpuMiner {
         let grid = MTLSize { width: (batch as usize) * POM_V4_THREADS, height: 1, depth: 1 };
         let tg = MTLSize { width: POM_V4_THREADS, height: 1, depth: 1 };
         enc.dispatch_threads(grid, tg);
-        enc.end_encoding();
+        // ComputeCommandEncoder::Drop ends the encoder. Dropping explicitly here guarantees it is
+        // ended before commit without sending Metal a second endEncoding message.
+        drop(enc);
         cmd.commit();
-        cmd.wait_until_completed();
+        wait_for_command(&cmd, "PoM Metal")?;
 
         let w = unsafe { *(winner_buf.contents() as *const u32) };
         Ok(if w == u32::MAX { None } else { Some(start + w as u64) })
@@ -392,9 +418,9 @@ impl PomGpuMiner {
         let grid = MTLSize { width: (batch as usize) * POM_V4_THREADS, height: 1, depth: 1 };
         let tg = MTLSize { width: POM_V4_THREADS, height: 1, depth: 1 };
         enc.dispatch_threads(grid, tg);
-        enc.end_encoding();
+        drop(enc); // Drop performs the single required endEncoding before commit.
         cmd.commit();
-        cmd.wait_until_completed();
+        wait_for_command(&cmd, "PoM Metal(dbg)")?;
 
         let mut out = vec![0u64; batch as usize];
         unsafe {
@@ -546,13 +572,13 @@ pub fn mine_v4(
     start: u64,
     batch: u64,
     daa: u64,
-) -> Option<u64> {
+) -> crate::pom::GrindResult {
     // 🔴 H10 HARD SAFETY GUARD (mirrors the CUDA backend). At/after the H10 gate the walk seed is
     // the one-way cSHAKE256 PowHash (keccak-f1600 absorbing RAW pph words + timestamp + nonce),
     // which is computed INSIDE the walk kernel because the nonce varies per thread. The Metal
     // shader only implements the pre-H10 reversible v4 fold, so grinding an H10-era job here would
     // walk the wrong tiles and every share would be rejected (BadTilePath) while still burning the
-    // GPU. Refuse instead: return None so the worker idles honestly (no phantom hashrate, nothing
+    // GPU. Refuse instead: return Paused so the worker idles honestly (no phantom hashrate, nothing
     // counted) and log once with the reason. Pre-H10 / testnet jobs below the gate are unaffected.
     // Lifting this needs keccak-f1600 + the H10 seed fold ported into the .metal shader and
     // validated against pom.rs's golden vectors (see `h10_seed_properties_and_golden`).
@@ -566,13 +592,24 @@ pub fn mine_v4(
                 device_id, daa
             );
         }
-        return None;
+        return Err(crate::pom::GrindError::Paused("Metal H10 seed unsupported"));
     }
     let miner = {
-        let g = miners().lock().ok()?;
-        g.get(&device_id)?.clone()
+        let Ok(g) = miners().lock() else {
+            return Err(crate::pom::GrindError::Backend("resident Metal miner mutex poisoned".into()));
+        };
+        let Some(miner) = g.get(&device_id) else {
+            return Err(crate::pom::GrindError::Paused("Metal walk not installed"));
+        };
+        miner.clone()
     };
-    miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
+    match miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch) {
+        Ok(winner) => Ok(crate::pom::GrindCompleted { winner, hashes_done: batch }),
+        Err(e) => {
+            log::warn!("PoM[metal{}]: v4 batch failed ({e}) — batch aborted and not counted", device_id);
+            Err(crate::pom::GrindError::Backend(e.to_string()))
+        }
+    }
 }
 
 /// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup — the PROCESS-WIDE

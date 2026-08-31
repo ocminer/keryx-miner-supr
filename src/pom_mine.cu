@@ -38,7 +38,7 @@ __device__ __forceinline__ void keccak_f1600(unsigned long long st[25]) {
     const unsigned int RHO[24] = {1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44};
     const unsigned int PI[24] = {10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1};
     unsigned long long bc[5];
-    #pragma unroll 1
+    #pragma unroll
     for (int round = 0; round < 24; round++) {
         #pragma unroll
         for (int i = 0; i < 5; i++) bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
@@ -90,13 +90,29 @@ __device__ __forceinline__ unsigned long long pom_seed_fold_h10(
     return st[0];
 }
 
-// Select the seed fold for the era. h10 != 0 → one-way H10 PowHash (p0..p3 = RAW pph words); else
-// the reversible v4 fold (p0..p3 = v4-salted words). The host supplies the correct words per era.
+// H10 seed pre-pass: one CUDA thread per nonce, so every lane in a warp computes useful work.
+// Keeping the 25-lane Keccak state out of the walk kernels is important: inlining it there added
+// 24-40 registers plus a 192-byte stack frame to EVERY walk lane even though only lane 0 executed
+// it, cutting the occupancy available to hide the 256 dependent model reads.  The resulting 8-byte
+// seed/nonce array is tiny next to the 256 KiB of model traffic each nonce consumes.
+extern "C" __global__ void pom_seed_h10_batch(
+    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long time_, unsigned long long nonce_base, unsigned long long n_nonces,
+    unsigned long long* seeds) {
+    const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (i < n_nonces) {
+        seeds[i] = pom_seed_fold_h10(nonce_base + i, time_, p0, p1, p2, p3);
+    }
+}
+
+// Select a precomputed H10 seed, or retain the cheap reversible pre-H10 fold. The walk kernels do
+// not reference pom_seed_fold_h10 directly, allowing ptxas to keep Keccak's state and stack entirely
+// out of their resource footprint.
 __device__ __forceinline__ unsigned long long pom_seed_fold_era(
-    unsigned int h10, unsigned long long nonce, unsigned long long time_,
+    unsigned int h10, const unsigned long long* h10_seeds, unsigned long long seed_index,
+    unsigned long long nonce, unsigned long long time_,
     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3) {
-    return h10 ? pom_seed_fold_h10(nonce, time_, p0, p1, p2, p3)
-               : pom_seed_fold(nonce, time_, p0, p1, p2, p3);
+    return h10 ? h10_seeds[seed_index] : pom_seed_fold(nonce, time_, p0, p1, p2, p3);
 }
 
 __device__ __forceinline__ void pom_pow_fold(
@@ -396,10 +412,11 @@ __device__ __forceinline__ unsigned long long v4_walk_block(
 
     for (unsigned int step = 1; step <= K; step++) {
         v4_load_tile(bases, prefix, T, off, s_tile, x);
-        __syncthreads();
+        __syncwarp();
 
-        // Next offset from the CURRENT tile's snippet (first 32 bytes = 8 words).
-        {
+        // No successor is consumed after the final transition. Avoid the last serial eight-mix
+        // snippet fold and 64-bit modulo; this condition is uniform across the block.
+        if (step < K) {
             unsigned long long sf = 0;
             #pragma unroll
             for (int w = 0; w < 8; w++) sf = mix64(sf ^ (unsigned long long)s_tile[w]);
@@ -425,24 +442,24 @@ __device__ __forceinline__ unsigned long long v4_walk_block(
         }
         #pragma unroll
         for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = new4[k4];
-        __syncthreads();
+        __syncwarp();
     }
 
     // root_K: 32 blake3 row leaves + complete depth-5 tree (scratch reuses the tile region).
     b3_hash_row32(row4, s_tile + x * 8);
-    __syncthreads();
+    __syncwarp();
     unsigned int* src = s_tile;
     unsigned int* dst = s_tile + V4_D * 8;
     for (unsigned int n = V4_D; n > 1; n >>= 1) {
         if (x < n / 2) b3_hash_pair(src + x * 16, dst + x * 8);
-        __syncthreads();
+        __syncwarp();
         unsigned int* tmp = src; src = dst; dst = tmp;
     }
     return (unsigned long long)src[0] | ((unsigned long long)src[1] << 32);
 }
 
 // v4 grind: one block of 32 threads per nonce. Dynamic shared = 2 KB (tile + fold scratch).
-extern "C" __global__ void pom_mine_v4(
+extern "C" __global__ void pom_mine_v4_seeded(
     const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
     unsigned long long n_tiles, unsigned int K,
     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
@@ -450,21 +467,24 @@ extern "C" __global__ void pom_mine_v4(
     unsigned long long time_,
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
-    unsigned int h10,
+    const unsigned long long* h10_seeds, unsigned int h10,
     unsigned long long* winner) {
     extern __shared__ unsigned int s_shared[];
     if ((unsigned long long)blockIdx.x >= n_nonces) return;
     const unsigned long long nonce = nonce_base + blockIdx.x;
-    // Compute the (post-H10 keccak) seed ONCE on lane 0 and broadcast — every thread needs the
-    // identical value, so this replaces 32x redundant keccak/mix64 with 1x + a warp shuffle.
+    // Select/load the already-produced H10 seed on lane 0 and broadcast; pre-H10 retains the cheap
+    // reversible fold on lane 0. Every lane then starts from the identical consensus seed.
     unsigned long long seed = ((threadIdx.x & 31u) == 0u)
-        ? pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3) : 0ULL;
+        ? pom_seed_fold_era(h10, h10_seeds, blockIdx.x, nonce, time_, s0, s1, s2, s3) : 0ULL;
     seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
     const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared);
     if (threadIdx.x == 0) {
         unsigned long long pv[4];
         pom_pow_fold(fin, p0, p1, p2, p3, pv);
-        if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, nonce);
+        // Store the batch-relative index, not the physical nonce. Besides making the atomic value
+        // smaller, this leaves ULLONG_MAX exclusively as the no-winner sentinel even when the
+        // legitimate physical nonce itself is ULLONG_MAX.
+        if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, (unsigned long long)blockIdx.x);
     }
 }
 
@@ -500,25 +520,27 @@ __device__ __forceinline__ const ulonglong2* v4_chunk_addr(
     return q + (idx - prefix[lo]) * 2ULL;
 }
 
-extern "C" __global__ void pom_mine_v4_chase(
+extern "C" __global__ void pom_mine_v4_chase_seeded(
     const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
     unsigned long long n_tiles, unsigned int K,
     unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
     unsigned long long time_, unsigned long long nonce_base, unsigned long long n_nonces,
-    unsigned int h10,
-    unsigned int* offsets /* [n_nonces][K] */) {
+    const unsigned long long* h10_seeds, unsigned int h10,
+    unsigned int* offsets /* step-major [K][n_nonces] for coalesced chase stores */) {
     const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     if (i >= n_nonces) return;
     const unsigned long long nonce = nonce_base + i;
-    // Compute the (post-H10 keccak) seed ONCE on lane 0 and broadcast — every thread needs the
-    // identical value, so this replaces 32x redundant keccak/mix64 with 1x + a warp shuffle.
-    unsigned long long seed = ((threadIdx.x & 31u) == 0u)
-        ? pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3) : 0ULL;
-    seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
+    // One thread owns one nonce in the chase. H10 seeds were produced by the dense seed pre-pass;
+    // broadcasting lane 0 here would incorrectly give 31 distinct nonces the same offset chain.
+    const unsigned long long seed =
+        pom_seed_fold_era(h10, h10_seeds, i, nonce, time_, s0, s1, s2, s3);
     unsigned long long off = mix64(seed ^ V4_OFFSET_FIRST_SALT) % n_tiles;
-    unsigned int* my = offsets + i * (unsigned long long)K;
     for (unsigned int step = 1; step <= K; step++) {
-        my[step - 1] = (unsigned int)off;
+        // Step-major layout makes every chase warp's stores contiguous. The TC consumer performs
+        // one uniform read per nonce/step either way, so this removes the old 1 KiB store stride
+        // without making its access pattern worse.
+        offsets[(unsigned long long)(step - 1) * n_nonces + i] = (unsigned int)off;
+        if (step == K) break; // the walk consumes K offsets; offset K+1 is never observed
         const ulonglong2* q = v4_chunk_addr(bases, prefix, T, off, 0);
         const ulonglong2 c0 = q[0], c1 = q[1];
         unsigned long long sf = 0;
@@ -596,7 +618,7 @@ __device__ __forceinline__ void v4_imma_step(
     __syncwarp();
 }
 
-extern "C" __global__ void pom_mine_v4_tc(
+extern "C" __global__ void pom_mine_v4_tc_seeded(
     const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
     unsigned int K,
     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
@@ -604,7 +626,8 @@ extern "C" __global__ void pom_mine_v4_tc(
     unsigned long long time_,
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
-    const unsigned int* offsets, unsigned int h10, unsigned long long* winner) {
+    const unsigned int* offsets, const unsigned long long* h10_seeds,
+    unsigned int h10, unsigned long long* winner) {
     extern __shared__ unsigned int s_shared[];
     const unsigned int w = threadIdx.x >> 5;
     const unsigned long long i = (unsigned long long)blockIdx.x * V4_TC_WARPS + w;
@@ -613,30 +636,34 @@ extern "C" __global__ void pom_mine_v4_tc(
     unsigned int* s_buf = s_shared + w * (256u * (V4_TC_PIPE + 1));
     unsigned int* s_state = s_buf + 256u * V4_TC_PIPE;
     const unsigned long long nonce = nonce_base + i;
-    // Compute the (post-H10 keccak) seed ONCE on lane 0 and broadcast — every thread needs the
-    // identical value, so this replaces 32x redundant keccak/mix64 with 1x + a warp shuffle.
+    // Select/load the already-produced H10 seed on lane 0 and broadcast; pre-H10 retains the cheap
+    // reversible fold on lane 0. Every lane then starts from the identical consensus seed.
     unsigned long long seed = ((threadIdx.x & 31u) == 0u)
-        ? pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3) : 0ULL;
+        ? pom_seed_fold_era(h10, h10_seeds, i, nonce, time_, s0, s1, s2, s3) : 0ULL;
     seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
-    const unsigned int* my = offsets + i * (unsigned long long)K;
-
+    // Start the cold random tile reads first, then build S_0 while cp.async is in flight.
+    #pragma unroll
+    for (unsigned int p = 0; p < V4_TC_PIPE - 1; p++) {
+        if (p < K) {
+            const unsigned int off = offsets[(unsigned long long)p * n_nonces + i];
+            v4_tile_cp_async(bases, prefix, T, off, s_buf + p * 256u, x);
+        }
+        asm volatile("cp.async.commit_group;");
+    }
     // S_0 straight into the shared state (spec keystream, same packing as the host).
     { unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)x));
       #pragma unroll
       for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); s_state[x * 8u + k4] = (unsigned int)h; } }
     __syncwarp();
 
-    #pragma unroll
-    for (unsigned int p = 0; p < V4_TC_PIPE - 1; p++) {
-        if (p < K) { v4_tile_cp_async(bases, prefix, T, my[p], s_buf + p * 256u, x); }
-        asm volatile("cp.async.commit_group;");
-    }
     for (unsigned int step = 1; step <= K; step++) {
         unsigned int* cur = s_buf + ((step - 1u) % V4_TC_PIPE) * 256u;
         asm volatile("cp.async.wait_group %0;" :: "n"(V4_TC_PIPE - 2));
         __syncwarp();
         if (step + V4_TC_PIPE - 2 < K) {
-            v4_tile_cp_async(bases, prefix, T, my[step + V4_TC_PIPE - 2],
+            const unsigned int off = offsets[
+                (unsigned long long)(step + V4_TC_PIPE - 2) * n_nonces + i];
+            v4_tile_cp_async(bases, prefix, T, off,
                              s_buf + ((step + V4_TC_PIPE - 2u) % V4_TC_PIPE) * 256u, x);
         }
         asm volatile("cp.async.commit_group;");
@@ -662,19 +689,20 @@ extern "C" __global__ void pom_mine_v4_tc(
         const unsigned long long fin = (unsigned long long)src[0] | ((unsigned long long)src[1] << 32);
         unsigned long long pv[4];
         pom_pow_fold(fin, p0, p1, p2, p3, pv);
-        if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, nonce);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, i);
     }
 }
 
 #else   // __CUDA_ARCH__ < 800: no int8 mma — stub so the module still loads; the host
         // checks compute capability and dispatches pom_mine_v4 instead.
-extern "C" __global__ void pom_mine_v4_tc(
+extern "C" __global__ void pom_mine_v4_tc_seeded(
     const unsigned long long*, const unsigned long long*, unsigned int, unsigned int,
     unsigned long long, unsigned long long, unsigned long long, unsigned long long,
     unsigned long long, unsigned long long, unsigned long long, unsigned long long,
     unsigned long long,
     unsigned long long, unsigned long long, unsigned long long, unsigned long long,
-    unsigned long long, unsigned long long, const unsigned int*, unsigned int, unsigned long long*) {}
+    unsigned long long, unsigned long long, const unsigned int*, const unsigned long long*,
+    unsigned int, unsigned long long*) {}
 #endif
 
 // ============================================================================
@@ -703,13 +731,15 @@ extern "C" __global__ void pom_mine_v4_tc(
 // A/B over 16K nonces + the v4_walk_kind_and_exactness bracket test).
 // ============================================================================
 
+#ifndef V4_NCF_WARPS
 #define V4_NCF_WARPS 4    // nonces (warps) per block; host launch must agree
+#endif
 
 __device__ __forceinline__ unsigned long long v4_barrett_mod(
     unsigned long long x, unsigned long long n, unsigned long long inv_n) {
     unsigned long long q = __umul64hi(x, inv_n);
     unsigned long long r = x - q * n;
-    while (r >= n) r -= n;
+    if (r >= n) r -= n; // floor((2^64-1)/n) underestimates the quotient by at most one
     return r;
 }
 
@@ -726,7 +756,7 @@ __device__ __forceinline__ const ulonglong2* v4_chunk_addr_lut(
 
 #if __CUDA_ARCH__ >= 800
 
-extern "C" __global__ void pom_mine_v4_ncf(
+extern "C" __global__ void pom_mine_v4_ncf_seeded(
     const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
     unsigned long long n_tiles, unsigned int K,
     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
@@ -735,7 +765,7 @@ extern "C" __global__ void pom_mine_v4_ncf(
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
     const unsigned short* lut, unsigned int lut_sh, unsigned long long inv_n,
-    unsigned int h10, unsigned long long* winner) {
+    const unsigned long long* h10_seeds, unsigned int h10, unsigned long long* winner) {
     extern __shared__ unsigned int s_shared[];
     const unsigned int w = threadIdx.x >> 5;
     const unsigned int x = threadIdx.x & 31u;
@@ -747,23 +777,24 @@ extern "C" __global__ void pom_mine_v4_ncf(
     unsigned int* s_tiles = s_warp + 256u;
 
     const unsigned long long nonce = nonce_base + i;
-    // Compute the (post-H10 keccak) seed ONCE on lane 0 and broadcast — every thread needs the
-    // identical value, so this replaces 32x redundant keccak/mix64 with 1x + a warp shuffle.
+    // Select/load the already-produced H10 seed on lane 0 and broadcast; pre-H10 retains the cheap
+    // reversible fold on lane 0. Every lane then starts from the identical consensus seed.
     unsigned long long seed = ((threadIdx.x & 31u) == 0u)
-        ? pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3) : 0ULL;
+        ? pom_seed_fold_era(h10, h10_seeds, i, nonce, time_, s0, s1, s2, s3) : 0ULL;
     seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
-    { unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)x));
-      #pragma unroll
-      for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); s_state[x * 8u + k4] = (unsigned int)h; } }
-    __syncwarp();
-
     unsigned long long off = v4_barrett_mod(mix64(seed ^ V4_OFFSET_FIRST_SALT), n_tiles, inv_n);
+    // Issue the first dependent tile before generating S_0, hiding part of its cold latency.
     {
         const ulonglong2* q = v4_chunk_addr_lut(bases, prefix, T, lut, lut_sh, off, x);
         ulonglong2* dst = (ulonglong2*)(s_tiles + 256u + x * 8);   // tile 1 -> buffer (1&1)=1
         v4_cp_async16(dst, q); v4_cp_async16(dst + 1, q + 1);
         asm volatile("cp.async.commit_group;");
     }
+    { unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)x));
+      #pragma unroll
+      for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); s_state[x * 8u + k4] = (unsigned int)h; } }
+    __syncwarp();
+
     for (unsigned int step = 1; step <= K; step++) {
         unsigned int* cur = s_tiles + (step & 1u) * 256u;
         asm volatile("cp.async.wait_group 0;");
@@ -802,12 +833,12 @@ extern "C" __global__ void pom_mine_v4_ncf(
         const unsigned long long fin = (unsigned long long)src[0] | ((unsigned long long)src[1] << 32);
         unsigned long long pv[4];
         pom_pow_fold(fin, p0, p1, p2, p3, pv);
-        if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, nonce);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, i);
     }
 }
 
 #else   // __CUDA_ARCH__ < 800: stub so the module still loads on old archs.
-extern "C" __global__ void pom_mine_v4_ncf(
+extern "C" __global__ void pom_mine_v4_ncf_seeded(
     const unsigned long long*, const unsigned long long*, unsigned int,
     unsigned long long, unsigned int,
     unsigned long long, unsigned long long, unsigned long long, unsigned long long,
@@ -816,5 +847,5 @@ extern "C" __global__ void pom_mine_v4_ncf(
     unsigned long long, unsigned long long, unsigned long long, unsigned long long,
     unsigned long long, unsigned long long,
     const unsigned short*, unsigned int, unsigned long long,
-    unsigned int, unsigned long long*) {}
+    const unsigned long long*, unsigned int, unsigned long long*) {}
 #endif

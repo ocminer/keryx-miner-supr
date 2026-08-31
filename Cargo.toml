@@ -11,6 +11,10 @@ keywords = ["blockchain", "cli"]
 include = [
     "src/**/*.rs",
     "src/**/*.s",
+    "src/**/*.cu",
+    "cuda/pom_mine.fatbin",
+    "metal/pom_mine.metal",
+    "plugins/opencl/resources/pom_mine.cl",
     "proto/**",
     "Cargo.toml",
     "Cargo.lock",
