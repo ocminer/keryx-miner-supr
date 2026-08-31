@@ -74,7 +74,6 @@ struct AiTask {
 
 /// Task attached to the current mining job, cleared on each new `mining.notify`.
 struct CurrentTask {
-    job_id: String,
     task: AiTask,
 }
 
@@ -929,7 +928,7 @@ impl StratumHandler {
                                 other => other.to_string(),
                             };
                             let inference_started =
-                                self.handle_ai_task(id.clone(), task_json, miner).await;
+                                self.handle_ai_task(task_json, miner).await;
                             if inference_started {
                                 // PoW already paused inside handle_ai_task — do NOT feed a new
                                 // block template or the GPU immediately resumes hashing.
@@ -1018,22 +1017,23 @@ impl StratumHandler {
                                 // activates on Short-only pools; floor at SALT-v4 era.
                                 let base = LAST_DAA_SCORE.load(std::sync::atomic::Ordering::Relaxed)
                                     .max(crate::pow::heavy_hash::POW_SALT_V4_ACTIVATION_DAA);
-                                // If the pool told us the fork is active (POOL_FORCED_POM),
-                                // floor at the CURRENT frontier — activation + H2 tier AND
-                                // the H3 gate (level_activation_daa, salted folds). The old
-                                // floor stopped at H2: on a Short-only pool/proxy (no
-                                // daa_score on the wire) the miner then mined UNSALTED
-                                // pre-H3 folds forever, and every post-H3 verifier rejected
-                                // ~every share as "low difficulty". H3 (like H2) is a frozen
-                                // frontier the network is permanently past, so any pool
-                                // forcing PoM today is necessarily post-H3.
+                                // If the pool told us the fork is active (POOL_FORCED_POM), floor at
+                                // the CURRENT frontier — H10, the one-way cSHAKE seed gate. Every
+                                // earlier gate (H2 38.95M, H3/level 43.45M, H4 54.766M) is a frozen
+                                // frontier the network is permanently past, and H10 (87.36M)
+                                // dominates all of them, so one max replaces the whole chain.
+                                //
+                                // This was a LATENT 100%-REJECT BUG: the old chain topped out at
+                                // h4_activation_daa() = 54.766M, which is BELOW the H10 gate. On a
+                                // Short-only pool/proxy that sends no daa_score, the miner floored
+                                // at 54.766M, `is_h10_seed_era()` returned false, and it ground the
+                                // OLD reversible v4 seed — so the verifier rejected EVERY share
+                                // (BadTilePath), exactly the v0.12.0 failure mode. Flooring at the
+                                // H10 gate makes a suffix-less pool mine the correct one-way seed.
+                                // (`h10_activation_daa()` honours KERYX_POM_H10_ACTIVATION_DAA, so
+                                // staging against a pre-H10 testnet still works.)
                                 if POOL_FORCED_POM.load(std::sync::atomic::Ordering::Relaxed) {
-                                    // 0.7.0 is the H4 binary: floor at the H4 frontier too, so a
-                                    // Short-only pool forcing PoM stamps the H4 tier and builds
-                                    // proof-v2 (h4 dominates H2/H3; env-override respected).
-                                    base.max(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA)
-                                        .max(keryx_miner::pom::level_activation_daa())
-                                        .max(keryx_miner::pom::h4_activation_daa())
+                                    base.max(keryx_miner::pom::h10_activation_daa())
                                 } else {
                                     base
                                 }
@@ -1403,7 +1403,7 @@ impl StratumHandler {
     /// Handles an AiTask dispatched by the bridge. Returns `true` if inference was launched
     /// and PoW has been paused — the caller must NOT call `process_block(Some(...))` in that
     /// case; PoW resumes automatically on the next `mining.notify` after inference completes.
-    async fn handle_ai_task(&mut self, job_id: String, task_json: String, miner: &mut MinerManager) -> bool {
+    async fn handle_ai_task(&mut self, task_json: String, miner: &mut MinerManager) -> bool {
         let mut task: AiTask = match serde_json::from_str(&task_json) {
             Ok(t) => t,
             Err(e) => {
@@ -1421,7 +1421,7 @@ impl StratumHandler {
         }
 
         // Store task for this job so create_block_channel can look up the CID.
-        *self.current_task_slot.lock().await = Some(CurrentTask { job_id, task: task.clone() });
+        *self.current_task_slot.lock().await = Some(CurrentTask { task: task.clone() });
 
         // Skip inference if there is no key (neither stable_id nor reqId) or it's already done/running.
         if task.stable_id.is_empty() {

@@ -201,48 +201,10 @@ pub fn pph_words_for_era(pre_pow_hash: &[u8; 32], h3: bool) -> [u64; 4] {
     w
 }
 
-/// H5.1 domain salt (emergency relaunch 2026-07-24) applied to the pph words feeding the WALK SEED
-/// fold ONLY, at/after `h5_1_activation_daa()`. Unlike the H3 salt this does NOT touch the pow fold
-/// (header-level pow + block levels stay era-stable). Every walk trajectory changes at the gate, so
-/// pre-H5.1 blocks fail node body validation — the forced-update mechanism for the relaunch.
-/// Derivation: sha256("keryx-h5.1-pom-pph-salt") read as 4 little-endian u64 words.
-/// MUST equal the node's `POM_H5_1_PPH_SALT`.
-pub const POM_H5_1_PPH_SALT: [u64; 4] = [0x0F86D1400D3F8664, 0xC296B67C7A7A6A5B, 0x5F89AD33D961FEAA, 0xAC6C9AFDFA053580];
-
-/// H5.2 domain salt (chain anchoring, keryxd v1.4.0, 2026-07-25) applied to the pph words feeding
-/// the WALK SEED fold ONLY, at/after `h5_2_activation_daa()`. Same mechanism as H5.1: rotating the
-/// seed salt invalidates every pre-gate fork point (the relaunched chain's accumulated work is
-/// small, so a private pre-gate branch could otherwise outweigh it). The pow fold keeps the H3
-/// salt — header pow / block levels are era-stable.
-/// Derivation: sha256("keryx-h5.2-pom-pph-salt") read as 4 little-endian u64 words.
-/// MUST equal the node's `POM_H5_2_PPH_SALT` (keryx-node v1.4.0 consensus/core/src/pom.rs).
-pub const POM_H5_2_PPH_SALT: [u64; 4] = [0x584ADE0A598D896D, 0x8783631D81BC2695, 0x2917FCF883A0B862, 0x533CCCFAC88FD614];
-
 /// pph words feeding the SEED fold for the era selected by (`h3`, `h5_1`, `h5_2`). Each seed-salt
 /// era uses RAW pph XOR its own salt (NO stacking — the v0.9.0 bug); the pow fold keeps using
 /// `pph_words_for_era` (H3) in every era.
 #[inline]
-pub fn seed_pph_words_for_era(pre_pow_hash: &[u8; 32], h3: bool, h5_1: bool, h5_2: bool) -> [u64; 4] {
-    if h5_2 {
-        // H5.2 seed words = RAW pph XOR the H5.2 salt ONLY (node `pph_words_h5_2`).
-        let mut w = pph_words(pre_pow_hash);
-        for (wi, si) in w.iter_mut().zip(POM_H5_2_PPH_SALT.iter()) {
-            *wi ^= si;
-        }
-        w
-    } else if h5_1 {
-        // H5.1 seed words = RAW pph XOR the H5.1 salt ONLY. The H3 salt is NOT stacked here —
-        // node `pph_words_h5_1` = `pph_words` (raw) XOR POM_H5_1_PPH_SALT. H3 still salts the POW
-        // fold (`pom_pow_value` via `pph_words_for_era`), just not the seed at/after the H5.1 gate.
-        let mut w = pph_words(pre_pow_hash);
-        for (wi, si) in w.iter_mut().zip(POM_H5_1_PPH_SALT.iter()) {
-            *wi ^= si;
-        }
-        w
-    } else {
-        pph_words_for_era(pre_pow_hash, h3)
-    }
-}
 
 #[inline]
 fn pom_block_seed_from_words(p: &[u64; 4], timestamp: u64, nonce: u64) -> u64 {
@@ -253,13 +215,6 @@ fn pom_block_seed_from_words(p: &[u64; 4], timestamp: u64, nonce: u64) -> u64 {
     s = mix64(s ^ p[2]);
     s = mix64(s ^ p[3]);
     s
-}
-
-/// Canonical block seed = initial walk state. mix64-fold of (nonce, time, pre_pow_hash).
-/// BYTE-IDENTICAL to `pom_mine.cu::pom_seed_fold` and the node's `pom_block_seed`(`_h3`/`_h5_1`/`_h5_2`).
-/// `h5_1`/`h5_2` swap the seed pph words to that era's salted set (the pow fold stays H3-salted).
-pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> u64 {
-    pom_block_seed_from_words(&seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2), timestamp, nonce)
 }
 
 /// Canonical pow value (256-bit LE) = mix64-fold of (final_state, pre_pow_hash).
@@ -1295,68 +1250,6 @@ pub fn is_level_activation_overridden() -> bool {
 }
 static LEVEL_ACTIVATION_DAA: OnceLock<u64> = OnceLock::new();
 
-/// H4 hardfork activation DAA — "coin-age verification" + the PoM verifier v2 (recompute-from-chunks
-/// proof). At/after this score: (1) the H4 model lineup is active (`models::pom_tier_index` returns the
-/// EXAONE/Mistral/GLM-4/Qwen3.6/Kimi tiers), and (2) the miner MUST build the recompute-from-chunks
-/// proof v2 (`build_proof_v2`: every K chunk the walk read, each Merkle-proven under R_T) — a pre-H4
-/// proof verifies false at/after the gate → rejected. MUST equal the node's H4 params + upstream
-/// keryx-miner v0.3.7's `COIN_AGE_VERIFICATION_ACTIVATION_DAA`. Mainnet: 54_766_000
-/// (~2026-07-18 20:31 UTC). Testnet builds: 3_000.
-pub const COIN_AGE_VERIFICATION_ACTIVATION_DAA: u64 = 54_766_000;
-
-/// H5 activation DAA score. At/after this score the possession walk switches from the frozen v1
-/// XOR-fold (`transition_v1`) to the non-foldable mix64-chained `transition_v2`, both on the GPU
-/// kernel (`pom_mine.cu`, `walk_v2` param) and the CPU walk/proof path — closing the pre-H5 fold
-/// shortcut. MUST equal the node's `MAINNET_PARAMS.h5_activation` (= node `H5_ACTIVATION_DAA`),
-/// node↔miner lockstep exactly like `COIN_AGE_VERIFICATION_ACTIVATION_DAA`. Mainnet: 59_009_037
-/// (upstream keryx-miner v0.3.8-OPoI / keryx-node v1.3.4+, the H5 relaunch tip with a difficulty
-/// reset). Pair with node v1.3.4+.
-pub const H5_ACTIVATION_DAA: u64 = 59_009_037;
-
-/// Effective H5 activation DAA. Overridable via `KERYX_H5_ACTIVATION_DAA` for STAGING / crossing
-/// tests only (e.g. set it just above the current tip to exercise the walk_v2 + Qwen3-8B tier-0
-/// crossing before mainnet reaches 59_009_037). Read once. Production (unset) = the const above.
-pub fn h5_activation_daa() -> u64 {
-    *H5_ACTIVATION_DAA_CELL.get_or_init(|| {
-        std::env::var("KERYX_H5_ACTIVATION_DAA")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(H5_ACTIVATION_DAA)
-    })
-}
-static H5_ACTIVATION_DAA_CELL: OnceLock<u64> = OnceLock::new();
-
-/// H5.1 (emergency relaunch 2026-07-24) activation DAA score. At/after this score the walk seed
-/// derives from the H5.1-salted pph words (`POM_H5_1_PPH_SALT`) — SEED fold only, the pow fold keeps
-/// the H3 salt. Gate = virtual daa of the isolated relaunch base. MUST equal the node's
-/// `MAINNET_PARAMS.h5_1_activation` / `H5_1_ACTIVATION_DAA` = 59_027_921 (keryx-node v1.3.41 /
-/// keryx-miner v0.3.81). Overridable via `KERYX_H5_1_ACTIVATION_DAA` for staging/crossing tests.
-pub const H5_1_ACTIVATION_DAA: u64 = 59_027_921;
-pub fn h5_1_activation_daa() -> u64 {
-    *H5_1_ACTIVATION_DAA_CELL.get_or_init(|| {
-        std::env::var("KERYX_H5_1_ACTIVATION_DAA")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(H5_1_ACTIVATION_DAA)
-    })
-}
-static H5_1_ACTIVATION_DAA_CELL: OnceLock<u64> = OnceLock::new();
-
-/// H5.2 (chain anchoring, keryxd v1.4.0, 2026-07-25) activation DAA score. At/after this score the
-/// walk seed derives from the H5.2-salted pph words (`POM_H5_2_PPH_SALT`) — SEED fold only, the pow
-/// fold keeps the H3 salt. MUST equal the node's `H5_2_ACTIVATION_DAA` = 59_170_000 (keryx-node
-/// v1.4.0 config/params.rs). Overridable via `KERYX_H5_2_ACTIVATION_DAA` for staging/crossing tests.
-pub const H5_2_ACTIVATION_DAA: u64 = 59_170_000;
-pub fn h5_2_activation_daa() -> u64 {
-    *H5_2_ACTIVATION_DAA_CELL.get_or_init(|| {
-        std::env::var("KERYX_H5_2_ACTIVATION_DAA")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(H5_2_ACTIVATION_DAA)
-    })
-}
-static H5_2_ACTIVATION_DAA_CELL: OnceLock<u64> = OnceLock::new();
-
 /// H6 (matrix-state walk, PoM v3) activation DAA score. At/after this score — decided per job from
 /// the TEMPLATE's own `daa_score`, never wall clock or tip — the miner grinds the v3 walk on the GPU
 /// and builds `PomProofV3`; a pre-H6 (trace/steps_v2) proof verifies false at/after the gate and is
@@ -1391,58 +1284,7 @@ pub fn reward_routing_activation_daa() -> u64 {
             .unwrap_or(79_251_000)
     })
 }
-
-/// AUTO-SWITCH: is this block at/after the H6 (PoM v3 matrix-walk) gate? Decided per job from the
-/// block's own `daa_score` so an already-running miner flips to the v3 walk + witness on the first
-/// post-gate job. Logs ONCE on first crossing.
-pub fn pom_v3_active(daa_score: u64) -> bool {
-    let active = daa_score >= pom_v3_activation_daa();
-    if active {
-        static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            log::info!(
-                "H6 hardfork ACTIVE (block DAA {} >= gate {}): PoM is now the int8 matrix-state walk \
-                 (v3). Building PomProofV3 witnesses.",
-                daa_score,
-                pom_v3_activation_daa()
-            );
-        }
-    }
-    active
-}
-
-/// Effective H4 activation DAA. Overridable via `KERYX_H4_ACTIVATION_DAA` for STAGING / pre-gate
-/// testing only (e.g. set to 0 to force H4 proof v2 + lineup on regardless of daa_score). Read once.
-pub fn h4_activation_daa() -> u64 {
-    *H4_ACTIVATION_DAA.get_or_init(|| {
-        std::env::var("KERYX_H4_ACTIVATION_DAA")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(COIN_AGE_VERIFICATION_ACTIVATION_DAA)
-    })
-}
 static H4_ACTIVATION_DAA: OnceLock<u64> = OnceLock::new();
-
-/// AUTO-SWITCH: is this block at/after the H3 gate? Decided per job from the block's `daa_score`,
-/// so an already-running miner flips to the post-fork PoM convention (H3-salted folds) on the first
-/// job past the gate — no restart, no model reload (the salt changes only the seed/pow folds, not
-/// the weights/tier/R_T). Logs ONCE the moment it first crosses so the switch is visible. This is
-/// what lets miners update now and just leave it running across the fork.
-pub fn h3_active(daa_score: u64) -> bool {
-    let active = daa_score >= level_activation_daa();
-    if active {
-        static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            log::info!(
-                "H3 hardfork ACTIVE (block DAA {} >= gate {}): auto-switched to the post-fork PoM \
-                 convention (H3-salted folds). No action needed — keep mining.",
-                daa_score,
-                level_activation_daa()
-            );
-        }
-    }
-    active
-}
 
 /// PoM PASSTHROUGH live-test mode (`KERYX_POM_PASSTHROUGH=1`). When set, the miner keeps mining
 /// kHeavyHash (the only valid PoW pre-fork) but ALSO attaches a `PomProof` to each winning share so
@@ -1820,85 +1662,6 @@ mod tests {
             rounds * batch,
             secs
         );
-    }
-
-    /// Full AMD path on the REAL tier: load_tier (WeightIndex + GPU blob + PomMiner) -> GPU mine
-    /// over the resident Gemma weights -> build proof from the resident index -> verify vs pinned R_T.
-    /// Proves the GPU blob and the proof-side WeightIndex are the same canonical chunks.
-    #[test]
-    #[ignore]
-    #[cfg(feature = "pom-opencl")]
-    /// CUDA variant: run the pom_mine kernel (cudarc) over the real Gemma-3-4B tier resident in
-    /// NVIDIA VRAM, build the proof from the resident WeightIndex, verify vs the pinned R_T, and
-    /// assert the consensus N + R_T. Proves the CUDA search reads the SAME canonical chunks as the
-    /// proof side (i.e. the NVIDIA path is byte-exact with consensus).
-    /// Run: KERYX_GEMMA_GGUF=… cargo test --release --features pom-cuda gpu_real_tier_end_to_end_cuda -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    #[cfg(feature = "pom-cuda")]
-    /// Tier-2 (Qwen3-32B) candle-CUDA consensus check: WeightIndex R_T must equal the node-pinned
-    /// tier-2 root e2aa6659…, the GPU gather N must match, and a candle-CUDA-mined nonce must build
-    /// a proof that verifies. Proves the bigger Qwen3 GGUF loads + gathers byte-exact (the 5090 tier).
-    /// Run: KERYX_QWEN3_GGUF=… cargo test --release --features pom-cuda gpu_real_tier_qwen3_cuda -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    #[cfg(feature = "pom-cuda")]
-    /// Emit a REAL `mining.submit` wire (params[5] = borsh PomProof hex) built over the real
-    /// Gemma-3-4B tier, for the pool to replay through `_submitBlock` → keryxd `verify_pom_proof`
-    /// in isolation. The proof is verified LOCALLY first, so this is a known-good vector. Writes
-    /// `<KERYX_SAMPLE_OUT>_submit.json` + `_vector.txt` (default prefix /tmp/pom_sample).
-    /// Run: KERYX_GEMMA_GGUF=… cargo test --features pom-opencl emit_sample_submit_wire -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    #[cfg(feature = "pom-opencl")]
-    /// Mode B: build a proof bound to a REAL staging header's pre_pow_hash + timestamp (supplied via
-    /// env), so the pool can reconstruct an RpcRawBlock and submit it to keryxd. Mines at an easy
-    /// test target (network diff is infeasible here), verifies locally, and writes the
-    /// `{nonce_u64_dec, pom_proof_hex_lowercase, notes}` reply JSON.
-    /// Run: KERYX_GEMMA_GGUF=… KERYX_POM_B_PPH=<64hex> KERYX_POM_B_TIME=<u64> \
-    ///      cargo test --release -p keryx-miner-supr --features pom-opencl emit_mode_b_proof -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    #[cfg(feature = "pom-opencl")]
-    /// Emit a REAL H4 PoM **proof-v2** (recompute-from-chunks) over a REAL H4 model, entirely
-    /// host-side (no GPU), for the pool's PoW / PoM-v2 acceptance test. Builds the WeightIndex from
-    /// the GGUF (canonical R_T = the node's pinned tier root), builds the v2 proof via
-    /// `build_proof_v2`, self-verifies via `verify_proof_v2`, and writes the wire hex + the full
-    /// context the pool feeds into `verify_pom_proof_v2`.
-    ///
-    /// Run (EXAONE = tier 0, the smallest H4 model):
-    ///   KERYX_H4_GGUF=$HOME/keryx-model-cache/EXAONE-4.0-1.2B/model.gguf KERYX_H4_TIER=0 \
-    ///   cargo test --release -p keryx-miner-supr emit_h4_v2_proof -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    /// Validate + benchmark candle's CPU backend on the AMD OPoI inference model (Gemma-3-4B, the
-    /// post-fork --light tier). Proves candle CPU can load + generate the Gemma3 quantized arch (the
-    /// AMD inference path) and reports the real tok/s on this box. Needs the model staged at
-    /// `<test-exe-dir>/models/Gemma-3-4B/` (symlink target/release/deps/models -> ../models).
-    /// Run: cargo test --release -p keryx-miner-supr --features pom-opencl cpu_inference_bench -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    #[cfg(feature = "pom-opencl")]
-    fn cpu_inference_bench() {
-        crate::slm::init_supported(&[&crate::models::GEMMA_3_4B]);
-        let id = crate::models::GEMMA_3_4B.model_id;
-        assert!(crate::slm::cpu_inference_enabled(), "pom-opencl build must force CPU inference");
-        // First call loads the 2.48 GiB GGUF into RAM on CPU (one-time) + a short generation.
-        let t_load = std::time::Instant::now();
-        let warm = crate::slm::load_and_run_inference(&id, "Hello", 8);
-        let load_s = t_load.elapsed().as_secs_f64();
-        assert!(warm.is_some(), "candle CPU failed to load/run Gemma-3-4B — AMD inference path broken");
-        // Second call: model resident -> the per-challenge generation rate.
-        let n = 48usize;
-        let t = std::time::Instant::now();
-        let out = crate::slm::load_and_run_inference(&id, "The capital of France is", n);
-        let s = t.elapsed().as_secs_f64();
-        let text = out.expect("CPU inference returned None on the resident call");
-        let sample: String = text.chars().take(120).collect();
-        eprintln!("=== Gemma-3-4B CPU inference on this box ===");
-        eprintln!("  load (first call, 2.48 GiB GGUF -> RAM): {:.1}s", load_s);
-        eprintln!("  resident gen: {} tokens in {:.1}s => ~{:.2} tok/s", n, s, n as f64 / s);
-        eprintln!("  sample: {:?}", sample);
     }
 
     /// H10 one-way seed — self-consistency + golden vectors.
