@@ -28,7 +28,10 @@ case "$VARIANT" in
 esac
 case "$LINE" in
   modern) ARCHS="75;80;86;89;90;120"; CUDAMOUNT=(); KCUDA=/usr/local/cuda ;;
-  legacy) ARCHS="70;75;80;86;89;90";  CUDAMOUNT=(-v /tmp/cuda124:/opt/cuda:ro); KCUDA=/opt/cuda ;;
+  # LEGACY now also carries Pascal (sm_61, GTX 10-series) so we keep exactly TWO shipped lines.
+  # sm_60 (P100) is deliberately NOT included: the v4 walk uses __dp4a, which is sm_61+.
+  legacy) ARCHS="61;70;75;80;86;89;90"; CUDAMOUNT=(-v /tmp/cuda124:/opt/cuda:ro); KCUDA=/opt/cuda ;;
+  # Kept for one-off Pascal-only engine builds; not part of the release train.
   pascal) ARCHS="60;61";              CUDAMOUNT=(-v /tmp/cuda124:/opt/cuda:ro); KCUDA=/opt/cuda ;;
   *) echo "usage: $0 <modern|legacy|pascal> [JOBS]"; exit 1 ;;
 esac
