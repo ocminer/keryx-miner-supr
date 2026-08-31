@@ -169,7 +169,10 @@ fn walk_load_err(e: impl std::fmt::Display) -> candle_core::Error {
          Pick the build line for your GPU: LEGACY = sm_70+ (Volta/V100, CMP 100-210, Turing+), \
          PASCAL = sm_60/61 (GTX 10-series), MODERN = sm_75+ with driver 575+. If you built from \
          source: CUDA 13.x cannot compile for Volta or Pascal — use a CUDA 12.x toolkit and set \
-         POM_CUDA_ARCH=compute_70 (Volta) or compute_60 (Pascal), plus CUDA_COMPUTE_CAP to match."
+         POM_CUDA_ARCH=compute_70 (Volta) or compute_61 (Pascal/GTX-10xx; compute_60/P100 CANNOT \
+          build the walk — __dp4a is sm_61+), plus CUDA_COMPUTE_CAP to match. Pascal also needs a \
+          CUDA 12.4 toolkit specifically: 12.5+ emits PTX ISA 8.5 which driver 550 rejects with \
+          CUDA_ERROR_UNSUPPORTED_PTX_VERSION."
     ))
 }
 
