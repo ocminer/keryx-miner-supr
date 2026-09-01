@@ -1858,8 +1858,8 @@ fn offset_buffer_count() -> u64 {
     if std::env::var("KERYX_POM_V4_CHASE_PREFETCH").ok().as_deref() == Some("1") { 2 } else { 1 }
 }
 
-/// Bytes of VRAM the offset arrays need for a batch (NCF/classic use none, so this is a conservative
-/// cap until the per-card solver has been selected).
+/// Bytes of VRAM the offset arrays need for a batch. Only the chase+TC pipeline allocates these;
+/// see `v4_batch_bytes_per_nonce` for what a given card actually pays.
 fn offsets_bytes_for(batch: u64) -> u64 {
     batch
         .saturating_mul(crate::pom_v4::POM_V4_K as u64)
@@ -1867,7 +1867,33 @@ fn offsets_bytes_for(batch: u64) -> u64 {
         .saturating_mul(offset_buffer_count())
 }
 
-/// Caps `want` so the offset buffers stay inside a quarter of this card's free VRAM.
+/// VRAM cost of ONE nonce in the batch-sized buffers, for the solver this card will actually run.
+///
+/// This matters a great deal on small cards. The chase+TC pipeline needs an offsets array —
+/// `K(256) × 4 B` = **1 KiB per nonce** — but the chaseless (NCF) and classic walks allocate no
+/// offsets at all; they derive the next tile from the tile just fetched. Charging every card the
+/// chase price throttled cards that never pay it: a field report on an 8 GB RTX 5060 Ti (Blackwell,
+/// so chaseless) had the cap pinned at ~26,368 with only ~257 MiB free, and `--intensity 15`
+/// (32,768) was refused as "not enough VRAM" for an offsets buffer that would never be allocated.
+///
+/// Safety: this may only be relaxed when we KNOW the card runs chaseless, because under-capping is
+/// exactly what poisons a CUDA context. The authority is a cached autotune result — `mine_v4`
+/// dispatches on `tune.ncf` first, and autotune only ever offers `chaseless` as a candidate when
+/// `v4_ncf_usable()` held. A stale tune from a different build cannot mislead us here because the
+/// cache is version-stamped and discarded whenever the miner version changes. With no cached tune
+/// we assume the chase price, which is the old, conservative behaviour.
+fn v4_batch_bytes_per_nonce(device_id: u32) -> u64 {
+    // The dense H10 seed array is 8 B/nonce and every solver reads it.
+    const SEED_BYTES: u64 = 8;
+    let chaseless = matches!(v4_tune_for(device_id), Some(t) if t.ncf);
+    if chaseless {
+        SEED_BYTES
+    } else {
+        SEED_BYTES + (crate::pom_v4::POM_V4_K as u64) * 4 * offset_buffer_count()
+    }
+}
+
+/// Caps `want` so the batch-sized buffers stay inside a tenth of this card's free VRAM.
 ///
 /// This is a HARD safety limit, not a tuning preference. An oversized batch does not merely run
 /// slowly: measured on an 8 GB RTX 3070 at `--intensity 18` (batch 262144 → 512 MiB of offsets on a
@@ -1876,8 +1902,15 @@ fn offsets_bytes_for(batch: u64) -> u64 {
 /// allocate and inference died on that GPU. A knob the operator is invited to turn must not be able
 /// to do that, so an unattainable intensity is clamped with a loud warning instead of honoured.
 fn cap_batch_to_vram(device_id: u32, want: u64) -> u64 {
-    static CAP: OnceLock<Mutex<HashMap<u32, u64>>> = OnceLock::new();
+    // Keyed by (device, per-nonce cost), NOT by device alone. The first cap on a card is computed
+    // before autotune has cached a result, so it necessarily assumes the conservative chase price;
+    // once the tune lands and the card is known to run chaseless the price drops ~128x. With a
+    // device-only key that first, pessimistic cap would be cached forever and the card would stay
+    // throttled for a buffer it never allocates — the exact bug this fix exists to remove.
+    static CAP: OnceLock<Mutex<HashMap<(u32, u64), u64>>> = OnceLock::new();
     let cache = CAP.get_or_init(|| Mutex::new(HashMap::new()));
+    let per_nonce = v4_batch_bytes_per_nonce(device_id);
+    let ckey = (device_id, per_nonce);
     // The reading is only meaningful once the model and walk are RESIDENT. The grind loop computes a
     // batch before the first `ensure_installed`, when the card still looks almost empty — caching
     // that reading produced a cap ~8x too generous and let an unattainable --intensity through,
@@ -1886,7 +1919,7 @@ fn cap_batch_to_vram(device_id: u32, want: u64) -> u64 {
     // remember it.
     let settled = is_installed(device_id);
     let cap = {
-        let cached = if settled { cache.lock().ok().and_then(|g| g.get(&device_id).copied()) } else { None };
+        let cached = if settled { cache.lock().ok().and_then(|g| g.get(&ckey).copied()) } else { None };
         match cached {
             Some(c) => c,
             None => {
@@ -1905,12 +1938,11 @@ fn cap_batch_to_vram(device_id: u32, want: u64) -> u64 {
                     // (thrashing, then a poisoned context) rather than degrading gracefully. The
                     // autotuned batch on that card needs ~34 MiB, well inside a tenth.
                     let budget = (free_mib * 1024 * 1024) / 10;
-                    (budget / (crate::pom_v4::POM_V4_K as u64 * 4 * offset_buffer_count()))
-                        .max(POM_V4_BATCH_MIN)
+                    (budget / per_nonce).max(POM_V4_BATCH_MIN)
                 };
                 if settled {
                     if let Ok(mut g) = cache.lock() {
-                        g.insert(device_id, c);
+                        g.insert(ckey, c);
                     }
                 }
                 c
@@ -3122,6 +3154,39 @@ mod tests {
         // Truncated/garbage envelopes must not be mistaken for current.
         assert!(v4_tune_entries_if_current(&serde_json::json!({})).is_none());
         assert!(v4_tune_entries_if_current(&serde_json::json!({ "version": 13 })).is_none());
+    }
+
+    /// A card may only be charged VRAM for buffers its solver actually allocates.
+    ///
+    /// Chase+TC allocates an offsets array (`K(256) × 4 B` = 1 KiB/nonce); chaseless and classic
+    /// allocate none. Charging every card the chase price throttled cards that never pay it:
+    /// reported on an 8 GB RTX 5060 Ti (Blackwell → chaseless) whose cap sat at ~26,368 with only
+    /// ~257 MiB free, so `--intensity 15` (32,768) was refused as "not enough VRAM" for a buffer
+    /// that would never be allocated.
+    #[test]
+    fn batch_cost_per_nonce_follows_the_actual_solver() {
+        let offsets = crate::pom_v4::POM_V4_K as u64 * 4; // 1 KiB of offsets per nonce
+        let (chase_dev, ncf_dev, untuned_dev) = (977u32, 978u32, 979u32);
+
+        set_v4_tune(chase_dev, V4Tune { ncf: false, tc: true, batch: 65536 });
+        assert_eq!(v4_batch_bytes_per_nonce(chase_dev), 8 + offsets, "chase pays seed + offsets");
+
+        set_v4_tune(ncf_dev, V4Tune { ncf: true, tc: true, batch: 65536 });
+        assert_eq!(v4_batch_bytes_per_nonce(ncf_dev), 8, "chaseless pays the seed array only");
+
+        // With no cached tune we must stay conservative and assume the chase price.
+        assert_eq!(v4_batch_bytes_per_nonce(untuned_dev), 8 + offsets);
+
+        // The reported card: ~257 MiB free, cap = a tenth of that.
+        let budget = 257u64 * 1024 * 1024 / 10;
+        assert!(
+            budget / (8 + offsets) < 32_768,
+            "at the chase price, intensity 15 is correctly refused on this card"
+        );
+        assert!(
+            budget / 8 > 1_000_000,
+            "at the chaseless price the same card is not meaningfully limited"
+        );
     }
 
     // The llama→raw fallback must fire on a pure layout mismatch, but NEVER on a GPU fault (OOM /
