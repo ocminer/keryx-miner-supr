@@ -1818,13 +1818,40 @@ fn v4_starting_batch(sm: u64) -> u64 {
 /// model nearly fills it — a 10 GB RTX 3080 runs at ~8.2/10.2 GB — that extra pressure showed up in
 /// the field as rebuild failures within minutes of starting. Cards with less than ~1.5 GB free keep
 /// the SM-derived batch; the autotune can still raise them later, having actually measured it.
+/// Decided ONCE per card MODEL, and from the most-free identical card — never from this device's
+/// instantaneous reading alone.
+///
+/// Two identical cards in one rig sample free VRAM at different instants during staging, and one may
+/// be read while its own model/index upload is still in flight. An 8 GB card running the very-light
+/// tier settles at ~1745 MiB free — barely 200 MiB above the threshold — so a transient dip flipped
+/// the answer and the two disagreed: a pair of RTX 3070s on the same rig, same model, same VRAM,
+/// started at 17,664 and 35,328. They do converge once the shared autotune entry lands (both cards
+/// hash the same key), so the divergence is transient rather than permanent, but identical hardware
+/// making different decisions is a bug in its own right and it costs the slower card real work until
+/// the cache catches up.
 fn v4_headroom_for_high_start(device_id: u32) -> bool {
-    let free_mib = query_all_gpus_free_vram()
-        .into_iter()
-        .find(|(o, _, _)| *o == device_id)
-        .map(|(_, free, _)| free)
-        .unwrap_or(0);
-    free_mib == 0 || free_mib >= 1536
+    static DECIDED: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let map = DECIDED.get_or_init(|| Mutex::new(HashMap::new()));
+    let sm = gpu_sm_count(device_id).unwrap_or(0);
+    let name = gpu_name(device_id);
+    let key = format!("{}|sm{}", name, sm);
+    if let Some(v) = map.lock().ok().and_then(|g| g.get(&key).copied()) {
+        return v;
+    }
+    // Take the MAX free across identical cards: a transient allocation dip on whichever card happens
+    // to be sampled first must not hand it a smaller starting batch than its twin.
+    let mut best = 0u64;
+    for (ord, free, _) in query_all_gpus_free_vram() {
+        if gpu_name(ord) == name && gpu_sm_count(ord).unwrap_or(0) == sm {
+            best = best.max(free);
+        }
+    }
+    // No reading at all (driver hiccup, or a card we cannot query) → keep the old permissive answer.
+    let v = best == 0 || best >= 1536;
+    if let Ok(mut g) = map.lock() {
+        g.insert(key, v);
+    }
+    v
 }
 
 // ── OPERATOR OVERRIDES: --intensity and --only-inference ───────────────────────────────────────
