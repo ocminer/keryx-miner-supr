@@ -12,7 +12,7 @@ pub struct Opt {
         long = "very-light",
         help = "Model tier: Qwen3-8B-abliterated (Q4_K_S) — 6 GB+ GPU, smallest tier (PoM tier 0, post-H5; EXAONE-4.0-1.2B in the H4→H5 window)",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["light", "high", "very_high", "tier"]
+        conflicts_with_all = &["light", "high", "very-high", "tier"]
     )]
     pub very_light: bool,
 
@@ -20,7 +20,7 @@ pub struct Opt {
         long = "light",
         help = "Model tier: Gemma-3-4B — any GPU (6 GB+ VRAM)",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "high", "very_high"]
+        conflicts_with_all = &["very-light", "high", "very-high"]
     )]
     pub light: bool,
 
@@ -28,7 +28,7 @@ pub struct Opt {
         long = "high",
         help = "Model tier: Qwen3-32B — RTX 3090 / 4090 (24 GB+ VRAM) + ~60 GB free disk (model + possession tree)",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "light", "very_high"]
+        conflicts_with_all = &["very-light", "light", "very-high"]
     )]
     pub high: bool,
 
@@ -36,7 +36,7 @@ pub struct Opt {
         long = "very-high",
         help = "Model tier: Llama-3.3-70B (Q2_K_L post-H2) — RTX 5090 / 32 GB+ VRAM + ~85 GB free disk (model + possession tree)",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "light", "high", "tier"]
+        conflicts_with_all = &["very-light", "light", "high", "tier"]
     )]
     pub very_high: bool,
 
@@ -45,7 +45,7 @@ pub struct Opt {
         value_name = "TIER",
         help = "Model tier: auto | very-light | light | default | high | very-high. DEFAULT (no flag) is 'auto' — picks the LARGEST tier that fits the GPU's VRAM (per-process) AND is downloaded = highest tier reward. Pass a name to pin a tier; overrides --very-light/--light/--high/--very-high.",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "light", "high", "very_high"]
+        conflicts_with_all = &["very-light", "light", "high", "very-high"]
     )]
     pub tier: Option<String>,
 
@@ -488,7 +488,7 @@ impl Opt {
 
 #[cfg(test)]
 mod escrow_dir_tests {
-    use super::escrow_path_in;
+    use super::{escrow_path_in, Opt};
 
     #[test]
     fn bare_filenames_move_into_the_escrow_dir() {
@@ -511,5 +511,38 @@ mod escrow_dir_tests {
     #[test]
     fn a_trailing_slash_on_the_dir_does_not_double_up() {
         assert_eq!(escrow_path_in("/persist/keryx/", "escrow.key").as_deref(), Some("/persist/keryx/escrow.key"));
+    }
+
+    /// clap validates the whole command definition — including that every id named in a
+    /// `conflicts_with*` / `requires*` list actually exists — but ONLY under `debug_assertions`.
+    /// A release build skips those asserts, so a wrong id is not an error there: the rule is just
+    /// silently never enforced. That is exactly what happened with the tier flags, which referenced
+    /// `very_light`/`very_high` while clap derives ids in KEBAB-case from the field name
+    /// (`very-light`/`very-high`). `--help` panicked in debug builds, and in the shipped release
+    /// builds `--very-light --very-high` was quietly accepted together.
+    ///
+    /// This test runs the same validation deliberately, so a bad id fails CI instead of reaching a
+    /// release as a silently dead constraint.
+    #[test]
+    fn clap_command_definition_is_valid() {
+        use clap::CommandFactory;
+        Opt::command().debug_assert();
+    }
+
+    /// The tier flags are mutually exclusive; prove the constraint is actually WIRED, not merely
+    /// declared. Passing two tier pins must be rejected.
+    #[test]
+    fn mutually_exclusive_tier_flags_are_rejected() {
+        use clap::CommandFactory;
+        for (a, b) in [
+            ("--very-light", "--very-high"),
+            ("--very-light", "--light"),
+            ("--light", "--high"),
+            ("--high", "--very-high"),
+            ("--very-high", "--tier=auto"),
+        ] {
+            let r = Opt::command().try_get_matches_from(vec!["keryx-miner", a, b]);
+            assert!(r.is_err(), "{a} and {b} must conflict, but clap accepted them together");
+        }
     }
 }
