@@ -1912,11 +1912,19 @@ fn offsets_bytes_for(batch: u64) -> u64 {
 fn v4_batch_bytes_per_nonce(device_id: u32) -> u64 {
     // The dense H10 seed array is 8 B/nonce and every solver reads it.
     const SEED_BYTES: u64 = 8;
-    let chaseless = matches!(v4_tune_for(device_id), Some(t) if t.ncf);
-    if chaseless {
-        SEED_BYTES
-    } else {
+    // ONLY chase+TC allocates the offsets array. Chaseless derives the next tile from the tile it
+    // just fetched, and the classic walk (`pom_mine_v4_seeded`, the Pascal/pre-sm_80 path) does the
+    // chase inline in registers — neither touches `v4_offsets_buf`. Testing `!t.ncf` alone would
+    // still have overcharged every classic card.
+    let needs_offsets = match v4_tune_for(device_id) {
+        Some(t) => !t.ncf && t.tc,
+        // No cached tune yet: assume the chase price, the old conservative behaviour.
+        None => true,
+    };
+    if needs_offsets {
         SEED_BYTES + (crate::pom_v4::POM_V4_K as u64) * 4 * offset_buffer_count()
+    } else {
+        SEED_BYTES
     }
 }
 
@@ -3211,6 +3219,12 @@ mod tests {
 
         // With no cached tune we must stay conservative and assume the chase price.
         assert_eq!(v4_batch_bytes_per_nonce(untuned_dev), 8 + offsets);
+
+        // The CLASSIC walk (Pascal / pre-sm_80) also allocates no offsets: it does the chase inline
+        // in registers. Testing `!ncf` alone would have overcharged every classic card.
+        let classic_dev = 980u32;
+        set_v4_tune(classic_dev, V4Tune { ncf: false, tc: false, batch: 16384 });
+        assert_eq!(v4_batch_bytes_per_nonce(classic_dev), 8, "classic pays the seed array only");
 
         // The reported card: ~257 MiB free, cap = a tenth of that.
         let budget = 257u64 * 1024 * 1024 / 10;
