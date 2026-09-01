@@ -45,3 +45,15 @@ DEPLOY_NOTES*.md
 # Agent/session docs stay LOCAL — never publish to GitHub
 STATIC_MEMORY.md
 docs/KERNEL_SOLVER_AUDIT_*.md
+
+# ── SESSION / AGENT DOCS — NEVER PUBLISH (this repo is PUBLIC) ──────────────
+# These name local paths, rig hostnames, internal IPs and fleet topology.
+# They live in $HOME, never in the repo. Deleting one in a later commit is NOT
+# enough -- the adding commit still publishes it. Do not weaken these patterns.
+*HANDOFF*
+*STATIC_MEMORY*
+*MEMORY.md
+docs/*AUDIT*
+docs/*_audit*
+*-handoff.md
+*.session.md
