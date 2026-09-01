@@ -41,3 +41,7 @@ DEPLOY_NOTES*.md
 
 # release archives (build artifacts — never commit)
 *-nvidia-release.zip
+
+# Agent/session docs stay LOCAL — never publish to GitHub
+STATIC_MEMORY.md
+docs/KERNEL_SOLVER_AUDIT_*.md
