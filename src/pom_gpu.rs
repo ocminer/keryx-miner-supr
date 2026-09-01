@@ -2149,7 +2149,15 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> bool {
             log::info!(
                 "PoM[gpu{}]: launch tuning restored from cache — {} walk, batch {} ({}).",
                 device_id,
-                if t.tc { "tensor-core" } else { "classic" },
+                // Must consider ncf: a chaseless tune is {ncf:true, tc:true}, so testing `tc`
+                // alone printed "tensor-core" for every chaseless card. That is the walk that
+                // ACTUALLY runs (mine_v4 dispatches on t.ncf first), and mislabelling it sends
+                // anyone debugging a chase-path problem after the wrong kernel.
+                match (t.ncf, t.tc) {
+                    (true, _) => "chaseless",
+                    (false, true) => "tensor-core",
+                    (false, false) => "classic",
+                },
                 t.batch, key
             );
             return true;
