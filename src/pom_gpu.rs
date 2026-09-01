@@ -2052,10 +2052,68 @@ fn v4_tune_key(device_id: u32, sm: u64, n_tiles: u64, k: u32, h10_era: bool) -> 
     format!("{}|sm{}|tiles{}|k{}|h10{}|g3", gpu_name(device_id), sm, n_tiles, k, u8::from(h10_era))
 }
 
+/// Delete the saved autotune cache (`--delete-autotune`). Returns whether a file was actually
+/// removed, so the caller can say something truthful rather than claiming a deletion that did not
+/// happen. A missing cache is success, not an error — there is nothing to delete.
+pub fn delete_v4_tune_cache() -> std::io::Result<bool> {
+    let Some(path) = v4_tune_cache_path() else {
+        return Ok(false);
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Version stamped into the autotune cache file. The cache stores KERNEL-SPECIFIC launch decisions
+/// (which walk kernel, which batch size), so a build whose kernels changed must never inherit them.
+///
+/// Relying on a human to bump the `g<N>` suffix in `v4_tune_key` is not enough: miss it once on a
+/// release that changed kernel behaviour and every upgrading user silently keeps the previous
+/// generation's choice. That is a real field failure — an RTX 3060 12GB reported "works on v0.12.1,
+/// stuck with no shares from v0.12.2", and a second miner independently fixed exactly that by
+/// wiping the autotune folder by hand. Nobody should have to know that.
+///
+/// Stamped with the exact miner version, so ANY version change invalidates the whole file and the
+/// card simply retunes (a few seconds per GPU at startup). The `g<N>` key suffix stays as a second,
+/// finer-grained layer for changes made within one version during development.
+const V4_TUNE_CACHE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The entries map, but only if the envelope was written by THIS exact build. Split out from the
+/// filesystem so the version gate itself is unit-testable without touching `$HOME`.
+fn v4_tune_entries_if_current(v: &serde_json::Value) -> Option<&serde_json::Value> {
+    if v.get("version").and_then(|s| s.as_str()) == Some(V4_TUNE_CACHE_VERSION) {
+        v.get("entries")
+    } else {
+        None
+    }
+}
+
 fn v4_tune_load(key: &str) -> Option<V4Tune> {
-    let raw = std::fs::read_to_string(v4_tune_cache_path()?).ok()?;
+    let path = v4_tune_cache_path()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let e = v.get(key)?;
+
+    let entries = match v4_tune_entries_if_current(&v) {
+        Some(e) => e,
+        None => {
+            // Written by a different miner version (or by a pre-versioning build, which has no
+            // stamp at all). Delete it outright rather than leaving a stale generation on disk to
+            // be half-trusted later, and let autotune write a fresh one.
+            let was = v.get("version").and_then(|s| s.as_str())
+                .unwrap_or("an older build (unversioned)");
+            log::warn!(
+                "PoM: autotune cache {} was written by {} but this miner is {} — deleting it and \
+                 retuning. Launch decisions are kernel-specific and do not survive a version change.",
+                path.display(), was, V4_TUNE_CACHE_VERSION
+            );
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+
+    let e = entries.get(key)?;
     Some(V4Tune {
         ncf: e.get("ncf").and_then(|v| v.as_bool()).unwrap_or(false),
         tc: e.get("tc")?.as_bool()?,
@@ -2065,12 +2123,21 @@ fn v4_tune_load(key: &str) -> Option<V4Tune> {
 
 fn v4_tune_save(key: &str, t: V4Tune, mhs: f64) {
     let Some(path) = v4_tune_cache_path() else { return };
-    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+    // Only build on the existing file if it belongs to THIS version; otherwise start from a fresh
+    // envelope so entries from an older generation cannot survive as siblings.
+    let mut v = std::fs::read_to_string(&path)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert(
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v4_tune_entries_if_current(v).is_some())
+        .unwrap_or_else(|| serde_json::json!({ "version": V4_TUNE_CACHE_VERSION, "entries": {} }));
+
+    // Defensive: an entries-less or non-object envelope is replaced rather than silently skipped,
+    // which would otherwise make every save a no-op and force a retune on every single start.
+    if !v.get("entries").map(|e| e.is_object()).unwrap_or(false) {
+        v = serde_json::json!({ "version": V4_TUNE_CACHE_VERSION, "entries": {} });
+    }
+    if let Some(entries) = v.get_mut("entries").and_then(|e| e.as_object_mut()) {
+        entries.insert(
             key.to_string(),
             serde_json::json!({
                 "ncf": t.ncf, "tc": t.tc, "batch": t.batch,
@@ -3017,6 +3084,44 @@ mod tests {
         assert!(record_sat_out(a), "after recovery, a's next sit-out logs again");
         clear_sat_out(a);
         clear_sat_out(b);
+    }
+
+    /// The autotune cache stores kernel-specific launch decisions, so a file written by any other
+    /// miner version must be rejected wholesale. Field evidence that this matters: an RTX 3060 12GB
+    /// reported "works on v0.12.1, stuck with no shares from v0.12.2", and another miner fixed the
+    /// same symptom by manually wiping the autotune folder. Nobody should need to know that.
+    #[test]
+    fn autotune_cache_is_rejected_unless_written_by_this_exact_version() {
+        let entry = serde_json::json!({ "ncf": true, "tc": true, "batch": 65536u64 });
+
+        // Written by THIS build → usable, and the entry survives the envelope.
+        let current = serde_json::json!({
+            "version": V4_TUNE_CACHE_VERSION,
+            "entries": { "somekey": entry.clone() },
+        });
+        let entries = v4_tune_entries_if_current(&current).expect("current version must be honoured");
+        assert_eq!(entries.get("somekey").unwrap()["batch"], 65536);
+
+        // Written by a DIFFERENT version → rejected, even though the entry is well-formed.
+        let stale = serde_json::json!({
+            "version": "0.12.1",
+            "entries": { "somekey": entry.clone() },
+        });
+        assert!(
+            v4_tune_entries_if_current(&stale).is_none(),
+            "a v0.12.1 cache must be invalid on {V4_TUNE_CACHE_VERSION}"
+        );
+
+        // Pre-versioning file: the old flat map with no stamp at all → rejected.
+        let legacy = serde_json::json!({ "somekey": entry });
+        assert!(
+            v4_tune_entries_if_current(&legacy).is_none(),
+            "an unversioned legacy cache must not be trusted"
+        );
+
+        // Truncated/garbage envelopes must not be mistaken for current.
+        assert!(v4_tune_entries_if_current(&serde_json::json!({})).is_none());
+        assert!(v4_tune_entries_if_current(&serde_json::json!({ "version": 13 })).is_none());
     }
 
     // The llama→raw fallback must fire on a pure layout mismatch, but NEVER on a GPU fault (OOM /

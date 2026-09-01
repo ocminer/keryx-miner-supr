@@ -283,6 +283,17 @@ If --threads is not given, it defaults to the number of physical CPU cores. Note
     pub disable_gpu: bool,
 
     #[clap(
+        long = "delete-autotune",
+        help = "Delete the saved autotune cache on startup and re-tune from scratch [default: false]",
+        long_help = "Delete the launch-tuning cache (~/.keryx/v4tune.json) before mining and measure every GPU again \
+from scratch. The cache is already invalidated automatically whenever the miner version changes, so this is only \
+needed to force a re-measurement within the SAME version — e.g. after changing GPUs, risers, power limits or clocks, \
+or if a card seems to be stuck on a bad batch size. Costs a few seconds per GPU at startup; the fresh result is saved \
+back to the cache."
+    )]
+    pub delete_autotune: bool,
+
+    #[clap(
         long = "mine-when-not-synced",
         help = "Mine even when keryxd says it is not synced",
         long_help = "Mine even when keryxd says it is not synced, only useful when passing `--allow-submit-block-when-not-synced` to keryxd  [default: false]"

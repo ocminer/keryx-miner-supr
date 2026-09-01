@@ -808,6 +808,26 @@ async fn run() -> Result<(), Error> {
     let _ = env_logger::builder().filter_level(opt.log_level()).parse_default_env().try_init();
     opt.process()?;
 
+    // --delete-autotune: wipe the saved launch tuning BEFORE any GPU is touched, so this run
+    // measures every card from scratch. The cache is already version-stamped and dropped
+    // automatically whenever the miner version changes; this flag exists for a re-measure WITHIN
+    // one version — new GPU, riser, power-limit or clock change, or a card stuck on a bad batch.
+    #[cfg(feature = "pom-cuda")]
+    if opt.delete_autotune {
+        match keryx_miner::pom_gpu::delete_v4_tune_cache() {
+            Ok(true) => info!(
+                "--delete-autotune: removed the saved autotune cache — every GPU is re-tuned this run."
+            ),
+            Ok(false) => info!(
+                "--delete-autotune: no saved autotune cache to remove — every GPU is tuned from scratch anyway."
+            ),
+            Err(e) => warn!(
+                "--delete-autotune: could NOT remove the autotune cache: {e}. Continuing with the \
+                 existing tuning — delete ~/.keryx/v4tune.json by hand if that is not what you want."
+            ),
+        }
+    }
+
     // Resolve the resident-tree switch ONCE (read by both the CUDA and OpenCL index builders).
     // Off by default. --resident-tree or KERYX_RESIDENT_TREE=1 (back-compat) turns it on;
     // --no-resident-tree forces it off and wins over everything (escape hatch for a stray env
