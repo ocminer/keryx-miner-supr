@@ -2332,6 +2332,14 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> bool {
         return true;
     };
 
+    // Publish the chosen KIND before sizing the batch. The VRAM cap charges chase+TC for its
+    // offsets array (1 KiB/nonce) but chaseless for nothing, and it reads that decision from the
+    // cached tune. Without this the sweep below is still capped at the chase price on a chaseless
+    // card, so the cheaper cost would only take effect on the NEXT run — and since the live batch
+    // then comes from the cached (capped) value, it would never grow at all. `best.batch` is
+    // provisional here; the final tune (kind + measured batch) is stored at the end.
+    set_v4_tune(device_id, best);
+
     // 2) Batch. A larger batch amortizes the launch and the offset chase over more nonces, but one
     // launch must still finish well inside a block interval (~100 ms at 10 BPS) or the whole batch
     // lands on a stale job. The SM-derived estimate is a good centre, not a maximum: it under-serves
