@@ -1480,7 +1480,8 @@ mod inference_pause_tests {
             target: Default::default(),
             nonce_mask: u64::MAX,
             nonce_fixed: 0,
-            hash: None,
+            pow_value: None,
+            network_target: None,
             pom_proof: Vec::new(),
             device_id: None,
         };

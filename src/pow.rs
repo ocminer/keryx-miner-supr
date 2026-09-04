@@ -34,7 +34,11 @@ pub enum BlockSeed {
         target: Uint256,
         nonce_mask: u64,
         nonce_fixed: u64,
-        hash: Option<String>,
+        /// Exact share PoW value, populated only after a winning nonce is verified.
+        pow_value: Option<Uint256>,
+        /// Exact network block target supplied with this Stratum job. Kept beside the share so a
+        /// later job cannot change which target is used for local block-candidate accounting.
+        network_target: Option<Uint256>,
         /// PoM (post-fork): borsh-encoded possession proof for this share. Empty pre-fork /
         /// legacy kHeavyHash. The stratum client hex-encodes it into `mining.submit` params[5].
         pom_proof: Vec<u8>,
@@ -210,9 +214,9 @@ impl State {
                 let header = &mut block.header.as_mut().expect("We checked that a header exists on creation");
                 header.nonce = nonce;
             }
-            BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut hash, .. } => {
+            BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut pow_value, .. } => {
                 *header_nonce = nonce;
-                *hash = Some(format!("{:x}", self.calculate_pow(nonce)))
+                *pow_value = Some(self.calculate_pow(nonce))
             }
         }
         Some(block_seed)
@@ -255,14 +259,21 @@ impl State {
         let proof = pom::PomProof::v4(tier, pow_value, final_state, v4);
         let wire = proof.to_wire_bytes();
         info!("PoM v4: proof built + submitting (nonce {}, tier {}, {} B)", nonce, tier, wire.len());
-        self.assemble_pom_block(nonce, final_state, tier, wire)
+        self.assemble_pom_block(nonce, final_state, tier, pow_value, wire)
     }
 
     /// Stamp the winning `nonce`, `final_state` (header pin) and the borsh proof bytes into a clone
     /// of the job's block seed (solo `FullBlock` sets the RpcBlock header + `pomProof`; pool
     /// `PartialBlock` carries the nonce + proof bytes for `mining.submit` params[5]). Shared by the
     /// v1/v2 and the H6 (v3) proof paths.
-    fn assemble_pom_block(&self, nonce: u64, final_state: u64, tier: u8, proof_bytes: Vec<u8>) -> Option<BlockSeed> {
+    fn assemble_pom_block(
+        &self,
+        nonce: u64,
+        final_state: u64,
+        tier: u8,
+        pow_value: [u8; 32],
+        proof_bytes: Vec<u8>,
+    ) -> Option<BlockSeed> {
         let mut block_seed = (*self.block).clone();
         match block_seed {
             BlockSeed::FullBlock(ref mut block) => {
@@ -281,8 +292,17 @@ impl State {
                 }
                 block.pom_proof = proof_bytes; // plain bytes field (empty = none on the wire)
             }
-            BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut pom_proof, .. } => {
+            BlockSeed::PartialBlock {
+                nonce: ref mut header_nonce,
+                pow_value: ref mut share_pow_value,
+                ref mut pom_proof,
+                ..
+            } => {
                 *header_nonce = nonce;
+                // `pom_pow_value` is a little-endian 256-bit value, matching Uint256. Preserve it
+                // as a typed integer so block-candidate accounting never compares rounded diffs or
+                // reparses presentation text.
+                *share_pow_value = Some(pom_pow_uint(pow_value));
                 *pom_proof = proof_bytes; // stratum client hex-encodes this into mining.submit params[5]
             }
         }
@@ -297,6 +317,11 @@ impl State {
     pub fn pow_gpu(&self, gpu_work: &mut dyn Worker) {
         gpu_work.calculate_hash(None, self.nonce_mask, self.nonce_fixed);
     }
+}
+
+#[inline(always)]
+fn pom_pow_uint(pow_value: [u8; 32]) -> Uint256 {
+    Uint256::from_le_bytes(pow_value)
 }
 
 #[cfg(not(any(target_pointer_width = "64", target_pointer_width = "32")))]
@@ -413,8 +438,9 @@ fn decode_to_slice<T: AsRef<[u8]>>(data: T, out: &mut [u8]) -> Result<(), FromHe
 #[cfg(test)]
 mod tests {
     use crate::pow::hasher::{Hasher, HeaderHasher};
-    use crate::pow::serialize_header;
+    use crate::pow::{serialize_header, BlockSeed, State};
     use crate::proto::{RpcBlockHeader, RpcBlockLevelParents};
+    use crate::target::Uint256;
     use crate::Hash;
     use keryx_miner::pom;
 
@@ -423,6 +449,43 @@ mod tests {
         fn update<A: AsRef<[u8]>>(&mut self, data: A) -> &mut Self {
             self.0.extend(data.as_ref());
             self
+        }
+    }
+
+    #[test]
+    fn pom_share_stamps_exact_little_endian_pow_value() {
+        let seed = BlockSeed::PartialBlock {
+            id: "job".to_string(),
+            header_hash: [1, 2, 3, 4],
+            timestamp: 123,
+            daa_score: 0,
+            nonce: 0,
+            target: Uint256([u64::MAX; 4]),
+            nonce_mask: u64::MAX,
+            nonce_fixed: 0,
+            pow_value: None,
+            network_target: Some(Uint256([u64::MAX; 4])),
+            pom_proof: Vec::new(),
+            device_id: None,
+        };
+        let state = State::new(0, seed).expect("partial test job must be valid");
+        let expected = Uint256([
+            0x0123_4567_89ab_cdef,
+            0xfedc_ba98_7654_3210,
+            0x8877_6655_4433_2211,
+            0x1020_3040_5060_7080,
+        ]);
+        let stamped = state
+            .assemble_pom_block(77, 88, 1, expected.to_le_bytes(), vec![9, 8, 7])
+            .expect("PoM share must be assembled");
+
+        match stamped {
+            BlockSeed::PartialBlock { nonce, pow_value, pom_proof, .. } => {
+                assert_eq!(nonce, 77);
+                assert_eq!(pow_value, Some(expected));
+                assert_eq!(pom_proof, vec![9, 8, 7]);
+            }
+            BlockSeed::FullBlock(_) => panic!("expected a partial pool share"),
         }
     }
 

@@ -271,7 +271,10 @@ pub struct Snapshot {
     pub failover_index: u64,
     pub job_sequence: u64,
     pub last_job_age_secs: Option<u64>,
+    /// Pool-assigned Stratum share difficulty. `None` in solo mode.
     pub difficulty: Option<f64>,
+    /// Consensus network difficulty derived from the current job's compact block target.
+    pub network_difficulty: Option<f64>,
     pub daa_score: Option<u64>,
     pub synced: Option<bool>,
     pub mining: MiningSnapshot,
@@ -306,7 +309,9 @@ struct RuntimeStats {
     connection_latency_ms: AtomicU64,
     job_sequence: AtomicU64,
     last_job_ms: AtomicU64,
+    /// Pool-assigned Stratum share difficulty; intentionally separate from network difficulty.
     difficulty_bits: AtomicU64,
+    network_difficulty_bits: AtomicU64,
     daa_score: AtomicU64,
     synced: AtomicU8,
 
@@ -420,6 +425,7 @@ impl RuntimeStats {
             job_sequence: AtomicU64::new(0),
             last_job_ms: AtomicU64::new(UNSET),
             difficulty_bits: AtomicU64::new(UNSET),
+            network_difficulty_bits: AtomicU64::new(UNSET),
             daa_score: AtomicU64::new(UNSET),
             synced: AtomicU8::new(0),
             mining_preparing: AtomicBool::new(true),
@@ -602,6 +608,8 @@ pub fn begin_connection(mode: MiningMode, endpoint: &str, failover_index: usize)
         let generation = stats.connection_generation.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         stats.inference_queue_depth.store(0, Ordering::Relaxed);
         stats.inference_queue_capacity.store(0, Ordering::Relaxed);
+        stats.difficulty_bits.store(UNSET, Ordering::Relaxed);
+        stats.network_difficulty_bits.store(UNSET, Ordering::Relaxed);
         generation
     };
     stats.mode.store(mode as u8, Ordering::Relaxed);
@@ -610,7 +618,6 @@ pub fn begin_connection(mode: MiningMode, endpoint: &str, failover_index: usize)
     stats.connected_at_ms.store(UNSET, Ordering::Relaxed);
     stats.connection_latency_ms.store(UNSET, Ordering::Relaxed);
     stats.last_job_ms.store(UNSET, Ordering::Relaxed);
-    stats.difficulty_bits.store(UNSET, Ordering::Relaxed);
     stats.daa_score.store(UNSET, Ordering::Relaxed);
     stats.synced.store(0, Ordering::Relaxed);
     stats.shares_pending.store(0, Ordering::Relaxed);
@@ -665,23 +672,40 @@ pub fn connection_lost(generation: u64, safe_reason: &'static str) {
     stats.event(EventKind::Error, safe_reason);
 }
 
-pub fn record_job(generation: u64, daa_score: Option<u64>, synced: Option<bool>) {
+/// Publish one mining job and replace its network difficulty, including clearing a previous V3
+/// value when the current job has no trustworthy compact target.
+pub fn record_job(
+    generation: u64,
+    daa_score: Option<u64>,
+    synced: Option<bool>,
+    network_difficulty: Option<f64>,
+) -> bool {
     let stats = hub();
+    let _connection_update = stats.inference_queue_update.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if !current_generation(stats, generation) {
-        return;
+        return false;
     }
     stats.job_sequence.fetch_add(1, Ordering::Relaxed);
     stats.last_job_ms.store(stats.now_ms(), Ordering::Relaxed);
+    store_optional_f64(&stats.network_difficulty_bits, network_difficulty.filter(|value| *value >= 1.0));
     if let Some(daa) = daa_score {
         stats.daa_score.store(daa, Ordering::Relaxed);
     }
     if let Some(synced) = synced {
         stats.synced.store(if synced { 2 } else { 1 }, Ordering::Relaxed);
     }
+    true
 }
 
-pub fn set_difficulty(difficulty: f64) {
-    store_optional_f64(&hub().difficulty_bits, Some(difficulty));
+/// Publish the assigned pool share difficulty for the active connection only.
+pub fn set_pool_difficulty(generation: u64, difficulty: f64) -> bool {
+    let stats = hub();
+    let _connection_update = stats.inference_queue_update.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !current_generation(stats, generation) {
+        return false;
+    }
+    store_optional_f64(&stats.difficulty_bits, Some(difficulty).filter(|value| *value > 0.0));
+    true
 }
 
 pub fn record_share_submitted() {
@@ -725,6 +749,18 @@ pub fn record_share_rejected(kind: ShareRejectKind, device_id: Option<u32>) {
     }
     .fetch_add(1, Ordering::Relaxed);
     stats.event(EventKind::ShareRejected, &share_event_message("Share rejected", device_id));
+}
+
+/// A pool share was successfully forwarded and its locally verified PoW also met that job's exact
+/// network target. Stratum's ordinary share reply is not an authoritative block result, so this
+/// deliberately changes only `found`; pool block accepted/rejected/pending remain unknown.
+pub fn record_pool_block_candidate_found(device_id: Option<u32>) {
+    let stats = hub();
+    stats.blocks_found.fetch_add(1, Ordering::Relaxed);
+    stats.event(
+        EventKind::BlockFound,
+        &share_event_message("Pool block candidate submitted", device_id),
+    );
 }
 
 /// A `FullBlock` candidate was successfully queued to the solo node connection.
@@ -1245,6 +1281,7 @@ pub fn try_snapshot() -> Option<Snapshot> {
         job_sequence: stats.job_sequence.load(Ordering::Relaxed),
         last_job_age_secs: age_secs(now_ms, load_optional_u64(&stats.last_job_ms)),
         difficulty: load_optional_f64(&stats.difficulty_bits),
+        network_difficulty: load_optional_f64(&stats.network_difficulty_bits),
         daa_score: load_optional_u64(&stats.daa_score),
         synced,
         mining: MiningSnapshot {
@@ -1364,8 +1401,9 @@ mod tests {
 
     use super::{
         begin_connection, begin_inference, clear_connection_inference_queue, connection_lost, escrow_claim_accepted,
-        escrow_claim_attempt, record_share_accepted, record_share_rejected, record_share_submitted, sanitize_endpoint,
-        sanitize_message, set_connection_inference_queue, share_event_message, try_snapshot, ConnectionState,
+        escrow_claim_attempt, record_job, record_pool_block_candidate_found, record_share_accepted,
+        record_share_rejected, record_share_submitted, sanitize_endpoint, sanitize_message,
+        set_connection_inference_queue, set_pool_difficulty, share_event_message, try_snapshot, ConnectionState,
         InferenceKind, MiningMode, ShareRejectKind, Snapshot,
     };
 
@@ -1428,6 +1466,25 @@ mod tests {
     }
 
     #[test]
+    fn pool_candidate_is_counted_once_without_inventing_an_ack_result() {
+        let _serial = enter_global_test();
+        let before = read_snapshot();
+
+        record_share_submitted();
+        record_pool_block_candidate_found(Some(4));
+        // The normal `true` Stratum reply records only an accepted share. It must not count the
+        // candidate again or claim that the pool/node accepted the block.
+        record_share_accepted(Some(4));
+
+        let after = read_snapshot();
+        assert_eq!(after.blocks.found - before.blocks.found, 1);
+        assert_eq!(after.blocks.accepted, before.blocks.accepted);
+        assert_eq!(after.blocks.rejected, before.blocks.rejected);
+        assert_eq!(after.blocks.pending, before.blocks.pending);
+        assert!(after.events.iter().any(|event| event.message == "Pool block candidate submitted (GPU4)"));
+    }
+
+    #[test]
     fn inference_attempts_finish_exactly_once() {
         let _serial = enter_global_test();
         let before = read_snapshot().inference;
@@ -1487,6 +1544,38 @@ mod tests {
         let remains_cleared = read_snapshot();
         assert_eq!(remains_cleared.inference.queue_depth, 0);
         assert_eq!(remains_cleared.inference.queue_capacity, 0);
+    }
+
+    #[test]
+    fn job_difficulties_are_exactly_scoped_to_connection_and_job() {
+        let _serial = enter_global_test();
+        let old = begin_connection(MiningMode::Pool, "pool-old.example:5555", 0);
+        assert!(set_pool_difficulty(old, 0.001));
+        assert!(record_job(old, Some(100), None, Some(33_762_627.830_873_9)));
+
+        let pool = read_snapshot();
+        assert_eq!(pool.difficulty, Some(0.001));
+        assert_eq!(pool.network_difficulty, Some(33_762_627.830_873_9));
+
+        let current = begin_connection(MiningMode::Solo, "grpc://node.example:16110", 0);
+        let reset = read_snapshot();
+        assert_eq!(reset.difficulty, None);
+        assert_eq!(reset.network_difficulty, None);
+
+        assert!(!set_pool_difficulty(old, 99.0));
+        assert!(!record_job(old, Some(999), None, Some(99.0)));
+        assert!(record_job(current, Some(101), Some(true), Some(65_536.007_812_500_93)));
+        let solo = read_snapshot();
+        assert_eq!(solo.difficulty, None);
+        assert_eq!(solo.network_difficulty, Some(65_536.007_812_500_93));
+        assert_eq!(solo.daa_score, Some(101));
+
+        // A current job without a trustworthy compact target must clear, not retain, the prior
+        // network value. This is the V3 -> V2/malformed-job fallback.
+        assert!(record_job(current, Some(102), Some(true), None));
+        let cleared = read_snapshot();
+        assert_eq!(cleared.network_difficulty, None);
+        assert_eq!(cleared.daa_score, Some(102));
     }
 
     #[test]

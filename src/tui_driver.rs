@@ -931,6 +931,7 @@ fn adapt_snapshot(snapshot: runtime::Snapshot, clocks: &mut ClockBaselines) -> U
             latency_ms: snapshot.connection_latency_ms,
             last_job_age_secs: snapshot.last_job_age_secs,
             difficulty: snapshot.difficulty,
+            network_difficulty: snapshot.network_difficulty,
             daa_score: snapshot.daa_score,
             failover: if snapshot.failover_index == 0 {
                 "primary".to_string()

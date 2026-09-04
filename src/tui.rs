@@ -6,10 +6,11 @@
 //! In particular, no key handled here can pause mining, change clocks, select
 //! an inference device, or mutate escrow state.
 //!
-//! Matrix-style animation is constrained to panel titles, reserved logo
-//! gutters, and a tiny allowlist of ornamental static body labels.  Numeric
-//! telemetry, endpoints, warnings, event messages, device names, counters and
-//! status values are never passed through the glyph mutator.
+//! Matrix-style animation is constrained to panel titles, panel borders,
+//! reserved logo gutters, and a tiny allowlist of ornamental static body
+//! labels. Numeric telemetry, endpoints, warnings, event messages, device
+//! names, counters and status values are never passed through the glyph
+//! mutator.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -33,6 +34,10 @@ const MATRIX_UNICODE: [char; 20] =
 const MATRIX_ASCII: [char; 12] = ['0', '1', '<', '>', '[', ']', '{', '}', ':', '/', '\\', '|'];
 const POWERED_BY: &str = "powered by krx.suprnova.cc";
 const POWER_SCAN_REST_TICKS: u64 = 40;
+const PANEL_PROMPT: &str = " rig://tty0>";
+const PANEL_PROMPT_WIDTH: u16 = 14;
+const CHROME_CLUSTER_WIDTH: u16 = 6;
+const BORDER_ACCENT_WIDTH: u16 = 5;
 
 /// Pool and solo counters have deliberately different meanings in the UI.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -108,7 +113,12 @@ pub struct ConnectionView {
     pub state: ConnectionState,
     pub latency_ms: Option<u64>,
     pub last_job_age_secs: Option<u64>,
+    /// Pool-assigned share difficulty. This is deliberately distinct from the
+    /// consensus target and is absent in solo mode.
     pub difficulty: Option<f64>,
+    /// Consensus network difficulty derived from the current job's compact
+    /// block target. A missing value is rendered as `--`, never guessed.
+    pub network_difficulty: Option<f64>,
     pub daa_score: Option<u64>,
     pub failover: String,
     pub synced: Option<bool>,
@@ -872,9 +882,216 @@ fn panel_block(title: &str, salt: u64, state: &TuiState, palette: &Palette, focu
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if focused { palette.border_focus } else { palette.border }))
+        .border_style(panel_border_style(salt, state, palette, focused))
         .style(Style::default().fg(palette.text).bg(palette.panel))
         .title(title)
+}
+
+fn panel_border_style(salt: u64, state: &TuiState, palette: &Palette, focused: bool) -> Style {
+    if !state.motion_enabled {
+        return Style::default().fg(if focused { palette.border_focus } else { palette.border });
+    }
+
+    // A slow, dark pulse keeps the frame alive without flashing the panel or competing with
+    // health colors. Focused panels retain a stronger floor throughout the cycle.
+    let phase = state.animation_tick.wrapping_add(salt.wrapping_mul(11)) % 48;
+    let color = if focused {
+        match phase {
+            0..=3 => palette.green,
+            4..=11 => palette.border_focus,
+            _ => palette.rain_head,
+        }
+    } else {
+        match phase {
+            0..=1 => palette.border_focus,
+            2..=8 => palette.rain_head,
+            _ => palette.border,
+        }
+    };
+    let style = Style::default().fg(color);
+    if focused || phase <= 3 {
+        style
+    } else {
+        style.add_modifier(Modifier::DIM)
+    }
+}
+
+/// Draw a panel and its presentation-only border chrome, returning the untouched inner rectangle.
+/// Every animated cell is on the one-cell border, never inside the telemetry region.
+fn render_panel_frame(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    salt: u64,
+    state: &TuiState,
+    palette: &Palette,
+    focused: bool,
+) -> Rect {
+    let block = panel_block(title, salt, state, palette, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    render_panel_chrome(frame, area, title, salt, state, palette, focused);
+    inner
+}
+
+fn border_accent_spans(salt: u64, state: &TuiState, palette: &Palette, reverse: bool) -> Vec<Span<'static>> {
+    let symbols: Vec<char> = if state.unicode_glyphs {
+        if reverse {
+            "╾┄┄┄╼"
+        } else {
+            "╼┄┄┄╾"
+        }
+    } else if reverse {
+        ">---<"
+    } else {
+        "<--->"
+    }
+    .chars()
+    .collect();
+    let gradient = [palette.rain, palette.border, palette.rain_head, palette.border, palette.rain];
+    let pulse =
+        state.motion_enabled.then_some(((state.animation_tick / 2).wrapping_add(salt)) as usize % symbols.len());
+
+    symbols
+        .into_iter()
+        .enumerate()
+        .map(|(index, symbol)| {
+            let gradient_index = if reverse { gradient.len() - 1 - index } else { index };
+            let mut style =
+                Style::default().fg(if pulse == Some(index) { palette.border_focus } else { gradient[gradient_index] });
+            if pulse == Some(index) {
+                style = style.add_modifier(Modifier::BOLD);
+            } else {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            Span::styled(symbol.to_string(), style)
+        })
+        .collect()
+}
+
+/// Short top-border burst. It deliberately has dark rest frames so glyphs visibly materialize and
+/// disappear instead of becoming a permanently noisy label.
+fn matrix_chrome_cluster(salt: u64, state: &TuiState, palette: &Palette) -> Option<Vec<Span<'static>>> {
+    if !state.motion_enabled {
+        return None;
+    }
+    let phase = state.animation_tick.wrapping_add(salt.wrapping_mul(7)) % 24;
+    if phase >= 16 {
+        return None;
+    }
+    let seed = state.animation_tick.wrapping_mul(29).wrapping_add(salt.wrapping_mul(101));
+    let frame_style = Style::default().fg(palette.rain).add_modifier(Modifier::DIM);
+    Some(vec![
+        Span::styled("[", frame_style),
+        Span::styled(matrix_glyph(state, seed).to_string(), Style::default().fg(palette.rain_head)),
+        Span::styled(
+            matrix_glyph(state, seed.wrapping_add(17)).to_string(),
+            Style::default().fg(palette.green).add_modifier(Modifier::DIM),
+        ),
+        Span::styled(":", Style::default().fg(palette.border)),
+        Span::styled(
+            matrix_glyph(state, seed.wrapping_add(43)).to_string(),
+            Style::default()
+                .fg(if phase <= 2 { palette.bright_green } else { palette.rain_head })
+                .add_modifier(if phase <= 2 { Modifier::BOLD } else { Modifier::DIM }),
+        ),
+        Span::styled("]", frame_style),
+    ])
+}
+
+/// An intermittent shell prompt on the lower border. During its active window the cursor alternates
+/// between a solid head and a cut-out cell every four renderer ticks. Motion-off uses a steady
+/// underscore, so accessibility mode never blinks.
+fn panel_prompt_spans(salt: u64, state: &TuiState, palette: &Palette) -> Option<Vec<Span<'static>>> {
+    let cursor = if state.motion_enabled {
+        let phase = state.animation_tick.wrapping_add(salt.wrapping_mul(9)) % 72;
+        if phase >= 40 {
+            return None;
+        }
+        if (phase / 4) % 2 == 0 {
+            "█"
+        } else {
+            " "
+        }
+    } else {
+        "_"
+    };
+    Some(vec![
+        Span::styled(PANEL_PROMPT, Style::default().fg(palette.label).add_modifier(Modifier::DIM)),
+        Span::styled(cursor, Style::default().fg(if cursor == " " { palette.rain } else { palette.bright_green })),
+        Span::styled(" ", Style::default().fg(palette.border)),
+    ])
+}
+
+fn render_panel_chrome(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    salt: u64,
+    state: &TuiState,
+    palette: &Palette,
+    focused: bool,
+) {
+    if area.width < 9 || area.height < 3 {
+        return;
+    }
+    let right = area.x.saturating_add(area.width);
+    let bottom = area.y.saturating_add(area.height).saturating_sub(1);
+
+    // Opposing dark gradients make the otherwise regular rounded frame intentionally asymmetric.
+    frame.render_widget(
+        Paragraph::new(Line::from(border_accent_spans(salt, state, palette, false))),
+        Rect::new(right.saturating_sub(1 + BORDER_ACCENT_WIDTH), area.y, BORDER_ACCENT_WIDTH, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(border_accent_spans(salt.wrapping_add(3), state, palette, true))),
+        Rect::new(area.x.saturating_add(1), bottom, BORDER_ACCENT_WIDTH, 1),
+    );
+
+    let title_width = safe_text(title).chars().count() as u16 + 2;
+    if area.width >= title_width.saturating_add(CHROME_CLUSTER_WIDTH).saturating_add(5) {
+        if let Some(cluster) = matrix_chrome_cluster(salt, state, palette) {
+            frame.render_widget(
+                Paragraph::new(Line::from(cluster)),
+                Rect::new(right.saturating_sub(1 + CHROME_CLUSTER_WIDTH), area.y, CHROME_CLUSTER_WIDTH, 1),
+            );
+        }
+    }
+
+    if focused && area.width >= PANEL_PROMPT_WIDTH.saturating_add(BORDER_ACCENT_WIDTH).saturating_add(4) {
+        if let Some(prompt) = panel_prompt_spans(salt, state, palette) {
+            frame.render_widget(
+                Paragraph::new(Line::from(prompt)),
+                Rect::new(right.saturating_sub(1 + PANEL_PROMPT_WIDTH), bottom, PANEL_PROMPT_WIDTH, 1),
+            );
+        }
+    }
+
+    // Two independently travelling border heads give the shell a patched-together open-rig feel.
+    // They are omitted entirely when motion is disabled and can only replace vertical border cells.
+    if state.motion_enabled && area.height >= 7 {
+        let travel = area.height.saturating_sub(4) as u64;
+        let left_y = area.y + 2 + ((state.animation_tick / 2 + salt.wrapping_mul(3)) % travel) as u16;
+        let right_y = area.y + 2 + ((state.animation_tick / 3 + salt.wrapping_mul(5)) % travel) as u16;
+        let left_glyph = matrix_glyph(state, state.animation_tick.wrapping_add(salt.wrapping_mul(59)));
+        let right_glyph = matrix_glyph(state, state.animation_tick.wrapping_add(salt.wrapping_mul(83)));
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                left_glyph.to_string(),
+                Style::default().fg(palette.rain_head).add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(area.x, left_y, 1, 1),
+        );
+        if (state.animation_tick.wrapping_add(salt)) % 4 != 0 {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    right_glyph.to_string(),
+                    Style::default().fg(palette.rain).add_modifier(Modifier::DIM),
+                )),
+                Rect::new(right.saturating_sub(1), right_y, 1, 1),
+            );
+        }
+    }
 }
 
 fn matrix_title(title: &str, salt: u64, state: &TuiState, palette: &Palette) -> Line<'static> {
@@ -985,13 +1202,13 @@ fn matrix_rail(width: u16, salt: u64, state: &TuiState, palette: &Palette) -> Li
     let mut spans = Vec::with_capacity(width as usize);
     for col in 0..width {
         let seed = state.animation_tick.wrapping_mul(131).wrapping_add(salt.wrapping_mul(17)).wrapping_add(col as u64);
-        let density = mix64(seed) % 9;
-        if density <= 1 {
+        let density = mix64(seed) % 8;
+        if density <= 2 {
             spans.push(Span::styled(
                 matrix_glyph(state, seed).to_string(),
                 Style::default()
                     .fg(if density == 0 { palette.rain_head } else { palette.rain })
-                    .add_modifier(Modifier::DIM),
+                    .add_modifier(if density == 0 { Modifier::BOLD } else { Modifier::DIM }),
             ));
         } else {
             spans.push(Span::raw(" "));
@@ -1010,11 +1227,8 @@ fn powered_scan_position(state: &TuiState) -> Option<(usize, ScanDirection)> {
     if !state.motion_enabled {
         return None;
     }
-    let eligible: Vec<usize> = POWERED_BY
-        .chars()
-        .enumerate()
-        .filter_map(|(index, ch)| ch.is_ascii_alphabetic().then_some(index))
-        .collect();
+    let eligible: Vec<usize> =
+        POWERED_BY.chars().enumerate().filter_map(|(index, ch)| ch.is_ascii_alphabetic().then_some(index)).collect();
     let scan_ticks = eligible.len() as u64;
     if scan_ticks == 0 {
         return None;
@@ -1068,36 +1282,54 @@ fn powered_brand_spans(state: &TuiState, palette: &Palette) -> Vec<Span<'static>
         .collect()
 }
 
-fn matrix_edge_lines(height: u16, salt: u64, state: &TuiState, palette: &Palette) -> Vec<Line<'static>> {
+fn matrix_edge_lines(width: u16, height: u16, salt: u64, state: &TuiState, palette: &Palette) -> Vec<Line<'static>> {
     (0..height)
         .map(|row| {
             if !state.motion_enabled {
-                return Line::raw(" ");
+                return Line::raw(" ".repeat(width as usize));
             }
-            let seed = state
-                .animation_tick
-                .wrapping_mul(97)
-                .wrapping_add(salt.wrapping_mul(41))
-                .wrapping_add(row as u64 * 17);
-            let density = mix64(seed) % 5;
-            if density <= 1 {
-                Line::from(Span::styled(
-                    matrix_glyph(state, seed).to_string(),
-                    Style::default()
-                        .fg(if density == 0 { palette.rain_head } else { palette.rain })
-                        .add_modifier(Modifier::DIM),
-                ))
-            } else {
-                Line::raw(" ")
+            let mut spans = Vec::with_capacity(width as usize);
+            for column in 0..width {
+                let stream = mix64(salt.wrapping_mul(41).wrapping_add(column as u64 * 193)) % 17;
+                let head = (state.animation_tick.wrapping_add(stream)) % 17;
+                let row_phase = (row as u64 + column as u64 * 7) % 17;
+                let distance = (head + 17 - row_phase) % 17;
+                let seed = state
+                    .animation_tick
+                    .wrapping_mul(97)
+                    .wrapping_add(salt.wrapping_mul(41))
+                    .wrapping_add(row as u64 * 17)
+                    .wrapping_add(column as u64 * 131);
+                let ambient = mix64(seed) % 19 == 0;
+                if distance <= 3 || ambient {
+                    let (color, modifier) = match distance {
+                        0 => (palette.rain_head, Modifier::BOLD),
+                        1 => (palette.rain_head, Modifier::DIM),
+                        _ => (palette.rain, Modifier::DIM),
+                    };
+                    spans.push(Span::styled(
+                        matrix_glyph(state, seed).to_string(),
+                        Style::default().fg(color).add_modifier(modifier),
+                    ));
+                } else {
+                    spans.push(Span::raw(" "));
+                }
             }
+            Line::from(spans)
         })
         .collect()
 }
 
 fn render_matrix_edges(frame: &mut Frame<'_>, left: Rect, right: Rect, state: &TuiState, palette: &Palette) {
     let style = Style::default().bg(palette.panel);
-    frame.render_widget(Paragraph::new(matrix_edge_lines(left.height, 31, state, palette)).style(style), left);
-    frame.render_widget(Paragraph::new(matrix_edge_lines(right.height, 47, state, palette)).style(style), right);
+    frame.render_widget(
+        Paragraph::new(matrix_edge_lines(left.width, left.height, 31, state, palette)).style(style),
+        left,
+    );
+    frame.render_widget(
+        Paragraph::new(matrix_edge_lines(right.width, right.height, 47, state, palette)).style(style),
+        right,
+    );
 }
 
 fn render_core(
@@ -1108,9 +1340,15 @@ fn render_core(
     palette: &Palette,
     compact: bool,
 ) {
-    let block = panel_block("KERYX // MINING CORE", 1, state, palette, state.page == DashboardPage::Overview);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = render_panel_frame(
+        frame,
+        area,
+        "KERYX // MINING CORE",
+        1,
+        state,
+        palette,
+        state.page == DashboardPage::Overview,
+    );
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -1168,10 +1406,17 @@ fn render_core(
                 snapshot.blocks.pending
             ))),
         }
-        lines.push(Line::from(format!(
-            "network {network} · diff {}",
-            format_difficulty(snapshot.connection.difficulty)
-        )));
+        match snapshot.connection.mode {
+            MiningMode::Pool => lines.push(Line::from(format!(
+                "network {network} · net diff {} · share diff {}",
+                format_difficulty(snapshot.connection.network_difficulty),
+                format_difficulty(snapshot.connection.difficulty)
+            ))),
+            MiningMode::Solo => lines.push(Line::from(format!(
+                "network {network} · net diff {}",
+                format_difficulty(snapshot.connection.network_difficulty)
+            ))),
+        }
     } else {
         lines.push(status_version_line(
             &format!("{mining_symbol} {mining_label} · {}", display_value(&snapshot.algorithm)),
@@ -1220,13 +1465,26 @@ fn render_core(
             "NETWORK",
             &network,
             Style::default().fg(palette.text),
-            "DIFFICULTY",
-            &format_difficulty(snapshot.connection.difficulty),
+            "NET DIFF",
+            &format_difficulty(snapshot.connection.network_difficulty),
             Style::default().fg(palette.text),
             inner.width,
             palette,
         ));
-        lines.push(Line::raw(""));
+        if snapshot.connection.mode == MiningMode::Pool {
+            lines.push(two_column_line(
+                "SHARE DIFF",
+                &format_difficulty(snapshot.connection.difficulty),
+                Style::default().fg(palette.cyan),
+                "BLOCK TEST",
+                "hash <= net target",
+                Style::default().fg(palette.label),
+                inner.width,
+                palette,
+            ));
+        } else {
+            lines.push(Line::raw(""));
+        }
         lines.push(two_column_line(
             "TOTAL HASH",
             &format_rate(snapshot.mining.total_hashrate_hs),
@@ -1314,9 +1572,7 @@ fn render_rig(
 ) {
     let title =
         format!("NEURAL RIG // {} GPU{}", snapshot.devices.len(), if snapshot.devices.len() == 1 { "" } else { "S" });
-    let block = panel_block(&title, 2, state, palette, state.page == DashboardPage::Gpus);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = render_panel_frame(frame, area, &title, 2, state, palette, state.page == DashboardPage::Gpus);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -1324,9 +1580,10 @@ fn render_rig(
     // Reserve actual gutters for the rain so decorative glyphs never overwrite names, rates or
     // warnings. The muted streams deliberately stay inside this one presentation pane.
     let content = if inner.width >= 36 {
+        let gutter_width = if inner.width >= 46 { 2 } else { 1 };
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+            .constraints([Constraint::Length(gutter_width), Constraint::Min(1), Constraint::Length(gutter_width)])
             .split(inner);
         render_matrix_edges(frame, columns[0], columns[2], state, palette);
         columns[1]
@@ -1398,20 +1655,9 @@ fn gpu_legend_lines(width: u16, palette: &Palette) -> Vec<Line<'static>> {
     let watch = Span::styled("▲ WATCH", palette.severity(Severity::Watch));
     let alert = Span::styled("■ ALERT", palette.severity(Severity::Alert));
     if width >= 43 {
-        vec![Line::from(vec![
-            nominal,
-            Span::raw("  "),
-            paused,
-            Span::raw("  "),
-            watch,
-            Span::raw("  "),
-            alert,
-        ])]
+        vec![Line::from(vec![nominal, Span::raw("  "), paused, Span::raw("  "), watch, Span::raw("  "), alert])]
     } else {
-        vec![
-            Line::from(vec![nominal, Span::raw("  "), paused]),
-            Line::from(vec![watch, Span::raw("  "), alert]),
-        ]
+        vec![Line::from(vec![nominal, Span::raw("  "), paused]), Line::from(vec![watch, Span::raw("  "), alert])]
     }
 }
 
@@ -1451,7 +1697,10 @@ fn append_device_suffix(
     status_style: Style,
     palette: &Palette,
 ) {
-    spans.push(Span::styled(format!(" · {}", format_rate(device.hashrate_hs)), Style::default().fg(palette.bright_green)));
+    spans.push(Span::styled(
+        format!(" · {}", format_rate(device.hashrate_hs)),
+        Style::default().fg(palette.bright_green),
+    ));
     if device.inference_host {
         spans.push(Span::styled(" [INF]", Style::default().fg(palette.cyan).add_modifier(Modifier::BOLD)));
     }
@@ -1480,11 +1729,8 @@ fn device_card_lines(
     let name_lines = wrap_device_name(&device.name, first_width, continuation_width);
     let rate_width = 3 + format_rate(device.hashrate_hs).chars().count();
     let inf_width = usize::from(device.inference_host) * 6;
-    let compact_width = if detailed {
-        0
-    } else {
-        2 + format_temperature(device.temp_c).chars().count() + 2 + label.chars().count()
-    };
+    let compact_width =
+        if detailed { 0 } else { 2 + format_temperature(device.temp_c).chars().count() + 2 + label.chars().count() };
     let suffix_width = rate_width + inf_width + compact_width;
     let last_capacity = if name_lines.len() == 1 { first_width } else { continuation_width };
     let suffix_needs_line = name_lines.last().map_or(false, |name| name.chars().count() + suffix_width > last_capacity);
@@ -1531,10 +1777,7 @@ fn device_card_lines(
             Span::styled(format!("C{}  ", format_clock(device.core_mhz)), palette.severity(core_sev)),
         ];
         if width >= 53 {
-            telemetry.push(Span::styled(
-                format!("M{}  ", format_clock(device.mem_mhz)),
-                palette.severity(mem_sev),
-            ));
+            telemetry.push(Span::styled(format!("M{}  ", format_clock(device.mem_mhz)), palette.severity(mem_sev)));
             telemetry.push(Span::styled(
                 format!("{}  ", format_vram(device.vram_used_mb, device.vram_total_mb)),
                 Style::default().fg(palette.label),
@@ -1547,10 +1790,15 @@ fn device_card_lines(
 }
 
 fn render_overview(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &UiSnapshot, palette: &Palette) {
-    let block =
-        panel_block("OPoI // NEURAL FABRIC + LIVE EVENTS", 3, state, palette, state.page == DashboardPage::Overview);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = render_panel_frame(
+        frame,
+        area,
+        "OPoI // NEURAL FABRIC + LIVE EVENTS",
+        3,
+        state,
+        palette,
+        state.page == DashboardPage::Overview,
+    );
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -1668,9 +1916,7 @@ fn service_bond_summary_line(bond: &ServiceBondView, palette: &Palette) -> Line<
 }
 
 fn render_gpu_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &UiSnapshot, palette: &Palette) {
-    let block = panel_block("GPU TELEMETRY // STABLE DEVICE ORDER", 5, state, palette, true);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = render_panel_frame(frame, area, "GPU TELEMETRY // STABLE DEVICE ORDER", 5, state, palette, true);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -1796,9 +2042,7 @@ fn render_inference_detail(
     snapshot: &UiSnapshot,
     palette: &Palette,
 ) {
-    let block = panel_block("OPoI + SOLO ESCROW // DELIVERY HEALTH", 6, state, palette, true);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = render_panel_frame(frame, area, "OPoI + SOLO ESCROW // DELIVERY HEALTH", 6, state, palette, true);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -1866,9 +2110,7 @@ fn render_expanded_logs(frame: &mut Frame<'_>, area: Rect, state: &TuiState, sna
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(4), Constraint::Length(1)])
         .split(area);
-    let block = panel_block("LIVE EVENT STREAM // READ-ONLY", 8, state, palette, true);
-    let inner = block.inner(rows[0]);
-    frame.render_widget(block, rows[0]);
+    let inner = render_panel_frame(frame, rows[0], "LIVE EVENT STREAM // READ-ONLY", 8, state, palette, true);
     let lines = event_lines(&snapshot.events, state.log_scroll, inner.height as usize, palette);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
     render_footer(frame, rows[1], state, palette);
@@ -2313,10 +2555,39 @@ fn format_millis(value: Option<u64>) -> String {
 }
 
 fn format_difficulty(value: Option<f64>) -> String {
-    value
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .map(|value| format!("{value:.2}"))
-        .unwrap_or_else(|| "--".to_owned())
+    let Some(value) = value.filter(|value| value.is_finite() && *value > 0.0) else {
+        return "--".to_owned();
+    };
+
+    let (scaled, suffix, decimals) = if value >= 1.0e15 {
+        (value / 1.0e15, "P", 3)
+    } else if value >= 1.0e12 {
+        (value / 1.0e12, "T", 3)
+    } else if value >= 1.0e9 {
+        (value / 1.0e9, "G", 3)
+    } else if value >= 1.0e6 {
+        (value / 1.0e6, "M", 3)
+    } else if value >= 1.0e3 {
+        (value / 1.0e3, "k", 3)
+    } else if value >= 100.0 {
+        (value, "", 2)
+    } else if value >= 1.0 {
+        (value, "", 3)
+    } else if value >= 0.001 {
+        (value, "", 6)
+    } else {
+        return format!("{value:.3e}");
+    };
+
+    let mut rendered = format!("{scaled:.decimals$}");
+    while rendered.contains('.') && rendered.ends_with('0') {
+        rendered.pop();
+    }
+    if rendered.ends_with('.') {
+        rendered.pop();
+    }
+    rendered.push_str(suffix);
+    rendered
 }
 
 fn format_optional_count(value: Option<u64>) -> String {
@@ -2404,6 +2675,7 @@ mod tests {
                 latency_ms: Some(28),
                 last_job_age_secs: Some(1),
                 difficulty: Some(8.0),
+                network_difficulty: Some(33_762_627.830_873_9),
                 daa_score: Some(12_847_291),
                 failover: "armed / idle".into(),
                 synced: Some(true),
@@ -2703,12 +2975,120 @@ mod tests {
         let second = line_text(&matrix_rail(96, 7, &state, &palette));
         assert_ne!(first, second, "rain must visibly advance between animation frames");
 
-        let edge_density: usize = matrix_edge_lines(30, 31, &state, &palette)
+        let edge_density: usize = matrix_edge_lines(2, 30, 31, &state, &palette)
             .iter()
             .map(line_text)
             .map(|line| line.chars().filter(|ch| !ch.is_whitespace()).count())
             .sum();
-        assert!(edge_density >= 5, "vertical rain gutter should be visibly populated: {edge_density}");
+        assert!(edge_density >= 10, "dual-column rain gutter should be visibly populated: {edge_density}");
+    }
+
+    #[test]
+    fn reserved_rain_cells_materialize_and_clear_between_frames() {
+        let palette = Palette::new(ColorMode::TrueColor);
+        let mut state = TuiState::default();
+        state.set_animation_tick(8);
+        let before: Vec<char> = matrix_edge_lines(2, 32, 31, &state, &palette)
+            .iter()
+            .flat_map(|line| line_text(line).chars().collect::<Vec<_>>())
+            .collect();
+        state.set_animation_tick(9);
+        let after: Vec<char> = matrix_edge_lines(2, 32, 31, &state, &palette)
+            .iter()
+            .flat_map(|line| line_text(line).chars().collect::<Vec<_>>())
+            .collect();
+
+        assert!(before.iter().zip(&after).any(|(old, new)| !old.is_whitespace() && new.is_whitespace()));
+        assert!(before.iter().zip(&after).any(|(old, new)| old.is_whitespace() && !new.is_whitespace()));
+    }
+
+    #[test]
+    fn border_hieroglyph_burst_appears_changes_and_returns_to_dark_rest() {
+        let palette = Palette::new(ColorMode::TrueColor);
+        let mut state = TuiState::default();
+        let mut visible = Vec::new();
+        let mut hidden = false;
+        for tick in 0..48 {
+            state.set_animation_tick(tick);
+            match matrix_chrome_cluster(1, &state, &palette) {
+                Some(spans) => visible.push(line_text(&Line::from(spans))),
+                None => hidden = true,
+            }
+        }
+        visible.sort();
+        visible.dedup();
+        assert!(hidden, "the border burst needs a genuine dark/rest interval");
+        assert!(visible.len() > 3, "hieroglyphs should visibly flip across active frames");
+
+        state.motion_enabled = false;
+        assert!(matrix_chrome_cluster(1, &state, &palette).is_none());
+    }
+
+    #[test]
+    fn border_prompt_is_intermittent_blinks_and_has_a_steady_motion_off_cursor() {
+        let palette = Palette::new(ColorMode::TrueColor);
+        let mut state = TuiState::default();
+
+        state.set_animation_tick(0);
+        let cursor_on = line_text(&Line::from(panel_prompt_spans(1, &state, &palette).expect("active prompt")));
+        assert_eq!(cursor_on, " rig://tty0>█ ");
+        state.set_animation_tick(3);
+        let cursor_off = line_text(&Line::from(panel_prompt_spans(1, &state, &palette).expect("active prompt")));
+        assert_eq!(cursor_off, " rig://tty0>  ");
+        state.set_animation_tick(31);
+        assert!(panel_prompt_spans(1, &state, &palette).is_none(), "prompt must have intermittent rest frames");
+
+        state.motion_enabled = false;
+        let steady = line_text(&Line::from(panel_prompt_spans(1, &state, &palette).expect("static prompt")));
+        assert_eq!(steady, " rig://tty0>_ ");
+        state.set_animation_tick(999);
+        let still_steady = line_text(&Line::from(panel_prompt_spans(1, &state, &palette).expect("static prompt")));
+        assert_eq!(still_steady, steady);
+    }
+
+    #[test]
+    fn border_accents_are_asymmetric_gradients_with_a_deterministic_pulse() {
+        let palette = Palette::new(ColorMode::TrueColor);
+        let mut state = TuiState::default();
+        state.set_animation_tick(0);
+        let leading = border_accent_spans(1, &state, &palette, false);
+        let trailing = border_accent_spans(1, &state, &palette, true);
+        assert_eq!(line_text(&Line::from(leading.clone())), "╼┄┄┄╾");
+        assert_eq!(line_text(&Line::from(trailing)), "╾┄┄┄╼");
+        let first_colors: Vec<_> = leading.iter().map(|span| span.style.fg).collect();
+
+        state.set_animation_tick(2);
+        let advanced = border_accent_spans(1, &state, &palette, false);
+        let advanced_colors: Vec<_> = advanced.iter().map(|span| span.style.fg).collect();
+        assert_ne!(first_colors, advanced_colors, "the brighter border cell should travel along the gradient");
+        assert!(first_colors.iter().filter(|color| **color == Some(palette.border_focus)).count() == 1);
+        assert!(advanced_colors.iter().filter(|color| **color == Some(palette.border_focus)).count() == 1);
+    }
+
+    #[test]
+    fn chrome_is_visible_on_full_render_but_never_rewrites_runtime_values() {
+        let snap = snapshot(MiningMode::Pool);
+        let mut state = TuiState::default();
+        state.set_animation_tick(0);
+        let active = render(&snap, &state, 140, 40);
+        assert!(active.contains("rig://tty0>"));
+        for immutable in ["krx.suprnova.cc:443", "184 accepted", "FAILED 1", "RX 7900 XTX", "1.781 MH/s"] {
+            assert!(active.contains(immutable), "missing immutable runtime value: {immutable}");
+        }
+
+        state.set_animation_tick(35);
+        let rest = render(&snap, &state, 140, 40);
+        assert!(!rest.contains("rig://tty0>"), "all focused prompts should be in their rest window");
+        for immutable in ["krx.suprnova.cc:443", "184 accepted", "FAILED 1", "RX 7900 XTX", "1.781 MH/s"] {
+            assert!(rest.contains(immutable), "animation rewrote runtime value: {immutable}");
+        }
+
+        state.motion_enabled = false;
+        state.set_animation_tick(0);
+        let static_zero = render(&snap, &state, 140, 40);
+        state.set_animation_tick(999);
+        let static_late = render(&snap, &state, 140, 40);
+        assert_eq!(static_zero, static_late, "motion-off output must be deterministic and steady");
     }
 
     #[test]
@@ -2735,11 +3115,13 @@ mod tests {
     fn pool_snapshot_keeps_shares_distinct_from_unknown_blocks() {
         let mut state = TuiState::default();
         state.motion_enabled = false;
-        let output = render(&snapshot(MiningMode::Pool), &state, 140, 40);
+        let mut pool = snapshot(MiningMode::Pool);
+        pool.blocks.found = 5;
+        let output = render(&pool, &state, 140, 40);
         assert!(output.contains("SHARES"));
         assert!(output.contains("184 accepted"));
         assert!(output.contains("BLOCK CAND."));
-        assert!(output.contains("0 found · -- accepted · -- rejected"));
+        assert!(output.contains("5 found · -- accepted · -- rejected"));
         assert!(output.contains("krx.suprnova.cc:443"));
         assert!(output.contains("SERVED 42"));
     }
@@ -2763,10 +3145,8 @@ mod tests {
         assert!(rows[device_y].contains("12.345 MH/s"), "hash rate must directly follow the full name");
         assert!(!output.contains("NVIDIA GeForce GTX 1080…"));
 
-        let legend_y = rows
-            .iter()
-            .position(|line| line.contains("● NOMINAL  ◆ PAUSED  ▲ WATCH  ■ ALERT"))
-            .expect("GPU legend");
+        let legend_y =
+            rows.iter().position(|line| line.contains("● NOMINAL  ◆ PAUSED  ▲ WATCH  ■ ALERT")).expect("GPU legend");
         let page_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(61), Constraint::Min(10), Constraint::Length(1)])
@@ -2796,11 +3176,8 @@ mod tests {
         state.set_animation_tick(0);
         let on = device_card_lines(&hot, true, 60, &state, &palette);
         let on_marker = &on[0].spans[0];
-        let on_alert = on
-            .iter()
-            .flat_map(|line| &line.spans)
-            .find(|span| span.content == "ALERT")
-            .expect("alert label");
+        let on_alert =
+            on.iter().flat_map(|line| &line.spans).find(|span| span.content == "ALERT").expect("alert label");
         assert_eq!(on_marker.style.fg, Some(palette.red));
         assert!(on_marker.style.add_modifier.contains(Modifier::REVERSED));
         assert_eq!(on_alert.style, on_marker.style);
@@ -2808,11 +3185,8 @@ mod tests {
         state.set_animation_tick(2);
         let off = device_card_lines(&hot, true, 60, &state, &palette);
         let off_marker = &off[0].spans[0];
-        let off_alert = off
-            .iter()
-            .flat_map(|line| &line.spans)
-            .find(|span| span.content == "ALERT")
-            .expect("alert label");
+        let off_alert =
+            off.iter().flat_map(|line| &line.spans).find(|span| span.content == "ALERT").expect("alert label");
         assert_eq!(off_marker.style.fg, Some(palette.alert_dim));
         assert!(off_marker.style.add_modifier.contains(Modifier::DIM));
         assert_eq!(off_alert.style.fg, Some(palette.alert_dim));
@@ -2820,11 +3194,8 @@ mod tests {
         state.motion_enabled = false;
         let steady = device_card_lines(&hot, true, 60, &state, &palette);
         let steady_marker = &steady[0].spans[0];
-        let steady_alert = steady
-            .iter()
-            .flat_map(|line| &line.spans)
-            .find(|span| span.content == "ALERT")
-            .expect("alert label");
+        let steady_alert =
+            steady.iter().flat_map(|line| &line.spans).find(|span| span.content == "ALERT").expect("alert label");
         assert_eq!(steady_marker.style.fg, Some(palette.red));
         assert!(steady_marker.style.add_modifier.contains(Modifier::BOLD));
         assert!(!steady_marker.style.add_modifier.contains(Modifier::REVERSED));
@@ -2872,6 +3243,31 @@ mod tests {
         assert!(output.contains("VERSION      keryx-miner-supr v0.13.1"));
         assert!(!output.contains("deadbee"));
         assert!(!output.contains("KERYX // MINING CORE v0.13.1"));
+    }
+
+    #[test]
+    fn difficulty_is_adaptive_and_pool_and_network_targets_are_not_conflated() {
+        assert_eq!(format_difficulty(Some(0.001)), "0.001");
+        assert_eq!(format_difficulty(Some(0.000_000_25)), "2.500e-7");
+        assert_eq!(format_difficulty(Some(8.0)), "8");
+        assert_eq!(format_difficulty(Some(33_762_627.830_873_9)), "33.763M");
+        assert_eq!(format_difficulty(Some(0.0)), "--");
+        assert_eq!(format_difficulty(Some(f64::NAN)), "--");
+
+        let mut state = TuiState::default();
+        state.motion_enabled = false;
+        let mut pool = snapshot(MiningMode::Pool);
+        pool.connection.difficulty = Some(0.001);
+        let output = render(&pool, &state, 140, 40);
+        assert!(output.contains("SHARE DIFF   0.001"));
+        assert!(output.contains("NET DIFF"));
+        assert!(output.contains("33.763M"));
+        assert!(!output.contains("DIFFICULTY   0.00"));
+
+        pool.connection.network_difficulty = None;
+        let missing = render(&pool, &state, 140, 40);
+        assert!(missing.contains("NET DIFF     --"));
+        assert!(missing.contains("SHARE DIFF   0.001"));
     }
 
     #[test]
@@ -2968,8 +3364,8 @@ mod tests {
     #[test]
     fn rendering_preserves_endpoint_while_titles_animate() {
         let snap = snapshot(MiningMode::Pool);
-        let rtl_scan = POWER_SCAN_REST_TICKS * 2
-            + POWERED_BY.chars().filter(|ch| ch.is_ascii_alphabetic()).count() as u64;
+        let rtl_scan =
+            POWER_SCAN_REST_TICKS * 2 + POWERED_BY.chars().filter(|ch| ch.is_ascii_alphabetic()).count() as u64;
         for tick in [0, 1, 22, 23, POWER_SCAN_REST_TICKS, POWER_SCAN_REST_TICKS + 1, rtl_scan, rtl_scan + 1] {
             let mut state = TuiState::default();
             state.set_animation_tick(tick);

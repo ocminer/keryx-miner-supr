@@ -400,6 +400,32 @@ fn job_id_daa(job_id: &str) -> Option<u64> {
     daa_field.parse::<u64>().ok()
 }
 
+/// Whether this submitted pool share also satisfies the immutable network target carried by its
+/// V3 job. PoW values and `Uint256` targets are both encoded little-endian in this miner.
+fn is_pool_block_candidate(pow_value: Option<Uint256>, network_target: Option<Uint256>) -> bool {
+    let (Some(pow_value), Some(network_target)) = (pow_value, network_target) else {
+        return false;
+    };
+    if network_target == Uint256::default() {
+        return false;
+    }
+    pow_value <= network_target
+}
+
+/// Run candidate accounting only after the outbound Stratum channel accepted this exact share.
+/// The recorder argument keeps the forwarding gate directly unit-testable without mutating the
+/// process-global runtime hub.
+fn record_forwarded_pool_candidate<E>(
+    forward_result: &Result<(), E>,
+    is_block_candidate: bool,
+    device_id: Option<u32>,
+    recorder: impl FnOnce(Option<u32>),
+) {
+    if forward_result.is_ok() && is_block_candidate {
+        recorder(device_id);
+    }
+}
+
 #[allow(dead_code)]
 pub struct StratumHandler {
     log_handler: JoinHandle<()>,
@@ -826,12 +852,13 @@ impl StratumHandler {
         let handle = tokio::spawn(async move {
             let mut recv_stream = ReceiverStream::new(recv);
             while let Some(seed) = recv_stream.next().await {
-                let (nonce, job_id, pom_proof, device_id) = match seed {
-                    BlockSeed::PartialBlock { nonce, id, pom_proof, device_id, .. } => {
-                        (nonce, id, pom_proof, device_id)
+                let (nonce, job_id, pow_value, network_target, pom_proof, device_id) = match seed {
+                    BlockSeed::PartialBlock { nonce, id, pow_value, network_target, pom_proof, device_id, .. } => {
+                        (nonce, id, pow_value, network_target, pom_proof, device_id)
                     }
                     BlockSeed::FullBlock(_) => unreachable!(),
                 };
+                let is_block_candidate = is_pool_block_candidate(pow_value, network_target);
                 let msg_id = last_stratum_id.fetch_add(1, Ordering::SeqCst);
                 // Store the finding GPU alongside the job id so the accept/reject response (matched by
                 // msg_id) can be attributed per-card.
@@ -979,7 +1006,14 @@ impl StratumHandler {
                         pending.insert(msg_id, key.clone());
                     }
                 }
-                if send_channel.send(line).await.is_err() {
+                let forward_result = send_channel.send(line).await;
+                record_forwarded_pool_candidate(
+                    &forward_result,
+                    is_block_candidate,
+                    device_id,
+                    keryx_miner::runtime_stats::record_pool_block_candidate_found,
+                );
+                if forward_result.is_err() {
                     share_stats.shares_pending.lock().await.remove(&msg_id);
                     share_stats.ai_responses_pending.lock().await.remove(&msg_id);
                     keryx_miner::runtime_stats::record_share_abandoned();
@@ -1138,6 +1172,7 @@ impl StratumHandler {
                                 self.runtime_generation,
                                 Some(daa_score),
                                 None,
+                                self.block_bits.and_then(crate::target::network_difficulty_from_compact_target),
                             );
                             // OPoI v2 hardfork: advance the served lineup when the chain crosses H.
                             // Upstream drives this from the solo grpc job loop (grpc.rs); stratum is
@@ -1180,7 +1215,10 @@ impl StratumHandler {
                                         target: self.effective_target(),
                                         nonce_mask: self.nonce_mask,
                                         nonce_fixed: self.nonce_fixed,
-                                        hash: None,
+                                        pow_value: None,
+                                        network_target: self
+                                            .block_bits
+                                            .and_then(crate::target::network_target_from_compact_target),
                                         pom_proof: Vec::new(),
                                         device_id: None,
                                     }))
@@ -1200,6 +1238,7 @@ impl StratumHandler {
                                 self.runtime_generation,
                                 Some(daa_score),
                                 None,
+                                self.block_bits.and_then(crate::target::network_difficulty_from_compact_target),
                             );
                             // OPoI v2 hardfork: advance the served lineup when the chain crosses H.
                             // Stratum is our job source (upstream drives this from solo grpc.rs), so the
@@ -1229,7 +1268,10 @@ impl StratumHandler {
                                     target: self.effective_target(),
                                     nonce_mask: self.nonce_mask,
                                     nonce_fixed: self.nonce_fixed,
-                                    hash: None,
+                                    pow_value: None,
+                                    network_target: self
+                                        .block_bits
+                                        .and_then(crate::target::network_target_from_compact_target),
                                     pom_proof: Vec::new(),
                                     device_id: None,
                                 }))
@@ -1285,6 +1327,7 @@ impl StratumHandler {
                                 self.runtime_generation,
                                 Some(daa_score),
                                 None,
+                                self.block_bits.and_then(crate::target::network_difficulty_from_compact_target),
                             );
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
@@ -1308,7 +1351,10 @@ impl StratumHandler {
                                     target: self.effective_target(),
                                     nonce_mask: self.nonce_mask,
                                     nonce_fixed: self.nonce_fixed,
-                                    hash: None,
+                                    pow_value: None,
+                                    network_target: self
+                                        .block_bits
+                                        .and_then(crate::target::network_target_from_compact_target),
                                     pom_proof: Vec::new(),
                                     device_id: None,
                                 }))
@@ -1515,7 +1561,7 @@ impl StratumHandler {
         }
 
         self.target_pool = Uint256::new(buf);
-        keryx_miner::runtime_stats::set_difficulty(*difficulty as f64);
+        let _ = keryx_miner::runtime_stats::set_pool_difficulty(self.runtime_generation, *difficulty as f64);
         info!("Difficulty: {:?}, Target: 0x{}", difficulty, hex::encode(self.target_pool.to_be_bytes()));
         // Expected work per share at this target, as wall-clock at typical PoM rates. Answers the
         // recurring "the card is hashing but never finds a share" report: PoM rates are MH/s (the
@@ -2188,7 +2234,48 @@ fn upload_inference_result(text: &str, ipfs_url: &str, stable_id: &str) -> Optio
 
 #[cfg(test)]
 mod job_id_daa_tests {
-    use super::{extranonce_assignment, job_id_daa};
+    use super::{extranonce_assignment, is_pool_block_candidate, job_id_daa, record_forwarded_pool_candidate};
+    use crate::target::{network_target_from_compact_target, Uint256};
+    use std::cell::Cell;
+
+    #[test]
+    fn pool_block_candidate_uses_inclusive_exact_network_target() {
+        let target = Uint256::from_u64(42);
+        assert!(is_pool_block_candidate(Some(Uint256::from_u64(41)), Some(target)));
+        assert!(is_pool_block_candidate(Some(target), Some(target)));
+        assert!(!is_pool_block_candidate(Some(Uint256::from_u64(43)), Some(target)));
+
+        // Cross a 64-bit limb so a byte-order or lexicographic comparison regression is visible.
+        let limb_target = Uint256([0, 1, 0, 0]);
+        assert!(is_pool_block_candidate(Some(Uint256([u64::MAX, 0, 0, 0])), Some(limb_target)));
+        assert!(is_pool_block_candidate(Some(limb_target), Some(limb_target)));
+        assert!(!is_pool_block_candidate(Some(Uint256([1, 1, 0, 0])), Some(limb_target)));
+    }
+
+    #[test]
+    fn pool_block_candidate_requires_valid_job_target_and_pow() {
+        assert!(!is_pool_block_candidate(Some(Uint256::from_u64(1)), None));
+        assert!(!is_pool_block_candidate(
+            Some(Uint256::from_u64(1)),
+            network_target_from_compact_target(0x2200_0101)
+        ));
+        assert!(!is_pool_block_candidate(None, Some(Uint256::from_u64(42))));
+    }
+
+    #[test]
+    fn pool_candidate_accounting_requires_successful_forward_and_runs_once() {
+        let calls = Cell::new(0u32);
+        let record = |_| calls.set(calls.get() + 1);
+
+        record_forwarded_pool_candidate(&Err::<(), _>(()), true, Some(2), record);
+        assert_eq!(calls.get(), 0, "failed forwarding must not count a candidate");
+
+        record_forwarded_pool_candidate(&Ok::<_, ()>(()), true, Some(2), record);
+        assert_eq!(calls.get(), 1, "one successfully forwarded candidate is counted once");
+
+        record_forwarded_pool_candidate(&Ok::<_, ()>(()), false, Some(2), record);
+        assert_eq!(calls.get(), 1, "an ordinary non-candidate share is not counted");
+    }
 
     #[test]
     fn extranonce_assignment_validates_edges_without_shifting_by_64() {

@@ -48,9 +48,9 @@ pub(crate) enum MiningNotify {
     // `mining.notify` line fail untagged deserialization when the pool sent an object.
     // ── keryx-stratum-v3 ─────────────────────────────────────────────────────
     // V3 = V2 plus `block_bits: u32` (the block's own compact target) after the
-    // daa_score. The miner takes max(pool_target, block_target) so it never
-    // discards a solution that IS a valid block just because the pool handed it
-    // a harder share target — at 10 bps the network target can dip below it.
+    // daa_score. Mining remains governed by the pool-assigned share target;
+    // `block_bits` is retained independently so a submitted share can be tested
+    // exactly against its own job's immutable network target.
     //
     // These MUST stay ABOVE the V2 variants. `serde(untagged)` tries variants in
     // declaration order, and our 5-element V2 arm ends in `Value`, which matches

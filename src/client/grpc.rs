@@ -1084,11 +1084,17 @@ impl KeryxdHandler {
             Payload::GetBlockTemplateResponse(template) => {
                 // Track DAA score for challenge_window_end computation.
                 let template_daa = template.block.as_ref().and_then(|b| b.header.as_ref()).map(|h| h.daa_score);
+                let template_network_difficulty = template
+                    .block
+                    .as_ref()
+                    .and_then(|block| block.header.as_ref())
+                    .and_then(|header| crate::target::network_difficulty_from_compact_target(header.bits));
                 if template.block.is_some() {
                     keryx_miner::runtime_stats::record_job(
                         self.runtime_generation,
                         template_daa,
                         Some(template.is_synced),
+                        template_network_difficulty,
                     );
                 }
                 if let Some(daa) = template_daa {

@@ -23,6 +23,48 @@ pub fn u256_from_compact_target(bits: u32) -> Uint256 {
     }
 }
 
+const MAX_DIFFICULTY_TARGET: Uint256 = Uint256([u64::MAX, u64::MAX, u64::MAX, 0x7fff_ffff_ffff_ffff]);
+
+/// Decode a compact consensus target only when it is a valid Keryx network target.
+///
+/// The raw compact decoder intentionally mirrors the historical consensus representation and
+/// silently truncates values that overflow 256 bits. Network telemetry and pool block-candidate
+/// accounting must instead reject negative, zero, overflowing, and above-maximum targets.
+pub fn network_target_from_compact_target(bits: u32) -> Option<Uint256> {
+    let size = bits >> 24;
+    let mantissa = bits & 0x007f_ffff;
+    if bits & 0x0080_0000 != 0
+        || mantissa == 0
+        || size > 34
+        || (size > 33 && mantissa > 0xff)
+        || (size > 32 && mantissa > 0xffff)
+    {
+        return None;
+    }
+
+    let target = u256_from_compact_target(bits);
+    (target != Uint256::default() && target <= MAX_DIFFICULTY_TARGET).then_some(target)
+}
+
+/// Convert a consensus compact block target into the network difficulty reported by keryxd.
+///
+/// Keryx network difficulty is `MAX_DIFFICULTY_TARGET / target`, where the all-network maximum is
+/// `2^255 - 1`. This is deliberately distinct from Stratum share difficulty, whose conventional
+/// difficulty-one target is `0xffff * 2^208`.
+pub fn network_difficulty_from_compact_target(bits: u32) -> Option<f64> {
+    const MAX_DIFFICULTY_TARGET_AS_F64: f64 = 5.789_604_461_865_81e76;
+
+    let target = network_target_from_compact_target(bits)?;
+    let target_f64 = target
+        .0
+        .iter()
+        .enumerate()
+        .map(|(word, value)| *value as f64 * 2f64.powi((word * 64) as i32))
+        .sum::<f64>();
+    let difficulty = MAX_DIFFICULTY_TARGET_AS_F64 / target_f64;
+    (difficulty.is_finite() && difficulty >= 1.0).then_some(difficulty)
+}
+
 /// Little-endian large integer type
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Default, Debug)]
 pub struct Uint256(pub [u64; 4]);
@@ -113,5 +155,33 @@ impl core::ops::Shl<usize> for Uint256 {
             }
         }
         Uint256(ret)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{network_difficulty_from_compact_target, network_target_from_compact_target};
+
+    fn assert_near(actual: f64, expected: f64) {
+        let relative_error = (actual - expected).abs() / expected;
+        assert!(relative_error < 1e-12, "actual={actual}, expected={expected}, relative_error={relative_error}");
+    }
+
+    #[test]
+    fn compact_target_uses_keryx_network_difficulty_convention() {
+        // 0x1e7fffff is the reset/genesis-scale target used throughout the miner tests.
+        assert_near(network_difficulty_from_compact_target(0x1e7f_ffff).unwrap(), 65_536.007_812_500_93);
+        // Known stratum-v3 fixture from statum_codec.rs.
+        assert_near(network_difficulty_from_compact_target(490_707_704).unwrap(), 33_762_627.830_873_9);
+    }
+
+    #[test]
+    fn compact_target_rejects_zero_negative_and_above_network_maximum() {
+        assert_eq!(network_difficulty_from_compact_target(0), None);
+        assert_eq!(network_difficulty_from_compact_target(0x2080_0000), None);
+        assert_eq!(network_difficulty_from_compact_target(0x2100_ffff), None);
+        // Exponent 34 with a mantissa wider than one byte overflows 256 bits; the historical raw
+        // decoder truncates it, while the checked network decoder must reject it.
+        assert_eq!(network_target_from_compact_target(0x2200_0101), None);
     }
 }
