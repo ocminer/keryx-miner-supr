@@ -31,6 +31,14 @@ case " $CLI_ARGS " in
   *) CLI_ARGS="$CLI_ARGS --hiveos" ;;
 esac
 
+# HiveOS consumes line-oriented logs through tee/h-stats; an alternate-screen dashboard would be
+# invisible to the agent and would corrupt its parser input. Keep this idempotent so an operator's
+# explicit extra arg is not duplicated.
+case " $CLI_ARGS " in
+  *" --no-tui "*) ;;
+  *) CLI_ARGS="$CLI_ARGS --no-tui" ;;
+esac
+
 echo "[keryx-miner-supr] launching: ./keryx-miner-supr $CLI_ARGS"
 # tee (not exec) so the log file exists for h-stats.sh.
 ./keryx-miner-supr $CLI_ARGS 2>&1 | tee "$CUSTOM_LOG_BASENAME.log"

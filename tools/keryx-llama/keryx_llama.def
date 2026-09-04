@@ -5,6 +5,8 @@
 LIBRARY keryx-llama
 EXPORTS
     keryx_llama_abi
+    keryx_llama_log_get_v1
+    keryx_llama_log_set_v1
     keryx_llama_load
     keryx_llama_tensor_count
     keryx_llama_tensor_info

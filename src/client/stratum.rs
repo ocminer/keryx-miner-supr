@@ -283,7 +283,7 @@ pub struct ShareStats {
     /// Rejections with no stratum reject-class: solo/gRPC block-submit errors land here so the
     /// stats API can still sum a meaningful `rejected`.
     pub rejected_other: AtomicU64,
-    pub shares_pending: Mutex<HashMap<u32, (String, u32)>>,
+    pub shares_pending: Mutex<HashMap<u32, (String, Option<u32>)>>,
     /// Content-bound AiResponse key carried by each pending share. A response is considered delivered
     /// only when that exact submit id is accepted; stale/rejected/write-failed shares remain
     /// retryable on the next solution.
@@ -470,6 +470,9 @@ pub struct StratumHandler {
     /// therefore RE-declare the current serveable set periodically, not just on change, so the pool
     /// self-heals. `None` until the first declare.
     last_declare_at: Option<std::time::Instant>,
+    /// Generation token for process-wide display state; stale detached handlers cannot overwrite
+    /// the status of a newer pool connection.
+    runtime_generation: u64,
 }
 
 #[async_trait(?Send)]
@@ -688,7 +691,28 @@ impl StratumHandler {
         ipfs_url: String,
     ) -> Result<Box<Self>, Error> {
         info!("Connecting to {}", address);
-        let socket = TcpStream::connect(address).await?;
+        let runtime_generation = keryx_miner::runtime_stats::begin_connection(
+            keryx_miner::runtime_stats::MiningMode::Pool,
+            &address,
+            ACTIVE_POOL.load(Ordering::Relaxed),
+        );
+        let connect_started = std::time::Instant::now();
+        let socket = match TcpStream::connect(address).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                keryx_miner::runtime_stats::connection_lost(runtime_generation, "Pool connection failed");
+                return Err(error.into());
+            }
+        };
+        keryx_miner::runtime_stats::connection_established(
+            runtime_generation,
+            Some(connect_started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        );
+        keryx_miner::runtime_stats::set_connection_inference_queue(
+            runtime_generation,
+            0,
+            MAX_DETACHED_INFERENCE_TASKS,
+        );
 
         // Keep the pool connection warm. Pools (and the NAT/firewalls between us)
         // drop connections that look idle; on a vardiff'd or high-diff rig we can
@@ -784,6 +808,7 @@ impl StratumHandler {
             start_time: std::time::Instant::now(),
             declared_model_ids: None,
             last_declare_at: None,
+            runtime_generation,
         }))
     }
 
@@ -811,6 +836,7 @@ impl StratumHandler {
                 // Store the finding GPU alongside the job id so the accept/reject response (matched by
                 // msg_id) can be attributed per-card.
                 share_stats.shares_pending.lock().await.insert(msg_id, (job_id.clone(), device_id));
+                keryx_miner::runtime_stats::record_share_submitted();
                 let nonce_hex = format!("{:016x}", nonce);
                 let opoi_tag = keryx_inference::tag_fixed(nonce);
 
@@ -956,6 +982,7 @@ impl StratumHandler {
                 if send_channel.send(line).await.is_err() {
                     share_stats.shares_pending.lock().await.remove(&msg_id);
                     share_stats.ai_responses_pending.lock().await.remove(&msg_id);
+                    keryx_miner::runtime_stats::record_share_abandoned();
                     // The socket-sink forwarder is gone → the connection's write
                     // half is dead. Signal `listen` to reconnect instead of
                     // silently dropping every future share.
@@ -1045,18 +1072,32 @@ impl StratumHandler {
                                 }
                                 let pending = self.shares_stats.shares_pending.lock().await.remove(&rid);
                                 if let Some((_jobid, device_id)) = pending {
-                                    if let Some(req_id) =
+                                    let delivered_inference = if let Some(req_id) =
                                         self.shares_stats.ai_responses_pending.lock().await.remove(&rid)
                                     {
                                         let mut accepted = self.shares_stats.ai_responses_accepted.lock().await;
                                         if accepted.len() >= MAX_INFERENCE_CACHE_RESULTS {
                                             accepted.clear();
                                         }
-                                        accepted.insert(req_id);
-                                    }
+                                        // Several shares can carry the same response before the
+                                        // first ACK arrives. Count delivery once per response key.
+                                        accepted.insert(req_id)
+                                    } else {
+                                        false
+                                    };
                                     self.shares_stats.accepted.fetch_add(1, Ordering::SeqCst);
-                                    crate::pow::record_share_accepted(device_id);
-                                    info!("Share accepted (GPU {})", device_id);
+                                    if let Some(device_id) = device_id {
+                                        crate::pow::record_share_accepted(device_id);
+                                    }
+                                    keryx_miner::runtime_stats::record_share_accepted(device_id);
+                                    if delivered_inference {
+                                        keryx_miner::runtime_stats::record_inference_delivered();
+                                    }
+                                    if let Some(device_id) = device_id {
+                                        info!("Share accepted (GPU{})", device_id);
+                                    } else {
+                                        info!("Share accepted");
+                                    }
                                 } else {
                                     info!("{:?} (Last: {})", msg.clone(), self.last_stratum_id.load(Ordering::SeqCst));
                                     warn!("Ignoring result for now");
@@ -1093,6 +1134,11 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
+                            keryx_miner::runtime_stats::record_job(
+                                self.runtime_generation,
+                                Some(daa_score),
+                                None,
+                            );
                             // OPoI v2 hardfork: advance the served lineup when the chain crosses H.
                             // Upstream drives this from the solo grpc job loop (grpc.rs); stratum is
                             // OUR job source, so the swap MUST be driven here or the v2 (uncensored)
@@ -1136,7 +1182,7 @@ impl StratumHandler {
                                         nonce_fixed: self.nonce_fixed,
                                         hash: None,
                                         pom_proof: Vec::new(),
-                                        device_id: 0,
+                                        device_id: None,
                                     }))
                                     .await
                             }
@@ -1150,6 +1196,11 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
+                            keryx_miner::runtime_stats::record_job(
+                                self.runtime_generation,
+                                Some(daa_score),
+                                None,
+                            );
                             // OPoI v2 hardfork: advance the served lineup when the chain crosses H.
                             // Stratum is our job source (upstream drives this from solo grpc.rs), so the
                             // swap MUST happen here or post-fork PoM-PoW has no v2 weights resident.
@@ -1180,7 +1231,7 @@ impl StratumHandler {
                                     nonce_fixed: self.nonce_fixed,
                                     hash: None,
                                     pom_proof: Vec::new(),
-                                    device_id: 0,
+                                    device_id: None,
                                 }))
                                 .await
                         }
@@ -1230,6 +1281,11 @@ impl StratumHandler {
                                     base
                                 }
                             };
+                            keryx_miner::runtime_stats::record_job(
+                                self.runtime_generation,
+                                Some(daa_score),
+                                None,
+                            );
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
                             if !keryx_miner::slm::has_proven_serveable_model() {
@@ -1254,7 +1310,7 @@ impl StratumHandler {
                                     nonce_fixed: self.nonce_fixed,
                                     hash: None,
                                     pom_proof: Vec::new(),
-                                    device_id: 0,
+                                    device_id: None,
                                 }))
                                 .await
                         }
@@ -1304,9 +1360,11 @@ impl StratumHandler {
                 self.shares_stats.ai_responses_pending.lock().await.remove(&id);
                 // Any error code here means this submitted share was NOT accepted — attribute the
                 // rejection to the GPU that found it (the R: column).
-                if let Some((_, device_id)) = &pending {
+                if let Some((_, Some(device_id))) = &pending {
                     crate::pow::record_share_rejected(*device_id);
                 }
+                let was_share = pending.is_some();
+                let device_id = pending.as_ref().and_then(|(_, device_id)| *device_id);
                 let jobid = pending.map(|(j, _)| j);
                 match code {
                     ErrorCode::Unknown => {
@@ -1314,25 +1372,55 @@ impl StratumHandler {
                         // share/block is logged but never fatal. Returning Err here tore down the
                         // whole connection and caused an infinite reconnect loop on every share.
                         self.shares_stats.low_diff.fetch_add(1, Ordering::SeqCst);
+                        if was_share {
+                            keryx_miner::runtime_stats::record_share_rejected(
+                                keryx_miner::runtime_stats::ShareRejectKind::LowDifficulty,
+                                device_id,
+                            );
+                        }
                         warn!("Share rejected by pool (Job id: {:?}): {}", jobid, error);
                         Ok(())
                     }
                     ErrorCode::JobNotFound => {
                         self.shares_stats.stale.fetch_add(1, Ordering::SeqCst);
+                        if was_share {
+                            keryx_miner::runtime_stats::record_share_rejected(
+                                keryx_miner::runtime_stats::ShareRejectKind::Stale,
+                                device_id,
+                            );
+                        }
                         warn!("Stale share (Job id: {:?})", jobid);
                         Ok(())
                     }
                     ErrorCode::DuplicateShare => {
                         self.shares_stats.duplicate.fetch_add(1, Ordering::SeqCst);
+                        if was_share {
+                            keryx_miner::runtime_stats::record_share_rejected(
+                                keryx_miner::runtime_stats::ShareRejectKind::Duplicate,
+                                device_id,
+                            );
+                        }
                         warn!("Duplicate share (Job id: {:?})", jobid);
                         Ok(())
                     }
                     ErrorCode::LowDifficultyShare => {
                         self.shares_stats.low_diff.fetch_add(1, Ordering::SeqCst);
+                        if was_share {
+                            keryx_miner::runtime_stats::record_share_rejected(
+                                keryx_miner::runtime_stats::ShareRejectKind::LowDifficulty,
+                                device_id,
+                            );
+                        }
                         warn!("Low difficulty share (Job id: {:?})", jobid);
                         Ok(())
                     }
                     ErrorCode::Unauthorized => {
+                        if was_share {
+                            keryx_miner::runtime_stats::record_share_rejected(
+                                keryx_miner::runtime_stats::ShareRejectKind::Other,
+                                device_id,
+                            );
+                        }
                         // Distinguish a genuine auth failure (bad wallet/worker) from the pool
                         // signalling the PoM hardfork: "Unauthorized: pom proof required (hardfork
                         // active)" means the pool is post-fork and requires a proof on every share,
@@ -1358,6 +1446,12 @@ impl StratumHandler {
                         }
                     }
                     ErrorCode::NotSubscribed => {
+                        if was_share {
+                            keryx_miner::runtime_stats::record_share_rejected(
+                                keryx_miner::runtime_stats::ShareRejectKind::Other,
+                                device_id,
+                            );
+                        }
                         error!("Got error code {}: {}", code, error);
                         Err(error.into())
                     }
@@ -1421,6 +1515,7 @@ impl StratumHandler {
         }
 
         self.target_pool = Uint256::new(buf);
+        keryx_miner::runtime_stats::set_difficulty(*difficulty as f64);
         info!("Difficulty: {:?}, Target: 0x{}", difficulty, hex::encode(self.target_pool.to_be_bytes()));
         // Expected work per share at this target, as wall-clock at typical PoM rates. Answers the
         // recurring "the card is hashing but never finds a share" report: PoM rates are MH/s (the
@@ -1501,6 +1596,9 @@ impl StratumHandler {
 
         if !keryx_miner::slm::model_serveable(&model_id) {
             warn!("OPoI challenge: model {:.8} not ready — sending empty response", model_id_hex);
+            keryx_miner::runtime_stats::record_inference_failed_request(
+                keryx_miner::runtime_stats::InferenceKind::PoolChallenge,
+            );
             self.send_channel.send(make_challenge_response_line(&model_id_hex, &nonce_hex, "")).await.ok();
             return;
         }
@@ -1524,10 +1622,17 @@ impl StratumHandler {
             }
             Err(AdmissionError::Full) => {
                 warn!("OPoI challenge: detached inference queue full — returning empty response");
+                keryx_miner::runtime_stats::record_inference_busy_request(
+                    keryx_miner::runtime_stats::InferenceKind::PoolChallenge,
+                );
                 self.send_channel.send(make_challenge_response_line(&model_id_hex, &nonce_hex, "")).await.ok();
                 return;
             }
         };
+        let mut runtime_attempt = keryx_miner::runtime_stats::begin_inference(
+            keryx_miner::runtime_stats::InferenceKind::PoolChallenge,
+            Some(&model_id),
+        );
 
         let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
         let send_channel = self.send_channel.clone();
@@ -1544,12 +1649,14 @@ impl StratumHandler {
                 Some(lease) => lease,
                 None => {
                     warn!("OPoI challenge: all eligible cards busy — dropping challenge for model {:.8}", model_id_hex);
+                    runtime_attempt.busy();
                     publisher.publish(DetachedTaskOutcome::Text(None));
                     send_channel.send(make_challenge_response_line(&model_id_hex, &nonce_hex, "")).await.ok();
                     return;
                 }
             };
             let gpu = lease.gpu();
+            runtime_attempt.set_gpu(gpu);
             let pause = crate::miner::begin_inference_pause();
             info!("OPoI challenge: PoW suspended (GPU {}) — model={:.8} nonce={:.8}", gpu, model_id_hex, nonce_hex);
             let result = tokio::task::spawn_blocking(move || {
@@ -1567,7 +1674,9 @@ impl StratumHandler {
             let text = result.unwrap_or_default();
             if text.is_empty() {
                 warn!("OPoI challenge: inference returned empty text for model {:.8}", model_id_hex);
+                runtime_attempt.failed();
             } else {
+                keryx_miner::runtime_stats::record_inference_prepared();
                 info!(
                     "OPoI challenge: done for model {:.8} ({} chars) — retained PoW job resumed",
                     model_id_hex,
@@ -1575,8 +1684,18 @@ impl StratumHandler {
                 );
             }
             let line = make_challenge_response_line(&model_id_hex, &nonce_hex, &text);
-            if send_channel.send(line).await.is_err() {
-                warn!("OPoI challenge: send_channel closed, could not deliver response");
+            match send_channel.send(line).await {
+                Ok(()) if !text.is_empty() => {
+                    runtime_attempt.served(text.split_whitespace().count());
+                    keryx_miner::runtime_stats::record_inference_delivered();
+                }
+                Ok(()) => {}
+                Err(_) => {
+                    if !text.is_empty() {
+                        runtime_attempt.failed();
+                    }
+                    warn!("OPoI challenge: send_channel closed, could not deliver response");
+                }
             }
         });
     }
@@ -1617,6 +1736,9 @@ impl StratumHandler {
         model_id.copy_from_slice(&model_id_bytes);
         if !keryx_miner::slm::model_serveable(&model_id) {
             warn!("chat[{}]: model {:.8} not ready", req_id, req.model_id);
+            keryx_miner::runtime_stats::record_inference_failed_request(
+                keryx_miner::runtime_stats::InferenceKind::Interactive,
+            );
             self.send_channel.send(make_inference_result_err(&req_id, "model not ready")).await.ok();
             return;
         }
@@ -1647,10 +1769,17 @@ impl StratumHandler {
             }
             Err(AdmissionError::Full) => {
                 warn!("chat[{}]: detached inference queue full", req_id);
+                keryx_miner::runtime_stats::record_inference_busy_request(
+                    keryx_miner::runtime_stats::InferenceKind::Interactive,
+                );
                 self.send_channel.send(make_inference_result_err(&req_id, "busy")).await.ok();
                 return;
             }
         };
+        let mut runtime_attempt = keryx_miner::runtime_stats::begin_inference(
+            keryx_miner::runtime_stats::InferenceKind::Interactive,
+            Some(&model_id),
+        );
 
         let prompt = req.prompt.clone();
         let max_tokens = req.max_tokens;
@@ -1661,12 +1790,14 @@ impl StratumHandler {
                 Some(lease) => lease,
                 None => {
                     warn!("chat[{}]: all eligible cards busy through deadline — replying busy", req_id);
+                    runtime_attempt.busy();
                     publisher.publish(DetachedTaskOutcome::Text(None));
                     send_channel.send(make_inference_result_err(&req_id, "busy")).await.ok();
                     return;
                 }
             };
             let gpu = lease.gpu();
+            runtime_attempt.set_gpu(gpu);
             let pause = crate::miner::begin_inference_pause();
             info!("chat[{}]: PoW suspended (GPU {}) — model={:.8}", req_id, gpu, model_hex);
             let started = std::time::Instant::now();
@@ -1683,22 +1814,35 @@ impl StratumHandler {
             });
             publisher.publish(DetachedTaskOutcome::Text(result.clone()));
             let ms = started.elapsed().as_millis() as u32;
-            let line = match result {
+            let (line, tokens) = match result {
                 Some(text) if !text.is_empty() => {
                     let tokens = text.split_whitespace().count() as u32;
+                    keryx_miner::runtime_stats::record_inference_prepared();
                     info!(
                         "chat[{}]: done model={:.8} ({} tokens, {} ms) — retained PoW job resumed",
                         req_id, model_hex, tokens, ms
                     );
-                    make_inference_result_ok(&req_id, text, tokens, ms)
+                    (make_inference_result_ok(&req_id, text, tokens, ms), Some(tokens as usize))
                 }
                 _ => {
                     warn!("chat[{}]: inference produced no output", req_id);
-                    make_inference_result_err(&req_id, "inference failed")
+                    runtime_attempt.failed();
+                    (make_inference_result_err(&req_id, "inference failed"), None)
                 }
             };
-            if send_channel.send(line).await.is_err() {
-                warn!("chat[{}]: send_channel closed, could not deliver result", req_id);
+            match send_channel.send(line).await {
+                Ok(()) => {
+                    if let Some(tokens) = tokens {
+                        runtime_attempt.served(tokens);
+                        keryx_miner::runtime_stats::record_inference_delivered();
+                    }
+                }
+                Err(_) => {
+                    if tokens.is_some() {
+                        runtime_attempt.failed();
+                    }
+                    warn!("chat[{}]: send_channel closed, could not deliver result", req_id);
+                }
             }
         });
     }
@@ -1764,6 +1908,9 @@ impl StratumHandler {
 
         if !keryx_miner::slm::model_serveable(&model_id) {
             warn!("OPoI [{}]: model not ready — inference skipped", task.stable_id);
+            keryx_miner::runtime_stats::record_inference_failed_request(
+                keryx_miner::runtime_stats::InferenceKind::PoolTask,
+            );
             return false;
         }
 
@@ -1777,15 +1924,24 @@ impl StratumHandler {
             }
             if cache.in_progress.len() >= MAX_DETACHED_INFERENCE_TASKS {
                 warn!("OPoI AiTask [{}]: inference queue full — skipping", task.stable_id);
+                keryx_miner::runtime_stats::record_inference_busy_request(
+                    keryx_miner::runtime_stats::InferenceKind::PoolTask,
+                );
                 return false;
             }
             cache.in_progress.insert(cache_key.clone());
+            keryx_miner::runtime_stats::set_connection_inference_queue(
+                self.runtime_generation,
+                cache.in_progress.len(),
+                MAX_DETACHED_INFERENCE_TASKS,
+            );
         }
         let mut publisher = match DetachedTaskAdmission::reserve(format!("aitask:{cache_key}")) {
             Ok(DetachedTaskAdmission::Leader(publisher)) => publisher,
             Ok(DetachedTaskAdmission::Follower(receiver)) => {
                 let follower_cache = Arc::clone(&self.inference_cache);
                 let follower_key = cache_key.clone();
+                let runtime_generation = self.runtime_generation;
                 tokio::spawn(async move {
                     let outcome = await_detached_outcome(receiver).await;
                     let mut cache = follower_cache.lock().await;
@@ -1800,15 +1956,33 @@ impl StratumHandler {
                         cache.results.insert(follower_key.clone(), result);
                     }
                     cache.in_progress.remove(&follower_key);
+                    keryx_miner::runtime_stats::set_connection_inference_queue(
+                        runtime_generation,
+                        cache.in_progress.len(),
+                        MAX_DETACHED_INFERENCE_TASKS,
+                    );
                 });
                 return false;
             }
             Err(AdmissionError::Full) => {
-                self.inference_cache.lock().await.in_progress.remove(&cache_key);
+                let mut cache = self.inference_cache.lock().await;
+                cache.in_progress.remove(&cache_key);
+                keryx_miner::runtime_stats::set_connection_inference_queue(
+                    self.runtime_generation,
+                    cache.in_progress.len(),
+                    MAX_DETACHED_INFERENCE_TASKS,
+                );
                 warn!("OPoI AiTask [{}]: detached inference queue full — skipping", task.stable_id);
+                keryx_miner::runtime_stats::record_inference_busy_request(
+                    keryx_miner::runtime_stats::InferenceKind::PoolTask,
+                );
                 return false;
             }
         };
+        let mut runtime_attempt = keryx_miner::runtime_stats::begin_inference(
+            keryx_miner::runtime_stats::InferenceKind::PoolTask,
+            Some(&model_id),
+        );
 
         let stable_id = task.stable_id.clone();
         let prompt = task.prompt.clone();
@@ -1816,23 +1990,32 @@ impl StratumHandler {
         let deadline_ms = task.deadline_ms;
         let ipfs_url = self.ipfs_url.clone();
         let cache_ref = Arc::clone(&self.inference_cache);
+        let runtime_generation = self.runtime_generation;
         tokio::spawn(async move {
             let lease = match keryx_miner::slm::acquire_inference_card_async(&model_id, deadline_ms).await {
                 Some(lease) => lease,
                 None => {
                     warn!("OPoI AiTask [{}]: all eligible cards busy through deadline — skipping", stable_id);
+                    runtime_attempt.busy();
                     publisher.publish(DetachedTaskOutcome::Ai(None));
-                    cache_ref.lock().await.in_progress.remove(&cache_key);
+                    let mut cache = cache_ref.lock().await;
+                    cache.in_progress.remove(&cache_key);
+                    keryx_miner::runtime_stats::set_connection_inference_queue(
+                        runtime_generation,
+                        cache.in_progress.len(),
+                        MAX_DETACHED_INFERENCE_TASKS,
+                    );
                     return;
                 }
             };
             let gpu = lease.gpu();
+            runtime_attempt.set_gpu(gpu);
             let pause = crate::miner::begin_inference_pause();
             info!("OPoI AiTask [{}]: PoW suspended for GPU {} inference", stable_id, gpu);
             if let Err(e) = tokio::task::spawn_blocking(move || {
                 run_inference_and_upload(
                     gpu, model_id, prompt, max_tokens, ipfs_url, stable_id, cache_key, cache_ref, publisher, pause,
-                    lease,
+                    lease, runtime_attempt, runtime_generation,
                 );
             })
             .await
@@ -1847,6 +2030,7 @@ impl StratumHandler {
 
 impl Drop for StratumHandler {
     fn drop(&mut self) {
+        keryx_miner::runtime_stats::connection_lost(self.runtime_generation, "Pool connection closed");
         self.log_handler.abort();
         self.block_handle.abort();
         self.sink_handler.abort();
@@ -1860,11 +2044,18 @@ impl Drop for StratumHandler {
 struct InProgressCleanup {
     cache_key: String,
     cache: InferenceCache,
+    runtime_generation: u64,
 }
 
 impl Drop for InProgressCleanup {
     fn drop(&mut self) {
-        self.cache.blocking_lock().in_progress.remove(&self.cache_key);
+        let mut cache = self.cache.blocking_lock();
+        cache.in_progress.remove(&self.cache_key);
+        keryx_miner::runtime_stats::set_connection_inference_queue(
+            self.runtime_generation,
+            cache.in_progress.len(),
+            MAX_DETACHED_INFERENCE_TASKS,
+        );
     }
 }
 
@@ -1882,8 +2073,10 @@ fn run_inference_and_upload(
     mut publisher: DetachedTaskPublisher,
     pause: crate::miner::InferencePauseGuard,
     lease: keryx_miner::slm::InferenceLease,
+    mut runtime_attempt: keryx_miner::runtime_stats::InferenceAttempt,
+    runtime_generation: u64,
 ) {
-    let _cleanup = InProgressCleanup { cache_key: cache_key.clone(), cache: Arc::clone(&cache) };
+    let _cleanup = InProgressCleanup { cache_key: cache_key.clone(), cache: Arc::clone(&cache), runtime_generation };
     let inference = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         info!("OPoI [{}]: starting SLM inference (max_tokens={}, GPU {})", stable_id, max_tokens, gpu);
         keryx_miner::slm::load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens)
@@ -1898,16 +2091,24 @@ fn run_inference_and_upload(
         Ok(Some(text)) if !text.is_empty() => text,
         Ok(_) => {
             warn!("OPoI [{}]: inference returned empty text — skipping IPFS upload", stable_id);
+            runtime_attempt.failed();
             publisher.publish(DetachedTaskOutcome::Ai(None));
             return;
         }
         Err(_) => {
             warn!("OPoI [{}]: inference panicked — request will be retryable", stable_id);
+            runtime_attempt.failed();
             publisher.publish(DetachedTaskOutcome::Ai(None));
             return;
         }
     };
     let result_opt = upload_inference_result(&text, &ipfs_url, &stable_id);
+    if let Some(result) = result_opt.as_ref() {
+        keryx_miner::runtime_stats::record_inference_prepared();
+        runtime_attempt.served(result.response_length as usize);
+    } else {
+        runtime_attempt.failed();
+    }
     publisher.publish(DetachedTaskOutcome::Ai(result_opt.clone()));
     let mut guard = cache.blocking_lock();
     if let Some(result) = result_opt {

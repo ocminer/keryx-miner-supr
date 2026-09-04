@@ -16,7 +16,7 @@ http://127.0.0.1:4067/mmpos
 It returns the mmpOS custom-miner JSON directly — no `mmp-stats.sh` needed:
 ```json
 {"busid":[0,1],"hash":[1781200,520900],"units":"hs",
- "air":["42","0","0"],"miner_name":"keryx-miner-supr","miner_version":"0.13.0"}
+ "air":["42","0","0"],"miner_name":"keryx-miner-supr","miner_version":"0.13.1"}
 ```
 (`/` or `/stats` on the same port returns a richer generic JSON for dashboards.)
 

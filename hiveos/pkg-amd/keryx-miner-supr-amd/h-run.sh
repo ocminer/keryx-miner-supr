@@ -98,6 +98,14 @@ case " $CLI_ARGS " in
   *) CLI_ARGS="$CLI_ARGS --hiveos" ;;
 esac
 
+
+# HiveOS consumes line-oriented logs through tee/h-stats; do not emit alternate-screen TUI escape
+# sequences into the parser log. Preserve an explicitly supplied flag without duplication.
+case " $CLI_ARGS " in
+  *" --no-tui "*) ;;
+  *) CLI_ARGS="$CLI_ARGS --no-tui" ;;
+esac
+
 echo "[keryx-miner-supr-amd] launching: ./keryx-miner-supr $CLI_ARGS" | tee -a "$LOG"
 # tee -a (not exec) so the log keeps the preflight lines + miner output for h-stats.sh.
 ./keryx-miner-supr $CLI_ARGS 2>&1 | tee -a "$LOG"

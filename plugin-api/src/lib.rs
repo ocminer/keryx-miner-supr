@@ -8,10 +8,38 @@
 use clap::ArgMatches;
 use std::any::Any;
 use std::error::Error as StdError;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod xoshiro256starstar;
 
 pub type Error = Box<dyn StdError + Send + Sync + 'static>;
+
+// These atomics are deliberately process/DSO-local. A statically linked worker shares the host's
+// copy; each dynamic plugin changes its own copy through the optional C-ABI control hook exported
+// below by the in-tree plugins. This avoids using the process environment as a runtime
+// synchronization mechanism after CUDA/ROCm and monitor threads already exist.
+static TUI_REQUESTED: AtomicBool = AtomicBool::new(false);
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn set_tui_requested(requested: bool) {
+    TUI_REQUESTED.store(requested, Ordering::Release);
+}
+
+#[doc(hidden)]
+pub fn tui_requested() -> bool {
+    TUI_REQUESTED.load(Ordering::Acquire)
+}
+
+#[doc(hidden)]
+pub fn set_tui_active(active: bool) {
+    TUI_ACTIVE.store(active, Ordering::Release);
+}
+
+#[doc(hidden)]
+pub fn tui_active() -> bool {
+    TUI_ACTIVE.load(Ordering::Acquire)
+}
 
 pub trait Plugin: Any + Send + Sync {
     fn name(&self) -> &'static str;

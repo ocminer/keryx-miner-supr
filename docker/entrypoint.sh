@@ -40,6 +40,14 @@ CMD=(./keryx-miner-supr -a "$WALLET" -s "$POOL" --tier "${KERYX_TIER:-auto}" --m
 # shellcheck disable=SC2206
 [ -n "${KERYX_EXTRA_ARGS:-}" ] && CMD+=($KERYX_EXTRA_ARGS)
 
+# Container logs are noninteractive, but make the contract explicit without duplicating an
+# operator-supplied flag (Clap rejects repeated boolean flags).
+HAS_NO_TUI=0
+for arg in "${CMD[@]:1}"; do
+    [ "$arg" = "--no-tui" ] && HAS_NO_TUI=1
+done
+[ "$HAS_NO_TUI" = "0" ] && CMD+=(--no-tui)
+
 # docker stop (SIGTERM) → forward as SIGINT (keryx clean shutdown; NEVER -9).
 MINER_PID=""; STOPPING=0
 forward() { STOPPING=1; [ -n "$MINER_PID" ] && kill -INT "$MINER_PID" 2>/dev/null; }

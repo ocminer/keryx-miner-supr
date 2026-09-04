@@ -35,6 +35,8 @@ mod metal_worker;
 mod miner;
 mod pow;
 mod target;
+mod tui;
+mod tui_driver;
 mod watch;
 
 #[cfg(not(feature = "static-cuda"))]
@@ -49,6 +51,13 @@ pub mod proto {
 pub type Error = Box<dyn StdError + Send + Sync + 'static>;
 
 type Hash = Uint256;
+
+/// Every hard-exit path must release raw mode and the alternate screen first. This is idempotent
+/// and a no-op in classic/headless mode.
+fn exit_process(code: i32) -> ! {
+    tui_driver::restore_terminal_for_exit();
+    std::process::exit(code)
+}
 
 /// Attempt to install the CUDA runtime libraries candle needs, on a Debian/Ubuntu host (HiveOS).
 ///
@@ -674,6 +683,7 @@ async fn client_main(
     pool_address: String,
     block_template_ctr: Arc<AtomicU16>,
     plugin_manager: &PluginManager,
+    miner_stats: Arc<std::sync::Mutex<crate::miner::MinerStats>>,
     escrow_privkey: Option<String>,
     escrow_cert: Option<String>,
 ) -> Result<(), Error> {
@@ -697,10 +707,8 @@ async fn client_main(
     .await?;
 
     client.register().await?;
-    let mut miner_manager = MinerManager::new(client.get_block_channel(), opt.num_threads, plugin_manager);
-    if let Some(bind) = opt.api_bind.clone() {
-        tokio::spawn(api::serve(bind, miner_manager.stats(), env!("CARGO_PKG_VERSION").to_string()));
-    }
+    let mut miner_manager =
+        MinerManager::new_with_stats(client.get_block_channel(), opt.num_threads, plugin_manager, miner_stats);
     client.listen(&mut miner_manager).await?;
     drop(miner_manager);
     Ok(())
@@ -758,6 +766,11 @@ fn main() -> Result<(), Error> {
 }
 
 async fn run() -> Result<(), Error> {
+    // Decide before any dynamically loaded worker installs its own stderr logger. The actual
+    // alternate screen starts only after the plugin-augmented CLI has parsed successfully.
+    let tui_requested = tui_driver::requested_from_process();
+    tui_driver::mark_requested(tui_requested);
+
     #[cfg(target_os = "windows")]
     adjust_console().unwrap_or_else(|e| {
         eprintln!("WARNING: Failed to protect console ({}). Any selection in console will freeze the miner.", e)
@@ -820,8 +833,29 @@ async fn run() -> Result<(), Error> {
 
     let matches = app.get_matches();
 
-    let worker_count = plugin_manager.process_options(&matches)?;
     let mut opt: Opt = Opt::from_arg_matches(&matches)?;
+    let mut tui_enabled = tui_requested && !opt.no_tui;
+    // Plugin constructors are asked to stay quiet until the host knows whether it can own the
+    // terminal. Switch current plugins back to classic logging for option validation, then require
+    // the versioned atomic hook from every dynamic plugin before enabling the alternate screen.
+    plugin_manager.set_plugin_tui_logging(false);
+    if tui_enabled && !plugin_manager.supports_tui_logging() {
+        tui_enabled = false;
+        tui_driver::mark_requested(false);
+        eprintln!(
+            "WARNING: a legacy GPU plugin cannot coordinate terminal logging; using classic logs. Update the plugin to enable the interactive dashboard."
+        );
+    }
+    if tui_enabled {
+        if let Err(error) = tui_driver::install_dashboard_logger(opt.log_level()) {
+            tui_enabled = false;
+            tui_driver::mark_requested(false);
+            eprintln!("WARNING: interactive dashboard logger could not start ({error}); using classic logs.");
+        } else {
+            tui_driver::configure_plugin_log_controls(plugin_manager.tui_log_controls());
+        }
+    }
+    let worker_count = plugin_manager.process_options(&matches)?;
     // With --disable-gpu there are no GPU workers, so default the CPU thread
     // count to the physical core count when the user didn't set --threads
     // (otherwise the miner would start with 0 workers and bail out). Checked
@@ -834,8 +868,137 @@ async fn run() -> Result<(), Error> {
     // node the miner is dialing. log_level() only reads the --debug flag, already parsed here.
     // try_init: in the static-cuda build CudaPlugin::new already set a logger;
     // init() would panic on the second call.
-    let _ = env_logger::builder().filter_level(opt.log_level()).parse_default_env().try_init();
+    if !tui_enabled {
+        let _ = env_logger::builder().filter_level(opt.log_level()).parse_default_env().try_init();
+    }
     opt.process()?;
+
+    let initial_mode = if opt.keryxd_address.starts_with("stratum+tcp://") {
+        keryx_miner::runtime_stats::MiningMode::Pool
+    } else {
+        keryx_miner::runtime_stats::MiningMode::Solo
+    };
+    keryx_miner::runtime_stats::begin_connection(initial_mode, &opt.keryxd_address, 0);
+
+    // API and dashboard state outlive individual pool connections. Construct this once, before
+    // model staging, so the dashboard can show first-run downloads/self-tests instead of a blank
+    // terminal and the HTTP listener never remains bound to a discarded MinerManager.
+    let miner_stats = Arc::new(std::sync::Mutex::new(crate::miner::MinerStats::default()));
+    if let Some(bind) = opt.api_bind.clone() {
+        tokio::spawn(api::serve(bind, Arc::clone(&miner_stats), env!("CARGO_PKG_VERSION").to_string()));
+    }
+
+    // Register OS signal handlers synchronously before the dashboard can put the terminal in raw
+    // mode. Constructing these streams installs Tokio's process handler immediately; a signal that
+    // arrives before the waiter task is first scheduled is retained for `recv()`. Creating the
+    // streams inside the async task left a real startup window where SIGTERM used its default action
+    // after EnterAlternateScreen and stranded the calling shell in raw mode.
+    #[cfg(unix)]
+    let shutdown_signals = {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let interrupt = match signal(SignalKind::interrupt()) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                log::error!("SIGINT handler install failed ({error}).");
+                None
+            }
+        };
+        let terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                log::error!("SIGTERM handler install failed ({error}).");
+                None
+            }
+        };
+        (interrupt, terminate)
+    };
+
+    #[cfg(windows)]
+    let shutdown_ctrl_c = match tokio::signal::windows::ctrl_c() {
+        Ok(stream) => Some(stream),
+        Err(error) => {
+            log::error!("Ctrl-C handler install failed ({error}).");
+            None
+        }
+    };
+
+    #[cfg(unix)]
+    let terminal_shutdown_is_safe = shutdown_signals.0.is_some() && shutdown_signals.1.is_some();
+    #[cfg(windows)]
+    let terminal_shutdown_is_safe = shutdown_ctrl_c.is_some();
+    #[cfg(not(any(unix, windows)))]
+    let terminal_shutdown_is_safe = false;
+
+    if tui_enabled && !terminal_shutdown_is_safe {
+        // Classic mode is still usable with whichever handler was installed. Raw mode is not: a
+        // missing handler would restore the OS default action for that signal and could terminate
+        // the process before LeaveAlternateScreen/disable_raw_mode runs.
+        tui_enabled = false;
+        tui_driver::mark_requested(false);
+        plugin_manager.set_plugin_tui_logging(false);
+        log::warn!("Interactive dashboard disabled because safe shutdown signal handling is unavailable; using classic logs.");
+    }
+
+    // Clean shutdown: respond to SIGINT (Ctrl-C) and SIGTERM — the signals HiveOS / mmpOS / SMOS /
+    // systemd send to STOP a miner. The GPU worker threads sit in long, uninterruptible CUDA calls
+    // and can't be stopped cooperatively, so we exit the process directly and let the OS reclaim the
+    // CUDA context; the orphan possession-tree sweep cleans any leftover pom-tree on the next start.
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        let (mut interrupt, mut terminate) = shutdown_signals;
+        let received = match (interrupt.as_mut(), terminate.as_mut()) {
+            (Some(interrupt), Some(terminate)) => {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = terminate.recv() => {}
+                }
+                true
+            }
+            (Some(interrupt), None) => {
+                let _ = interrupt.recv().await;
+                true
+            }
+            (None, Some(terminate)) => {
+                let _ = terminate.recv().await;
+                true
+            }
+            (None, None) => false,
+        };
+        if received {
+            log::warn!("Shutdown signal received — stopping keryx-miner.");
+            exit_process(0);
+        }
+    });
+
+    #[cfg(windows)]
+    if let Some(mut ctrl_c) = shutdown_ctrl_c {
+        tokio::spawn(async move {
+            let _ = ctrl_c.recv().await;
+            log::warn!("Shutdown signal received — stopping keryx-miner.");
+            exit_process(0);
+        });
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    tokio::spawn(async {
+        let _ = tokio::signal::ctrl_c().await;
+        log::warn!("Shutdown signal received — stopping keryx-miner.");
+        exit_process(0);
+    });
+
+    let _tui_guard = if tui_enabled {
+        match tui_driver::start_dashboard() {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                tui_driver::restore_terminal_best_effort();
+                warn!("Interactive dashboard unavailable ({error}); continuing with classic logs.");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // --delete-autotune: wipe the saved launch tuning BEFORE any GPU is touched, so this run
     // measures every card from scratch. The cache is already version-stamped and dropped
@@ -870,36 +1033,6 @@ async fn run() -> Result<(), Error> {
         if resident_tree { "ON" } else { "off" },
         if resident_tree { "lookup-time proof build, high RAM" } else { "frugal on-disk proof build" }
     );
-
-    // Clean shutdown: respond to SIGINT (Ctrl-C) and SIGTERM — the signals HiveOS / mmpOS / SMOS /
-    // systemd send to STOP a miner. The GPU worker threads sit in long, uninterruptible CUDA calls
-    // and can't be stopped cooperatively, so we exit the process directly and let the OS reclaim the
-    // CUDA context; the orphan possession-tree sweep cleans any leftover pom-tree on the next start.
-    // (Without this the miner ignored SIGINT/SIGTERM and only died on SIGKILL.)
-    tokio::spawn(async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            match signal(SignalKind::terminate()) {
-                Ok(mut term) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = term.recv() => {}
-                    }
-                }
-                Err(e) => {
-                    log::error!("SIGTERM handler install failed ({e}) — falling back to Ctrl-C only.");
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-        log::warn!("Shutdown signal received — stopping keryx-miner.");
-        std::process::exit(0);
-    });
 
     info!("=================================================================================");
     info!("                 Keryx-Miner GPU {}", env!("CARGO_PKG_VERSION"));
@@ -1665,7 +1798,7 @@ async fn run() -> Result<(), Error> {
                         }
                         _ => {
                             info!("CUDA libs installed successfully — restarting miner to activate them.");
-                            std::process::exit(0);
+                            exit_process(0);
                         }
                     }
                 }
@@ -1700,7 +1833,7 @@ async fn run() -> Result<(), Error> {
         // (dlopen'd libkeryx-llama-vk.so) may already be loading the model on a background thread,
         // and unwinding out of main() races its teardown into a segfault (field report on an NVIDIA
         // box). exit() tears the process down cleanly without running that destructor.
-        std::process::exit(1);
+        exit_process(1);
     }
 
     let block_template_ctr = Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16));
@@ -1757,7 +1890,7 @@ async fn run() -> Result<(), Error> {
                          exiting (code 75) so the wrapper relaunches it and resets stuck workers.",
                         stall_secs
                     );
-                    std::process::exit(75);
+                    exit_process(75);
                 }
             }
         });
@@ -1898,6 +2031,7 @@ async fn run() -> Result<(), Error> {
             pool_address,
             block_template_ctr.clone(),
             &plugin_manager,
+            Arc::clone(&miner_stats),
             escrow_privkey.clone(),
             escrow_cert.clone(),
         )

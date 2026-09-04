@@ -3,8 +3,9 @@ use keryx_plugin_api::declare_plugin;
 use clap::{ArgMatches, FromArgMatches};
 use cust::prelude::*;
 use keryx_plugin_api::{Plugin, Worker, WorkerSpec};
-use log::LevelFilter;
+use log::{LevelFilter, Log, Metadata, Record};
 use std::error::Error as StdError;
+use std::sync::Once;
 #[cfg(feature = "overclock")]
 use {
     log::{error, info, warn},
@@ -28,6 +29,66 @@ use crate::cli::NonceGenEnum;
 use crate::worker::CudaGPUWorker;
 
 const DEFAULT_WORKLOAD_SCALE: f32 = 1024.;
+
+/// A dynamically loaded plugin has a separate `log` global from the host executable. Keep its
+/// normal `env_logger` installed, but silence it while the host owns the terminal for the TUI.
+/// The state is a DSO-local atomic toggled through `keryx_plugin_set_tui_active_v1`; process
+/// environment mutation is intentionally not used as a cross-thread synchronization primitive.
+struct TuiAwareLogger {
+    inner: env_logger::Logger,
+}
+
+impl Log for TuiAwareLogger {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        !keryx_plugin_api::tui_active() && self.inner.enabled(metadata)
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        // Recheck here because the dashboard can start or stop between `enabled` and `log`.
+        if !keryx_plugin_api::tui_active() {
+            self.inner.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        if !keryx_plugin_api::tui_active() {
+            self.inner.flush();
+        }
+    }
+}
+
+/// Optional dynamic-plugin dashboard logger handshake. Old hosts ignore this symbol; new hosts
+/// discover it with `dlsym` and pass only 0/1.
+#[no_mangle]
+pub extern "C" fn keryx_plugin_set_tui_active_v1(active: u8) {
+    keryx_plugin_api::set_tui_active(active != 0);
+}
+
+fn init_logger() {
+    // A Rust cdylib carries its own std::panicking hook slot, so the host executable's TUI panic
+    // hook cannot intercept panics originating in this DSO. Preserve normal/default diagnostics in
+    // classic mode, but never let that private hook write raw stderr into the alternate screen.
+    static PANIC_FILTER: Once = Once::new();
+    PANIC_FILTER.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !keryx_plugin_api::tui_active() {
+                previous(info);
+            }
+        }));
+    });
+
+    let mut builder = env_logger::Builder::new();
+    builder.filter_level(LevelFilter::Info).parse_default_env();
+    let logger = builder.build();
+    let max_level = logger.filter();
+
+    // A statically linked plugin shares the host's `log` global, so failure here simply means the
+    // host logger is already authoritative. Dynamic plugins install this logger in their own DSO.
+    if log::set_boxed_logger(Box::new(TuiAwareLogger { inner: logger })).is_ok() {
+        log::set_max_level(max_level);
+    }
+}
 
 /// Optional dynamic-plugin output-contract handshake.
 ///
@@ -67,11 +128,21 @@ pub struct CudaPlugin {
 
 impl CudaPlugin {
     pub fn new() -> Result<Self, Error> {
+        Self::new_inner(false)
+    }
+
+    // The exported plugin factory uses this constructor, while a static-cuda host calls `new`
+    // directly. That distinction matters only during early TUI startup: a static plugin shares
+    // the host's logger slot and must leave it free for the dashboard logger.
+    fn new_dynamic() -> Result<Self, Error> {
+        Self::new_inner(true)
+    }
+
+    fn new_inner(dynamic_plugin: bool) -> Result<Self, Error> {
         cust::init(CudaFlags::empty())?;
-        // try_init (not init) so it doesn't panic when the host binary also
-        // initialises a logger — happens in the statically-linked build where
-        // plugin and binary share one global logger.
-        let _ = env_logger::builder().filter_level(LevelFilter::Info).parse_default_env().try_init();
+        if dynamic_plugin || !keryx_plugin_api::tui_requested() {
+            init_logger();
+        }
         Ok(Self {
             specs: Vec::new(),
             _enabled: false,
@@ -285,4 +356,29 @@ impl WorkerSpec for CudaWorkerSpec {
     }
 }
 
-declare_plugin!(CudaPlugin, CudaPlugin::new, CudaOpt);
+#[cfg(test)]
+mod tui_panic_filter_tests {
+    use super::init_logger;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static FORWARDED: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn dso_panic_output_is_forwarded_only_in_classic_mode() {
+        std::panic::set_hook(Box::new(|_| {
+            FORWARDED.fetch_add(1, Ordering::SeqCst);
+        }));
+        init_logger();
+
+        keryx_plugin_api::set_tui_active(false);
+        let _ = std::panic::catch_unwind(|| panic!("classic panic probe"));
+        assert_eq!(FORWARDED.load(Ordering::SeqCst), 1);
+
+        keryx_plugin_api::set_tui_active(true);
+        let _ = std::panic::catch_unwind(|| panic!("dashboard panic probe"));
+        assert_eq!(FORWARDED.load(Ordering::SeqCst), 1);
+        keryx_plugin_api::set_tui_active(false);
+    }
+}
+
+declare_plugin!(CudaPlugin, CudaPlugin::new_dynamic, CudaOpt);

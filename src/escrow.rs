@@ -323,6 +323,8 @@ struct InFlightClaim {
     outpoints: Vec<(String, u32)>,
     /// DAA score at submission — drives the response timeout.
     submit_daa: u64,
+    /// Gross input amount before the fixed claim fee. Operational accounting only.
+    gross_sompi: u64,
 }
 
 impl EscrowWatcher {
@@ -377,6 +379,7 @@ impl EscrowWatcher {
             validation_unknown: 0,
         };
         watcher.rebuild_indexes();
+        watcher.publish_runtime_gauges();
         Ok(watcher)
     }
 
@@ -423,6 +426,7 @@ impl EscrowWatcher {
     /// Hold/release claim submission (node-version safety gate — grpc.rs GetInfoResponse).
     pub fn set_claims_held(&mut self, held: bool) {
         self.claims_held = held;
+        keryx_miner::runtime_stats::escrow_claims_held(held);
     }
 
     pub fn pubkey_hex(&self) -> String {
@@ -447,6 +451,7 @@ impl EscrowWatcher {
     pub fn handle_block(&mut self, block: &crate::proto::RpcBlock) -> Option<RpcTransaction> {
         let daa_score = block.header.as_ref()?.daa_score;
         self.last_daa_score = daa_score;
+        keryx_miner::runtime_stats::escrow_heartbeat(daa_score);
 
         // Release claims whose response never arrived so the queue cannot wedge.
         self.expire_in_flight(daa_score);
@@ -486,6 +491,7 @@ impl EscrowWatcher {
         // their coinbase UTXOs will never exist in the virtual UTXO set.
         // O(reds) via block_index instead of scanning all entries per red hash.
         if let Some(verbose) = &block.verbose_data {
+            let mut discarded_red = 0u64;
             for red_hash in &verbose.merge_set_reds_hashes {
                 let Some(indices) = self.block_index.get(red_hash).cloned() else { continue };
                 for i in indices {
@@ -497,10 +503,14 @@ impl EscrowWatcher {
                                 &entry.coinbase_txid[..16.min(entry.coinbase_txid.len())]
                             );
                             entry.slashed = true;
+                            discarded_red += 1;
                             self.mark_dirty();
                         }
                     }
                 }
+            }
+            if discarded_red != 0 {
+                keryx_miner::runtime_stats::escrow_discarded_red(discarded_red);
             }
         }
 
@@ -586,15 +596,48 @@ impl EscrowWatcher {
     /// not proven dead (entries solo-rejected as orphans are excluded — including them
     /// would inflate the figure with outpoints that will never pay).
     pub fn pending_escrow(&self) -> (u64, u64) {
-        let mut outputs = 0u64;
-        let mut sompi = 0u64;
+        let gauges = self.runtime_gauges();
+        let pending = (gauges.pending_live_outputs, gauges.pending_gross_sompi);
+        keryx_miner::runtime_stats::publish_escrow_gauges(gauges);
+        pending
+    }
+
+    /// Build the sanitized, numeric escrow gauge in the same scan used by `pending_escrow`.
+    /// No outpoint, address, key, file path, or peer-provided text crosses this boundary.
+    fn runtime_gauges(&self) -> keryx_miner::runtime_stats::EscrowGauges {
+        let mut gauges = keryx_miner::runtime_stats::EscrowGauges {
+            held: self.claims_held,
+            validation_in_progress: !self.validation_pending.is_empty(),
+            validation_pending_blocks: self.validation_pending.len() as u64,
+            in_flight_txs: self.in_flight.len() as u64,
+            last_seen_daa: self.last_daa_score,
+            ..Default::default()
+        };
         for e in &self.state.entries {
+            if !e.claimed && !e.slashed {
+                gauges.tracked_live_outputs += 1;
+                if self.last_daa_score >= e.confirm_daa.saturating_add(e.csv_window).saturating_add(10) {
+                    gauges.mature_outputs += 1;
+                    gauges.mature_gross_sompi = gauges.mature_gross_sompi.saturating_add(e.amount_sompi);
+                }
+            }
             if !e.claimed && !e.slashed && !e.orphan_slashed && e.orphan_retries == 0 {
-                outputs += 1;
-                sompi += e.amount_sompi;
+                gauges.pending_live_outputs += 1;
+                gauges.pending_gross_sompi = gauges.pending_gross_sompi.saturating_add(e.amount_sompi);
+            }
+            if !e.claimed && !e.slashed && (e.orphan_slashed || e.orphan_retries != 0) {
+                gauges.quarantined_outputs += 1;
             }
         }
-        (outputs, sompi)
+        for claim in self.in_flight.values() {
+            gauges.in_flight_outputs = gauges.in_flight_outputs.saturating_add(claim.outpoints.len() as u64);
+            gauges.in_flight_gross_sompi = gauges.in_flight_gross_sompi.saturating_add(claim.gross_sompi);
+        }
+        gauges
+    }
+
+    fn publish_runtime_gauges(&self) {
+        keryx_miner::runtime_stats::publish_escrow_gauges(self.runtime_gauges());
     }
 
     /// Release in-flight claims whose response never arrived (connection hiccup, node
@@ -615,6 +658,10 @@ impl EscrowWatcher {
                 txid,
                 CLAIM_RESPONSE_TIMEOUT_DAA,
                 claim.outpoints.len()
+            );
+            keryx_miner::runtime_stats::escrow_claim_timeout(
+                claim.outpoints.len() as u64,
+                claim.gross_sompi,
             );
             for (t, i) in &claim.outpoints {
                 self.in_flight_outpoints.remove(&format!("{}:{}", t, i));
@@ -637,6 +684,7 @@ impl EscrowWatcher {
         self.validation_pending = hashes.clone();
         self.validation_purged = 0;
         self.validation_unknown = 0;
+        keryx_miner::runtime_stats::escrow_validation_progress(self.validation_pending.len());
         if !self.validation_pending.is_empty() {
             info!(
                 "EscrowWatcher: validating {} block(s) against the node before claiming — ghost entries will be purged",
@@ -653,6 +701,7 @@ impl EscrowWatcher {
         if !self.validation_pending.remove(hash) {
             return;
         }
+        let mut discarded_ghost = 0u64;
         if !exists {
             if let Some(indices) = self.block_index.get(hash) {
                 for &i in indices {
@@ -660,11 +709,16 @@ impl EscrowWatcher {
                     if !e.claimed && !e.slashed {
                         e.slashed = true;
                         self.validation_purged += 1;
+                        discarded_ghost += 1;
                     }
                 }
             }
             self.mark_dirty();
         }
+        if discarded_ghost != 0 {
+            keryx_miner::runtime_stats::escrow_discarded_ghost(discarded_ghost);
+        }
+        keryx_miner::runtime_stats::escrow_validation_progress(self.validation_pending.len());
         self.finish_validation_if_done();
     }
 
@@ -678,6 +732,7 @@ impl EscrowWatcher {
             if self.validation_purged == 1 { "y" } else { "ies" },
             self.validation_unknown
         );
+        self.publish_runtime_gauges();
         self.maybe_flush();
     }
 
@@ -698,6 +753,7 @@ impl EscrowWatcher {
         };
         self.validation_pending.remove(&hash);
         self.validation_unknown += 1;
+        keryx_miner::runtime_stats::escrow_validation_progress(self.validation_pending.len());
         debug!("EscrowWatcher: block {} unknown to the node at boot — entries kept", hash);
         self.finish_validation_if_done();
         true
@@ -792,11 +848,17 @@ impl EscrowWatcher {
                 for (t, i) in &outpoints {
                     self.in_flight_outpoints.insert(format!("{}:{}", t, i));
                 }
-                self.in_flight.insert(claim_txid, InFlightClaim { outpoints, submit_daa: daa_score });
+                let output_count = outpoints.len() as u64;
+                self.in_flight.insert(
+                    claim_txid,
+                    InFlightClaim { outpoints, submit_daa: daa_score, gross_sompi: total },
+                );
+                keryx_miner::runtime_stats::escrow_claim_attempt(output_count, total);
                 Some(tx)
             }
             Err(e) => {
                 debug!("EscrowWatcher: failed to build claim TX: {}", e);
+                keryx_miner::runtime_stats::escrow_build_failed();
                 None
             }
         }
@@ -826,12 +888,18 @@ impl EscrowWatcher {
             self.in_flight_outpoints.remove(&format!("{}:{}", t, i));
         }
         let n_outputs = claim.outpoints.len();
+        let claim_gross_sompi = claim.gross_sompi;
 
         let mut outcome = SubmitResponseOutcome::Handled;
         match error {
             None => {
                 info!("EscrowWatcher: claim accepted ({} output(s), txid={})", n_outputs, claim_txid);
                 let amount_sompi = self.mark_entries_claimed(&claim.outpoints);
+                keryx_miner::runtime_stats::escrow_claim_accepted(
+                    n_outputs as u64,
+                    claim_gross_sompi,
+                    CLAIM_FEE_SOMPI,
+                );
                 outcome = SubmitResponseOutcome::Accepted { outputs: n_outputs as u64, amount_sompi };
             }
             // Claim TXs are deterministic (same inputs → same txid), so a retry of one that
@@ -843,6 +911,11 @@ impl EscrowWatcher {
                     n_outputs, claim_txid
                 );
                 let amount_sompi = self.mark_entries_claimed(&claim.outpoints);
+                keryx_miner::runtime_stats::escrow_claim_accepted(
+                    n_outputs as u64,
+                    claim_gross_sompi,
+                    CLAIM_FEE_SOMPI,
+                );
                 outcome = SubmitResponseOutcome::Accepted { outputs: n_outputs as u64, amount_sompi };
             }
             Some(msg) => {
@@ -852,6 +925,7 @@ impl EscrowWatcher {
                 let is_seq_lock = msg.contains("sequence lock");
                 let batch_rejected = n_outputs > 1;
                 let last_daa = self.last_daa_score;
+                let mut terminal_slashed_outputs = 0u64;
                 // Bisection step: one dead input orphans the whole batch, but most members
                 // are usually fine. Halve every member's cap and retry as smaller batches —
                 // valid entries re-group into accepted batches within log2(batch) rounds,
@@ -880,6 +954,7 @@ impl EscrowWatcher {
                             if e.orphan_retries >= MAX_ORPHAN_RETRIES {
                                 e.orphan_slashed = false;
                                 e.slashed = true;
+                                terminal_slashed_outputs += 1;
                                 debug!(
                                     "EscrowWatcher: coinbase={}[{}] slashed after {} orphan retries",
                                     t, i, e.orphan_retries
@@ -918,10 +993,24 @@ impl EscrowWatcher {
                     if batch_rejected { ", batch cap halved" } else { "" },
                     msg
                 );
+                let reject_kind = if is_orphan {
+                    keryx_miner::runtime_stats::EscrowRejectKind::Orphan
+                } else if is_seq_lock {
+                    keryx_miner::runtime_stats::EscrowRejectKind::SequenceLock
+                } else {
+                    keryx_miner::runtime_stats::EscrowRejectKind::Unknown
+                };
+                keryx_miner::runtime_stats::escrow_claim_rejected(
+                    reject_kind,
+                    n_outputs as u64,
+                    claim_gross_sompi,
+                    terminal_slashed_outputs,
+                );
             }
         }
         self.mark_dirty();
         self.maybe_flush();
+        self.publish_runtime_gauges();
         outcome
     }
 
@@ -1076,6 +1165,7 @@ impl EscrowWatcher {
         self.outpoint_set.insert(key);
         self.mark_dirty();
         self.maybe_flush();
+        self.publish_runtime_gauges();
     }
 
     fn save_state(&self) {
@@ -1083,9 +1173,15 @@ impl EscrowWatcher {
             Ok(json) => {
                 if let Err(e) = fs::write(&self.state_path, &json) {
                     warn!("EscrowWatcher: failed to save state: {}", e);
+                    keryx_miner::runtime_stats::escrow_persistence_result(false);
+                } else {
+                    keryx_miner::runtime_stats::escrow_persistence_result(true);
                 }
             }
-            Err(e) => warn!("EscrowWatcher: failed to serialize state: {}", e),
+            Err(e) => {
+                warn!("EscrowWatcher: failed to serialize state: {}", e);
+                keryx_miner::runtime_stats::escrow_persistence_result(false);
+            }
         }
     }
 }

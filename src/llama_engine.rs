@@ -32,6 +32,26 @@ type FreeFn = unsafe extern "C" fn(*mut c_void);
 // symbol (absent on older .so builds → the ownership gate below degrades to a no-op).
 type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
 
+/// Install a process-lifetime bridge over llama.cpp/ggml's native stderr logger. Older shipped
+/// sidecars already export these stable llama API symbols, so the host fix also protects them
+/// without requiring an immediate sidecar rebuild.
+unsafe fn install_native_log_bridge(lib: &Library) -> bool {
+    let get = lib
+        .get::<crate::native_llama_log::LogGet>(b"keryx_llama_log_get_v1\0")
+        .or_else(|_| lib.get::<crate::native_llama_log::LogGet>(b"llama_log_get\0"))
+        .ok()
+        .map(|symbol| *symbol);
+    let set = lib
+        .get::<crate::native_llama_log::LogSet>(b"keryx_llama_log_set_v1\0")
+        .or_else(|_| lib.get::<crate::native_llama_log::LogSet>(b"llama_log_set\0"))
+        .ok()
+        .map(|symbol| *symbol);
+    let (Some(get), Some(set)) = (get, set) else {
+        return false;
+    };
+    crate::native_llama_log::install(get, set)
+}
+
 const ABI: c_int = 2;
 
 struct Engine {
@@ -344,6 +364,16 @@ fn engine_lib() -> Option<&'static Library> {
             return None;
         }
     };
+    // Do this immediately after dlopen and before llama_backend_init/model load. If a foreign
+    // sidecar lacks the stable logging API, never invoke it while an alternate screen is active;
+    // the silent llama-server GPU fallback remains available instead.
+    if !unsafe { install_native_log_bridge(&loaded) } && crate::tui_active() {
+        log::warn!(
+            "llama engine: sidecar cannot coordinate native logging with the interactive dashboard — \
+             skipping the in-process route; use --no-tui for this legacy sidecar."
+        );
+        return None;
+    }
     if LIB.set(loaded).is_ok() {
         log::info!("llama engine: loaded {} (in-process llama.cpp engine).", so.display());
     }

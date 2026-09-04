@@ -28,6 +28,17 @@ type PickFn = unsafe extern "C" fn() -> c_int;
 type PickAbiFn = unsafe extern "C" fn() -> c_int;
 type DevicePciFn = unsafe extern "C" fn(c_int, *mut u32, *mut u32, *mut u32, *mut u32) -> bool;
 
+unsafe fn install_native_log_bridge(lib: *mut c_void) -> bool {
+    let get = sym::<crate::native_llama_log::LogGet>(lib, "keryx_llama_log_get_v1")
+        .or_else(|| sym::<crate::native_llama_log::LogGet>(lib, "llama_log_get"));
+    let set = sym::<crate::native_llama_log::LogSet>(lib, "keryx_llama_log_set_v1")
+        .or_else(|| sym::<crate::native_llama_log::LogSet>(lib, "llama_log_set"));
+    let (Some(get), Some(set)) = (get, set) else {
+        return false;
+    };
+    crate::native_llama_log::install(get, set)
+}
+
 const ABI: c_int = 2;
 const VK_ABI: c_int = 5; // bumped 4->5 at H5.1: keryx_llama_pom_mine gained the seed-words arg
 
@@ -137,6 +148,30 @@ unsafe fn sym<T: Copy>(lib: *mut c_void, name: &str) -> Option<T> {
     Some(std::mem::transmute_copy::<*mut c_void, T>(&p))
 }
 
+/// Open the Vulkan sidecar once and retain it for the process lifetime. Besides keeping every FFI
+/// pointer valid, this is required by the native log bridge: its saved downstream callback lives
+/// in this DSO and must never be invalidated by a probe-time `dlclose`.
+fn sidecar_lib(so: &std::path::Path) -> Option<*mut c_void> {
+    static LIB: OnceLock<usize> = OnceLock::new();
+    if let Some(address) = LIB.get() {
+        return Some(*address as *mut c_void);
+    }
+    let cso = CString::new(so.to_string_lossy().as_bytes()).ok()?;
+    let loaded = unsafe { libc::dlopen(cso.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    if loaded.is_null() {
+        return None;
+    }
+    match LIB.set(loaded as usize) {
+        Ok(()) => Some(loaded),
+        Err(_) => {
+            // Another startup thread published the same sidecar first. Drop only our redundant
+            // loader reference; the retained winning handle and every saved callback stay valid.
+            unsafe { libc::dlclose(loaded) };
+            LIB.get().map(|address| *address as *mut c_void)
+        }
+    }
+}
+
 // ── Discrete-GPU selection (issue #18) ──────────────────────────────────────────────────────
 // The model must NOT land on an integrated GPU (UMA system RAM → the miner exits/restart-loops).
 // A device index is only meaningful WITHIN the Vulkan instance that produced it: ggml enumerates
@@ -157,14 +192,12 @@ pub fn auto_device_allowlist_active() -> bool {
 
 pub fn pick_discrete_ggml_device() -> Option<i32> {
     let so = so_path()?;
-    let cso = CString::new(so.to_string_lossy().as_bytes()).ok()?;
     unsafe {
-        // Already loaded when the engine is active → same handle (refcounted); harmless otherwise.
-        let lib = libc::dlopen(cso.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-        if lib.is_null() {
+        let lib = sidecar_lib(&so)?;
+        if !install_native_log_bridge(lib) && crate::tui_active() {
             return None;
         }
-        let result = (|| -> Option<i32> {
+        (|| -> Option<i32> {
             let pick: PickFn = sym(lib, "keryx_vk_pick_discrete_device")?;
             if auto_device_allowlist_active() {
                 // A pre-allowlist sidecar still exports the old picker but considers every Vulkan
@@ -177,9 +210,7 @@ pub fn pick_discrete_ggml_device() -> Option<i32> {
             }
             let d = pick();
             (d >= 0).then_some(d)
-        })();
-        libc::dlclose(lib);
-        result
+        })()
     }
 }
 
@@ -191,13 +222,12 @@ pub fn ggml_device_pci(device: i32) -> Option<(u32, u32, u32, u32)> {
         return None;
     }
     let so = so_path()?;
-    let cso = CString::new(so.to_string_lossy().as_bytes()).ok()?;
     unsafe {
-        let lib = libc::dlopen(cso.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-        if lib.is_null() {
+        let lib = sidecar_lib(&so)?;
+        if !install_native_log_bridge(lib) && crate::tui_active() {
             return None;
         }
-        let result = (|| -> Option<(u32, u32, u32, u32)> {
+        (|| -> Option<(u32, u32, u32, u32)> {
             let picker_abi: PickAbiFn = sym(lib, "keryx_vk_picker_abi")?;
             if picker_abi() < 1 {
                 return None;
@@ -205,9 +235,7 @@ pub fn ggml_device_pci(device: i32) -> Option<(u32, u32, u32, u32)> {
             let pci: DevicePciFn = sym(lib, "keryx_vk_device_pci")?;
             let (mut domain, mut bus, mut dev, mut function) = (0, 0, 0, 0);
             pci(device, &mut domain, &mut bus, &mut dev, &mut function).then_some((domain, bus, dev, function))
-        })();
-        libc::dlclose(lib);
-        result
+        })()
     }
 }
 
@@ -253,19 +281,21 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
         dedication_attempt.armed = true;
     }
     let Some(so) = so_path() else { return false };
-    let cso = match CString::new(so.to_string_lossy().as_bytes()) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
     unsafe {
-        let lib = libc::dlopen(cso.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-        if lib.is_null() {
+        let Some(lib) = sidecar_lib(&so) else {
             let err = libc::dlerror();
             let msg = if err.is_null() { "?".into() } else { CStr::from_ptr(err).to_string_lossy().into_owned() };
             log::warn!(
                 "llama-vk engine: dlopen({}) failed: {} — the llama-server GPU route and any explicitly enabled deprecated CPU fallback remain available.",
                 so.display(),
                 msg
+            );
+            return false;
+        };
+        if !install_native_log_bridge(lib) && crate::tui_active() {
+            log::warn!(
+                "llama-vk engine: sidecar cannot coordinate native logging with the interactive \
+                 dashboard — skipping the in-process route; use --no-tui for this legacy sidecar."
             );
             return false;
         }

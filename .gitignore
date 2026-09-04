@@ -2,6 +2,7 @@
 /target-cuda
 models/
 escrow.key
+escrow.cert
 escrow_state.json
 .env
 

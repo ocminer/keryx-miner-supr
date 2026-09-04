@@ -15,4 +15,11 @@ cd `dirname $0`
 # so this is only a belt-and-suspenders hint for the dynamic loader.
 export LD_LIBRARY_PATH="$(dirname $0):${LD_LIBRARY_PATH:-}:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu"
 
-./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) $@ 2>&1 | tee $CUSTOM_LOG_BASENAME.log
+CLI_ARGS="$(< "$CUSTOM_CONFIG_FILENAME") $*"
+case " $CLI_ARGS " in
+  *" --no-tui "*) ;;
+  *) CLI_ARGS="--no-tui $CLI_ARGS" ;;
+esac
+# Intentional word splitting: HiveOS stores the complete miner command line in this config file.
+# shellcheck disable=SC2086
+./$CUSTOM_MINERBIN $CLI_ARGS 2>&1 | tee "$CUSTOM_LOG_BASENAME.log"

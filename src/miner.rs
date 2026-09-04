@@ -82,6 +82,7 @@ impl Drop for InferencePauseGuard {
         debug_assert!(state.inflight > 0, "OPoI inference pause counter underflow");
         state.inflight = state.inflight.saturating_sub(1);
         if state.inflight == 0 {
+            keryx_miner::runtime_stats::inference_pause_ended();
             if let Some(control) = state.current_miner.as_ref().and_then(Weak::upgrade) {
                 control.resume_stratum_job();
             }
@@ -126,7 +127,11 @@ impl Drop for InflightProofPermit {
 /// a notify arrives between a detached task deciding to pause and its GPU call beginning.
 pub fn begin_inference_pause() -> InferencePauseGuard {
     let mut state = lock_inference_pause_state();
+    let was_idle = state.inflight == 0;
     state.inflight = state.inflight.saturating_add(1);
+    if was_idle {
+        keryx_miner::runtime_stats::inference_pause_started();
+    }
     if let Some(control) = state.current_miner.as_ref().and_then(Weak::upgrade) {
         control.active_flag.store(true, Ordering::SeqCst);
         let _ = control.block_channel.send(None);
@@ -263,7 +268,7 @@ pub struct DeviceRate {
 }
 
 /// Live hashrate snapshot, refreshed by the logger every LOG_RATE. Read by the stats API.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct MinerStats {
     pub total_hashrate: f64,
     pub devices: Vec<DeviceRate>,
@@ -342,11 +347,24 @@ const LOG_RATE: Duration = Duration::from_secs(10);
 
 impl MinerManager {
     pub fn new(send_channel: Sender<BlockSeed>, n_cpus: Option<u16>, manager: &PluginManager) -> Self {
+        Self::new_with_stats(send_channel, n_cpus, manager, Arc::new(Mutex::new(MinerStats::default())))
+    }
+
+    /// Construct a mining session that publishes into a process-lifetime statistics snapshot.
+    ///
+    /// Pool reconnects replace `MinerManager`, but the API and TUI must keep observing the same
+    /// `Arc`; otherwise their uptime/history survives while their hashrate silently freezes on the
+    /// manager from the first connection.
+    pub fn new_with_stats(
+        send_channel: Sender<BlockSeed>,
+        n_cpus: Option<u16>,
+        manager: &PluginManager,
+        stats: Arc<Mutex<MinerStats>>,
+    ) -> Self {
         register_freeze_handler();
         let hashes_tried = Arc::new(AtomicU64::new(0));
         let hashes_by_worker = Arc::new(Mutex::new(HashMap::<String, Arc<AtomicU64>>::new()));
         let opoi_challenge_active = Arc::new(AtomicBool::new(false));
-        let stats = Arc::new(Mutex::new(MinerStats::default()));
         let (send, recv) = watch::channel(None);
         let send = Arc::new(send);
         let pause_control = Arc::new(InferencePauseControl {
@@ -501,13 +519,7 @@ impl MinerManager {
     ) -> MinerHandler {
         std::thread::spawn(move || {
             let no_winner = spec.no_winner();
-            #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
-            let worker_ordinal = spec
-                .id()
-                .strip_prefix('#')
-                .and_then(|s| s.split_whitespace().next())
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0);
+            let worker_ordinal = crate::gpu_health::ordinal_from_label(&spec.id());
             #[cfg(feature = "pom-opencl")]
             let opencl_device_id = spec.opencl_device_id();
             let mut box_ = spec.build();
@@ -648,7 +660,7 @@ impl MinerManager {
                         // NVIDIA (CUDA) + Apple Silicon (Metal): per-device v4 grind. Device id = the
                         // worker's "#N (name)" label (per-device MINERS map → no CUDA_VISIBLE_DEVICES).
                         #[cfg(any(feature = "pom-opencl", all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
-                        let wdid = worker_ordinal;
+                        let wdid = worker_ordinal.unwrap_or(0);
                         // Batch: env override wins, else SM-derived per this card (PR #37) — keeps a
                         // launch inside the ~100ms template window at 10 BPS even on small cards.
                         #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
@@ -880,7 +892,7 @@ impl MinerManager {
                                                         if let crate::pow::BlockSeed::PartialBlock { device_id, .. } =
                                                             &mut block_seed
                                                         {
-                                                            *device_id = wdid;
+                                                            *device_id = worker_ordinal;
                                                         }
                                                         match tx.blocking_send(block_seed.clone()) {
                                                             Ok(()) => block_seed.report_block(),
@@ -912,7 +924,7 @@ impl MinerManager {
                                 // Tag the share with the GPU that found it so pool accept/reject is
                                 // attributed per-card (the A: / R: columns).
                                 if let crate::pow::BlockSeed::PartialBlock { device_id, .. } = &mut block_seed {
-                                    *device_id = wdid;
+                                    *device_id = worker_ordinal;
                                 }
                                 match send_channel.blocking_send(block_seed.clone()) {
                                     Ok(()) => block_seed.report_block(),
@@ -947,7 +959,7 @@ impl MinerManager {
                                                     if let crate::pow::BlockSeed::PartialBlock { device_id, .. } =
                                                         &mut block_seed
                                                     {
-                                                        *device_id = wdid;
+                                                        *device_id = worker_ordinal;
                                                     }
                                                     match tx.blocking_send(block_seed.clone()) {
                                                         Ok(()) => block_seed.report_block(),
@@ -995,7 +1007,10 @@ impl MinerManager {
 
                     gpu_work.copy_output_to(&mut nonces)?;
                     if nonces[0] != no_winner {
-                        if let Some(block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
+                        if let Some(mut block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
+                            if let BlockSeed::PartialBlock { device_id, .. } = &mut block_seed {
+                                *device_id = worker_ordinal;
+                            }
                             match send_channel.blocking_send(block_seed.clone()) {
                                 Ok(()) => block_seed.report_block(),
                                 // "block_seed" is a share at pool difficulty (or a real block when it
@@ -1293,6 +1308,50 @@ impl MinerManager {
             if let (Some(w), Some(e)) = (total_power_w, total_eff) {
                 info!("Rig efficiency: {:.1} W total, {:.3} MH/s/W", w, e);
             }
+            // Publish a backend-neutral copy for optional frontends. This uses only values already
+            // sampled for the normal ten-second log tick; no extra NVML/sysfs calls touch mining.
+            let runtime_devices = devices
+                .iter()
+                .enumerate()
+                .map(|(fallback_index, device)| {
+                    let index = crate::gpu_health::ordinal_from_label(&device.label)
+                        .unwrap_or_else(|| u32::try_from(fallback_index).unwrap_or(u32::MAX));
+                    let (accepted, rejected) = crate::pow::device_share_counts(index);
+                    let health = device.health.as_ref();
+                    keryx_miner::runtime_stats::DeviceSnapshot {
+                        index,
+                        label: device.label.clone(),
+                        backend: if cfg!(feature = "pom-opencl") {
+                            "OpenCL"
+                        } else if cfg!(all(target_os = "macos", feature = "pom-metal")) {
+                            "Metal"
+                        } else {
+                            "CUDA"
+                        }
+                        .to_string(),
+                        hashrate_hs: device.hashrate,
+                        temp_c: health.and_then(|sample| sample.temp_c),
+                        hotspot_c: None,
+                        fan_pct: health.and_then(|sample| sample.fan_pct),
+                        power_w: health.and_then(|sample| sample.power_w),
+                        core_mhz: health.and_then(|sample| sample.core_mhz),
+                        mem_mhz: health.and_then(|sample| sample.mem_mhz),
+                        vram_used_mb: health.and_then(|sample| sample.vram_used_mb),
+                        vram_total_mb: health.and_then(|sample| sample.vram_total_mb),
+                        efficiency_mhs_per_w: device.efficiency_mhs_per_w,
+                        accepted,
+                        rejected,
+                    }
+                })
+                .collect();
+            keryx_miner::runtime_stats::publish_mining_snapshot(
+                total,
+                total_power_w,
+                total_eff,
+                preparing,
+                challenge_active,
+                runtime_devices,
+            );
             // Publish the snapshot for the stats API (hashrates are hashes/sec).
             if let Ok(mut s) = stats.lock() {
                 s.total_hashrate = total;
@@ -1423,7 +1482,7 @@ mod inference_pause_tests {
             nonce_fixed: 0,
             hash: None,
             pom_proof: Vec::new(),
-            device_id: 0,
+            device_id: None,
         };
         WorkerCommand::Job(Box::new(pow::State::new(id, seed).expect("test job must be valid")))
     }

@@ -240,6 +240,13 @@ pub struct Opt {
     #[clap(short, long, help = "Enable debug logging level")]
     pub debug: bool,
 
+    #[clap(
+        long = "no-tui",
+        help = "Disable the interactive terminal dashboard and retain the classic line-oriented logs. The dashboard is selected automatically only on an interactive terminal; use this flag for HiveOS, mmpOS, log collectors and supervisors.",
+        help_heading = "Mining"
+    )]
+    pub no_tui: bool,
+
     #[clap(short = 'a', long = "mining-address", help = "The Keryx address for the miner reward")]
     pub mining_address: Option<String>,
 
@@ -545,5 +552,12 @@ mod escrow_dir_tests {
             let r = Opt::command().try_get_matches_from(vec!["keryx-miner", a, b]);
             assert!(r.is_err(), "{a} and {b} must conflict, but clap accepted them together");
         }
+    }
+
+    #[test]
+    fn no_tui_flag_is_exposed_and_parsed() {
+        use clap::Parser;
+        let opt = Opt::try_parse_from(["keryx-miner", "--no-tui"]).expect("--no-tui must be a valid flag");
+        assert!(opt.no_tui);
     }
 }

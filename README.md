@@ -157,6 +157,34 @@ LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64 \
 
 Add `--cuda-device N` to run a single GPU, a tier flag (`--very-high`, …) to pin all cards to one tier, or `--force-model` to set a model per card (see [Model tiers](#model-tiers) below).
 
+### Interactive Matrix dashboard
+
+When standard input, output, and error are all attached to a real terminal, the miner opens its
+interactive dashboard automatically. The dark green Matrix-style presentation is deliberately
+lightweight: only borders, titles, and a small allowlist of static labels animate. Hashrates,
+temperatures, balances, endpoints, warnings, and other live values are never altered.
+
+The overview keeps the information a miner needs on one screen:
+
+- connection mode and health, runtime, current job, difficulty, shares, and SOLO blocks;
+- the Keryx logo, `powered by krx.suprnova.cc`, per-GPU hashrate, temperature, fan, power, clocks,
+  VRAM, efficiency, and accepted/rejected work;
+- GPU inference readiness, active work, queue depth, served/failed/delivered counters, latency, and
+  total PoW pause time;
+- in SOLO mode, the escrow claim worker heartbeat, claim activity, pending/accepted/lost outputs,
+  claimable/claimed KRX, persistence health, and service-bond state;
+- a bounded, sanitized event stream. Private payout identities, credentials, local paths, request
+  identifiers, and transaction identifiers are not shown in the dashboard.
+
+Controls are shown in the footer: `1`/`2`/`3` select Overview, GPUs, or Inference; arrow keys move
+between pages and scroll events; `L` expands the event view; `M` toggles motion; `?` opens help;
+press `Q` twice deliberately to quit. `Ctrl-C` also exits after restoring the terminal.
+
+Use `--no-tui` for HiveOS, mmpOS, Docker, log collectors, or the original line-oriented output.
+The supplied headless launchers add it automatically. The dashboard also stays off when streams are
+redirected, `TERM=dumb`, or `KERYX_TUI=off`. Set `KERYX_TUI_MOTION=off` to keep the dashboard but
+disable animation, or `NO_COLOR=1` for monochrome rendering.
+
 ### Overclocking & power control (built in — no external tool needed)
 
 The miner applies per-GPU clock locks, power limits and fan speed itself via NVML,

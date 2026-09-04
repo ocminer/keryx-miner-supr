@@ -35,7 +35,7 @@ use tokio::sync::{
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::{PollSendError, PollSender};
-use tonic::{transport::Channel as TonicChannel, Streaming};
+use tonic::{transport::{Channel as TonicChannel, Endpoint}, Streaming};
 
 static EXTRA_DATA: &str = concat!(env!("CARGO_PKG_VERSION"), "/", env!("PACKAGE_COMPILE_TIME"));
 type BlockHandle = JoinHandle<Result<(), PollSendError<KaspadMessage>>>;
@@ -99,7 +99,6 @@ impl BoundedAiRequestQueue {
         self.entries.iter()
     }
 
-    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -176,12 +175,26 @@ impl BoundedAiSeen {
 /// template request consumes it; `poll_ready` returns true only on the Running -> Ready edge.
 struct ChallengeInference {
     challenge: String,
-    receiver: Option<oneshot::Receiver<Option<String>>>,
-    result: Option<Option<String>>,
+    receiver: Option<oneshot::Receiver<(
+        Option<String>,
+        keryx_miner::runtime_stats::InferenceAttempt,
+    )>>,
+    result: Option<
+        Result<
+            (Option<String>, keryx_miner::runtime_stats::InferenceAttempt),
+            (),
+        >,
+    >,
 }
 
 impl ChallengeInference {
-    fn running(challenge: String, receiver: oneshot::Receiver<Option<String>>) -> Self {
+    fn running(
+        challenge: String,
+        receiver: oneshot::Receiver<(
+            Option<String>,
+            keryx_miner::runtime_stats::InferenceAttempt,
+        )>,
+    ) -> Self {
         Self { challenge, receiver: Some(receiver), result: None }
     }
 
@@ -193,9 +206,9 @@ impl ChallengeInference {
             return false;
         };
         let result = match receiver.try_recv() {
-            Ok(result) => result,
+            Ok(result) => Ok(result),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => None,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err(()),
         };
         self.receiver = None;
         self.result = Some(result);
@@ -226,9 +239,13 @@ pub struct KeryxdHandler {
     /// Used by poll_inference to register the escrow outpoint after a successful AiResponse.
     ai_request_txids: HashMap<AiRequestKey, (String, u64)>,
 
-    /// In-flight SLM inference task: (full key, request_hash, result_receiver).
-    /// None result means inference failed (model not ready or empty output) — skip IPFS upload.
-    inference_rx: Option<(AiRequestKey, [u8; 32], oneshot::Receiver<Option<String>>)>,
+    /// In-flight SLM inference task: (full key, request_hash, result + stats-attempt receiver).
+    /// The attempt remains live through IPFS + submission, making success/failure exactly-once.
+    inference_rx: Option<(
+        AiRequestKey,
+        [u8; 32],
+        oneshot::Receiver<(Option<String>, keryx_miner::runtime_stats::InferenceAttempt)>,
+    )>,
 
     /// In-flight or completed inference for a node-issued challenge. Completion is edge-triggered
     /// so the 200 ms timer emits one, not 5-per-second, GetBlockTemplate refresh.
@@ -269,6 +286,10 @@ pub struct KeryxdHandler {
 
     /// Last rendered service-bond status — logged only on change. (upstream 777f2cc)
     strike_status: Option<String>,
+
+    /// Generation token for process-wide display state. A dropped prior connection cannot mark a
+    /// newer solo session offline.
+    runtime_generation: u64,
 }
 
 #[async_trait(?Send)]
@@ -356,6 +377,7 @@ impl KeryxdHandler {
             }
             None => (None, None),
         };
+        keryx_miner::runtime_stats::escrow_enabled(escrow_watcher.is_some());
 
         let service_identity = match crate::escrow::service_identity_hex(&miner_address) {
             Ok(id) => Some(id),
@@ -365,15 +387,47 @@ impl KeryxdHandler {
             }
         };
 
-        let mut client = RpcClient::connect(address).await?;
+        let endpoint: Endpoint = address.try_into().map_err(Into::into)?;
+        let endpoint_label = endpoint.uri().to_string();
+        let runtime_generation = keryx_miner::runtime_stats::begin_connection(
+            keryx_miner::runtime_stats::MiningMode::Solo,
+            &endpoint_label,
+            0,
+        );
+        let connect_started = std::time::Instant::now();
+        let mut client = match RpcClient::connect(endpoint).await {
+            Ok(client) => client,
+            Err(error) => {
+                keryx_miner::runtime_stats::connection_lost(runtime_generation, "Solo node connection failed");
+                return Err(error.into());
+            }
+        };
         // Outbound message channel to the node. ALL client->node messages share this:
         // mining (submit_block, GetBlockTemplate) AND OPoI traffic (per-block GetBlock,
         // escrow submit_transaction). With a capacity of 2 the OPoI traffic could fill the
         // buffer and block GetBlockTemplate, stalling template delivery → the GPU sits idle
         // between blocks. A large buffer keeps the mining requests from queuing behind OPoI.
         let (send_channel, recv) = mpsc::channel(1024);
-        send_channel.send(GetInfoRequestMessage {}.into()).await?;
-        let stream = client.message_stream(ReceiverStream::new(recv)).await?.into_inner();
+        if let Err(error) = send_channel.send(GetInfoRequestMessage {}.into()).await {
+            keryx_miner::runtime_stats::connection_lost(runtime_generation, "Solo node connection failed");
+            return Err(error.into());
+        }
+        let stream = match client.message_stream(ReceiverStream::new(recv)).await {
+            Ok(stream) => stream.into_inner(),
+            Err(error) => {
+                keryx_miner::runtime_stats::connection_lost(runtime_generation, "Solo node connection failed");
+                return Err(error.into());
+            }
+        };
+        keryx_miner::runtime_stats::connection_established(
+            runtime_generation,
+            Some(connect_started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        );
+        keryx_miner::runtime_stats::set_connection_inference_queue(
+            runtime_generation,
+            0,
+            AI_REQUEST_QUEUE_CAPACITY,
+        );
         let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone());
         Ok(Box::new(Self {
             client,
@@ -400,6 +454,7 @@ impl KeryxdHandler {
             last_pending_escrow: None,
             last_strike_poll: std::time::Instant::now() - std::time::Duration::from_secs(55),
             strike_status: None,
+            runtime_generation,
         }))
     }
 
@@ -469,18 +524,21 @@ impl KeryxdHandler {
         if let Some(challenge) = self.challenge_inference.as_mut() {
             challenge.poll_ready();
         }
+        let mut completed_attempt = None;
         let inference_result = match self.challenge_inference.take() {
             Some(mut challenge) => match challenge.result.take() {
-                Some(Some(text)) => {
+                Some(Ok((Some(text), runtime_attempt))) if !text.is_empty() => {
                     // challenge_str = "model_id_hex:nonce_hex"
                     let mut parts = challenge.challenge.splitn(2, ':');
                     let model_id_hex = parts.next().unwrap_or("");
                     let nonce_hex_c = parts.next().unwrap_or("");
                     info!("OPoI: sending challenge response model={:.8}", model_id_hex);
+                    keryx_miner::runtime_stats::record_inference_prepared();
+                    completed_attempt = Some((runtime_attempt, text.split_whitespace().count()));
                     // Response format: "model_id_hex:nonce_hex:result_text"
                     format!("{}:{}:{}", model_id_hex, nonce_hex_c, text)
                 }
-                Some(None) => {
+                Some(Ok((Some(_), _))) | Some(Ok((None, _))) | Some(Err(())) => {
                     warn!("OPoI: challenge inference failed — sending empty result, node will re-challenge");
                     String::new()
                 }
@@ -491,7 +549,17 @@ impl KeryxdHandler {
             },
             None => String::new(),
         };
-        self.client_send(GetBlockTemplateRequestMessage { pay_address, extra_data, inference_result }).await
+        let sent = self.client_send(GetBlockTemplateRequestMessage { pay_address, extra_data, inference_result }).await;
+        if let Some((mut attempt, tokens)) = completed_attempt {
+            if sent.is_ok() {
+                // The response is now queued on the node transport. There is no response-specific
+                // acknowledgement in this RPC, so `delivered` intentionally remains unknown.
+                attempt.served(tokens);
+            } else {
+                attempt.failed();
+            }
+        }
+        sent
     }
 
     /// Preserve the historical 16-hex-character operator label without using it as identity.
@@ -527,6 +595,9 @@ impl KeryxdHandler {
             SeenInsert::Duplicate => return false,
             SeenInsert::AllEntriesProtected => {
                 warn!("OPoI: replay cache is full of live requests — dropping newest AiRequest");
+                keryx_miner::runtime_stats::record_inference_busy_request(
+                    keryx_miner::runtime_stats::InferenceKind::SoloRequest,
+                );
                 return false;
             }
             SeenInsert::Inserted { evicted } => {
@@ -544,8 +615,16 @@ impl KeryxdHandler {
                 AI_REQUEST_QUEUE_CAPACITY,
                 Self::request_log_id(&evicted.request_hash)
             );
+            keryx_miner::runtime_stats::record_inference_busy_request(
+                keryx_miner::runtime_stats::InferenceKind::SoloRequest,
+            );
             self.finish_ai_request(evicted.key, false);
         }
+        keryx_miner::runtime_stats::set_connection_inference_queue(
+            self.runtime_generation,
+            self.ai_request_queue.len(),
+            AI_REQUEST_QUEUE_CAPACITY,
+        );
         true
     }
 
@@ -743,33 +822,55 @@ impl KeryxdHandler {
             return false;
         }
         while let Some(request) = self.ai_request_queue.pop_front() {
+            keryx_miner::runtime_stats::set_connection_inference_queue(
+                self.runtime_generation,
+                self.ai_request_queue.len(),
+                AI_REQUEST_QUEUE_CAPACITY,
+            );
             let QueuedAiRequest { key, request_hash, model_id, prompt, max_tokens } = request;
             let log_id = Self::request_log_id(&request_hash);
             // Second guard: re-check readiness at execution time (files could have been deleted).
             if !keryx_miner::slm::model_serveable(&model_id) {
                 log::error!("OPoI: model became unavailable after queuing id={} — discarding request", log_id);
+                keryx_miner::runtime_stats::record_inference_failed_request(
+                    keryx_miner::runtime_stats::InferenceKind::SoloRequest,
+                );
                 self.finish_ai_request(key, false);
                 continue;
             }
             info!("OPoI: spawning SLM inference (max_tokens={})", max_tokens);
-            let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
+            let (tx_done, rx_done) = oneshot::channel::<(
+                Option<String>,
+                keryx_miner::runtime_stats::InferenceAttempt,
+            )>();
             let task_id = log_id;
+            let mut runtime_attempt = keryx_miner::runtime_stats::begin_inference(
+                keryx_miner::runtime_stats::InferenceKind::SoloRequest,
+                Some(&model_id),
+            );
             tokio::task::spawn_blocking(move || {
                 // Acquire a concrete card first, then atomically stop whichever MinerManager is
                 // current (including one created after a reconnect) before entering GPU code.
-                let result = keryx_miner::slm::acquire_inference_card(
+                let result = match keryx_miner::slm::acquire_inference_card(
                     &model_id,
                     keryx_miner::slm::DEFAULT_INFERENCE_DEADLINE_MS,
-                )
-                .and_then(|lease| {
-                    let gpu = lease.gpu();
-                    let _pause = crate::miner::begin_inference_pause();
-                    keryx_miner::slm::load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens)
-                });
+                ) {
+                    Some(lease) => {
+                        let gpu = lease.gpu();
+                        runtime_attempt.set_gpu(gpu);
+                        let _pause = crate::miner::begin_inference_pause();
+                        keryx_miner::slm::load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens)
+                    }
+                    None => {
+                        runtime_attempt.busy();
+                        None
+                    }
+                };
                 if result.is_none() {
                     log::warn!("OPoI: inference returned no result for id={} — AiResponse will be skipped", task_id);
+                    runtime_attempt.failed();
                 }
-                let _ = tx_done.send(result);
+                let _ = tx_done.send((result, runtime_attempt));
             });
             self.inference_rx = Some((key, request_hash, rx_done));
             return true;
@@ -785,7 +886,7 @@ impl KeryxdHandler {
             return false;
         };
         let log_id = Self::request_log_id(&request_hash);
-        let result_opt = match rx.try_recv() {
+        let (result_opt, mut runtime_attempt) = match rx.try_recv() {
             Ok(result) => result,
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                 self.inference_rx = Some((key, request_hash, rx));
@@ -816,15 +917,18 @@ impl KeryxdHandler {
             Ok(Ok(cid)) => cid,
             Ok(Err(e)) => {
                 warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e);
+                runtime_attempt.failed();
                 self.finish_ai_request(key, false);
                 return true;
             }
             Err(e) => {
                 warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e);
+                runtime_attempt.failed();
                 self.finish_ai_request(key, false);
                 return true;
             }
         };
+        keryx_miner::runtime_stats::record_inference_prepared();
 
         let challenge_window_end = self.last_known_daa + 1000;
         let response_length = result.split_whitespace().count() as u32;
@@ -873,9 +977,11 @@ impl KeryxdHandler {
         };
         if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx)).await {
             warn!("OPoI: failed to send AiResponse tx: {}", e);
+            runtime_attempt.failed();
             self.finish_ai_request(key, false);
             return true;
         }
+        runtime_attempt.served(response_length as usize);
 
         // Register inference escrow outpoint for auto-claim after the challenge window.
         if let Some((txid, inference_reward)) = self.finish_ai_request(key, true) {
@@ -894,6 +1000,18 @@ impl KeryxdHandler {
         let strike = resp.strikes.iter().find(|s| s.miner.eq_ignore_ascii_case(me));
         let suspension = resp.suspended.iter().find(|s| s.miner.eq_ignore_ascii_case(me));
         let burns: Vec<_> = resp.pending_burns.iter().filter(|b| b.miner.eq_ignore_ascii_case(me)).collect();
+        let consecutive_misses = strike.map_or(0, |entry| entry.consecutive_misses as u64);
+        let last_strike_daa = strike.map(|entry| entry.last_strike_daa_score);
+        let burned_claims: u64 = burns.iter().map(|entry| entry.burned_claims as u64).sum();
+        let burned_sompi: u64 = burns.iter().map(|entry| entry.burned_sompi).sum();
+        let suspended_until_daa = suspension.map(|entry| entry.until_daa_score);
+        keryx_miner::runtime_stats::service_bond_update(
+            consecutive_misses,
+            last_strike_daa,
+            burned_claims,
+            burned_sompi,
+            suspended_until_daa,
+        );
         let status = if strike.is_none() && suspension.is_none() && burns.is_empty() {
             "clear".to_string()
         } else {
@@ -941,7 +1059,10 @@ impl KeryxdHandler {
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
                         self.report_pending_escrow();
                         if let Some(tx) = claim_tx {
-                            self.client_send(KaspadMessage::submit_transaction(tx)).await?;
+                            if let Err(error) = self.client_send(KaspadMessage::submit_transaction(tx)).await {
+                                keryx_miner::runtime_stats::escrow_transport_failed();
+                                return Err(Box::new(error));
+                            }
                         }
                     } else {
                         // Transactions absent — fetch the full block from the node.
@@ -954,12 +1075,23 @@ impl KeryxdHandler {
             }
             Payload::NewBlockTemplateNotification(_) => self.client_get_block_template().await?,
             Payload::GetServiceStrikesResponse(resp) => match resp.error.as_ref() {
-                Some(e) => warn!("service-bond status unavailable: {}", e.message),
+                Some(e) => {
+                    keryx_miner::runtime_stats::service_bond_unavailable();
+                    warn!("service-bond status unavailable: {}", e.message)
+                }
                 None => self.report_service_strikes(&resp),
             },
             Payload::GetBlockTemplateResponse(template) => {
                 // Track DAA score for challenge_window_end computation.
-                if let Some(daa) = template.block.as_ref().and_then(|b| b.header.as_ref()).map(|h| h.daa_score) {
+                let template_daa = template.block.as_ref().and_then(|b| b.header.as_ref()).map(|h| h.daa_score);
+                if template.block.is_some() {
+                    keryx_miner::runtime_stats::record_job(
+                        self.runtime_generation,
+                        template_daa,
+                        Some(template.is_synced),
+                    );
+                }
+                if let Some(daa) = template_daa {
                     if daa > self.last_known_daa {
                         self.last_known_daa = daa;
                     }
@@ -986,22 +1118,43 @@ impl KeryxdHandler {
                                 );
                                 let prompt =
                                     format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
-                                let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
+                                let (tx_done, rx_done) = oneshot::channel::<(
+                                    Option<String>,
+                                    keryx_miner::runtime_stats::InferenceAttempt,
+                                )>();
+                                let mut runtime_attempt = keryx_miner::runtime_stats::begin_inference(
+                                    keryx_miner::runtime_stats::InferenceKind::SoloChallenge,
+                                    Some(&model_id),
+                                );
                                 tokio::task::spawn_blocking(move || {
-                                    let result = keryx_miner::slm::acquire_inference_card(
+                                    let result = match keryx_miner::slm::acquire_inference_card(
                                         &model_id,
                                         keryx_miner::slm::DEFAULT_INFERENCE_DEADLINE_MS,
-                                    )
-                                    .and_then(|lease| {
-                                        let gpu = lease.gpu();
-                                        let _pause = crate::miner::begin_inference_pause();
-                                        keryx_miner::slm::load_and_run_inference_on(gpu, &model_id, &prompt, 64)
-                                    });
-                                    let _ = tx_done.send(result);
+                                    ) {
+                                        Some(lease) => {
+                                            let gpu = lease.gpu();
+                                            runtime_attempt.set_gpu(gpu);
+                                            let _pause = crate::miner::begin_inference_pause();
+                                            keryx_miner::slm::load_and_run_inference_on(
+                                                gpu, &model_id, &prompt, 64,
+                                            )
+                                        }
+                                        None => {
+                                            runtime_attempt.busy();
+                                            None
+                                        }
+                                    };
+                                    if result.as_ref().map_or(true, String::is_empty) {
+                                        runtime_attempt.failed();
+                                    }
+                                    let _ = tx_done.send((result, runtime_attempt));
                                 });
                                 self.challenge_inference = Some(ChallengeInference::running(challenge, rx_done));
                             } else {
                                 warn!("OPoI: challenge for unready model={:.8} — cannot respond", model_id_hex);
+                                keryx_miner::runtime_stats::record_inference_failed_request(
+                                    keryx_miner::runtime_stats::InferenceKind::SoloChallenge,
+                                );
                             }
                         }
                     }
@@ -1075,7 +1228,10 @@ impl KeryxdHandler {
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
                         self.report_pending_escrow();
                         if let Some(tx) = claim_tx {
-                            self.client_send(KaspadMessage::submit_transaction(tx)).await?;
+                            if let Err(error) = self.client_send(KaspadMessage::submit_transaction(tx)).await {
+                                keryx_miner::runtime_stats::escrow_transport_failed();
+                                return Err(Box::new(error));
+                            }
                         }
                     }
                 }
@@ -1094,10 +1250,12 @@ impl KeryxdHandler {
                 match res.error {
                     None => {
                         stats.accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        keryx_miner::runtime_stats::record_solo_block_accepted();
                         info!("block submitted successfully!");
                     }
                     Some(e) => {
                         stats.rejected_other.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        keryx_miner::runtime_stats::record_solo_block_rejected();
                         warn!("Failed submitting block: {:?}", e);
                     }
                 }
@@ -1203,6 +1361,11 @@ impl KeryxdHandler {
 
 impl Drop for KeryxdHandler {
     fn drop(&mut self) {
+        keryx_miner::runtime_stats::record_inference_abandoned_requests(
+            keryx_miner::runtime_stats::InferenceKind::SoloRequest,
+            self.ai_request_queue.len(),
+        );
+        keryx_miner::runtime_stats::connection_lost(self.runtime_generation, "Solo node connection closed");
         self.block_handle.abort();
     }
 }
@@ -1310,16 +1473,31 @@ mod grpc_tests {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let mut challenge = ChallengeInference::running("model:nonce".to_string(), receiver);
         assert!(!challenge.poll_ready());
-        sender.send(Some("answer".to_string())).unwrap();
+        let mut attempt = keryx_miner::runtime_stats::begin_inference(
+            keryx_miner::runtime_stats::InferenceKind::SoloChallenge,
+            None,
+        );
+        attempt.served(1);
+        sender.send((Some("answer".to_string()), attempt)).unwrap();
         assert!(challenge.poll_ready());
         assert!(!challenge.poll_ready(), "latched completion must not request another template");
-        assert_eq!(challenge.result.as_ref().and_then(|result| result.as_deref()), Some("answer"));
+        assert_eq!(
+            challenge
+                .result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|(result, _)| result.as_deref()),
+            Some("answer")
+        );
 
-        let (sender, receiver) = tokio::sync::oneshot::channel::<Option<String>>();
+        let (sender, receiver) = tokio::sync::oneshot::channel::<(
+            Option<String>,
+            keryx_miner::runtime_stats::InferenceAttempt,
+        )>();
         let mut dropped = ChallengeInference::running("model:nonce".to_string(), receiver);
         drop(sender);
         assert!(dropped.poll_ready());
         assert!(!dropped.poll_ready(), "closed completion must also emit only one edge");
-        assert_eq!(dropped.result, Some(None));
+        assert!(matches!(dropped.result, Some(Err(()))));
     }
 }

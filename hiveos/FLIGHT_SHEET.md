@@ -27,7 +27,7 @@ AMD rigs: use `keryx-miner-supr-amd-<version>.tar.gz` instead (same steps,
 algorithm field still `keryxhash`).
 
 > The line name is part of the HiveOS miner name, before the final version field
-> (for example `keryx-miner-supr-modern-0.13.0.tar.gz`). Don't rename it.
+> (for example `keryx-miner-supr-modern-0.13.1.tar.gz`). Don't rename it.
 
 ## 3. Create the Flight Sheet
 HiveOS → **Flight Sheets** → **Add Flight Sheet**. Pick any coin/wallet (keryx

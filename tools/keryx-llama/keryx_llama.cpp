@@ -41,6 +41,18 @@ extern "C" {
 // ABI version — the miner refuses to use a mismatched .so.
 int keryx_llama_abi() { return 2; }
 
+// Optional presentation ABI: expose llama.cpp's logger through wrapper-owned names. ELF/Mach-O
+// hosts can also resolve llama_log_get/set directly from historical sidecars; the named bridge is
+// required on Windows, whose module-definition file intentionally exports only this wrapper API.
+// The host installs a callback once, before backend initialization, which preserves classic logs
+// while preventing native stderr writes during an alternate-screen dashboard.
+void keryx_llama_log_get_v1(ggml_log_callback* callback, void** user_data) {
+    llama_log_get(callback, user_data);
+}
+void keryx_llama_log_set_v1(ggml_log_callback callback, void* user_data) {
+    llama_log_set(callback, user_data);
+}
+
 KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();

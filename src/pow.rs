@@ -38,10 +38,10 @@ pub enum BlockSeed {
         /// PoM (post-fork): borsh-encoded possession proof for this share. Empty pre-fork /
         /// legacy kHeavyHash. The stratum client hex-encodes it into `mining.submit` params[5].
         pom_proof: Vec<u8>,
-        /// The GPU (device ordinal) that FOUND this share. Set by the worker before submit (default
-        /// 0 in job templates), threaded to `shares_pending` so pool accept/reject is attributed
-        /// per-GPU for the per-card `A: / R:` diagnostic (catches phantom-hashrate/OC instability).
-        device_id: u32,
+        /// The GPU (device ordinal) that FOUND this share. Job templates and CPU results carry
+        /// `None`; a GPU worker stamps `Some(actual_ordinal)` before submit. Threaded to
+        /// `shares_pending` so ACK/reject events never guess GPU0 when attribution is unavailable.
+        device_id: Option<u32>,
     },
 }
 
@@ -75,6 +75,9 @@ impl BlockSeed {
     pub fn report_block(&self) {
         match self {
             BlockSeed::FullBlock(block) => {
+                // `report_block` is called only after the candidate entered the solo client's
+                // submit channel, so this is both the found counter and the live pending gauge.
+                keryx_miner::runtime_stats::record_solo_block_found();
                 let block_hash =
                     block.block_hash().expect("We just got it from the state, we should be able to hash it");
                 let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");

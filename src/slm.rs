@@ -23,6 +23,30 @@ use tokenizers::Tokenizer;
 use crate::models::{ModelFormat, ModelSpec};
 
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
+
+// The interactive dashboard owns stdout/stderr while its alternate screen is active. Preserve
+// the existing download output byte-for-byte in classic mode, but never let carriage-return
+// progress (or an exceptional direct diagnostic) punch through the dashboard. Structured runtime
+// state and the ordinary logger remain visible inside the TUI.
+fn tui_owns_terminal() -> bool {
+    crate::tui_active()
+}
+
+macro_rules! classic_eprint {
+    ($($arg:tt)*) => {
+        if !tui_owns_terminal() {
+            eprint!($($arg)*);
+        }
+    };
+}
+
+macro_rules! classic_eprintln {
+    ($($arg:tt)*) => {
+        if !tui_owns_terminal() {
+            eprintln!($($arg)*);
+        }
+    };
+}
 /// Remote inference admission limits. These are enforced again at the engine boundary (not only
 /// by the Stratum/gRPC parsers), because inference is also called by startup and self-test paths.
 pub const MAX_INFERENCE_PROMPT_BYTES: usize = 4 * 1024;
@@ -214,12 +238,14 @@ pub fn set_staging_error(msg: impl Into<String>) {
     if let Ok(mut g) = staging_error_slot().lock() {
         *g = Some(msg.into());
     }
+    crate::runtime_stats::set_staging_error(true);
 }
 /// Clear the staging failure once a model is ready again.
 pub fn clear_staging_error() {
     if let Ok(mut g) = staging_error_slot().lock() {
         *g = None;
     }
+    crate::runtime_stats::set_staging_error(false);
 }
 /// The last recorded staging failure, if any (for the miner status line).
 pub fn last_staging_error() -> Option<String> {
@@ -259,7 +285,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         }
     }
     let _dl = DlGuard;
-    eprintln!("[keryx-miner] Downloading {} ...", url);
+    classic_eprintln!("[keryx-miner] Downloading {} ...", url);
     let mut attempt = 0u32;
     loop {
         // Resume offset = how many bytes we already have on disk.
@@ -276,7 +302,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
             // reached. Treat it here as "already fully downloaded" (e.g. a GGUF pre-fetched via
             // aria2, or a re-run over a complete file) instead of looping on it forever.
             Err(ureq::Error::Status(416, _)) if resume_from > 0 => {
-                eprintln!("  already complete ({} MB).", resume_from / 1_000_000);
+                classic_eprintln!("  already complete ({} MB).", resume_from / 1_000_000);
                 return Ok(());
             }
             Err(e) => {
@@ -292,7 +318,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                     set_staging_error(&msg);
                     return Err(anyhow!(msg));
                 }
-                eprintln!("\n[keryx-miner] connect error ({e}); retry {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s (resume @ {} MB)…",
+                classic_eprintln!("\n[keryx-miner] connect error ({e}); retry {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s (resume @ {} MB)…",
                     resume_from / 1_000_000);
                 std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS));
                 continue;
@@ -314,7 +340,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
             (f, resume_from, total)
         } else if resume_from > 0 && status == 416 {
             // Range not satisfiable ⇒ the file is already fully downloaded.
-            eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
+            classic_eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
             return Ok(());
         } else {
             // 200, or the server ignored Range. Never wipe a local file that already matches
@@ -324,7 +350,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
             if resume_from > 0 {
                 if let Some(t) = total {
                     if resume_from >= t {
-                        eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
+                        classic_eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
                         return Ok(());
                     }
                 }
@@ -341,7 +367,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                             resume_from / 1_000_000
                         ));
                     }
-                    eprintln!(
+                    classic_eprintln!(
                             "\n[keryx-miner] server ignored Range (HTTP {status}); keeping local {} MB, retry {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s…",
                             resume_from / 1_000_000
                         );
@@ -372,7 +398,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                         where_dir.display()
                     );
                     log::error!("[keryx-miner] {msg}");
-                    eprintln!("\n[keryx-miner] ERROR: {msg}\n");
+                    classic_eprintln!("\n[keryx-miner] ERROR: {msg}\n");
                     set_staging_error(&msg);
                     return Err(anyhow!(msg));
                 }
@@ -400,7 +426,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                     }
                     downloaded += n as u64;
                     if let Some(t) = total {
-                        eprint!(
+                        classic_eprint!(
                             "\r  {:.1}/{:.1} MB ({}%)   ",
                             downloaded as f64 / 1_000_000.0,
                             t as f64 / 1_000_000.0,
@@ -441,7 +467,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         // usually returns a parsable Content-Range and self-heals.
         let complete = stream_err.is_none() && matches!(total, Some(t) if downloaded >= t);
         if complete {
-            eprintln!();
+            classic_eprintln!();
             return Ok(());
         }
 
@@ -458,7 +484,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
             return Err(anyhow!(msg));
         }
         let why = stream_err.unwrap_or_else(|| "short read".into());
-        eprintln!(
+        classic_eprintln!(
             "\n[keryx-miner] interrupted ({why}); resuming {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s @ {} MB…",
             downloaded / 1_000_000
         );
@@ -495,7 +521,7 @@ fn ensure_safetensors(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path
     }
     std::fs::create_dir_all(&dir)?;
     let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
-    eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
+    classic_eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
     if !tok.exists() {
         download_file(&ipfs_url(spec.tokenizer_cid), &tok)?;
     }
@@ -504,12 +530,12 @@ fn ensure_safetensors(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path
     }
     for (i, (cid, path)) in spec.weight_cids.iter().zip(wts.iter()).enumerate() {
         if spec.weight_cids.len() > 1 {
-            eprintln!("[keryx-miner] Shard {}/{}", i + 1, spec.weight_cids.len());
+            classic_eprintln!("[keryx-miner] Shard {}/{}", i + 1, spec.weight_cids.len());
         }
         download_file(&ipfs_url(cid), path)?;
     }
     std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
-    eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
+    classic_eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
     Ok((tok, cfg, wts))
 }
 
@@ -587,7 +613,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     let _ = std::fs::remove_file(&ok_flag); // clear stale flag before (re)downloading
 
     if !gguf_ready {
-        eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
+        classic_eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
         // download_file resumes a truncated GGUF, refuses to wipe a partial on Range-less
         // gateways (keeps bytes + backoff-retries), and no-ops a complete one (Range → 416).
         download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
@@ -614,7 +640,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
 
     std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
     clear_staging_error();
-    eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
+    classic_eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
     Ok((tok, gguf))
 }
 
@@ -1830,6 +1856,9 @@ fn inference_device() -> candle_core::Result<Device> {
 /// Register the set of models this miner currently serves (drives `ai:cap`).
 pub fn init_supported(specs: &'static [&'static ModelSpec]) {
     *SUPPORTED_SPECS.write().unwrap() = specs;
+    if let Some(spec) = specs.first() {
+        publish_runtime_model_status(&spec.model_id);
+    }
 }
 
 /// Stage the pre-filtered OPoI-v2 lineup to swap in at the hardfork crossing.
@@ -1885,6 +1914,9 @@ pub fn advance_lineup_if_due(daa: u64) {
     }
     *SUPPORTED_SPECS.write().unwrap() = v2;
     evict_engine();
+    if let Some(spec) = v2.first() {
+        publish_runtime_model_status(&spec.model_id);
+    }
 }
 
 /// Outcome of the startup GPU inference probe.
@@ -2044,6 +2076,7 @@ pub fn record_serveable_on(model_id: &[u8; 32], gpu: usize) {
     if let Ok(mut failures) = self_test_failures().write() {
         failures.remove(&(*model_id, gpu));
     }
+    publish_runtime_model_status(model_id);
 }
 
 fn record_unserveable_on(model_id: &[u8; 32], gpu: usize) {
@@ -2053,6 +2086,7 @@ fn record_unserveable_on(model_id: &[u8; 32], gpu: usize) {
     if let Ok(mut failures) = self_test_failures().write() {
         failures.insert((*model_id, gpu), std::time::Instant::now());
     }
+    publish_runtime_model_status(model_id);
 }
 
 /// The honest declare set: staged models that have PROVEN they can serve inference on this rig.
@@ -2064,6 +2098,92 @@ fn record_unserveable_on(model_id: &[u8; 32], gpu: usize) {
 /// about whether CUDA, Vulkan, or Metal can load and generate on the selected GPU.
 fn proven_serveable_model_ids() -> Vec<[u8; 32]> {
     loaded_model_ids().into_iter().filter(|m| model_serveable(m)).collect()
+}
+
+/// Exact GPU ordinals whose live proofs currently make `model_id` serveable. Keep this separate
+/// from external-request accounting: startup self-tests deliberately do not increment inference
+/// request counters, but the dashboard still needs to identify the route they proved.
+fn proven_route_gpus(model_id: &[u8; 32]) -> Vec<usize> {
+    if model_is_unavailable(model_id) {
+        return Vec::new();
+    }
+    let mut routes = self_test_state()
+        .read()
+        .map(|state| {
+            state
+                .iter()
+                .filter_map(|((candidate, gpu), passed)| {
+                    (candidate == model_id && *passed && inference_card_allowed(*gpu)).then_some(*gpu)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    routes.sort_unstable();
+    routes.dedup();
+    routes
+}
+
+/// Keep the dashboard's displayed model and route as one coherent fact. A route loss for one
+/// model can be published while another model remains serveable, so aggregate readiness alone
+/// must never leave the just-failed model paired with an invented generic "GPU route" label.
+fn select_runtime_status_route(
+    requested_model: [u8; 32],
+    requested_routes: Vec<usize>,
+    proven_candidates: &[([u8; 32], Vec<usize>)],
+) -> ([u8; 32], Vec<usize>) {
+    if !requested_routes.is_empty() {
+        return (requested_model, requested_routes);
+    }
+    proven_candidates
+        .iter()
+        .find(|(_, routes)| !routes.is_empty())
+        .cloned()
+        .unwrap_or((requested_model, requested_routes))
+}
+
+/// Publish only public model metadata and aggregate readiness. This never exposes prompts,
+/// response text, CIDs, paths, device identities, or a peer-provided failure reason.
+fn publish_runtime_model_status(model_id: &[u8; 32]) {
+    if !crate::models::REGISTRY.iter().any(|spec| &spec.model_id == model_id) {
+        return;
+    }
+    let serveable_model_ids = proven_serveable_model_ids();
+    let proven_candidates = serveable_model_ids
+        .iter()
+        .copied()
+        .filter(|candidate| crate::models::REGISTRY.iter().any(|spec| spec.model_id == *candidate))
+        .map(|candidate| (candidate, proven_route_gpus(&candidate)))
+        .collect::<Vec<_>>();
+    let (display_model_id, display_routes) =
+        select_runtime_status_route(*model_id, proven_route_gpus(model_id), &proven_candidates);
+    let Some(spec) = crate::models::REGISTRY.iter().copied().find(|spec| spec.model_id == display_model_id) else {
+        return;
+    };
+    let tier = match crate::models::REGISTRY.iter().position(|candidate| candidate.model_id == display_model_id) {
+        Some(0) => "very-light",
+        Some(1) => "light",
+        Some(2) => "default",
+        Some(3) => "high",
+        Some(4) => "very-high",
+        _ => "custom",
+    };
+    #[cfg(feature = "pom-cuda")]
+    let backend = "CUDA";
+    #[cfg(all(not(feature = "pom-cuda"), feature = "pom-opencl"))]
+    let backend = "Vulkan";
+    #[cfg(all(not(feature = "pom-cuda"), not(feature = "pom-opencl"), feature = "pom-metal"))]
+    let backend = "Metal";
+    #[cfg(all(not(feature = "pom-cuda"), not(feature = "pom-opencl"), not(feature = "pom-metal")))]
+    let backend = "GPU";
+    crate::runtime_stats::set_inference_model_status(
+        spec.name,
+        &display_model_id,
+        tier,
+        backend,
+        &display_routes,
+        serveable_model_ids.len(),
+        last_staging_error().is_some(),
+    );
 }
 
 /// Whether this process has at least one staged model with a live GPU-route proof, independent of
@@ -2096,6 +2216,7 @@ pub fn clear_self_test(model_id: &[u8; 32]) {
     if let Ok(mut failures) = self_test_failures().write() {
         failures.retain(|(mid, _), _| mid != model_id);
     }
+    publish_runtime_model_status(model_id);
 }
 
 /// The AMD/Vulkan engine is a process-wide singleton. If it is evicted so the OpenCL walk can own
@@ -2457,6 +2578,7 @@ pub fn mark_model_unavailable(model_id: &[u8; 32], reason: &str) {
     if unavailable_models().write().unwrap().insert(*model_id) {
         log::warn!("SlmEngine: model {:.8} withdrawn from ai:cap ({})", hex::encode(model_id), reason);
     }
+    publish_runtime_model_status(model_id);
 }
 
 /// Re-announce a model after it serves again (upstream 0795e92).
@@ -2464,6 +2586,7 @@ pub fn mark_model_available(model_id: &[u8; 32], reason: &str) {
     if unavailable_models().write().unwrap().remove(model_id) {
         log::info!("SlmEngine: model {:.8} back in ai:cap ({})", hex::encode(model_id), reason);
     }
+    publish_runtime_model_status(model_id);
 }
 
 fn model_is_unavailable(model_id: &[u8; 32]) -> bool {
@@ -2670,7 +2793,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                 // v0.12.4 made this path terminal ("upstream parity") to stop a rare cascade that
                 // wedged a rig. That fix caused a MUCH worse regression: on every MULTI-GPU rig the
                 // cards sat at "preparing" forever with "OPoI: no models ready — mining suspended".
-                // A/B on rig08 (2x 3070 + 1x 5080, same config, healthy cards):
+                // A/B on a mixed three-GPU validation rig (2x 3070 + 1x 5080, same config, healthy cards):
                 //   v0.12.3 -> all three cards mine (1.31 + 1.31 + 3.26 MH/s), probes PASS on GPU 2
                 //   v0.12.5 -> all three stall, self-test FAILS on GPU 1 (a 3070)
                 // Failing fast here makes the self-test probe fail, which fires the inference-host
@@ -3079,7 +3202,7 @@ mod inference_admission_tests {
 
 #[cfg(test)]
 mod inference_probe_tests {
-    use super::current_probe_passed;
+    use super::{current_probe_passed, select_runtime_status_route};
 
     #[test]
     fn stale_cached_success_cannot_reopen_a_failed_route() {
@@ -3090,5 +3213,29 @@ mod inference_probe_tests {
         assert!(!current_probe_passed(current_probe_output));
         assert!(!current_probe_passed(Some("  \n\t")));
         assert!(current_probe_passed(Some("OK")));
+    }
+
+    #[test]
+    fn aggregate_readiness_selects_a_model_with_an_exact_proven_route() {
+        let failed_model = [0x41; 32];
+        let ready_model = [0x42; 32];
+        let candidates = vec![(failed_model, Vec::new()), (ready_model, vec![1, 3])];
+
+        assert_eq!(
+            select_runtime_status_route(failed_model, Vec::new(), &candidates),
+            (ready_model, vec![1, 3])
+        );
+    }
+
+    #[test]
+    fn requested_model_keeps_its_own_exact_route_when_still_proven() {
+        let requested_model = [0x51; 32];
+        let other_model = [0x52; 32];
+        let candidates = vec![(other_model, vec![7])];
+
+        assert_eq!(
+            select_runtime_status_route(requested_model, vec![2], &candidates),
+            (requested_model, vec![2])
+        );
     }
 }

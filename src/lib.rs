@@ -6,6 +6,20 @@ pub mod inference;
 pub mod integrity;
 pub mod keccak;
 pub mod models;
+#[cfg(any(
+    all(feature = "pom-opencl", unix),
+    all(
+        any(
+            all(feature = "pom-cuda", not(feature = "pom-opencl")),
+            all(target_os = "macos", feature = "pom-metal")
+        ),
+        any(unix, windows)
+    )
+))]
+mod native_llama_log;
+/// Process-wide, backend-neutral operational statistics for optional frontends.
+/// Producers are best-effort and never block mining or inference work.
+pub mod runtime_stats;
 pub mod slm;
 /// Stratum miner-telemetry (mining.hello / mining.telemetry) — display/ops only, best-effort.
 pub mod telemetry;
@@ -150,7 +164,14 @@ pub mod pom_gpu;
 #[cfg(all(target_os = "macos", feature = "pom-metal"))]
 #[path = "pom_gpu_metal.rs"]
 pub mod pom_gpu;
-pub use keryx_plugin_api::{declare_plugin, xoshiro256starstar, Error, Plugin, Worker, WorkerSpec};
+pub use keryx_plugin_api::{
+    declare_plugin, set_tui_active, set_tui_requested, tui_active, tui_requested, xoshiro256starstar, Error, Plugin,
+    Worker, WorkerSpec,
+};
+
+/// Optional dynamic-plugin hook used to switch its private logger when the host enters/leaves the
+/// alternate screen. `u8` keeps the C ABI explicit (`0` = classic, nonzero = dashboard).
+pub type PluginTuiLogControl = unsafe extern "C" fn(u8);
 
 #[derive(Default)]
 pub struct PluginManager {
@@ -161,6 +182,8 @@ pub struct PluginManager {
 struct ManagedPlugin {
     plugin: Box<dyn Plugin>,
     no_winner: u64,
+    tui_log_control: Option<PluginTuiLogControl>,
+    dynamic: bool,
 }
 
 /// Host-owned metadata around an unchanged plugin `WorkerSpec` trait object. The wrapper is kept on
@@ -216,6 +239,17 @@ impl PluginManager {
         self.loaded_libraries.push(lib); // Save library so it persists in memory
         let lib = self.loaded_libraries.last().unwrap();
 
+        // Optional and ABI-safe: old plugins do not expose this symbol. Seed a current plugin's
+        // private atomic before its constructor installs a logger, then retain the plain function
+        // pointer so the dashboard can switch it without mutating the process environment.
+        let tui_log_control = lib
+            .get::<PluginTuiLogControl>(b"keryx_plugin_set_tui_active_v1")
+            .ok()
+            .map(|control| *control);
+        if let Some(control) = tui_log_control {
+            control(u8::from(keryx_plugin_api::tui_requested()));
+        }
+
         // Optional, ABI-safe capability negotiation. Absence means the historical zero sentinel,
         // so an old plugin beside this host remains safe. The new CUDA plugin only exposes raw MAX
         // after this call; without it, it translates MAX back to zero for an old host.
@@ -236,7 +270,7 @@ impl PluginManager {
             return Err((app, *Box::from_raw(error as *mut Error)));
         }
         let plugin = Box::from_raw(boxed_raw);
-        self.plugins.push(ManagedPlugin { plugin, no_winner });
+        self.plugins.push(ManagedPlugin { plugin, no_winner, tui_log_control, dynamic: true });
 
         Ok(app)
     }
@@ -252,7 +286,7 @@ impl PluginManager {
         augment: impl FnOnce(clap::App<'help>) -> clap::App<'help>,
     ) -> clap::App<'help> {
         let app = augment(app);
-        self.plugins.push(ManagedPlugin { plugin, no_winner: 0 });
+        self.plugins.push(ManagedPlugin { plugin, no_winner: 0, tui_log_control: None, dynamic: false });
         app
     }
 
@@ -267,8 +301,30 @@ impl PluginManager {
         augment: impl FnOnce(clap::App<'help>) -> clap::App<'help>,
     ) -> clap::App<'help> {
         let app = augment(app);
-        self.plugins.push(ManagedPlugin { plugin, no_winner });
+        self.plugins.push(ManagedPlugin { plugin, no_winner, tui_log_control: None, dynamic: false });
         app
+    }
+
+    /// A legacy dynamic plugin can write directly to stderr and corrupt the alternate screen. The
+    /// host therefore enables the dashboard only when every loaded dynamic plugin implements the
+    /// optional atomic logger switch. Built-in plugins share the host logger and need no hook.
+    pub fn supports_tui_logging(&self) -> bool {
+        self.plugins.iter().all(|managed| !managed.dynamic || managed.tui_log_control.is_some())
+    }
+
+    /// Switch every dynamic plugin logger through its DSO-local atomic control hook.
+    pub fn set_plugin_tui_logging(&self, active: bool) {
+        for control in self.plugins.iter().filter_map(|managed| managed.tui_log_control) {
+            // SAFETY: the pointer came from a successfully loaded library that is retained in
+            // `loaded_libraries` for at least as long as this manager.
+            unsafe { control(u8::from(active)) };
+        }
+    }
+
+    /// Copy controls into the dashboard guard. Function pointers remain valid because the guard is
+    /// declared after, and therefore dropped before, the owning PluginManager in the host.
+    pub fn tui_log_controls(&self) -> Vec<PluginTuiLogControl> {
+        self.plugins.iter().filter_map(|managed| managed.tui_log_control).collect()
     }
 
     pub fn build(&self) -> Result<Vec<ManagedWorkerSpec>, Error> {
