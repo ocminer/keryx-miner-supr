@@ -1195,26 +1195,69 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SparseBurst {
+    frame: u64,
+    entropy: u64,
+}
+
+/// Select a short active window inside a much longer epoch.  Both the epoch's
+/// eligibility and its start/duration are independently mixed, so decoration
+/// arrives in uneven, deterministic bursts without needing mutable RNG state.
+fn sparse_burst(tick: u64, salt: u64, epoch_ticks: u64, active_modulus: u64, max_duration: u64) -> Option<SparseBurst> {
+    debug_assert!(epoch_ticks > max_duration && max_duration > 0 && active_modulus > 0);
+    let epoch = tick / epoch_ticks;
+    let offset = tick % epoch_ticks;
+    let entropy =
+        mix64(epoch.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(salt.wrapping_mul(0xd1b5_4a32_d192_ed03)));
+    if mix64(entropy ^ 0xa076_1d64_78bd_642f) % active_modulus != 0 {
+        return None;
+    }
+
+    let duration = 1 + mix64(entropy ^ 0xe703_7ed1_a0b4_28db) % max_duration;
+    let start = mix64(entropy ^ 0x8ebc_6af0_9c88_c6e3) % (epoch_ticks - duration + 1);
+    (offset >= start && offset < start + duration).then(|| SparseBurst { frame: offset - start, entropy })
+}
+
 fn matrix_rail(width: u16, salt: u64, state: &TuiState, palette: &Palette) -> Line<'static> {
     if !state.motion_enabled || width == 0 {
         return Line::raw("");
     }
-    let mut spans = Vec::with_capacity(width as usize);
-    for col in 0..width {
-        let seed = state.animation_tick.wrapping_mul(131).wrapping_add(salt.wrapping_mul(17)).wrapping_add(col as u64);
-        let density = mix64(seed) % 8;
-        if density <= 2 {
-            spans.push(Span::styled(
-                matrix_glyph(state, seed).to_string(),
-                Style::default()
-                    .fg(if density == 0 { palette.rain_head } else { palette.rain })
-                    .add_modifier(if density == 0 { Modifier::BOLD } else { Modifier::DIM }),
-            ));
-        } else {
-            spans.push(Span::raw(" "));
+    let Some(burst) = sparse_burst(state.animation_tick, salt.wrapping_add(0x5241_494c), 53, 2, 3) else {
+        return Line::raw(" ".repeat(width as usize));
+    };
+
+    // One or two isolated cells replace the old row-wide static. Positions are
+    // re-mixed per frame rather than incremented, avoiding a mechanical march.
+    let glyph_count = 1 + (mix64(burst.entropy ^ 0x6a09_e667_f3bc_c909) & 1) as usize;
+    let mut cells = vec![None; width as usize];
+    for glyph_index in 0..glyph_count.min(width as usize) {
+        let seed = mix64(
+            burst.entropy
+                ^ burst.frame.wrapping_mul(0xbb67_ae85_84ca_a73b)
+                ^ (glyph_index as u64).wrapping_mul(0x3c6e_f372_fe94_f82b),
+        );
+        let mut column = seed as usize % cells.len();
+        while cells[column].is_some() {
+            column = (column + 1) % cells.len();
         }
+        cells[column] = Some((matrix_glyph(state, seed), glyph_index == 0));
     }
-    Line::from(spans)
+
+    Line::from(
+        cells
+            .into_iter()
+            .map(|cell| match cell {
+                Some((glyph, head)) => Span::styled(
+                    glyph.to_string(),
+                    Style::default()
+                        .fg(if head { palette.rain_head } else { palette.rain })
+                        .add_modifier(Modifier::DIM),
+                ),
+                None => Span::raw(" "),
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1283,6 +1326,37 @@ fn powered_brand_spans(state: &TuiState, palette: &Palette) -> Vec<Span<'static>
 }
 
 fn matrix_edge_lines(width: u16, height: u16, salt: u64, state: &TuiState, palette: &Palette) -> Vec<Line<'static>> {
+    #[derive(Clone, Copy)]
+    struct EdgePulse {
+        head: u16,
+        echo: Option<u16>,
+        seed: u64,
+    }
+
+    let pulses: Vec<Option<EdgePulse>> = (0..width)
+        .map(|column| {
+            if !state.motion_enabled || height == 0 {
+                return None;
+            }
+            let stream = mix64(
+                salt.wrapping_mul(0x517c_c1b7_2722_0a95)
+                    .wrapping_add((column as u64).wrapping_mul(0x6eed_0e9d_a4d9_4a4f)),
+            );
+            let epoch_ticks = 41 + mix64(stream ^ 0x94d0_49bb_1331_11eb) % 29;
+            let burst = sparse_burst(state.animation_tick, stream, epoch_ticks, 2, 4)?;
+            let frame_seed = mix64(burst.entropy ^ burst.frame.wrapping_mul(0xbf58_476d_1ce4_e5b9));
+            let head = (frame_seed % height as u64) as u16;
+            let echo = (height > 1 && mix64(frame_seed ^ 0x243f_6a88_85a3_08d3) % 4 == 0).then(|| {
+                if mix64(frame_seed ^ 0x1319_8a2e_0370_7344) & 1 == 0 {
+                    (head + 1) % height
+                } else {
+                    (head + height - 1) % height
+                }
+            });
+            Some(EdgePulse { head, echo, seed: frame_seed })
+        })
+        .collect();
+
     (0..height)
         .map(|row| {
             if !state.motion_enabled {
@@ -1290,27 +1364,21 @@ fn matrix_edge_lines(width: u16, height: u16, salt: u64, state: &TuiState, palet
             }
             let mut spans = Vec::with_capacity(width as usize);
             for column in 0..width {
-                let stream = mix64(salt.wrapping_mul(41).wrapping_add(column as u64 * 193)) % 17;
-                let head = (state.animation_tick.wrapping_add(stream)) % 17;
-                let row_phase = (row as u64 + column as u64 * 7) % 17;
-                let distance = (head + 17 - row_phase) % 17;
-                let seed = state
-                    .animation_tick
-                    .wrapping_mul(97)
-                    .wrapping_add(salt.wrapping_mul(41))
-                    .wrapping_add(row as u64 * 17)
-                    .wrapping_add(column as u64 * 131);
-                let ambient = mix64(seed) % 19 == 0;
-                if distance <= 3 || ambient {
-                    let (color, modifier) = match distance {
-                        0 => (palette.rain_head, Modifier::BOLD),
-                        1 => (palette.rain_head, Modifier::DIM),
-                        _ => (palette.rain, Modifier::DIM),
-                    };
-                    spans.push(Span::styled(
-                        matrix_glyph(state, seed).to_string(),
-                        Style::default().fg(color).add_modifier(modifier),
-                    ));
+                if let Some(pulse) = pulses[column as usize] {
+                    if row == pulse.head {
+                        spans.push(Span::styled(
+                            matrix_glyph(state, pulse.seed.wrapping_add(row as u64)).to_string(),
+                            Style::default().fg(palette.rain_head).add_modifier(Modifier::DIM),
+                        ));
+                    } else if Some(row) == pulse.echo {
+                        let seed = pulse.seed.wrapping_add(row as u64).wrapping_add(0x9e37_79b9);
+                        spans.push(Span::styled(
+                            matrix_glyph(state, seed).to_string(),
+                            Style::default().fg(palette.rain).add_modifier(Modifier::DIM),
+                        ));
+                    } else {
+                        spans.push(Span::raw(" "));
+                    }
                 } else {
                     spans.push(Span::raw(" "));
                 }
@@ -2963,43 +3031,114 @@ mod tests {
     }
 
     #[test]
-    fn matrix_rain_is_dense_visible_and_changes_without_touching_data() {
+    fn rig_logo_rail_is_sparse_dim_and_irregular() {
         let palette = Palette::new(ColorMode::TrueColor);
         let mut state = TuiState::default();
-        state.set_animation_tick(7);
-        let first = line_text(&matrix_rail(96, 7, &state, &palette));
-        let first_density = first.chars().filter(|ch| !ch.is_whitespace()).count();
-        assert!(first_density >= 8, "edge rail should be visibly populated: {first_density}");
+        let mut active = Vec::new();
+        let mut starts = Vec::new();
+        let mut previous_active = false;
+        let mut longest_rest = 0usize;
+        let mut current_rest = 0usize;
 
-        state.set_animation_tick(8);
-        let second = line_text(&matrix_rail(96, 7, &state, &palette));
-        assert_ne!(first, second, "rain must visibly advance between animation frames");
+        for tick in 0..4_096 {
+            state.set_animation_tick(tick);
+            let rail = matrix_rail(96, 7, &state, &palette);
+            let density = line_text(&rail).chars().filter(|ch| !ch.is_whitespace()).count();
+            assert!(density <= 2, "logo rail burst became noisy at tick {tick}: {density} cells");
+            for span in &rail.spans {
+                if span.content.chars().any(|ch| !ch.is_whitespace()) {
+                    assert!(span.style.add_modifier.contains(Modifier::DIM));
+                    assert!(!span.style.add_modifier.contains(Modifier::BOLD));
+                }
+            }
 
-        let edge_density: usize = matrix_edge_lines(2, 30, 31, &state, &palette)
-            .iter()
-            .map(line_text)
-            .map(|line| line.chars().filter(|ch| !ch.is_whitespace()).count())
-            .sum();
-        assert!(edge_density >= 10, "dual-column rain gutter should be visibly populated: {edge_density}");
+            let is_active = density > 0;
+            if is_active {
+                active.push(line_text(&rail));
+                if !previous_active {
+                    starts.push(tick);
+                }
+                current_rest = 0;
+            } else {
+                current_rest += 1;
+                longest_rest = longest_rest.max(current_rest);
+            }
+            previous_active = is_active;
+        }
+
+        assert!(active.len() > 12, "rail should still materialize occasionally");
+        assert!(active.len() < 4_096 / 10, "rail should be dark for more than 90% of frames");
+        assert!(longest_rest >= 80, "rail needs genuinely long quiet gaps: {longest_rest}");
+        active.sort();
+        active.dedup();
+        assert!(active.len() > 8, "burst cells should not repeat a regular marching pattern");
+
+        let mut gaps: Vec<u64> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        gaps.sort_unstable();
+        gaps.dedup();
+        assert!(gaps.len() >= 5, "burst intervals should be visibly irregular: {gaps:?}");
     }
 
     #[test]
-    fn reserved_rain_cells_materialize_and_clear_between_frames() {
+    fn rig_edge_streams_are_sparse_irregular_and_desynchronized() {
         let palette = Palette::new(ColorMode::TrueColor);
         let mut state = TuiState::default();
-        state.set_animation_tick(8);
-        let before: Vec<char> = matrix_edge_lines(2, 32, 31, &state, &palette)
-            .iter()
-            .flat_map(|line| line_text(line).chars().collect::<Vec<_>>())
-            .collect();
-        state.set_animation_tick(9);
-        let after: Vec<char> = matrix_edge_lines(2, 32, 31, &state, &palette)
-            .iter()
-            .flat_map(|line| line_text(line).chars().collect::<Vec<_>>())
-            .collect();
+        let mut active_frames = 0usize;
+        let mut starts = Vec::new();
+        let mut previous_active = false;
+        let mut left_only = false;
+        let mut right_only = false;
+        let mut differing_heads = false;
 
-        assert!(before.iter().zip(&after).any(|(old, new)| !old.is_whitespace() && new.is_whitespace()));
-        assert!(before.iter().zip(&after).any(|(old, new)| old.is_whitespace() && !new.is_whitespace()));
+        for tick in 0..8_192 {
+            state.set_animation_tick(tick);
+            let lines = matrix_edge_lines(2, 32, 31, &state, &palette);
+            let occupied: Vec<Vec<usize>> = (0..2)
+                .map(|column| {
+                    lines
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(row, line)| {
+                            line_text(line)
+                                .chars()
+                                .nth(column)
+                                .is_some_and(|glyph| !glyph.is_whitespace())
+                                .then_some(row)
+                        })
+                        .collect()
+                })
+                .collect();
+            let density = occupied.iter().map(Vec::len).sum::<usize>();
+            assert!(density <= 4, "reserved gutters became noisy at tick {tick}: {density} cells");
+            for line in &lines {
+                for span in &line.spans {
+                    if span.content.chars().any(|ch| !ch.is_whitespace()) {
+                        assert!(span.style.add_modifier.contains(Modifier::DIM));
+                        assert!(!span.style.add_modifier.contains(Modifier::BOLD));
+                    }
+                }
+            }
+
+            let is_active = density > 0;
+            active_frames += usize::from(is_active);
+            if is_active && !previous_active {
+                starts.push(tick);
+            }
+            previous_active = is_active;
+            left_only |= !occupied[0].is_empty() && occupied[1].is_empty();
+            right_only |= occupied[0].is_empty() && !occupied[1].is_empty();
+            differing_heads |= !occupied[0].is_empty() && !occupied[1].is_empty() && occupied[0][0] != occupied[1][0];
+        }
+
+        assert!(active_frames > 30, "edge glyphs should still appear occasionally");
+        assert!(active_frames < 8_192 / 5, "edge gutters should be dark for more than 80% of frames");
+        assert!(left_only && right_only, "gutter columns must activate independently");
+        assert!(differing_heads, "simultaneous streams must not share a marching head position");
+
+        let mut gaps: Vec<u64> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        gaps.sort_unstable();
+        gaps.dedup();
+        assert!(gaps.len() >= 8, "edge burst spacing should not settle into a cadence: {gaps:?}");
     }
 
     #[test]
@@ -3127,7 +3266,7 @@ mod tests {
     }
 
     #[test]
-    fn rig_pane_preserves_full_gpu_name_rate_and_bottom_pinned_legend() {
+    fn rig_pane_preserves_full_gpu_name_rate_and_bottom_pinned_legend_during_motion() {
         let mut snap = snapshot(MiningMode::Pool);
         snap.devices.truncate(1);
         snap.devices[0].index = 0;
@@ -3158,6 +3297,18 @@ mod tests {
         let rig_inner_bottom = top[1].y + top[1].height - 2;
         assert_eq!(legend_y as u16, rig_inner_bottom, "legend must stay pinned to the pane's bottom row");
         assert!(legend_y > device_y);
+
+        state.motion_enabled = true;
+        for tick in (0..512).step_by(17) {
+            state.set_animation_tick(tick);
+            let animated = render(&snap, &state, 140, 40);
+            let device_line = animated
+                .lines()
+                .find(|line| line.contains("NVIDIA GeForce GTX 1080 Ti"))
+                .expect("animation must preserve the complete GPU name");
+            assert!(device_line.contains("12.345 MH/s"));
+            assert!(animated.contains("● NOMINAL  ◆ PAUSED  ▲ WATCH  ■ ALERT"));
+        }
     }
 
     #[test]
