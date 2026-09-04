@@ -30,7 +30,7 @@ args="-a ${CUSTOM_TEMPLATE} -s ${url}"
 # If NONE is present, default to per-card AUTO: each GPU loads the heaviest model its own VRAM
 # can hold (a mixed rig gets a different model per card) = max reward. Passing a tier flag still
 # pins every card to that one tier; --tier auto is the explicit form of the default.
-# (Recognising --force-model here avoids a spurious "--light" that would clash with it.)
+# (Recognising --force-model here avoids appending a conflicting AUTO selection.)
 extra="$CUSTOM_USER_CONFIG"
 case " $extra " in
   *" --very-light "*|*" --light "*|*" --high "*|*" --very-high "*|*" --tier "*|*" --tier="*|*" --force-model "*|*" --force-model="*) : ;;  # model chosen

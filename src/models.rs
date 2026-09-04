@@ -3,11 +3,12 @@
 /// model_id = sha2-256(primary_weight_file) = CIDv0_bytes[2..34].
 /// Verifiable: decode the weight CID from base58btc, skip the 2-byte multihash prefix.
 ///
-/// Uncensored lineup (4 tiers / 4 model families):
-///   --light       Gemma-3-4B-it-abliterated     (Google)  — any GPU (6 GB+)
-///   (default)     Dolphin-3.0-Llama-3.1-8B       (Llama)  — RTX 3060 12GB / 3070
-///   --high        Qwen3-32B-abliterated (Q4_K_M) (Qwen)   — 24 GB (3090 / 4090 / 5090)
-///   --very-high   Llama-3.3-70B-abliterated      (Meta)   — 48 GB single-GPU
+/// Current H6/H10 lineup (five tiers):
+///   --very-light  Qwen3.5-9B-abliterated         — 7 GB auto-select floor
+///   --light       GLM-4-9B-0414                  — 11 GB
+///   (default)     Gemma-4-12B-abliterated        — 15 GB
+///   --high        Qwen3.6-27B                    — 22 GB
+///   --very-high   Kimi-Linear-48B                — 28 GB
 ///
 /// All GGUF weights + tokenizers are pinned on the Keryx IPFS gateway; each
 /// model_id = base58-decode(weight CID)[2..34].
@@ -59,10 +60,8 @@ pub struct ModelSpec {
 pub const GLM_4_9B_0414: ModelSpec = ModelSpec {
     name: "glm-4-9b-0414",
     model_id: [
-        0xfa, 0x2f, 0x13, 0xbe, 0x08, 0x50, 0xe2, 0x6c,
-        0x5c, 0xe8, 0x6c, 0x7a, 0xc7, 0x9d, 0xa8, 0x5e,
-        0x30, 0x0c, 0x1d, 0xa8, 0xb3, 0x29, 0x0f, 0x9a,
-        0x18, 0xd4, 0x71, 0x05, 0xf1, 0xf2, 0x14, 0x0a,
+        0xfa, 0x2f, 0x13, 0xbe, 0x08, 0x50, 0xe2, 0x6c, 0x5c, 0xe8, 0x6c, 0x7a, 0xc7, 0x9d, 0xa8, 0x5e, 0x30, 0x0c,
+        0x1d, 0xa8, 0xb3, 0x29, 0x0f, 0x9a, 0x18, 0xd4, 0x71, 0x05, 0xf1, 0xf2, 0x14, 0x0a,
     ],
     format: ModelFormat::GgufGlm4,
     tokenizer_cid: "",
@@ -75,10 +74,8 @@ pub const GLM_4_9B_0414: ModelSpec = ModelSpec {
 pub const QWEN3_6_27B: ModelSpec = ModelSpec {
     name: "qwen3.6-27b",
     model_id: [
-        0xb8, 0xbd, 0xc0, 0x1f, 0xa4, 0x07, 0xea, 0xb9,
-        0x43, 0xe4, 0xfe, 0xfc, 0x80, 0x74, 0x83, 0xb3,
-        0x9f, 0x81, 0x42, 0x78, 0x52, 0x56, 0x04, 0x9e,
-        0x1f, 0x55, 0x96, 0x98, 0xa5, 0x28, 0x47, 0x46,
+        0xb8, 0xbd, 0xc0, 0x1f, 0xa4, 0x07, 0xea, 0xb9, 0x43, 0xe4, 0xfe, 0xfc, 0x80, 0x74, 0x83, 0xb3, 0x9f, 0x81,
+        0x42, 0x78, 0x52, 0x56, 0x04, 0x9e, 0x1f, 0x55, 0x96, 0x98, 0xa5, 0x28, 0x47, 0x46,
     ],
     format: ModelFormat::GgufQwen35,
     tokenizer_cid: "",
@@ -91,10 +88,8 @@ pub const QWEN3_6_27B: ModelSpec = ModelSpec {
 pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
     name: "kimi-linear-48b",
     model_id: [
-        0x3d, 0xc0, 0x93, 0x58, 0xad, 0x75, 0xc6, 0xef,
-        0x0c, 0x9c, 0x86, 0xee, 0x4f, 0x47, 0xc4, 0xd6,
-        0xac, 0xda, 0x96, 0x1f, 0xec, 0xbd, 0x0e, 0x4f,
-        0x9c, 0xf5, 0x5e, 0x8f, 0x0f, 0xdf, 0xfd, 0xdb,
+        0x3d, 0xc0, 0x93, 0x58, 0xad, 0x75, 0xc6, 0xef, 0x0c, 0x9c, 0x86, 0xee, 0x4f, 0x47, 0xc4, 0xd6, 0xac, 0xda,
+        0x96, 0x1f, 0xec, 0xbd, 0x0e, 0x4f, 0x9c, 0xf5, 0x5e, 0x8f, 0x0f, 0xdf, 0xfd, 0xdb,
     ],
     format: ModelFormat::GgufKimiLinear,
     tokenizer_cid: "",
@@ -114,10 +109,8 @@ pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
 pub const QWEN3_5_9B_ABLITERATED: ModelSpec = ModelSpec {
     name: "qwen3.5-9b-abliterated",
     model_id: [
-        0xbd, 0x34, 0x56, 0x8c, 0xd8, 0x9f, 0x5f, 0x19,
-        0xc6, 0xc3, 0xa6, 0xe1, 0xa6, 0x1b, 0x92, 0x9b,
-        0xc8, 0x68, 0x70, 0x94, 0x09, 0xea, 0xad, 0x8e,
-        0x67, 0x2d, 0x85, 0xf3, 0xc1, 0xeb, 0x57, 0x10,
+        0xbd, 0x34, 0x56, 0x8c, 0xd8, 0x9f, 0x5f, 0x19, 0xc6, 0xc3, 0xa6, 0xe1, 0xa6, 0x1b, 0x92, 0x9b, 0xc8, 0x68,
+        0x70, 0x94, 0x09, 0xea, 0xad, 0x8e, 0x67, 0x2d, 0x85, 0xf3, 0xc1, 0xeb, 0x57, 0x10,
     ],
     format: ModelFormat::GgufQwen35,
     tokenizer_cid: "",
@@ -132,10 +125,8 @@ pub const QWEN3_5_9B_ABLITERATED: ModelSpec = ModelSpec {
 pub const GEMMA_4_12B_ABLITERATED: ModelSpec = ModelSpec {
     name: "gemma-4-12b-abliterated",
     model_id: [
-        0x39, 0x99, 0x84, 0x04, 0x56, 0x00, 0xf7, 0xd5,
-        0x8d, 0x1b, 0x2c, 0xf0, 0x1e, 0x6a, 0x4b, 0xf4,
-        0x66, 0xfa, 0x15, 0xc7, 0xac, 0x31, 0xbd, 0x0d,
-        0xd1, 0xa7, 0x1e, 0x00, 0x3b, 0x61, 0x7c, 0xc6,
+        0x39, 0x99, 0x84, 0x04, 0x56, 0x00, 0xf7, 0xd5, 0x8d, 0x1b, 0x2c, 0xf0, 0x1e, 0x6a, 0x4b, 0xf4, 0x66, 0xfa,
+        0x15, 0xc7, 0xac, 0x31, 0xbd, 0x0d, 0xd1, 0xa7, 0x1e, 0x00, 0x3b, 0x61, 0x7c, 0xc6,
     ],
     format: ModelFormat::GgufGemma4,
     tokenizer_cid: "",
@@ -260,13 +251,9 @@ impl Tier {
 /// + KV cache for GPU inference). Returns the tier and its budgeted MiB requirement.
 ///
 /// The budget is the model's `min_vram_mb` (which already accounts for weights + KV + workspace),
-/// plus a `headroom_mb` margin on top. Empirically an 8 GB 3070 OOMs Gemma-3-4B on the GPU
-/// (needs `--cpu-inference`), so the margin must be conservative: with the default 2 GB headroom,
-/// Light (min_vram_mb=0) is the only tier that fits an 8 GB card, and Default (needs 8000) does
-/// NOT — which is the correct, OOM-safe choice.
-///
-/// `cpu_inference`: when true, GPU inference is off, so the GPU only needs to hold the PoM walk's
-/// resident weights (no inference KV/workspace), but we keep the same conservative margin.
+/// plus a `headroom_mb` margin on top. Empirically an 8 GB 3070 OOMs the larger inference tiers,
+/// so the margin must be conservative: Light (min_vram_mb=0) is the safe floor on an 8 GB card,
+/// while Default (needs 8000) is not selected. CPU inference is not part of normal tier sizing.
 pub fn auto_select_tier(vram_mb: u64, _headroom_mb: u64) -> (Tier, u64) {
     // Upstream-parity floors (`Tier::pom_tier_floor_mb`) ARE the threshold — margin baked in, no
     // extra headroom added (that is what wrongly pushed Gemma to 22 GB before). `_headroom_mb` is
@@ -301,13 +288,8 @@ pub fn specs_for(daa: u64, tier: Tier) -> &'static [&'static ModelSpec] {
 /// The H6 lineup — resolves a model name/id. Retired pre-H6 models are gone: they are not mineable
 /// (`pom_tier_index` returns None for them), so keeping them only invited staging a model the node
 /// would reject.
-pub const REGISTRY: &[&ModelSpec] = &[
-    &QWEN3_5_9B_ABLITERATED,
-    &GLM_4_9B_0414,
-    &GEMMA_4_12B_ABLITERATED,
-    &QWEN3_6_27B,
-    &KIMI_LINEAR_48B,
-];
+pub const REGISTRY: &[&ModelSpec] =
+    &[&QWEN3_5_9B_ABLITERATED, &GLM_4_9B_0414, &GEMMA_4_12B_ABLITERATED, &QWEN3_6_27B, &KIMI_LINEAR_48B];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
     REGISTRY.iter().copied().find(|m| m.name == name)

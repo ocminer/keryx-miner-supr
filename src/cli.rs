@@ -4,10 +4,14 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nModel tiers (default: AUTO — largest PoM tier that fits this GPU's VRAM = highest tier reward):\n  (default)    auto — largest tier that fits VRAM & is downloaded (8GB->Gemma, 24GB->Qwen3-32B, 32GB->Llama-70B)\n  --light      Gemma-3-4B — any GPU (6GB+)\n  --high       Qwen3-32B — RTX 3090 / 4090 (24GB+)\n  --very-high  Llama-3.3-70B — RTX 5090 / 48GB+\n  --tier <t>   auto | light | default | high | very-high (pins the tier)", term_width = 0)]
+#[clap(
+    name = "keryx-miner",
+    version,
+    about = "A Keryx high performance GPU miner with OPoI inference\n\nModel tiers (default: AUTO — largest PoM tier that fits this GPU's VRAM = highest tier reward):\n  (default)    auto — largest tier that fits VRAM & is downloaded (8GB->Gemma, 24GB->Qwen3-32B, 32GB->Llama-70B)\n  --light      Gemma-3-4B — any GPU (6GB+)\n  --high       Qwen3-32B — RTX 3090 / 4090 (24GB+)\n  --very-high  Llama-3.3-70B — RTX 5090 / 48GB+\n  --tier <t>   auto | light | default | high | very-high (pins the tier)",
+    term_width = 0
+)]
 pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
-
     #[clap(
         long = "very-light",
         help = "Model tier: Qwen3-8B-abliterated (Q4_K_S) — 6 GB+ GPU, smallest tier (PoM tier 0, post-H5; EXAONE-4.0-1.2B in the H4→H5 window)",
@@ -66,7 +70,7 @@ pub struct Opt {
 
     #[clap(
         long = "cpu-inference",
-        help = "Run OPoI inference on the CPU instead of the GPU — frees the GPU for hashing and avoids weak-fp16 GPUs (e.g. GTX 1060). Pairs well with --light. (Implies --enable-cpu-inference.)",
+        help = "DEPRECATED emergency override: force OPoI inference onto the CPU. This is extremely slow and is retained only as the final explicit fallback before inference is unavailable; normal mining must use GPU inference. (Implies --enable-cpu-inference.)",
         help_heading = "OPoI / Inference"
     )]
     pub cpu_inference: bool,
@@ -88,7 +92,7 @@ pub struct Opt {
 
     #[clap(
         long = "enable-cpu-inference",
-        help = "Allow OPoI inference to FALL BACK to the CPU when GPU inference cannot load (OFF by default). CPU inference is very slow and rarely worthwhile; without this flag a card that cannot run GPU inference withdraws from OPoI instead of doing futile CPU work. NVIDIA/Windows: the fix for 'GPU inference failed' is to ship keryx-llama.dll + the CUDA runtime DLLs next to the miner, NOT this flag.",
+        help = "DEPRECATED emergency compatibility flag: after every GPU inference path fails, allow one final CPU attempt (OFF by default). CPU inference is extremely slow and is planned for removal; normal mining must use GPU inference. NVIDIA/Windows: fix GPU loading by shipping keryx-llama.dll + the CUDA runtime DLLs, not by enabling this fallback.",
         help_heading = "OPoI / Inference"
     )]
     pub enable_cpu_inference: bool,
@@ -207,13 +211,11 @@ pub struct Opt {
     #[clap(
         long = "resident-tree",
         help = "Hold the full possession Merkle tree in RAM so the per-block proof is built by \
-                lookup instead of the default on-disk recompute. MEASURED (5090, tier-0 blob): \
-                15.4 ms -> 0.87 ms per proof (17x); the recompute is ~96% of proof-build time. \
-                OFF by default because the tree costs ~2x the blob in RAM (~12 GB at tier 0, tens \
-                of GB above) — do NOT enable on low-RAM rigs. Worth it for SOLO (faster proof \
-                release wins chain races) and, on NVIDIA, for high-share-rate pool rigs: the \
-                CUDA submit path builds the proof synchronously, so each share stalls the grind \
-                for that long (~0.5% of GPU time at 20 shares/min, ~0.03% with this flag).",
+                lookup instead of the optimized default level-5 sparse-checkpoint path. OFF by \
+                default because the dense tree costs ~2x the blob in RAM (~12 GB at tier 0, tens \
+                of GB above) — do NOT enable on low-RAM rigs. Worth considering for SOLO (lower \
+                proof-release latency can win chain races) and unusually high-share-rate pool rigs; \
+                normal pool miners should keep the much smaller sparse tree.",
         help_heading = "Mining"
     )]
     pub resident_tree: bool,
@@ -235,7 +237,6 @@ pub struct Opt {
     pub recover_escrow_api: String,
 
     // ── Mining ────────────────────────────────────────────────────────────────
-
     #[clap(short, long, help = "Enable debug logging level")]
     pub debug: bool,
 
@@ -345,9 +346,8 @@ fn resolve_model_dir(raw: &str) -> Result<std::path::PathBuf, Error> {
     if !expanded.is_dir() {
         return Err(format!("model dir '{}': exists but is not a directory", raw).into());
     }
-    let dir = expanded
-        .canonicalize()
-        .map_err(|e| Error::from(format!("model dir '{}': cannot resolve path: {}", raw, e)))?;
+    let dir =
+        expanded.canonicalize().map_err(|e| Error::from(format!("model dir '{}': cannot resolve path: {}", raw, e)))?;
     let probe = dir.join(".keryx-writetest");
     match std::fs::File::create(&probe) {
         Ok(_) => {
@@ -395,7 +395,8 @@ impl Opt {
             log::warn!(
                 "--escrow-dir '{}' could not be created ({}) — falling back to the working directory. \
                  Your escrow key and claim state will NOT survive a miner reinstall.",
-                dir, e
+                dir,
+                e
             );
             return;
         }

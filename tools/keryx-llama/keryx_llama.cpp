@@ -8,7 +8,8 @@
 // (`pom_gpu_metal` Phase 3a) so the tensor-pointer contract there only feeds the future zero-dup
 // Metal walk; today it just satisfies the loader-side count/name enumeration.
 //
-// The miner dlopens this next to its own binary; absent = the candle fallback stays active.
+// The miner dlopens this next to its own binary; absent = other GPU routes are tried, while
+// candle-CPU remains an explicit, deprecated emergency fallback only.
 // Built by hiveos/build-keryx-llama.sh (CUDA) or hiveos/build-keryx-llama-macos.sh (Metal).
 #include "llama.h"
 #include "llama-model.h"
@@ -133,7 +134,10 @@ int keryx_llama_tensor_device(KeryxLlama* h, size_t i) {
 // Generate up to max_tokens; writes UTF-8 into out (cap bytes, NUL-terminated). Returns written
 // length, or -1 on error. Serialized — one generation at a time (OPoI challenges are rare).
 int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
-    if (!h || !prompt || !out || cap < 2) return -1;
+    if (!h || !prompt || !out || cap < 2 || max_tokens <= 0 || max_tokens > 2048) return -1;
+    size_t prompt_len = 0;
+    while (prompt_len <= 4096 && prompt[prompt_len] != '\0') ++prompt_len;
+    if (prompt_len == 0 || prompt_len > 4096) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
 
@@ -162,6 +166,9 @@ int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char
     toks.resize(n);
 
     llama_memory_clear(llama_get_memory(h->ctx), true);
+    // Penalty/DRY samplers retain accepted-token history. Reset it with the KV cache so one remote
+    // request cannot bias or truncate the next independent request.
+    llama_sampler_reset(h->smpl);
     llama_batch batch = llama_batch_get_one(toks.data(), (int32_t)toks.size());
     int written = 0;
     std::string acc; // mirrors `out` for cross-piece stop-string scanning

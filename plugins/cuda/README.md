@@ -1,29 +1,31 @@
-# Cuda Support For Kaspa-Miner
+# CUDA support for keryx-miner-supr
 
 ## Building
 
-The plugin is a shared library file that resides in the same library as the miner. 
+The plugin is a shared library file that resides in the same directory as the miner.
 You can build the library by running
 ```sh
-cargo build -p kaspacuda
+cargo build -p keryxcuda
 ```
 
-This version includes a precompiled PTX, which would work with most modern GPUs. To compile the PTX youself,
-you have to clone the project:
+The plugin embeds architecture-specific PTX for sm_61, sm_75, sm_80, sm_86, sm_89, sm_90,
+sm_100, and sm_120. Regenerate all of them from the canonical CUDA source with:
 
 ```sh
-git clone https://github.com/tmrlvi/kaspa-miner.git
-cd kaspa-miner
-# Compute version 8.6
-/usr/local/cuda-11.5/bin/nvcc plugins/cuda/kaspa-cuda-native/src/kaspa-cuda.cu -std=c++11 -O3 --restrict --ptx --gpu-architecture=compute_86 --gpu-code=sm_86 -o plugins/cuda/resources/kaspa-cuda-sm86.ptx -Xptxas -O3 -Xcompiler -O3
-# Compute version 7.5
-/usr/local/cuda-11.5/bin/nvcc plugins/cuda/kaspa-cuda-native/src/kaspa-cuda.cu -std=c++11 -O3 --restrict --ptx --gpu-architecture=compute_75 --gpu-code=sm_75 -o plugins/cuda/resources/kaspa-cuda-sm75.ptx -Xptxas -O3 -Xcompiler -O3
-# Compute version 6.1
-/usr/local/cuda-11.2/bin/nvcc plugins/cuda/kaspa-cuda-native/src/kaspa-cuda.cu -std=c++11 -O3 --restrict --ptx --gpu-architecture=compute_61 --gpu-code=sm_61 -o plugins/cuda/resources/kaspa-cuda-sm61.ptx -Xptxas -O3 -Xcompiler -O3
-# Compute version 3.0
-/usr/local/cuda-9.2/bin/nvcc plugins/cuda/kaspa-cuda-native/src/kaspa-cuda.cu -ccbin=gcc-7 -std=c++11 -O3 --restrict --ptx --gpu-architecture=compute_30 --gpu-code=sm_30 -o plugins/cuda/resources/kaspa-cuda-sm30.ptx
-# Compute version 2.0
-/usr/local/cuda-8.0/bin/nvcc plugins/cuda/kaspa-cuda-native/src/kaspa-cuda.cu -ccbin=gcc-5 -std=c++11 -O3 --restrict --ptx --gpu-architecture=compute_20 --gpu-code=sm_20 -o plugins/cuda/resources/kaspa-cuda-sm20.ptx
- 
-cargo build --release
+./plugins/cuda/regenerate-ptx.sh
 ```
+
+The script uses digest-pinned NVIDIA CUDA containers:
+
+- CUDA 12.2.2 for sm_61 through sm_90. PTX ISA 8.2 preserves the original older-driver floor.
+- CUDA 12.8.0 for sm_100 and sm_120.
+
+It stages the complete set, verifies the target and `atomicMin` winner contract, then replaces the
+resources atomically per file and writes `resources/PTX_MANIFEST.txt` with source and artifact hashes.
+Docker is required; compilation itself does not require a GPU.
+
+The winner slot uses `u64::MAX` for no result. CUDA publishes the lowest qualifying nonce with
+`atomicMin`, and hash equality is accepted (`hash <= target`) exactly like consensus. A new host
+negotiates raw-MAX output through the optional `keryx_plugin_enable_raw_nonce_v1` symbol, which makes
+nonce zero representable without changing the Rust plugin trait ABI. Without that handshake the
+plugin translates MAX to the historical zero sentinel, preserving compatibility with older miners.

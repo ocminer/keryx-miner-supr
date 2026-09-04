@@ -5,18 +5,24 @@
 #
 # By default it ships the portable OLD-glibc artifacts from hiveos/dist-amd/
 # (built by hiveos/build-amd-glibc.sh — runs on HiveOS, Ubuntu 20.04+, etc.).
-# Pass --native to package the local dist-amd/ build instead (glibc of this host;
-# only for distros as new as the build box).
+# Native packaging is deliberately retired: `build-amd.sh` does not produce the
+# mandatory, source-bound Vulkan inference route. Use the portable builder only.
 #
 set -e
 cd "$(dirname "$0")"
 REPO="$(pwd)"
+# shellcheck source=hiveos/amd-inference-route.sh
+source "$REPO/hiveos/amd-inference-route.sh"
 
 SRC="$REPO/hiveos/dist-amd"          # portable old-glibc build (default)
 LABEL="portable (glibc 2.31)"
 if [ "${1:-}" = "--native" ]; then
-    SRC="$REPO/dist-amd"
-    LABEL="native ($(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1) glibc)"
+    echo "ERROR: --native was retired because it cannot produce the mandatory GPU inference route." >&2
+    echo "Use: hiveos/build-amd-glibc.sh && ./package-amd.sh" >&2
+    exit 2
+elif [ -n "${1:-}" ]; then
+    echo "ERROR: unknown argument: $1" >&2
+    exit 2
 fi
 
 VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
@@ -27,39 +33,49 @@ DEST="$OUT/$PKGNAME"
 
 if [ ! -x "$SRC/$NAME" ] || [ ! -f "$SRC/libkeryxopencl.so" ]; then
     echo "ERROR: AMD artifacts missing in $SRC" >&2
-    echo "  build them first:  ${1:-} hiveos/build-amd-glibc.sh   (or ./build-amd.sh for --native)" >&2
+    echo "  build them first: hiveos/build-amd-glibc.sh" >&2
     exit 1
 fi
+keryx_require_amd_inference_route "$SRC"
 
 rm -rf "$DEST"; mkdir -p "$DEST"
 cp "$SRC/$NAME" "$DEST/"
 cp "$SRC/libkeryxopencl.so" "$DEST/"
-chmod +x "$DEST/$NAME"
+keryx_copy_amd_inference_route "$SRC" "$DEST"
+cat > "$DEST/run.sh" <<'SH'
+#!/usr/bin/env bash
+set -e
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export LD_LIBRARY_PATH="$HERE${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$HERE/keryx-miner-supr" "$@"
+SH
+chmod +x "$DEST/$NAME" "$DEST/run.sh"
 
 cat > "$DEST/RUN.txt" <<TXT
 keryx-miner-supr — AMD/OpenCL package (v${VERSION})
 
 A KeryxHash miner for AMD GPUs (OpenCL). The binary dlopens libkeryxopencl.so
-from its own directory; it auto-detects the AMD OpenCL platform and mines on all
-AMD GPUs it finds. Needs an AMD OpenCL runtime (libOpenCL.so.1 from the AMD/ROCm
-driver) — no CUDA, no OpenCL SDK.
+for mining and the bundled libkeryx-llama-vk.so for required OPoI GPU inference.
+The portable Vulkan loader is included; the AMD driver must still provide both
+the OpenCL runtime (libOpenCL.so.1) and a Vulkan ICD. No CUDA toolkit is needed.
 
 Run:
-  ./keryx-miner-supr \\
+  ./run.sh \\
       -a keryx:<your_address>.<worker> \\
       -s stratum+tcp://krx.suprnova.cc:4401 \\
-      --light
-(--light = TinyLlama only; drop it for higher LLM tiers / more VRAM.)
+      --very-light
+(--very-light pins H6 tier 0, Qwen3.5-9B; omit it for per-card AUTO tier selection.)
 
 Useful flags:
   --opencl-device 0,1     mine on specific GPU indices (default: all)
   --opencl-workload N     nonces-per-dispatch ratio. AUTO by default — picks a
                           capability-driven value per arch (gfx906 MI50 -> 2048,
                           gfx1102/RDNA3 -> 4096). Override only to tune.
-  --disable-gpu           CPU-only mining (testing / GPU-less boxes).
+  --enable-cpu-inference  deprecated emergency-only inference fallback; normally omit.
 
-Performance is the v_dot8 packed-4-bit matmul + per-arch workload defaults: e.g.
-RX 7600 XT ~332 MH/s, MI50 ~421 MH/s peak (thermally capped), 0 rejects.
+PoM v4 reference pool measurements (tier-0 model): RX 7900 XTX gfx1100
+~1.781 MH/s with its exact-tested one-state WMMA path; MI50 gfx906 ~0.521 MH/s
+with DP4A. gfx1102/gfx12 retain the exact-tested multi-state WMMA path.
 TXT
 
 mkdir -p "$OUT"
@@ -71,4 +87,6 @@ echo "[package-amd] $LABEL package ready:"
 ls -la "$DEST"
 echo ""
 echo "  archive: $TARBALL"
-echo "  sha256:  $(sha256sum "$TARBALL" | cut -d' ' -f1)"
+sha256sum "$TARBALL" > "$TARBALL.sha256"
+echo "  sha256:  $(cut -d' ' -f1 < "$TARBALL.sha256")"
+echo "  checksum: $TARBALL.sha256"

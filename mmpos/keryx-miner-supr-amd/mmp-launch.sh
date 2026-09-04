@@ -5,7 +5,7 @@
 #
 # Unlike the NVIDIA package, AMD needs no bundled CUDA runtime: the GPU driver
 # provides libOpenCL.so.1 at runtime, and the dlopen'd libkeryxopencl.so ships
-# next to this binary. OPoI inference runs on CPU on AMD.
+# next to this binary. OPoI inference uses the packaged llama.cpp Vulkan GPU route.
 cd "$(dirname "$(realpath "$0")")"
 
 # Resolve the bundled libs from THIS package dir first (the Vulkan loader libvulkan.so.1 + the

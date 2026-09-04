@@ -2,9 +2,9 @@
 #
 # Build the AMD/OpenCL flavour of keryx-miner-supr.
 #
-# Produces, in ./dist-amd/:
-#   keryx-miner-supr      - the miner binary (dynamic plugin build, CUDA-free,
-#                           candle falls back to CPU; OPoI per-share tag still works)
+# Produces miner-only development artifacts in ./dist-amd/:
+#   keryx-miner-supr      - the miner binary (dynamic plugin build, CUDA-free;
+#                           OPoI uses the packaged Vulkan GPU route)
 #   libkeryxopencl.so     - the OpenCL worker plugin (dlopened at runtime)
 #
 # The miner auto-detects AMD: on a box with an AMD OpenCL platform the OpenCL
@@ -14,6 +14,9 @@
 # This does NOT build plugins/cuda (that needs the CUDA toolkit). The CUDA path is
 # unchanged — build it on the NVIDIA host as before (cargo build --release, or
 # --features static-cuda for the single-file HiveOS binary).
+# It also deliberately does not build the Vulkan inference sidecar. Shippable AMD packages require
+# the release-complete `hiveos/build-amd-glibc.sh` flow (or an explicitly populated, validated
+# inference route) and will fail closed rather than archive these two files alone.
 #
 set -e
 cd "$(dirname "$0")"
@@ -58,12 +61,12 @@ fi
 
 # --- build --------------------------------------------------------------------
 echo "[build-amd] building libkeryxopencl.so ..."
-cargo build -p keryxopencl --release
+cargo build --locked -p keryxopencl --release
 
 echo "[build-amd] building keryx-miner-supr (dynamic, CUDA-free, PoM/OpenCL) ..."
 # pom-opencl is REQUIRED post-fork: without it the Proof-of-Model mining path is
 # compiled out and AMD mines the dead kHeavyHash algo -> zero valid blocks.
-cargo build --release --bin keryx-miner-supr --features pom-opencl
+cargo build --locked --release --bin keryx-miner-supr --features pom-opencl
 
 mkdir -p dist-amd
 cp -f target/release/keryx-miner-supr dist-amd/
@@ -75,4 +78,4 @@ echo ""
 echo "Run e.g.:"
 echo "  cd dist-amd && ./keryx-miner-supr \\"
 echo "    -s stratum+tcp://krx.suprnova.cc:4401 \\"
-echo "    -a keryx:<your_address>.<worker> --light"
+echo "    -a keryx:<your_address>.<worker> --tier auto"

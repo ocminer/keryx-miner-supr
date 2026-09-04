@@ -1,9 +1,11 @@
 name: windows-build
 
 # Windows (MSVC) builds for keryx-miner-supr.
-#  - windows-amd : keryx-miner-supr.exe + keryxopencl.dll   (AMD/OpenCL + CPU, no CUDA toolchain)
-#  - windows-cuda: keryxcuda.dll                            (NVIDIA plugin; drop next to the exe)
-# Both are independent jobs: an AMD artifact is produced even if the CUDA job fails.
+#  - windows-amd : developer-only miner/OpenCL compile artifact (no GPU inference route yet)
+#  - windows-cuda: developer-only legacy plugin compile artifact
+# The AMD job is deliberately excluded from tagged releases: Windows has no safely scoped Vulkan
+# engine/server path yet, and CPU inference is deprecated + explicit-only, so publishing its bare
+# exe/OpenCL DLL as a working post-fork miner would create an artifact stuck behind the OPoI gate.
 # Triggers: manual, and on a vX.Y.Z tag (assets are attached to the GitHub release).
 #
 # NOTE: the legacy ci.yaml / deploy.yaml in this dir are stale upstream (kaspa-*) workflows
@@ -25,10 +27,12 @@ env:
 
 jobs:
   # ----------------------------------------------------------------------------
-  # AMD / OpenCL + CPU — the primary, CUDA-free Windows artifact.
+  # AMD / OpenCL miner-only compile artifact. Manual/PR diagnostics only until a Windows Vulkan
+  # inference route exists; NEVER attach this incomplete payload to a tagged release.
   # ----------------------------------------------------------------------------
   windows-amd:
-    name: Windows AMD/OpenCL + CPU (MSVC)
+    name: Windows AMD/OpenCL miner-only check (MSVC; no release)
+    if: github.event_name != 'push'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -74,19 +78,24 @@ jobs:
         # would fail ("package does not contain this feature"). pom_opencl.rs is portable and
         # OpenCL.lib is already on LIB via the vcpkg step above.
         run: |
-          cargo build --release --target $env:TARGET -p keryxopencl
-          cargo build --release --target $env:TARGET --features pom-opencl -p keryx-miner-supr
+          cargo build --locked --release --target $env:TARGET -p keryxopencl
+          cargo build --locked --release --target $env:TARGET --features pom-opencl -p keryx-miner-supr
 
       - name: Stage artifact
         shell: pwsh
         run: |
           $rel = "target\$env:TARGET\release"
-          $out = "dist-win-amd"
+          $out = "dist-win-amd-miner-only"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "$rel\keryx-miner-supr.exe" $out\
           Copy-Item "$rel\keryxopencl.dll"      $out\
           @"
-          keryx-miner-supr — Windows (AMD/OpenCL + CPU)
+          keryx-miner-supr — Windows AMD/OpenCL MINER-ONLY DEVELOPER ARTIFACT
+
+          NOT A FUNCTIONAL POST-FORK RELEASE. This payload has no Windows Vulkan GPU
+          inference route. Automatic CPU inference has been removed; without a real
+          GPU inference route the OPoI safety gate intentionally keeps mining stopped.
+          It is retained only to compile/test the OpenCL worker on manual/PR runs.
 
           Files:
             keryx-miner-supr.exe  - the miner
@@ -96,61 +105,24 @@ jobs:
           startup; on a box with an AMD OpenCL platform it self-enables. Requires the
           AMD GPU driver (provides OpenCL.dll) installed on the machine.
 
-          For NVIDIA GPUs, also drop keryxcuda.dll (from the windows-cuda artifact)
-          into this folder.
-
-          EASIEST START: open start.bat in Notepad, replace REPLACE_ME with your
-          keryx wallet address (and rename rig1 if you like), save, then just
-          double-click start.bat. It keeps the window open if the miner exits.
-
-          Example (manual):
-            keryx-miner-supr.exe -s stratum+tcp://krx.suprnova.cc:4404 -a <keryx-address>.<worker> --light
+          Do not redistribute or attach this zip to a release. Windows AMD support
+          must first gain a safely selected Vulkan engine/server and dependency closure.
           "@ | Out-File -FilePath "$out\README-windows.txt" -Encoding utf8
-          @'
-          @echo off
-          setlocal
-          title Keryx Miner
-
-          REM ================================================================
-          REM  EDIT THE NEXT LINE: replace REPLACE_ME with YOUR keryx wallet
-          REM  address, and change rig1 to any worker name you like.
-          REM ================================================================
-          set WALLET=keryx:REPLACE_ME.rig1
-
-          set POOL=stratum+tcp://krx.suprnova.cc:4404
-
-          echo Starting keryx-miner-supr as %WALLET%
-          echo Pool: %POOL%
-          echo.
-          keryx-miner-supr.exe -a %WALLET% -s %POOL% --light
-
-          echo.
-          echo ================================================================
-          echo  The miner STOPPED or CRASHED - read the messages above for the
-          echo  reason. This window stays open on purpose. Press any key to close.
-          echo ================================================================
-          pause
-          '@ | Out-File -FilePath "$out\start.bat" -Encoding ascii
-          Compress-Archive -Path "$out\*" -DestinationPath "keryx-miner-supr-windows-amd.zip" -Force
+          Compress-Archive -Path "$out\*" -DestinationPath "keryx-miner-supr-windows-amd-miner-only.zip" -Force
 
       - uses: actions/upload-artifact@v4
         with:
-          name: keryx-miner-supr-windows-amd
-          path: keryx-miner-supr-windows-amd.zip
+          name: keryx-miner-supr-windows-amd-miner-only
+          path: keryx-miner-supr-windows-amd-miner-only.zip
           if-no-files-found: error
 
-      - name: Attach to release (tag builds)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: keryx-miner-supr-windows-amd.zip
-
   # ----------------------------------------------------------------------------
-  # NVIDIA / CUDA plugin — heavier (needs the CUDA toolkit). Independent of the
-  # AMD job. cust 0.3 is old; if this needs iteration the AMD artifact still ships.
+  # NVIDIA / CUDA plugin compile check. Its old dynamic host was the now miner-only AMD artifact;
+  # tagged releases use the complete windows-cuda-pom package below instead.
   # ----------------------------------------------------------------------------
   windows-cuda:
-    name: Windows NVIDIA/CUDA plugin (MSVC)
+    name: Windows NVIDIA/CUDA plugin-only check (MSVC; no release)
+    if: github.event_name != 'push'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -185,7 +157,7 @@ jobs:
 
       - name: Build CUDA plugin
         shell: pwsh
-        run: cargo build --release --target $env:TARGET -p keryxcuda
+        run: cargo build --locked --release --target $env:TARGET -p keryxcuda
 
       - name: Stage artifact
         shell: pwsh
@@ -197,9 +169,9 @@ jobs:
           @"
           keryx-miner-supr — Windows NVIDIA/CUDA plugin
 
-          keryxcuda.dll - CUDA worker. Drop this into the SAME folder as
-          keryx-miner-supr.exe (from the windows-amd artifact). The miner auto-loads
-          it and mines on NVIDIA GPUs. Requires an NVIDIA driver.
+          keryxcuda.dll - developer-only dynamic CUDA worker compile artifact.
+          The former dynamic host is no longer a functional tagged release. Use the
+          complete keryx-miner-supr-windows-nvidia-pom package for Windows mining.
           "@ | Out-File -FilePath "$out\README-cuda.txt" -Encoding utf8
           Compress-Archive -Path "$out\*" -DestinationPath "keryxcuda-windows.zip" -Force
 
@@ -208,12 +180,6 @@ jobs:
           name: keryxcuda-windows
           path: keryxcuda-windows.zip
           if-no-files-found: error
-
-      - name: Attach to release (tag builds)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: keryxcuda-windows.zip
 
   # ----------------------------------------------------------------------------
   # NVIDIA Proof-of-Model — self-contained .exe with candle-CUDA (PoM, post-fork)
@@ -269,12 +235,13 @@ jobs:
         env:
           # 70 = lowest arch candle-kernels compiles for; its sm_70 PTX
           # forward-JITs across sm_70→sm_120 (Volta→5090). Was 80 (broke
-          # Volta/Turing GPU inference). Pascal sm_61 → --cpu-inference.
+          # Volta/Turing GPU inference). Pascal sm_61 is served by the Linux legacy line,
+          # not this modern Windows artifact.
           CUDA_COMPUTE_CAP: "70"
         run: |
           Write-Host "CUDA_PATH=$env:CUDA_PATH"
           & "$env:CUDA_PATH\bin\nvcc.exe" --version
-          cargo build --release --target $env:TARGET --features static-cuda,pom-cuda -p keryx-miner-supr
+          cargo build --locked --release --target $env:TARGET --features static-cuda,pom-cuda -p keryx-miner-supr
 
       # The in-process llama.cpp engine as keryx-llama.dll. Without it a Windows NVIDIA rig cannot
       # serve the H4/H6 models (they load ONLY via llama.cpp; candle has no loader) and inference
@@ -353,13 +320,17 @@ jobs:
           }
           $cudaBin = "$env:CUDA_PATH\bin"
           foreach ($pat in @("cublas64_*.dll","cublasLt64_*.dll","curand64_*.dll","cudart64_*.dll")) {
-            Get-ChildItem -Path $cudaBin -Filter $pat -ErrorAction SilentlyContinue | Copy-Item -Destination $out
+            $matches = @(Get-ChildItem -Path $cudaBin -Filter $pat -ErrorAction SilentlyContinue)
+            if ($matches.Count -eq 0) {
+              throw "required CUDA runtime family '$pat' is missing from $cudaBin"
+            }
+            $matches | Copy-Item -Destination $out
           }
           @"
           keryx-miner-supr — Windows NVIDIA (Proof-of-Model)
 
           Self-contained PoM miner. Keep the bundled *.dll next to the .exe.
-          Requires an NVIDIA driver (R535+). Mines kHeavyHash pre-fork and
+          Requires a CUDA 12.8-compatible NVIDIA driver (R570+). Mines kHeavyHash pre-fork and
           auto-switches to PoM at the hardfork.
 
           EASIEST START: open start.bat in Notepad, replace REPLACE_ME with your
@@ -367,7 +338,7 @@ jobs:
           double-click start.bat. It keeps the window open if the miner exits.
 
           Example (manual):
-            keryx-miner-supr.exe -s stratum+tcp://krx.suprnova.cc:4404 -a <keryx-address>.<worker> --light
+            keryx-miner-supr.exe -s stratum+tcp://krx.suprnova.cc:4404 -a <keryx-address>.<worker> --tier auto
           "@ | Out-File -FilePath "$out\README-nvidia-pom.txt" -Encoding utf8
           @'
           @echo off
@@ -385,7 +356,7 @@ jobs:
           echo Starting keryx-miner-supr as %WALLET%
           echo Pool: %POOL%
           echo.
-          keryx-miner-supr.exe -a %WALLET% -s %POOL% --light
+          keryx-miner-supr.exe -a %WALLET% -s %POOL% --tier auto
 
           echo.
           echo ================================================================

@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Build keryx-miner-supr against an OLD glibc (Ubuntu 20.04 = glibc 2.31) so the
 # binary + plugins run on HiveOS, which ships an older glibc than the dev rig
-# (Ubuntu 24.04 = glibc 2.39). The PoW PTX is pre-built and `include_str!`'d, so
-# no nvcc-in-container PTX regen happens — the CUDA 13.0 / PTX 9.0 kernels ride
-# along unchanged. `cust` links the CUDA *driver* API (libcuda), provided on the
-# HiveOS host at runtime; here we link against the toolkit stub.
+# (Ubuntu 24.04 = glibc 2.39). The legacy-worker PTX is pre-built and `include_str!`'d
+# (CUDA 12.2 / PTX 8.2 for sm_61–sm_90; CUDA 12.8 / PTX 8.7 for sm_100/sm_120),
+# and the modern PoM walk embeds its separate CUDA 13.3 fatbin. Neither committed
+# image set is regenerated in this container. `cust` links the CUDA *driver* API
+# (libcuda), provided on the HiveOS host at runtime; here we link against the toolkit stub.
 #
 # Usage:  hiveos/build-glibc.sh
-# Output: hiveos/dist/{keryx-miner-supr,libkeryxcuda.so,libkeryxopencl.so}
+# Output: hiveos/dist/keryx-miner-supr (static CUDA worker + pom-cuda backend)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,7 +36,8 @@ docker run --rm \
     # 0.9.2 compiles for (reduce.cu needs sm_70+ half atomicAdd; sm_61 fails) →
     # the resulting sm_70 PTX JITs across the whole fleet sm_70(Volta)→sm_75
     # (Turing)→sm_80/86 (3070/Ampere)→sm_89 (Ada)→sm_90 (Hopper)→sm_120 (5090).
-    # Was 80 (re-broke Volta/Turing). Pascal sm_61 cannot run GPU inference → --cpu-inference.
+    # Was 80 (re-broke Volta/Turing). Pascal packages use the dedicated llama.cpp CUDA sm_61 GPU
+    # engine; CPU inference is deprecated, explicit emergency behavior only.
     export CUDA_COMPUTE_CAP=70
     export PATH=/usr/local/cuda/bin:$PATH
     # Link cust against the toolkit libcuda stub (driver provides it at runtime).
@@ -58,7 +60,7 @@ docker run --rm \
     # 12.8 toolkit here. It links the candle CUDA RUNTIME libcudart + libcublas, so
     # unlike the old kHeavyHash static-cuda build the payload now needs those .so
     # files at runtime; hiveos/package.sh bundles them next to the binary.
-    cargo build --release --features static-cuda,pom-cuda
+    cargo build --locked --release --features static-cuda,pom-cuda
     # Make artifacts readable by the host (uid 1000) after a root build.
     cp target-hiveos/release/keryx-miner-supr /src/hiveos/dist/
     chmod -R a+rX /src/hiveos/dist

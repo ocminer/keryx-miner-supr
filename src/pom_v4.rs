@@ -1,7 +1,7 @@
 //! PoM v4 (D=32 re-walk) — wire structs, constants, host proof-build. Byte-exact mirror of the
 //! node's `consensus/core/src/pom_v4.rs`. Field order and salts MUST stay bit-identical.
 
-use crate::pom::{blake, merkle_root, mix64, verify_merkle, WeightIndex};
+use crate::pom::{blake, hash_pair, mix64, verify_merkle, WeightIndex};
 use anyhow::{anyhow, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
 
@@ -218,45 +218,108 @@ pub fn v4_transition_into(dst: &mut [u8], src: &[u8], tile: &[u8], step: u32) {
     debug_assert_eq!(src.len(), POM_V4_D * POM_V4_D);
     debug_assert_eq!(tile.len(), POM_V4_TILE_BYTES);
     #[cfg(target_arch = "x86_64")]
-    let avx2 = is_x86_feature_detected!("avx2");
-    #[cfg(target_arch = "x86_64")]
-    let sse41 = !avx2 && is_x86_feature_detected!("sse4.1");
+    {
+        // Dispatch the WHOLE 32x32 transition once. Calling a #[target_feature] dot-product helper
+        // from the generic loop leaves an out-of-line call in every one of the 1,024 cells on rustc,
+        // i.e. 262,144 calls per proof walk (twice that with the independent verifier). Once the
+        // outer function carries the same feature, LLVM can inline the dot into the cell loop.
+        if is_x86_feature_detected!("avx2") {
+            unsafe { v4_transition_into_avx2(dst, src, tile, step) };
+            return;
+        }
+        if is_x86_feature_detected!("sse4.1") {
+            unsafe { v4_transition_into_sse41(dst, src, tile, step) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { v4_transition_into_neon(dst, src, tile, step) };
+        return;
+    }
+    v4_transition_into_scalar(dst, src, tile, step);
+}
+
+#[inline]
+fn v4_transition_into_scalar(dst: &mut [u8], src: &[u8], tile: &[u8], step: u32) {
     for x in 0..POM_V4_D {
         let row = &src[x * POM_V4_D..(x + 1) * POM_V4_D];
         for j in 0..POM_V4_D {
             let col = &tile[j * POM_V4_D..(j + 1) * POM_V4_D];
-            let dot = {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    if avx2 {
-                        unsafe { dot_i8_avx2(row, col) }
-                    } else if sse41 {
-                        unsafe { dot_i8_sse41(row, col) }
-                    } else {
-                        dot_i8_scalar(row, col)
-                    }
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    dot_i8(row, col)
-                }
-            };
+            let dot = dot_i8_scalar(row, col);
             dst[x * POM_V4_D + j] = rho8(dot, rho_tweak(step, x as u32, j as u32));
         }
     }
 }
 
-fn v4_state_leaves(state: &[u8]) -> Vec<[u8; 32]> {
-    (0..POM_V4_D).map(|r| blake(&state[r * POM_V4_D..(r + 1) * POM_V4_D])).collect()
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn v4_transition_into_avx2(dst: &mut [u8], src: &[u8], tile: &[u8], step: u32) {
+    for x in 0..POM_V4_D {
+        let row = &src[x * POM_V4_D..(x + 1) * POM_V4_D];
+        for j in 0..POM_V4_D {
+            let col = &tile[j * POM_V4_D..(j + 1) * POM_V4_D];
+            let dot = unsafe { dot_i8_avx2(row, col) };
+            dst[x * POM_V4_D + j] = rho8(dot, rho_tweak(step, x as u32, j as u32));
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn v4_transition_into_sse41(dst: &mut [u8], src: &[u8], tile: &[u8], step: u32) {
+    for x in 0..POM_V4_D {
+        let row = &src[x * POM_V4_D..(x + 1) * POM_V4_D];
+        for j in 0..POM_V4_D {
+            let col = &tile[j * POM_V4_D..(j + 1) * POM_V4_D];
+            let dot = unsafe { dot_i8_sse41(row, col) };
+            dst[x * POM_V4_D + j] = rho8(dot, rho_tweak(step, x as u32, j as u32));
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn v4_transition_into_neon(dst: &mut [u8], src: &[u8], tile: &[u8], step: u32) {
+    for x in 0..POM_V4_D {
+        let row = &src[x * POM_V4_D..(x + 1) * POM_V4_D];
+        for j in 0..POM_V4_D {
+            let col = &tile[j * POM_V4_D..(j + 1) * POM_V4_D];
+            let dot = unsafe { dot_i8_neon(row, col) };
+            dst[x * POM_V4_D + j] = rho8(dot, rho_tweak(step, x as u32, j as u32));
+        }
+    }
+}
+
+fn merkle_root_32(mut nodes: [[u8; 32]; POM_V4_D]) -> [u8; 32] {
+    let mut len = POM_V4_D;
+    while len > 1 {
+        for i in 0..len / 2 {
+            let left = nodes[i * 2];
+            let right = nodes[i * 2 + 1];
+            nodes[i] = hash_pair(&left, &right);
+        }
+        len /= 2;
+    }
+    nodes[0]
 }
 
 pub fn v4_state_root(state: &[u8]) -> [u8; 32] {
-    merkle_root(&v4_state_leaves(state))
+    debug_assert_eq!(state.len(), POM_V4_D * POM_V4_D);
+    let mut leaves = [[0u8; 32]; POM_V4_D];
+    for (r, leaf) in leaves.iter_mut().enumerate() {
+        *leaf = blake(&state[r * POM_V4_D..(r + 1) * POM_V4_D]);
+    }
+    merkle_root_32(leaves)
 }
 
 fn v4_tile_subtree_root(tile: &[u8]) -> [u8; 32] {
-    let leaves: Vec<[u8; 32]> = tile.chunks(POM_V4_CHUNK_BYTES).map(blake).collect();
-    merkle_root(&leaves)
+    debug_assert_eq!(tile.len(), POM_V4_TILE_BYTES);
+    let mut leaves = [[0u8; 32]; POM_V4_D];
+    for (leaf, chunk) in leaves.iter_mut().zip(tile.chunks_exact(POM_V4_CHUNK_BYTES)) {
+        *leaf = blake(chunk);
+    }
+    merkle_root_32(leaves)
 }
 
 /// Re-walk `seed` reading tiles from `index`, returning the proof and the derived `final_state`.
@@ -279,10 +342,7 @@ pub fn build_proof_v4(tier: u8, seed: u64, index: &WeightIndex) -> Result<(PomPr
         let mut tile = vec![0u8; POM_V4_TILE_BYTES];
         index.read_chunks_into(off * POM_V4_TILE_CHUNKS, &mut tile);
         let snippet: [u8; 32] = tile[..POM_V4_SNIPPET_BYTES].try_into().unwrap();
-        let path = index.merkle_path_from_level(
-            off * POM_V4_TILE_CHUNKS,
-            POM_V4_TILE_SUBTREE_DEPTH,
-        );
+        let path = index.merkle_path_from_level(off * POM_V4_TILE_CHUNKS, POM_V4_TILE_SUBTREE_DEPTH);
         merkle.push(PomV4RangeProof { path });
         v4_transition_into(&mut scratch, &state, &tile, step as u32);
         std::mem::swap(&mut state, &mut scratch);
@@ -334,7 +394,10 @@ mod simd_dot_tests {
     #[test]
     fn simd_dot_matches_scalar_oracle() {
         let mut h = 0x9E3779B97F4A7C15u64;
-        let mut next = || { h = mix64(h); h };
+        let mut next = || {
+            h = mix64(h);
+            h
+        };
         for _ in 0..2000 {
             let row: Vec<u8> = (0..POM_V4_D).map(|_| next() as u8).collect();
             let col: Vec<u8> = (0..POM_V4_D).map(|_| next() as u8).collect();
@@ -361,14 +424,33 @@ mod simd_dot_tests {
     #[test]
     fn transition_into_matches_allocating() {
         let mut h = 0xDEADBEEFCAFEBABEu64;
-        let mut next = || { h = mix64(h); h };
+        let mut next = || {
+            h = mix64(h);
+            h
+        };
         let state: Vec<u8> = (0..POM_V4_D * POM_V4_D).map(|_| next() as u8).collect();
         let tile: Vec<u8> = (0..POM_V4_TILE_BYTES).map(|_| next() as u8).collect();
         for step in [1u32, 7, 255] {
             let a = v4_transition(&state, &tile, step);
             let mut b = vec![0u8; POM_V4_D * POM_V4_D];
+            let mut oracle = vec![0u8; POM_V4_D * POM_V4_D];
             v4_transition_into(&mut b, &state, &tile, step);
+            v4_transition_into_scalar(&mut oracle, &state, &tile, step);
             assert_eq!(a, b, "transition_into != v4_transition at step {step}");
+            assert_eq!(b, oracle, "SIMD transition != scalar oracle at step {step}");
         }
+    }
+
+    #[test]
+    fn fixed_merkle_reducers_match_generic_oracle() {
+        let mut h = 0x1234_5678_9abc_def0u64;
+        let mut bytes = vec![0u8; POM_V4_TILE_BYTES];
+        for b in &mut bytes {
+            h = mix64(h);
+            *b = h as u8;
+        }
+        let leaves: Vec<[u8; 32]> = bytes.chunks_exact(POM_V4_CHUNK_BYTES).map(blake).collect();
+        assert_eq!(v4_tile_subtree_root(&bytes), crate::pom::merkle_root(&leaves));
+        assert_eq!(v4_state_root(&bytes), crate::pom::merkle_root(&leaves));
     }
 }

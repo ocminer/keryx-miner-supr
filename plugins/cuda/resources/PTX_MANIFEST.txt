@@ -1,0 +1,19 @@
+Keryx legacy CUDA PTX manifest
+source=plugins/cuda/kaspa-cuda-native/src/kaspa-cuda.cu
+input_sha256=eced94fe4860923b7ab3303b6121c2ddadf95d8aabaea68fb17639f861f7fc7c plugins/cuda/kaspa-cuda-native/src/kaspa-cuda.cu
+input_sha256=a5f87cccebffe9fa6387cabd3dd10671f4733561424372759de2285b5c654137 plugins/cuda/kaspa-cuda-native/src/keccak-tiny.c
+input_sha256=dfbe669f8568a889a8a7713e33e134fce067e8c0ebb5bd1b00baebeb86fe71a0 plugins/cuda/kaspa-cuda-native/src/xoshiro256starstar.c
+inputs_set_sha256=bbdbe78f8c2b29a7579cb60cd282cb6ca56e3beb2bf7d392db1683426125f06d
+flags=-std=c++11 -O3 --restrict --ptx --gpu-architecture=compute_N --gpu-code=sm_N -Xptxas -O3 -Xcompiler -O3
+cuda_12_2_image=nvidia/cuda@sha256:b7074ef6f9aa30c27fe747f3a7e10402ec442f001290718c73e0972d1ee61342 (sm_61,sm_75,sm_80,sm_86,sm_89,sm_90)
+cuda_12_8_image=nvidia/cuda@sha256:cd0f8e1c41628ff2513e9f7c42dd9bd8740fe87fd6615b9c4a6f392995a589c0 (sm_100,sm_120)
+
+sha256  bytes  file
+c155d4199a541a8d890c9f6a38c6ca05cdbfeb142f669f34ece23dc9e113c058  536086  keryx-cuda-sm61.ptx
+b34b3e3300b1169f618bac185b22b5ecaa22148e7dc480e75737f682bd987aab  536497  keryx-cuda-sm75.ptx
+fd96396c44ba879919637a41ff83919a471f17561f672b4b6a93d33cfd7e0b09  536532  keryx-cuda-sm80.ptx
+f40678526fd0e5a5de174d81d60b925b02e625d2084146585c00ac34b324b10a  536497  keryx-cuda-sm86.ptx
+c84a3e2ef4fdeb22e86d3f3119e5aab811f6445210817407d9e5227ce1e7f45c  536497  keryx-cuda-sm89.ptx
+352369deee062dfaed83e44e9addf280a3cf303f646f7685095c1010a5229b63  536497  keryx-cuda-sm90.ptx
+f5e7f2a42c35faf680c2f4f7e6a4a211f82b04f459afe623c9435378a2b2bf79  571552  keryx-cuda-sm100.ptx
+28d15cdf4827acc61ac19c9d608c117e8ec234e38da5c2f34c2a59816892e59d  571552  keryx-cuda-sm120.ptx

@@ -55,8 +55,9 @@ jobs:
           key: ${{ runner.os }}-metal-llama-${{ hashFiles('hiveos/build-keryx-llama-macos.sh', 'tools/keryx-llama/keryx_llama.cpp') }}
 
       # In-process llama.cpp (Metal) engine — libkeryx-llama.dylib. Bundled next to the miner
-      # binary, dlopen'd at startup by src/llama_engine.rs to serve OPoI inference. Absent = the
-      # candle-Metal fallback stays active, byte-identical to the pre-Phase-3b Metal build.
+      # binary, dlopen'd at startup by src/llama_engine.rs to serve OPoI inference. This is a
+      # required release component: candle-Metal inference has been removed, so absence keeps the
+      # OPoI safety gate closed (unless the deprecated CPU emergency override is explicit).
       - name: Build libkeryx-llama.dylib (Metal)
         run: ./hiveos/build-keryx-llama-macos.sh
 
@@ -108,8 +109,8 @@ jobs:
           strip target/release/keryx-miner-supr
           cp target/release/keryx-miner-supr "$DIR/"
           # In-process llama.cpp (Metal) engine: src/llama_engine.rs dlopens this next to the
-          # binary at startup. Absent = the miner still runs, candle-Metal inference stays active
-          # as fallback. build-keryx-llama-macos.sh already ad-hoc-signed it in-place.
+          # binary at startup. This is mandatory for normal OPoI service; there is no automatic
+          # CPU fallback. build-keryx-llama-macos.sh already ad-hoc-signed it in-place.
           cp hiveos/dist-macos-arm64/libkeryx-llama.dylib "$DIR/"
           # Ad-hoc code sign AFTER strip: strip invalidates the linker's default ad-hoc signature,
           # which on Apple Silicon makes the kernel refuse to exec it ("killed: 9"). Re-signing with
@@ -133,7 +134,7 @@ jobs:
           xattr -dr com.apple.quarantine . 2>/dev/null
           chmod +x keryx-miner-supr run.sh whitelist-macos.command 2>/dev/null
           echo "✅ Whitelisted. Now run in Terminal:"
-          echo "   ./run.sh -a keryx:<yourwallet>.<worker> -s stratum+tcp://krx.suprnova.cc:4401 --light"
+          echo "   ./run.sh -a keryx:<yourwallet>.<worker> -s stratum+tcp://krx.suprnova.cc:4401 --tier auto"
           echo "(press any key to close)"; read -n 1
           SH
           chmod +x "$DIR/run.sh" "$DIR/keryx-miner-supr" "$DIR/whitelist-macos.command"
@@ -141,12 +142,13 @@ jobs:
           keryx-miner-supr ${VER} — macOS Apple Silicon (arm64), Metal PoM. EXPERIMENTAL.
           The PoM walk runs on the Apple GPU via Metal (candle-independent, packed single MTLBuffer).
           OPoI inference runs on Metal via bundled libkeryx-llama.dylib (llama.cpp Metal backend)
-          when the .dylib sits next to the miner — falls back to candle-CPU otherwise. H3-ready:
-          auto-switches at the fork.
+          through the bundled libkeryx-llama.dylib. Keep that dylib beside the miner: without a
+          GPU inference route the OPoI safety gate stops mining. CPU inference is a deprecated,
+          explicit emergency override only.
 
           FIRST RUN (macOS Gatekeeper blocks unsigned downloads):
             Easiest — in Terminal, from this folder:
-              ./run.sh -a keryx:<yourwallet>.<worker> -s stratum+tcp://krx.suprnova.cc:4401 --light
+              ./run.sh -a keryx:<yourwallet>.<worker> -s stratum+tcp://krx.suprnova.cc:4401 --tier auto
               (run.sh clears the quarantine flag itself on first launch)
             Or double-click  whitelist-macos.command  in Finder, then run ./run.sh
             Or manually:  xattr -dr com.apple.quarantine .

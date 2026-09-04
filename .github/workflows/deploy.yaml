@@ -1,7 +1,7 @@
-name: Build and upload assets
-on:
-  release:
-    types: [ published ]
+name: "RETIRED upstream Kaspa release workflow (do not run)"
+# Historical only: all jobs below name removed kaspa-miner/kaspacuda artifacts. Release assets are
+# produced by the maintained vendor-specific workflows; never publish these stale payloads.
+on: workflow_dispatch
 
 jobs:
   build:

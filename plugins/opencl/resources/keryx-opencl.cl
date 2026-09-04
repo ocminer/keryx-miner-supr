@@ -286,6 +286,12 @@ inline uint64_t xoshiro256_next(global ulong4 *s) {
 #ifdef cl_khr_int64_base_atomics
 #pragma OPENCL EXTENSION cl_khr_int64_base_atomics: enable
 #endif
+#ifdef cl_khr_int64_extended_atomics
+#pragma OPENCL EXTENSION cl_khr_int64_extended_atomics: enable
+#endif
+#if !defined(cl_khr_int64_base_atomics) && !defined(cl_khr_int64_extended_atomics)
+#error "Keryx OpenCL mining requires 64-bit global atomics"
+#endif
 
 #define BLOCKDIM 1024
 #define MATRIX_SIZE 64
@@ -296,11 +302,7 @@ inline uint64_t xoshiro256_next(global ulong4 *s) {
 #define RANDOM_TYPE_LEAN 0
 #define RANDOM_TYPE_XOSHIRO 1
 
-#define LT_U256(X,Y) (X.w != Y->w ? X.w < Y->w : X.z != Y->z ? X.z < Y->z : X.y != Y->y ? X.y < Y->y : X.x < Y->x)
-
-#ifndef cl_khr_int64_base_atomics
-global int lock = false;
-#endif
+#define LE_U256(X,Y) (X.w != Y->w ? X.w < Y->w : X.z != Y->z ? X.z < Y->z : X.y != Y->y ? X.y < Y->y : X.x <= Y->x)
 
 // NO_INLINE_ASM (set by the worker on Windows): the AMD Adrenalin OpenCL compiler rejects the GNU
 // `__asm__`/`asm` extension ("implicit declaration of function 'asm' is invalid in C99" ->
@@ -401,12 +403,6 @@ kernel void heavy_hash(
     int nonceId = get_global_id(0);
     #endif
 
-    #ifndef cl_khr_int64_base_atomics
-    if (nonceId == 0)
-       lock = 0;
-    work_group_barrier(CLK_GLOBAL_MEM_FENCE);
-    #endif
-
     private uint64_t nonce;
     switch (random_type){
       case RANDOM_TYPE_LEAN:
@@ -472,14 +468,20 @@ kernel void heavy_hash(
 
     hash(heavyP, (const ulong*)buffer, &hash_.hash);
 
-    if (LT_U256(hash_.hash, target)){
-        //printf("%lu: %lu < %lu: %d %d\n", nonce, ((uint64_t *)hash_)[3], target[3], ((uint64_t *)hash_)[3] < target[3], LT_U256((uint64_t *)hash_, target));
-        #ifdef cl_khr_int64_base_atomics
-        atom_cmpxchg(final_nonce, 0, nonce);
-        #else
-        if (!atom_cmpxchg(&lock, 0, 1)) {
-            *final_nonce = nonce;
-            //for(int i=0;i<4;i++) final_hash[i] = ((uint64_t volatile *)hash_)[i];
+    if (LE_U256(hash_.hash, target)){
+        // Publish the lowest valid nonce. The host initializes final_nonce to
+        // UINT64_MAX before every launch, so nonce zero remains representable.
+        #ifdef cl_khr_int64_extended_atomics
+        atom_min(final_nonce, nonce);
+        #elif defined(cl_khr_int64_base_atomics)
+        // CAS(MAX, MAX) is an atomic load; avoid mixing an ordinary read with
+        // concurrent atomic writers on implementations that expose only the
+        // base 64-bit atomics extension.
+        uint64_t observed = atom_cmpxchg(final_nonce, ~(uint64_t)0, ~(uint64_t)0);
+        while (nonce < observed) {
+            uint64_t prior = atom_cmpxchg(final_nonce, observed, nonce);
+            if (prior == observed) break;
+            observed = prior;
         }
         #endif
     }

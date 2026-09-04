@@ -9,9 +9,33 @@ use keryx_plugin_api::Worker;
 use log::{error, info};
 use rand::{Fill, RngCore};
 use std::ffi::CString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 static BPS: f32 = 1.;
+
+/// Raw device/host no-winner sentinel for the legacy CUDA kernel. A real nonce 0 is valid, so zero
+/// cannot double as absence. Keep the raw value through `copy_output_to`; the caller must test MAX.
+pub const CUDA_NO_WINNER: u64 = u64::MAX;
+
+// Rust trait objects cross the dynamic-plugin boundary in this project, so the Worker vtable may
+// not be extended safely.  A new host explicitly negotiates raw-MAX output through an optional C
+// symbol; without that handshake (old host + new plugin), copy_output_to translates MAX back to the
+// historical zero sentinel.  That keeps both mixed-version directions safe.
+static RAW_NONCE_OUTPUT_V1: AtomicBool = AtomicBool::new(false);
+
+pub fn enable_raw_nonce_output_v1() -> u64 {
+    RAW_NONCE_OUTPUT_V1.store(true, Ordering::Release);
+    CUDA_NO_WINNER
+}
+
+fn output_for_host(raw: u64, raw_contract: bool) -> u64 {
+    if !raw_contract && raw == CUDA_NO_WINNER {
+        0
+    } else {
+        raw
+    }
+}
 
 static PTX_120: &str = include_str!("../resources/keryx-cuda-sm120.ptx");
 static PTX_100: &str = include_str!("../resources/keryx-cuda-sm100.ptx");
@@ -116,9 +140,9 @@ impl<'gpu> Worker for CudaGPUWorker<'gpu> {
             NonceGenEnum::Xoshiro => 1,
         };
 
-        // Clear the winner slot host-side: the kernel must not clear it while its own blocks
-        // are already publishing into it. (upstream 2c020ab)
-        self.final_nonce_buff.copy_from(&[0]).unwrap();
+        // Reset host-side before launch. Clearing in block/thread 0 races blocks that have already
+        // published. MAX is both atomicMin's identity and distinct from valid nonce 0.
+        self.final_nonce_buff.copy_from(&[CUDA_NO_WINNER]).unwrap();
         self.start_event.record(stream).unwrap();
         unsafe {
             launch!(
@@ -155,6 +179,11 @@ impl<'gpu> Worker for CudaGPUWorker<'gpu> {
     #[inline(always)]
     fn copy_output_to(&mut self, nonces: &mut Vec<u64>) -> Result<(), Error> {
         self.final_nonce_buff.copy_to(nonces)?;
+        // Old hosts know only the zero sentinel. New hosts call the optional negotiation symbol
+        // before constructing workers and compare the raw value against CUDA_NO_WINNER instead.
+        if let Some(nonce) = nonces.first_mut() {
+            *nonce = output_for_host(*nonce, RAW_NONCE_OUTPUT_V1.load(Ordering::Acquire));
+        }
         Ok(())
     }
 }
@@ -188,17 +217,17 @@ impl<'gpu> CudaGPUWorker<'gpu> {
             })
         };
 
-        // For sm_89 (Ada/RTX 40) and sm_100 (Blackwell/RTX 50), the PTX was compiled with
-        // CUDA 13.2 (PTX ISA 9.2) which requires driver >= 570. If the driver is older, we
-        // fall back to sm_86 (CUDA 12.0 / PTX 8.0, driver >= 520) which runs on all these
-        // architectures via NVIDIA's backward-compatible PTX JIT.
+        // The committed generation is reproducibly built by regenerate-ptx.sh: sm_61..sm_90 use
+        // CUDA 12.2 / PTX ISA 8.2 to preserve the original older-driver floor; sm_100/sm_120 use
+        // CUDA 12.8 / PTX ISA 8.7 (the first toolkit with consumer Blackwell). If a native virtual
+        // target cannot load, the older sm_86 PTX remains a forward-JIT fallback.
         if major >= 12 {
             // sm_120 (RTX 50 / consumer Blackwell — GeForce RTX 5090 etc.).
             // NVIDIA splits sm_100 (datacenter Blackwell — H100/B100/GH100) and
             // sm_120 (consumer Blackwell) as separate compute architectures, so
             // the sm_100 PTX errors out with `unknown error` on a 5090 even with
             // a 580+ driver. Compiled with CUDA 12.8 nvcc against compute_120
-            // (the first toolkit with native sm_120 support).
+            // (CUDA 12.8, the first toolkit with native sm_120 support).
             _module = Arc::new(match load_ptx(PTX_120, "sm_120") {
                 Ok(m) => {
                     info!("GPU #{} using optimised sm_120 PTX", device_id);
@@ -213,14 +242,17 @@ impl<'gpu> CudaGPUWorker<'gpu> {
                 }
             });
         } else if major >= 10 {
-            // sm_100 (datacenter Blackwell — H100 / B100 / GH100)
+            // sm_100 (datacenter Blackwell — B100 / B200 / GB200)
             _module = Arc::new(match load_ptx(PTX_100, "sm_100") {
                 Ok(m) => {
                     info!("GPU #{} using optimised sm_100 PTX", device_id);
                     m
                 }
                 Err(e) => {
-                    info!("GPU #{} falling back to sm_86 PTX (update driver to 570+ for full Blackwell optimisation)", device_id);
+                    info!(
+                        "GPU #{} falling back to sm_86 PTX (update driver to 570+ for full Blackwell optimisation)",
+                        device_id
+                    );
                     load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?
                 }
             });
@@ -248,7 +280,10 @@ impl<'gpu> CudaGPUWorker<'gpu> {
                     m
                 }
                 Err(e) => {
-                    info!("GPU #{} falling back to sm_86 PTX (update driver to 570+ for full Ada Lovelace optimisation)", device_id);
+                    info!(
+                        "GPU #{} falling back to sm_86 PTX (update driver to 570+ for full Ada Lovelace optimisation)",
+                        device_id
+                    );
                     load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?
                 }
             });
@@ -306,7 +341,7 @@ impl<'gpu> CudaGPUWorker<'gpu> {
         info!("GPU #{} Chosen workload: {}", device_id, chosen_workload);
         heavy_hash_kernel.set_workload(chosen_workload);
 
-        let final_nonce_buff = vec![0u64; 1].as_slice().as_dbuf()?;
+        let final_nonce_buff = vec![CUDA_NO_WINNER; 1].as_slice().as_dbuf()?;
 
         let rand_state: DeviceBuffer<u64> = match random {
             NonceGenEnum::Xoshiro => {
@@ -352,5 +387,56 @@ impl<'gpu> CudaGPUWorker<'gpu> {
             heavy_hash_kernel,
             random,
         })
+    }
+}
+
+#[cfg(test)]
+mod winner_contract_tests {
+    use super::*;
+
+    #[test]
+    fn max_sentinel_preserves_nonce_zero() {
+        assert_eq!(CUDA_NO_WINNER, u64::MAX);
+        assert_ne!(CUDA_NO_WINNER, 0);
+        assert_eq!(output_for_host(CUDA_NO_WINNER, false), 0, "old hosts retain their sentinel");
+        assert_eq!(output_for_host(CUDA_NO_WINNER, true), CUDA_NO_WINNER, "negotiated hosts receive the raw sentinel");
+        assert_eq!(output_for_host(0, false), 0);
+        assert_eq!(output_for_host(0, true), 0, "nonce zero survives the negotiated contract");
+    }
+
+    #[test]
+    fn atomic_min_contract_selects_lowest_winner() {
+        let mut slot = CUDA_NO_WINNER;
+        for nonce in [91u64, 7, 42, 0, 13] {
+            slot = slot.min(nonce);
+        }
+        assert_eq!(slot, 0);
+    }
+
+    #[test]
+    fn canonical_cuda_source_has_consensus_winner_contract() {
+        let src = include_str!("../kaspa-cuda-native/src/kaspa-cuda.cu");
+        assert!(src.contains("#define LE_U256"));
+        assert!(src.contains("X.number[0] <= Y.number[0]"));
+        assert!(src.contains("atomicMin((unsigned long long int*) final_nonce"));
+        assert!(!src.contains("atomicCAS((unsigned long long int*) final_nonce"));
+    }
+
+    #[test]
+    fn every_embedded_ptx_uses_atomic_min_not_cas() {
+        for (arch, ptx) in [
+            ("61", PTX_61),
+            ("75", PTX_75),
+            ("80", PTX_80),
+            ("86", PTX_86),
+            ("89", PTX_89),
+            ("90", PTX_90),
+            ("100", PTX_100),
+            ("120", PTX_120),
+        ] {
+            assert!(ptx.contains(&format!(".target sm_{arch}")), "wrong target in sm_{arch} PTX");
+            assert!(ptx.contains(".global.min.u64"), "sm_{arch} PTX has no u64 atomicMin");
+            assert!(!ptx.contains(".global.cas.b64"), "sm_{arch} PTX still contains atomicCAS");
+        }
     }
 }

@@ -24,7 +24,9 @@ typedef union _uint256_t {
 #define RANDOM_LEAN 0
 #define RANDOM_XOSHIRO 1
 
-#define LT_U256(X,Y) (X.number[3] != Y.number[3] ? X.number[3] < Y.number[3] : X.number[2] != Y.number[2] ? X.number[2] < Y.number[2] : X.number[1] != Y.number[1] ? X.number[1] < Y.number[1] : X.number[0] < Y.number[0])
+// Consensus accepts hash <= target. The low limb must therefore use <= once all higher limbs are
+// equal; a strict comparison loses the (rare but valid) hash == target boundary case.
+#define LE_U256(X,Y) (X.number[3] != Y.number[3] ? X.number[3] < Y.number[3] : X.number[2] != Y.number[2] ? X.number[2] < Y.number[2] : X.number[1] != Y.number[1] ? X.number[1] < Y.number[1] : X.number[0] <= Y.number[0])
 
 __constant__ uint8_t matrix[MATRIX_SIZE][MATRIX_SIZE];
 __constant__ uint8_t hash_header[HASH_HEADER_SIZE];
@@ -286,8 +288,11 @@ extern "C" {
             }
             nonce = (nonce & nonce_mask) | nonce_fixed;
             uint256_t hash_ = keryx_hash_one(nonce);
-            if (LT_U256(hash_, target)){
-                atomicCAS((unsigned long long int*) final_nonce, 0, (unsigned long long int) nonce);
+            if (LE_U256(hash_, target)){
+                // The host initializes the slot to UINT64_MAX. Atomic minimum both permits nonce 0
+                // (the old zero sentinel could not represent it) and deterministically publishes the
+                // lowest qualifying nonce when several blocks finish concurrently.
+                atomicMin((unsigned long long int*) final_nonce, (unsigned long long int) nonce);
             }
         }
     }

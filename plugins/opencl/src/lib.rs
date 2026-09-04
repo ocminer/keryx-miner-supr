@@ -19,6 +19,14 @@ use crate::worker::OpenCLGPUWorker;
 // capability-driven default ratio from the GPU arch (see worker::default_workload_scale).
 const AUTO_WORKLOAD: f32 = 0.;
 
+/// Optional dynamic-plugin output-contract handshake. New hosts call this
+/// before constructing workers and compare the raw result against MAX. Old
+/// hosts continue to receive their historical zero no-winner sentinel.
+#[no_mangle]
+pub extern "C" fn keryx_plugin_enable_raw_nonce_v1() -> u64 {
+    worker::enable_raw_nonce_output_v1()
+}
+
 pub struct OpenCLPlugin {
     specs: Vec<OpenCLWorkerSpec>,
     _enabled: bool,
@@ -126,10 +134,9 @@ impl Plugin for OpenCLPlugin {
                     },
                     is_absolute: opts.opencl_workload_absolute,
                     experimental_amd: opts.experimental_amd,
-                    // v0.5.2: default to JIT-compiling the OpenCL source on the actual
-                    // GPU (it always matches the current kernel + driver). The bundled
-                    // precompiled .bin blobs could desync from the host/kernel and yield
-                    // rejected shares, so they are now opt-in via --opencl-use-amd-binary.
+                    // The legacy flag remains parse-compatible, but the worker now always
+                    // JIT-compiles the canonical source. Archived binaries predate the
+                    // MAX/atomic-min winner contract and are intentionally never loaded.
                     use_amd_binary: opts.opencl_use_amd_binary && !opts.opencl_no_amd_binary,
                     random: opts.opencl_nonce_gen,
                 })

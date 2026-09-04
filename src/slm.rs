@@ -1,20 +1,20 @@
+use crate::quantized_gemma3_split::ModelWeights as Gemma3SplitWeights;
+use crate::quantized_llama_split::ModelWeights as SplitWeights;
+use crate::quantized_qwen3_split::ModelWeights as Qwen3SplitWeights;
 /// Phase-3 OPoI: multi-model inference engine (safetensors + GGUF) via candle.
 ///
 /// Models are loaded on demand when an AiRequest arrives and cached between
 /// consecutive requests for the same model. Mining pauses during inference.
 use anyhow::{anyhow, Context, Result};
-use candle_core::{DType, Device, Tensor};
 use candle_core::quantized::{gguf_file, QTensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::llama::{Cache, Config, LlamaConfig, Llama};
+use candle_transformers::models::llama::{Cache, Config, Llama, LlamaConfig};
+use candle_transformers::models::quantized_gemma3::ModelWeights as Gemma3Weights;
 use candle_transformers::models::quantized_llama::ModelWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3Weights;
-use candle_transformers::models::quantized_gemma3::ModelWeights as Gemma3Weights;
-use crate::quantized_gemma3_split::ModelWeights as Gemma3SplitWeights;
-use crate::quantized_llama_split::ModelWeights as SplitWeights;
-use crate::quantized_qwen3_split::ModelWeights as Qwen3SplitWeights;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -23,9 +23,41 @@ use tokenizers::Tokenizer;
 use crate::models::{ModelFormat, ModelSpec};
 
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
+/// Remote inference admission limits. These are enforced again at the engine boundary (not only
+/// by the Stratum/gRPC parsers), because inference is also called by startup and self-test paths.
+pub const MAX_INFERENCE_PROMPT_BYTES: usize = 4 * 1024;
+pub const MAX_INFERENCE_TOKENS: usize = 2_048;
+pub const DEFAULT_INFERENCE_DEADLINE_MS: u64 = 30_000;
+pub const MAX_INFERENCE_DEADLINE_MS: u64 = 120_000;
+
+/// Validate untrusted inference controls and return the effective routing deadline. A zero
+/// deadline means the protocol default; oversized values are rejected instead of silently turning
+/// into a very long queue wait.
+pub fn validate_inference_request(
+    prompt: &str,
+    max_tokens: usize,
+    deadline_ms: u64,
+) -> std::result::Result<u64, &'static str> {
+    if prompt.is_empty() {
+        return Err("prompt is empty");
+    }
+    if prompt.len() > MAX_INFERENCE_PROMPT_BYTES {
+        return Err("prompt exceeds 4096 bytes");
+    }
+    if max_tokens == 0 {
+        return Err("max_tokens must be at least 1");
+    }
+    if max_tokens > MAX_INFERENCE_TOKENS {
+        return Err("max_tokens exceeds 2048");
+    }
+    let effective = if deadline_ms == 0 { DEFAULT_INFERENCE_DEADLINE_MS } else { deadline_ms };
+    if effective > MAX_INFERENCE_DEADLINE_MS {
+        return Err("deadline_ms exceeds 120000");
+    }
+    Ok(effective)
+}
 // Legacy lineup (pre-OPoI-v2) system prompts.
-const SYSTEM_PROMPT_TINYLLAMA: &str =
-    "You are a Keryx Network AI — a decentralized assistant running on GPU miners. \
+const SYSTEM_PROMPT_TINYLLAMA: &str = "You are a Keryx Network AI — a decentralized assistant running on GPU miners. \
      No internet access. Be concise.";
 const SYSTEM_PROMPT_DEEPSEEK: &str =
     "You are a Keryx Network AI — a decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
@@ -94,7 +126,11 @@ pub fn pom_force_split() -> bool {
 }
 
 enum ModelInner {
-    Full { model: Llama, config: Config, cache_dtype: DType },
+    Full {
+        model: Llama,
+        config: Config,
+        cache_dtype: DType,
+    },
     Quantized(ModelWeights),
     /// GGUF llama-arch model via the split loader (single-device, for PoM zero-dup tensor sharing).
     QuantizedSplit(SplitWeights),
@@ -175,11 +211,15 @@ fn staging_error_slot() -> &'static Mutex<Option<String>> {
 }
 /// Record a staging failure (also logged at ERROR by the caller). Shown by the miner status loop.
 pub fn set_staging_error(msg: impl Into<String>) {
-    if let Ok(mut g) = staging_error_slot().lock() { *g = Some(msg.into()); }
+    if let Ok(mut g) = staging_error_slot().lock() {
+        *g = Some(msg.into());
+    }
 }
 /// Clear the staging failure once a model is ready again.
 pub fn clear_staging_error() {
-    if let Ok(mut g) = staging_error_slot().lock() { *g = None; }
+    if let Ok(mut g) = staging_error_slot().lock() {
+        *g = None;
+    }
 }
 /// The last recorded staging failure, if any (for the miner status line).
 pub fn last_staging_error() -> Option<String> {
@@ -193,13 +233,17 @@ pub fn last_staging_error() -> Option<String> {
 fn free_disk_bytes(path: &std::path::Path) -> Option<u64> {
     let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
     let out = std::process::Command::new("df").arg("-kP").arg(dir).output().ok()?;
-    if !out.status.success() { return None; }
+    if !out.status.success() {
+        return None;
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let avail_kb: u64 = text.lines().last()?.split_whitespace().nth(3)?.parse().ok()?;
     Some(avail_kb.saturating_mul(1024))
 }
 #[cfg(not(unix))]
-fn free_disk_bytes(_path: &std::path::Path) -> Option<u64> { None }
+fn free_disk_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
 
 fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
     const MAX_ATTEMPTS: u32 = 240; // survives long gateway outages (~40 min of retries)
@@ -210,7 +254,9 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
     DOWNLOADING.store(true, AtomicOrdering::Relaxed);
     struct DlGuard;
     impl Drop for DlGuard {
-        fn drop(&mut self) { DOWNLOADING.store(false, AtomicOrdering::Relaxed); }
+        fn drop(&mut self) {
+            DOWNLOADING.store(false, AtomicOrdering::Relaxed);
+        }
     }
     let _dl = DlGuard;
     eprintln!("[keryx-miner] Downloading {} ...", url);
@@ -255,59 +301,57 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         let status = response.status();
 
         // Decide whether to append (server honored the range) or (re)start, and the total size.
-        let (mut file, mut downloaded, total): (std::fs::File, u64, Option<u64>) =
-            if resume_from > 0 && status == 206 {
-                // Content-Range: "bytes <start>-<end>/<total>"
-                let total = response
-                    .header("Content-Range")
-                    .and_then(|cr| cr.rsplit('/').next())
-                    .and_then(|t| t.trim().parse::<u64>().ok());
-                let f = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(dest)
-                    .with_context(|| format!("open append {}", dest.display()))?;
-                (f, resume_from, total)
-            } else if resume_from > 0 && status == 416 {
-                // Range not satisfiable ⇒ the file is already fully downloaded.
-                eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
-                return Ok(());
-            } else {
-                // 200, or the server ignored Range. Never wipe a local file that already matches
-                // the remote size — IPFS gateways often ignore Range and answer 200 + full
-                // Content-Length, which previously truncated multi-GB GGUFs back to zero.
-                let total = response.header("Content-Length").and_then(|s| s.parse::<u64>().ok());
-                if resume_from > 0 {
-                    if let Some(t) = total {
-                        if resume_from >= t {
-                            eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
-                            return Ok(());
-                        }
+        let (mut file, mut downloaded, total): (std::fs::File, u64, Option<u64>) = if resume_from > 0 && status == 206 {
+            // Content-Range: "bytes <start>-<end>/<total>"
+            let total = response
+                .header("Content-Range")
+                .and_then(|cr| cr.rsplit('/').next())
+                .and_then(|t| t.trim().parse::<u64>().ok());
+            let f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dest)
+                .with_context(|| format!("open append {}", dest.display()))?;
+            (f, resume_from, total)
+        } else if resume_from > 0 && status == 416 {
+            // Range not satisfiable ⇒ the file is already fully downloaded.
+            eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
+            return Ok(());
+        } else {
+            // 200, or the server ignored Range. Never wipe a local file that already matches
+            // the remote size — IPFS gateways often ignore Range and answer 200 + full
+            // Content-Length, which previously truncated multi-GB GGUFs back to zero.
+            let total = response.header("Content-Length").and_then(|s| s.parse::<u64>().ok());
+            if resume_from > 0 {
+                if let Some(t) = total {
+                    if resume_from >= t {
+                        eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
+                        return Ok(());
                     }
-                    // Partial local file + no Range support: keep the bytes and resume via a
-                    // fresh request without Range only when we have nothing useful; otherwise
-                    // refuse to truncate and retry later (gateway may regain Range support).
-                    if resume_from > 1_000_000 {
-                        drop(response);
-                        attempt += 1;
-                        if attempt >= MAX_ATTEMPTS {
-                            return Err(anyhow!(
-                                "download {} cannot resume: server ignored Range and local partial is {} MB",
-                                url,
-                                resume_from / 1_000_000
-                            ));
-                        }
-                        eprintln!(
+                }
+                // Partial local file + no Range support: keep the bytes and resume via a
+                // fresh request without Range only when we have nothing useful; otherwise
+                // refuse to truncate and retry later (gateway may regain Range support).
+                if resume_from > 1_000_000 {
+                    drop(response);
+                    attempt += 1;
+                    if attempt >= MAX_ATTEMPTS {
+                        return Err(anyhow!(
+                            "download {} cannot resume: server ignored Range and local partial is {} MB",
+                            url,
+                            resume_from / 1_000_000
+                        ));
+                    }
+                    eprintln!(
                             "\n[keryx-miner] server ignored Range (HTTP {status}); keeping local {} MB, retry {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s…",
                             resume_from / 1_000_000
                         );
-                        std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS));
-                        continue;
-                    }
+                    std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS));
+                    continue;
                 }
-                let f = std::fs::File::create(dest)
-                    .with_context(|| format!("create {}", dest.display()))?;
-                (f, 0u64, total)
-            };
+            }
+            let f = std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+            (f, 0u64, total)
+        };
 
         // DISK-SPACE PREFLIGHT: refuse to start a download we can't finish, and say exactly where +
         // how short we are, instead of streaming until ENOSPC and dying with an opaque OS error.
@@ -321,8 +365,11 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                         "NOT ENOUGH DISK SPACE for {}: need ~{} MB more (download {} MB + 512 MB headroom) \
                          but only {} MB free on the filesystem holding {}. Free up space or move --model-dir \
                          to a bigger disk, then restart the miner.",
-                        dest.display(), (need + MARGIN) / 1_000_000, need / 1_000_000,
-                        free / 1_000_000, where_dir.display()
+                        dest.display(),
+                        (need + MARGIN) / 1_000_000,
+                        need / 1_000_000,
+                        free / 1_000_000,
+                        where_dir.display()
                     );
                     log::error!("[keryx-miner] {msg}");
                     eprintln!("\n[keryx-miner] ERROR: {msg}\n");
@@ -353,10 +400,12 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                     }
                     downloaded += n as u64;
                     if let Some(t) = total {
-                        eprint!("\r  {:.1}/{:.1} MB ({}%)   ",
+                        eprint!(
+                            "\r  {:.1}/{:.1} MB ({}%)   ",
                             downloaded as f64 / 1_000_000.0,
                             t as f64 / 1_000_000.0,
-                            downloaded * 100 / t.max(1));
+                            downloaded * 100 / t.max(1)
+                        );
                         let _ = std::io::stderr().flush();
                         if last_log.elapsed().as_secs() >= 30 {
                             last_log = std::time::Instant::now();
@@ -367,13 +416,19 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                                  after the download + possession-index build. Do NOT restart the miner: the \
                                  download resumes, but every restart prolongs it (disable rig watchdogs until \
                                  the first accepted share).",
-                                downloaded as f64 / 1e6, t as f64 / 1e6,
-                                downloaded * 100 / t.max(1), rate / 1e6, eta_min.max(1.0),
+                                downloaded as f64 / 1e6,
+                                t as f64 / 1e6,
+                                downloaded * 100 / t.max(1),
+                                rate / 1e6,
+                                eta_min.max(1.0),
                             );
                         }
                     }
                 }
-                Err(e) => { stream_err = Some(e.to_string()); break; }
+                Err(e) => {
+                    stream_err = Some(e.to_string());
+                    break;
+                }
             }
         }
         let _ = file.flush();
@@ -403,8 +458,10 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
             return Err(anyhow!(msg));
         }
         let why = stream_err.unwrap_or_else(|| "short read".into());
-        eprintln!("\n[keryx-miner] interrupted ({why}); resuming {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s @ {} MB…",
-            downloaded / 1_000_000);
+        eprintln!(
+            "\n[keryx-miner] interrupted ({why}); resuming {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s @ {} MB…",
+            downloaded / 1_000_000
+        );
         std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS));
     }
 }
@@ -418,10 +475,18 @@ fn ensure_safetensors(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path
     let tok = dir.join("tokenizer.json");
     let cfg = dir.join("config.json");
     let ok_flag = dir.join(".ok");
-    let wts: Vec<_> = spec.weight_cids.iter().enumerate().map(|(i, _)| {
-        if spec.weight_cids.len() == 1 { dir.join("model.safetensors") }
-        else { dir.join(format!("model-{:05}-of-{:05}.safetensors", i + 1, spec.weight_cids.len())) }
-    }).collect();
+    let wts: Vec<_> = spec
+        .weight_cids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            if spec.weight_cids.len() == 1 {
+                dir.join("model.safetensors")
+            } else {
+                dir.join(format!("model-{:05}-of-{:05}.safetensors", i + 1, spec.weight_cids.len()))
+            }
+        })
+        .collect();
 
     // .ok sentinel written only after a complete download — guards against truncated files
     if tok.exists() && cfg.exists() && wts.iter().all(|p| p.exists()) && ok_flag.exists() {
@@ -431,10 +496,16 @@ fn ensure_safetensors(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path
     std::fs::create_dir_all(&dir)?;
     let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
     eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
-    if !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
-    if !cfg.exists() { download_file(&ipfs_url(spec.config_cid), &cfg)?; }
+    if !tok.exists() {
+        download_file(&ipfs_url(spec.tokenizer_cid), &tok)?;
+    }
+    if !cfg.exists() {
+        download_file(&ipfs_url(spec.config_cid), &cfg)?;
+    }
     for (i, (cid, path)) in spec.weight_cids.iter().zip(wts.iter()).enumerate() {
-        if spec.weight_cids.len() > 1 { eprintln!("[keryx-miner] Shard {}/{}", i + 1, spec.weight_cids.len()); }
+        if spec.weight_cids.len() > 1 {
+            eprintln!("[keryx-miner] Shard {}/{}", i + 1, spec.weight_cids.len());
+        }
         download_file(&ipfs_url(cid), path)?;
     }
     std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
@@ -477,7 +548,8 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
             log::info!(
                 "SlmEngine: adopting pre-staged model '{}' at {} (GGUF complete by tensor \
                  coverage; not re-downloading).",
-                spec.name, dir.display()
+                spec.name,
+                dir.display()
             );
         }
         clear_staging_error();
@@ -491,12 +563,16 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
         log::warn!(
             "SlmEngine: model '{}' NOT ready — expected GGUF at {}: {}. \
              (Path must be exactly <model-dir>/{}/model.gguf.)",
-            spec.name, gguf.display(), reason, spec.dir_name
+            spec.name,
+            gguf.display(),
+            reason,
+            spec.dir_name
         );
     } else if need_tok && !tok.exists() {
         log::warn!(
             "SlmEngine: model '{}' GGUF is complete at {} but tokenizer.json is missing — will fetch it.",
-            spec.name, gguf.display()
+            spec.name,
+            gguf.display()
         );
     }
 
@@ -504,7 +580,8 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     if ok_flag.exists() && !gguf_ready {
         log::warn!(
             "SlmEngine: '{}' at {} has a stale .ok but the GGUF is incomplete (truncated?) — repairing.",
-            spec.name, gguf.display()
+            spec.name,
+            gguf.display()
         );
     }
     let _ = std::fs::remove_file(&ok_flag); // clear stale flag before (re)downloading
@@ -521,7 +598,10 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
             let msg = format!(
                 "model '{}' file at {} is INVALID after download ({}). If YOU copied a file here, it is \
                  the wrong/corrupt model — DELETE {} and restart so the miner re-downloads the correct one.",
-                spec.name, gguf.display(), reason, gguf.display()
+                spec.name,
+                gguf.display(),
+                reason,
+                gguf.display()
             );
             log::error!("[keryx-miner] {msg}");
             set_staging_error(&msg);
@@ -546,7 +626,9 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
 /// hardcoded ID so generation always terminates even if the tokenizer exposes
 /// special tokens differently (e.g. via `added_tokens` vs the regular vocab).
 fn collect_stop_ids(tokenizer: &Tokenizer, names: &[&str], fallbacks: &[u32]) -> Vec<u32> {
-    let mut ids: Vec<u32> = names.iter().zip(fallbacks.iter())
+    let mut ids: Vec<u32> = names
+        .iter()
+        .zip(fallbacks.iter())
         .map(|(name, &fallback)| tokenizer.token_to_id(name).unwrap_or(fallback))
         .collect();
     ids.sort_unstable();
@@ -561,10 +643,7 @@ fn collect_stop_ids(tokenizer: &Tokenizer, names: &[&str], fallbacks: &[u32]) ->
 fn stop_config(tokenizer: &Tokenizer, name: &str) -> (Vec<u32>, Vec<&'static str>) {
     match name {
         // Generic fallback (incl. TinyLlama / Zephyr): </s> ends a turn; 0 = padding safety net.
-        _ => (
-            collect_stop_ids(tokenizer, &["</s>"], &[2, 0]),
-            vec!["</s>", "<|user|>", "<|system|>", "<|assistant|>"],
-        ),
+        _ => (collect_stop_ids(tokenizer, &["</s>"], &[2, 0]), vec!["</s>", "<|user|>", "<|system|>", "<|assistant|>"]),
     }
 }
 
@@ -574,41 +653,37 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
     match spec.format {
         ModelFormat::Safetensors => {
             let (tok_path, cfg_path, wt_paths) = ensure_safetensors(spec)?;
-            let config: LlamaConfig = serde_json::from_str(
-                &std::fs::read_to_string(&cfg_path)?
-            ).context("parse config.json")?;
+            let config: LlamaConfig =
+                serde_json::from_str(&std::fs::read_to_string(&cfg_path)?).context("parse config.json")?;
             let config = config.into_config(false);
-            let tokenizer = Tokenizer::from_file(&tok_path)
-                .map_err(|e| anyhow!("load tokenizer: {}", e))?;
+            let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("load tokenizer: {}", e))?;
             let wt_refs: Vec<_> = wt_paths.iter().map(|p| p.as_path()).collect();
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&wt_refs, DType::F32, &device)
-            }.map_err(|e| anyhow!("mmap weights: {}", e))?;
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&wt_refs, DType::F32, &device) }
+                .map_err(|e| anyhow!("mmap weights: {}", e))?;
             let model = Llama::load(vb, &config).map_err(|e| anyhow!("build model: {}", e))?;
             let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
             log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
-                model_id: spec.model_id, name: spec.name,
+                model_id: spec.model_id,
+                name: spec.name,
                 inner: ModelInner::Full { model, config, cache_dtype: DType::F32 },
-                tokenizer, device, stop_token_ids, stop_strings,
+                tokenizer,
+                device,
+                stop_token_ids,
+                stop_strings,
             })
         }
         ModelFormat::Gguf => {
             let (tok_path, gguf_path) = ensure_gguf(spec)?;
-            let tokenizer = Tokenizer::from_file(&tok_path)
-                .map_err(|e| anyhow!("load tokenizer: {}", e))?;
-            let mut gguf_file = std::fs::File::open(&gguf_path)
-                .with_context(|| format!("open {}", gguf_path.display()))?;
-            let content = gguf_file::Content::read(&mut gguf_file)
-                .map_err(|e| anyhow!("read gguf: {}", e))?;
+            let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("load tokenizer: {}", e))?;
+            let mut gguf_file =
+                std::fs::File::open(&gguf_path).with_context(|| format!("open {}", gguf_path.display()))?;
+            let content = gguf_file::Content::read(&mut gguf_file).map_err(|e| anyhow!("read gguf: {}", e))?;
             // PoM zero-dup: load via the single-device split loader so the mining-tier model
             // exposes its quant tensors for in-place sharing with the possession walk. Otherwise
             // a regular single-device load.
             let inner = if pom_force_split() && device.is_cuda() {
-                log::info!(
-                    "SlmEngine: PoM zero-dup — loading '{}' (LLaMA) via single-device split loader",
-                    spec.name
-                );
+                log::info!("SlmEngine: PoM zero-dup — loading '{}' (LLaMA) via single-device split loader", spec.name);
                 let model = SplitWeights::from_gguf(content, &mut gguf_file, &[device.clone()])
                     .map_err(|e| anyhow!("load gguf weights (pom split): {}", e))?;
                 ModelInner::QuantizedSplit(model)
@@ -620,28 +695,27 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
             let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
             log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
-                model_id: spec.model_id, name: spec.name,
+                model_id: spec.model_id,
+                name: spec.name,
                 inner,
-                tokenizer, device, stop_token_ids, stop_strings,
+                tokenizer,
+                device,
+                stop_token_ids,
+                stop_strings,
             })
         }
         ModelFormat::GgufGemma3 => {
             let (tok_path, gguf_path) = ensure_gguf(spec)?;
-            let tokenizer = Tokenizer::from_file(&tok_path)
-                .map_err(|e| anyhow!("load tokenizer: {}", e))?;
-            let mut gguf_file = std::fs::File::open(&gguf_path)
-                .with_context(|| format!("open {}", gguf_path.display()))?;
-            let content = gguf_file::Content::read(&mut gguf_file)
-                .map_err(|e| anyhow!("read gguf: {}", e))?;
+            let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("load tokenizer: {}", e))?;
+            let mut gguf_file =
+                std::fs::File::open(&gguf_path).with_context(|| format!("open {}", gguf_path.display()))?;
+            let content = gguf_file::Content::read(&mut gguf_file).map_err(|e| anyhow!("read gguf: {}", e))?;
             // PoM zero-dup: Gemma-3-4B is a NON-split GGUF (baseline tier), so without this
             // the possession walk loads a SECOND VRAM copy → OOM on 8 GB cards. Load via the
             // single-device split fork (exposes quant tensors) so the walk shares this copy.
-            // Otherwise (CPU inference / non-PoM) a regular single-device load.
+            // Otherwise use the regular single-device GPU loader.
             let inner = if pom_force_split() && device.is_cuda() {
-                log::info!(
-                    "SlmEngine: PoM zero-dup — loading '{}' (Gemma3) via single-device split loader",
-                    spec.name
-                );
+                log::info!("SlmEngine: PoM zero-dup — loading '{}' (Gemma3) via single-device split loader", spec.name);
                 let model = Gemma3SplitWeights::from_gguf(content, &mut gguf_file, &device)
                     .map_err(|e| anyhow!("load gemma3 gguf weights (pom split): {}", e))?;
                 ModelInner::QuantizedGemma3Split(model)
@@ -653,45 +727,46 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
             let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
             log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
-                model_id: spec.model_id, name: spec.name,
+                model_id: spec.model_id,
+                name: spec.name,
                 inner,
-                tokenizer, device, stop_token_ids, stop_strings,
+                tokenizer,
+                device,
+                stop_token_ids,
+                stop_strings,
             })
         }
         ModelFormat::GgufQwen2 => {
             let (tok_path, gguf_path) = ensure_gguf(spec)?;
-            let tokenizer = Tokenizer::from_file(&tok_path)
-                .map_err(|e| anyhow!("load tokenizer: {}", e))?;
-            let mut gguf_file = std::fs::File::open(&gguf_path)
-                .with_context(|| format!("open {}", gguf_path.display()))?;
-            let content = gguf_file::Content::read(&mut gguf_file)
-                .map_err(|e| anyhow!("read gguf: {}", e))?;
+            let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("load tokenizer: {}", e))?;
+            let mut gguf_file =
+                std::fs::File::open(&gguf_path).with_context(|| format!("open {}", gguf_path.display()))?;
+            let content = gguf_file::Content::read(&mut gguf_file).map_err(|e| anyhow!("read gguf: {}", e))?;
             let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
                 .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
             let inner = ModelInner::QuantizedQwen2(model);
             let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
             log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
-                model_id: spec.model_id, name: spec.name,
+                model_id: spec.model_id,
+                name: spec.name,
                 inner,
-                tokenizer, device, stop_token_ids, stop_strings,
+                tokenizer,
+                device,
+                stop_token_ids,
+                stop_strings,
             })
         }
         ModelFormat::GgufQwen3 => {
             let (tok_path, gguf_path) = ensure_gguf(spec)?;
-            let tokenizer = Tokenizer::from_file(&tok_path)
-                .map_err(|e| anyhow!("load tokenizer: {}", e))?;
-            let mut gguf_file = std::fs::File::open(&gguf_path)
-                .with_context(|| format!("open {}", gguf_path.display()))?;
-            let content = gguf_file::Content::read(&mut gguf_file)
-                .map_err(|e| anyhow!("read gguf: {}", e))?;
+            let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("load tokenizer: {}", e))?;
+            let mut gguf_file =
+                std::fs::File::open(&gguf_path).with_context(|| format!("open {}", gguf_path.display()))?;
+            let content = gguf_file::Content::read(&mut gguf_file).map_err(|e| anyhow!("read gguf: {}", e))?;
             // PoM zero-dup: single-device split loader (exposes quant tensors for the walk),
             // otherwise a regular single-device load.
             let inner = if pom_force_split() && device.is_cuda() {
-                log::info!(
-                    "SlmEngine: PoM zero-dup — loading '{}' (Qwen3) via single-device split loader",
-                    spec.name
-                );
+                log::info!("SlmEngine: PoM zero-dup — loading '{}' (Qwen3) via single-device split loader", spec.name);
                 let model = Qwen3SplitWeights::from_gguf(content, &mut gguf_file, &[device.clone()])
                     .map_err(|e| anyhow!("load qwen3 gguf weights (pom split): {}", e))?;
                 ModelInner::QuantizedQwen3Split(model)
@@ -703,9 +778,13 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
             let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
             log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
-                model_id: spec.model_id, name: spec.name,
+                model_id: spec.model_id,
+                name: spec.name,
                 inner,
-                tokenizer, device, stop_token_ids, stop_strings,
+                tokenizer,
+                device,
+                stop_token_ids,
+                stop_strings,
             })
         }
         // H4 lineup (EXAONE-4 / GLM-4 / Qwen3.6-hybrid-SSM / Kimi-Linear-MoE): candle cannot run these
@@ -720,7 +799,8 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
             anyhow::bail!(
                 "model '{}' ({}) is an H4 arch served only by the in-process llama.cpp engine \
                  (libkeryx-llama.so) — candle has no loader for it. Ensure the .so is present/loads.",
-                spec.name, spec.dir_name
+                spec.name,
+                spec.dir_name
             )
         }
     }
@@ -729,25 +809,20 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
 /// Run `load_engine` but catch BOTH a `Result::Err` AND a panic. candle/cudarc can either return an
 /// error (clean OOM / file error) or *panic* (CUDA_ERROR_INVALID_PTX from a too-high-arch dequant
 /// kernel, a cudarc launch failure, etc.) when loading the quantized model on the GPU. We must not
-/// let either crash the miner — instead we capture the reason for the graceful CPU fallback above.
+/// let either crash the miner — instead we capture a structured failure and withdraw the route.
 fn try_load_engine(spec: &'static ModelSpec, device: Device) -> std::result::Result<SlmEngine, String> {
-    // Test hook (validation only): force the FIRST GPU load to fail so the auto CPU fallback path
-    // can be exercised on a card whose GPU inference actually works. Honoured once, on CUDA only.
+    // Test hook (validation only): force the first GPU load to fail so capability withdrawal and
+    // retry behavior can be exercised on a card whose GPU inference otherwise works.
     if device.is_cuda() && std::env::var("KERYX_FORCE_GPU_INFER_FAIL").is_ok() {
         static FIRED: AtomicBool = AtomicBool::new(false);
         if !FIRED.swap(true, AtomicOrdering::Relaxed) {
-            return Err(
-                "KERYX_FORCE_GPU_INFER_FAIL=1 — simulated GPU model-load failure (test hook)".to_string(),
-            );
+            return Err("KERYX_FORCE_GPU_INFER_FAIL=1 — simulated GPU model-load failure (test hook)".to_string());
         }
     }
 
-    // Silence candle/cudarc's own panic hook for this load so a forced INVALID_PTX backtrace doesn't
-    // scare the logs; we report our own clean, actionable warning from the fallback.
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    // Do not replace the process-global panic hook here. Model loads can overlap across cards; a
+    // take/set/restore sequence races and can permanently install another thread's temporary hook.
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_engine(spec, device)));
-    std::panic::set_hook(prev_hook);
     match res {
         Ok(Ok(engine)) => Ok(engine),
         Ok(Err(e)) => Err(format!("{}", e)),
@@ -763,60 +838,50 @@ fn try_load_engine(spec: &'static ModelSpec, device: Device) -> std::result::Res
     }
 }
 
-/// Load the model with an automatic GPU→CPU fallback. On the NVIDIA build, if the GPU (CUDA) model
-/// load fails for ANY reason (wrong-arch PTX / OOM / old driver / cudarc panic), we WARN loudly,
-/// flip the process to CPU inference (`set_cpu_inference(true)`), and reload on `Device::Cpu` so the
-/// miner DEGRADES instead of crashing. The PoW possession walk keeps running on the GPU; only the
-/// (rare) OPoI inference challenge runs slower on the CPU. The happy path (working GPU inference)
-/// stays on the GPU at full speed — this only triggers on an actual failure.
-fn load_engine_with_fallback(spec: &'static ModelSpec) -> Result<SlmEngine> {
-    let device = inference_device()
-        .map_err(|e| anyhow!("inference device unavailable: {}", e))?;
-    // Fall back to CPU on ANY GPU failure — CUDA (NVIDIA) or Metal (Apple Silicon). A Metal device
-    // may init fine but hit an unsupported quantized op mid-load; that surfaces here and degrades.
-    let on_gpu = device.is_cuda() || device.is_metal();
-
-    match try_load_engine(spec, device) {
-        Ok(engine) => Ok(engine),
-        Err(reason) if on_gpu && cpu_inference_allowed() => {
-            // GPU load failed AND the operator opted into CPU fallback (--enable-cpu-inference /
-            // --cpu-inference) → degrade to CPU instead of withdrawing.
+/// Last-resort legacy candle path. GPU llama.cpp routes are tried first. CPU is reached only when
+/// the operator explicitly opted in (`--enable-cpu-inference`) or forced it (`--cpu-inference`).
+fn load_legacy_engine_on(spec: &'static ModelSpec, gpu: usize) -> Result<SlmEngine> {
+    if cpu_inference_enabled() {
+        return try_load_engine(spec, Device::Cpu)
+            .map_err(|reason| anyhow!("CPU inference failed for '{}': {}", spec.name, reason));
+    }
+    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    {
+        let device = Device::new_cuda(gpu).map_err(|e| anyhow!("CUDA:{} inference device unavailable: {}", gpu, e))?;
+        return match try_load_engine(spec, device) {
+            Ok(engine) => Ok(engine),
+            Err(reason) if cpu_inference_allowed() => {
+                log::warn!(
+                    "GPU inference failed for '{}' on CUDA:{} ({}); using explicitly enabled, deprecated CPU emergency fallback",
+                    spec.name,
+                    gpu,
+                    reason
+                );
+                set_cpu_inference(true);
+                try_load_engine(spec, Device::Cpu)
+                    .map_err(|cpu| anyhow!("CPU inference fallback also failed for '{}': {}", spec.name, cpu))
+            }
+            Err(reason) => Err(anyhow!(
+                "GPU inference failed for '{}' on CUDA:{} ({}); CPU fallback was not enabled",
+                spec.name,
+                gpu,
+                reason
+            )),
+        };
+    }
+    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+    {
+        let _ = gpu;
+        if cpu_inference_allowed() {
             log::warn!(
-                "⚠️ GPU inference FAILED to load on this device ({reason}) — falling back to CPU \
-                 inference (MUCH slower; you enabled it). The PoW walk still runs on the GPU."
+                "GPU llama.cpp routes failed for '{}'; using explicitly enabled, deprecated CPU emergency fallback",
+                spec.name
             );
             set_cpu_inference(true);
-            let cpu = Device::Cpu;
-            try_load_engine(spec, cpu).map_err(|e| {
-                anyhow!("CPU inference fallback ALSO failed to load '{}': {}", spec.name, e)
-            }).map(|engine| {
-                log::warn!(
-                    "SlmEngine: '{}' now loaded on CPU (degraded inference); mining (PoW walk) \
-                     continues on the GPU.",
-                    spec.name
-                );
-                engine
-            })
-        }
-        Err(reason) if on_gpu => {
-            // GPU load failed and CPU fallback is DISABLED (the default). Do NOT waste cycles on
-            // glacial CPU inference — surface a clear, actionable error; the caller withdraws the
-            // model from OPoI. The real fix is a working in-process llama.cpp engine on the GPU.
-            Err(anyhow!(
-                "GPU inference could not load '{}' ({}). CPU fallback is OFF by default — the model \
-                 is withdrawn from OPoI rather than run on the CPU (far too slow to be useful). \
-                 Fix: ensure the in-process llama.cpp engine is present and loads next to the miner \
-                 — Linux: libkeryx-llama.so; Windows: keryx-llama.dll — together with the bundled \
-                 CUDA runtime libs, and a driver new enough for the build (modern R575+, legacy \
-                 R535+). To force CPU anyway, pass --enable-cpu-inference.",
-                spec.name, reason
-            ))
-        }
-        Err(reason) => {
-            // Already on CPU (explicit --cpu-inference / AMD / prior fallback) — nothing left to
-            // fall back to; surface the error to the caller (non-fatal at the call sites).
-            Err(anyhow!("load '{}' on {:?} failed: {}", spec.name,
-                if cpu_inference_enabled() { "CPU" } else { "device" }, reason))
+            try_load_engine(spec, Device::Cpu)
+                .map_err(|reason| anyhow!("CPU inference failed for '{}': {}", spec.name, reason))
+        } else {
+            Err(anyhow!("GPU llama.cpp inference unavailable for '{}'; CPU fallback was not enabled", spec.name))
         }
     }
 }
@@ -866,23 +931,21 @@ fn strip_think_tags(text: &str) -> String {
     // Ordered by how far into the output the answer begins; use the LAST occurrence of each so a
     // reasoning block that itself quotes the marker doesn't cut the real answer short.
     const CLOSERS: &[&str] = &[
-        "</think>",            // Qwen3.x / GLM-4 / DeepSeek ChatML think block
-        "<channel|>message",   // Gemma-4 <|channel>thought … <channel|>message<answer>
-        "<channel|>",          // Gemma-4 fallback (empty/closed thought channel)
-        "<|/thought|>",        // GLM channel-thought variant
+        "</think>",          // Qwen3.x / GLM-4 / DeepSeek ChatML think block
+        "<channel|>message", // Gemma-4 <|channel>thought … <channel|>message<answer>
+        "<channel|>",        // Gemma-4 fallback (empty/closed thought channel)
+        "<|/thought|>",      // GLM channel-thought variant
     ];
-    for close in CLOSERS {
-        if let Some(pos) = text.rfind(close) {
-            return text[pos + close.len()..].trim().to_string();
-        }
+    if let Some(answer_start) = CLOSERS.iter().filter_map(|close| text.rfind(close).map(|pos| pos + close.len())).max()
+    {
+        return text[answer_start..].trim().to_string();
     }
     text.trim().to_string()
 }
 
 fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Result<String> {
     let formatted = format_prompt(engine, prompt);
-    let enc = engine.tokenizer.encode(formatted.as_str(), true)
-        .map_err(|e| anyhow!("encode: {}", e))?;
+    let enc = engine.tokenizer.encode(formatted.as_str(), true).map_err(|e| anyhow!("encode: {}", e))?;
     let mut all_tokens: Vec<u32> = enc.get_ids().to_vec();
     let mut generated: Vec<u32> = Vec::new();
     let mut lp = LogitsProcessor::new(42, Some(0.7), Some(0.9));
@@ -905,13 +968,16 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 let input = Tensor::new(input_ids, &engine.device)
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
-                let logits = model.forward(&input, pos, &mut cache)
-                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let logits = model.forward(&input, pos, &mut cache).map_err(|e| anyhow!("forward: {}", e))?;
                 let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if engine.stop_token_ids.contains(&next) { break; }
+                if engine.stop_token_ids.contains(&next) {
+                    break;
+                }
                 all_tokens.push(next);
                 generated.push(next);
-                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) {
+                    break;
+                }
             }
         }
         ModelInner::Quantized(model) => {
@@ -925,13 +991,16 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 let input = Tensor::new(input_ids, &engine.device)
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
-                let logits = model.forward(&input, pos)
-                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let logits = model.forward(&input, pos).map_err(|e| anyhow!("forward: {}", e))?;
                 let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if engine.stop_token_ids.contains(&next) { break; }
+                if engine.stop_token_ids.contains(&next) {
+                    break;
+                }
                 all_tokens.push(next);
                 generated.push(next);
-                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) {
+                    break;
+                }
             }
         }
         ModelInner::QuantizedSplit(model) => {
@@ -945,13 +1014,16 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 let input = Tensor::new(input_ids, &engine.device)
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
-                let logits = model.forward(&input, pos)
-                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let logits = model.forward(&input, pos).map_err(|e| anyhow!("forward: {}", e))?;
                 let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if engine.stop_token_ids.contains(&next) { break; }
+                if engine.stop_token_ids.contains(&next) {
+                    break;
+                }
                 all_tokens.push(next);
                 generated.push(next);
-                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) {
+                    break;
+                }
             }
         }
         ModelInner::QuantizedGemma3(model) => {
@@ -965,13 +1037,16 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 let input = Tensor::new(input_ids, &engine.device)
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
-                let logits = model.forward(&input, pos)
-                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let logits = model.forward(&input, pos).map_err(|e| anyhow!("forward: {}", e))?;
                 let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if engine.stop_token_ids.contains(&next) { break; }
+                if engine.stop_token_ids.contains(&next) {
+                    break;
+                }
                 all_tokens.push(next);
                 generated.push(next);
-                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) {
+                    break;
+                }
             }
         }
         ModelInner::QuantizedGemma3Split(model) => {
@@ -989,13 +1064,16 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 let input = Tensor::new(input_ids, &engine.device)
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
-                let logits = model.forward(&input, pos)
-                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let logits = model.forward(&input, pos).map_err(|e| anyhow!("forward: {}", e))?;
                 let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if engine.stop_token_ids.contains(&next) { break; }
+                if engine.stop_token_ids.contains(&next) {
+                    break;
+                }
                 all_tokens.push(next);
                 generated.push(next);
-                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) {
+                    break;
+                }
             }
         }
         ModelInner::QuantizedQwen3(model) => {
@@ -1014,13 +1092,16 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 let input = Tensor::new(input_ids, &engine.device)
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
-                let logits = model.forward(&input, pos)
-                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let logits = model.forward(&input, pos).map_err(|e| anyhow!("forward: {}", e))?;
                 let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if engine.stop_token_ids.contains(&next) { break; }
+                if engine.stop_token_ids.contains(&next) {
+                    break;
+                }
                 all_tokens.push(next);
                 generated.push(next);
-                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) {
+                    break;
+                }
             }
         }
         ModelInner::QuantizedQwen3Split(model) => {
@@ -1036,13 +1117,16 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 let input = Tensor::new(input_ids, &engine.device)
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
-                let logits = model.forward(&input, pos)
-                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let logits = model.forward(&input, pos).map_err(|e| anyhow!("forward: {}", e))?;
                 let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if engine.stop_token_ids.contains(&next) { break; }
+                if engine.stop_token_ids.contains(&next) {
+                    break;
+                }
                 all_tokens.push(next);
                 generated.push(next);
-                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) {
+                    break;
+                }
             }
         }
         ModelInner::QuantizedQwen2(model) => {
@@ -1056,25 +1140,24 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 let input = Tensor::new(input_ids, &engine.device)
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
-                let logits = model.forward(&input, pos)
-                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let logits = model.forward(&input, pos).map_err(|e| anyhow!("forward: {}", e))?;
                 let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if engine.stop_token_ids.contains(&next) { break; }
+                if engine.stop_token_ids.contains(&next) {
+                    break;
+                }
                 all_tokens.push(next);
                 generated.push(next);
-                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) {
+                    break;
+                }
             }
         }
     }
 
-    let text = engine.tokenizer.decode(&generated, true)
-        .map_err(|e| anyhow!("decode: {}", e))?;
+    let text = engine.tokenizer.decode(&generated, true).map_err(|e| anyhow!("decode: {}", e))?;
     // Truncate at the earliest stop string in case a control marker leaked into
     // the output (tokenizer that renders special tokens as plain text).
-    let cut = engine.stop_strings.iter()
-        .filter_map(|s| text.find(s))
-        .min()
-        .unwrap_or(text.len());
+    let cut = engine.stop_strings.iter().filter_map(|s| text.find(s)).min().unwrap_or(text.len());
     let answer = text[..cut].trim();
     // Reasoning models emit a <think> block (Qwen3-style ChatML emits an empty pair; others prime
     // an open one) which must not be published. Strip unconditionally — it is a no-op on text with
@@ -1105,60 +1188,27 @@ fn sample_next(logits: &Tensor, lp: &mut LogitsProcessor, context: &[u32]) -> Re
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Runtime CPU-inference flag (NVIDIA/pom-cuda build). Starts false (GPU inference) and is flipped
-/// to true either explicitly via `--cpu-inference` or AUTOMATICALLY when the GPU model load fails
-/// (wrong arch PTX / OOM / old driver) — see `load_engine_with_fallback`. Once set, every
-/// `inference_device()` returns `Device::Cpu` and the stratum/grpc CPU-mode plumbing (which keys
-/// off `cpu_inference_enabled()`) stops pausing the PoW walk during an inference challenge.
+/// Deprecated emergency fallback state. It is never enabled automatically unless the operator
+/// explicitly opted in; GPU inference remains the primary and expected route.
 static CPU_INFERENCE: AtomicBool = AtomicBool::new(false);
 
-/// Whether OPoI inference runs on the CPU. True for the AMD/OpenCL build always (candle 0.9 has no
-/// AMD-GPU backend), or for the NVIDIA build once `--cpu-inference` is set or the GPU model load
-/// has fallen back to CPU. The stratum/grpc CPU-mode plumbing keys off this so it won't pause
-/// hashing during a CPU challenge; the PoW walk keeps the GPU busy meanwhile.
 pub fn cpu_inference_enabled() -> bool {
-    // AMD/OpenCL build: candle 0.9 has no AMD-GPU backend (CPU/CUDA/Metal only), so OPoI inference
-    // is FORCED onto the CPU — slow, but the only path that runs on AMD at all.
-    #[cfg(feature = "pom-opencl")]
-    {
-        true
-    }
-    // NVIDIA/CUDA build: runtime flag (default GPU, flips to CPU on explicit flag or load failure).
-    #[cfg(not(feature = "pom-opencl"))]
-    {
-        CPU_INFERENCE.load(AtomicOrdering::Relaxed)
-    }
+    CPU_INFERENCE.load(AtomicOrdering::Relaxed)
 }
 
-/// Force OPoI inference onto the CPU at runtime (NVIDIA build). Called when the operator passes
-/// `--cpu-inference`, or automatically by the GPU-load fallback. No-op-equivalent on the AMD build
-/// (already CPU-forced at compile time). Evicts any GPU-resident engine so the next load uses CPU.
 pub fn set_cpu_inference(on: bool) {
-    let prev = CPU_INFERENCE.swap(on, AtomicOrdering::Relaxed);
-    if prev != on {
-        // The cached engine (if any) is on the wrong device now — drop it so the next
-        // load_engine/ensure_loaded re-resolves the device via inference_device().
+    let previous = CPU_INFERENCE.swap(on, AtomicOrdering::Relaxed);
+    if previous != on {
         evict_engine();
     }
 }
 
-/// Whether CPU inference is ALLOWED as a fallback (default: NO). Off unless the operator passes
-/// `--enable-cpu-inference` (or `--cpu-inference`, which forces CPU from the start). When off, a GPU
-/// that cannot load inference withdraws the model from OPoI instead of degrading to useless,
-/// glacially-slow CPU inference — see `load_engine_with_fallback`. Forced on for the AMD/OpenCL
-/// build (candle 0.9 has no AMD-GPU backend, so CPU is the only path there).
 static CPU_INFERENCE_ALLOWED: AtomicBool = AtomicBool::new(false);
 
-/// True when CPU inference may be used (opt-in via `--enable-cpu-inference`/`--cpu-inference`, or
-/// always on the AMD/OpenCL build). Gates the automatic GPU→CPU fallback.
 pub fn cpu_inference_allowed() -> bool {
-    #[cfg(feature = "pom-opencl")]
-    { true }
-    #[cfg(not(feature = "pom-opencl"))]
-    { CPU_INFERENCE_ALLOWED.load(AtomicOrdering::Relaxed) }
+    CPU_INFERENCE_ALLOWED.load(AtomicOrdering::Relaxed)
 }
 
-/// Permit CPU inference (set from the CLI when `--enable-cpu-inference` or `--cpu-inference` is given).
 pub fn set_cpu_inference_allowed(on: bool) {
     CPU_INFERENCE_ALLOWED.store(on, AtomicOrdering::Relaxed);
 }
@@ -1235,10 +1285,22 @@ fn inference_cards_restrict() -> Vec<usize> {
     if let Some(v) = INFERENCE_CARDS.get() {
         return v.clone();
     }
-    std::env::var("KERYX_INFERENCE_CARDS")
-        .ok()
-        .map(|s| s.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect())
-        .unwrap_or_default()
+    let Ok(raw) = std::env::var("KERYX_INFERENCE_CARDS") else {
+        return Vec::new();
+    };
+    let tokens: Vec<&str> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let parsed: Option<Vec<usize>> = tokens.iter().map(|token| token.parse::<usize>().ok()).collect();
+    match parsed {
+        Some(cards) if !cards.is_empty() => cards,
+        _ => {
+            // A malformed explicit safety restriction must never broaden to "all GPUs".
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, AtomicOrdering::Relaxed) {
+                log::error!("KERYX_INFERENCE_CARDS is malformed/empty — failing closed with no usable inference card");
+            }
+            vec![usize::MAX]
+        }
+    }
 }
 
 /// Per-card inference busy flags (keyed by CUDA ordinal). A set flag ⇒ that card is mid-generation.
@@ -1248,18 +1310,32 @@ fn card_busy() -> &'static Mutex<std::collections::HashMap<usize, bool>> {
 }
 
 fn try_claim_card(gpu: usize) -> bool {
-    let mut g = match card_busy().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    let mut g = match card_busy().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
     let slot = g.entry(gpu).or_insert(false);
-    if *slot { false } else { *slot = true; true }
+    if *slot {
+        false
+    } else {
+        *slot = true;
+        true
+    }
 }
 
 fn release_card(gpu: usize) {
-    let mut g = match card_busy().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    let mut g = match card_busy().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
     g.insert(gpu, false);
 }
 
 fn card_is_free(gpu: usize) -> bool {
-    let g = match card_busy().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    let g = match card_busy().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
     !g.get(&gpu).copied().unwrap_or(false)
 }
 
@@ -1270,10 +1346,37 @@ pub struct InferenceLease {
     gpu: usize,
 }
 impl InferenceLease {
-    pub fn gpu(&self) -> usize { self.gpu }
+    pub fn gpu(&self) -> usize {
+        self.gpu
+    }
 }
 impl Drop for InferenceLease {
-    fn drop(&mut self) { release_card(self.gpu); }
+    fn drop(&mut self) {
+        release_card(self.gpu);
+    }
+}
+
+fn bounded_deadline_ms(deadline_ms: u64) -> u64 {
+    if deadline_ms == 0 {
+        DEFAULT_INFERENCE_DEADLINE_MS
+    } else {
+        deadline_ms.min(MAX_INFERENCE_DEADLINE_MS)
+    }
+}
+
+/// Claim one exact card. Used by a self-test which must prove the same `(model, gpu)` route it
+/// records, rather than being silently migrated by the policy router.
+fn acquire_specific_inference_card(gpu: usize, deadline_ms: u64) -> Option<InferenceLease> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bounded_deadline_ms(deadline_ms));
+    loop {
+        if try_claim_card(gpu) {
+            return Some(InferenceLease { gpu });
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 /// Measured tokens/sec per card — populated on the first real generation on each card
@@ -1286,7 +1389,9 @@ fn card_toks() -> &'static Mutex<std::collections::HashMap<usize, f64>> {
 
 fn record_card_toks(gpu: usize, toks_per_s: f64) {
     if toks_per_s.is_finite() && toks_per_s > 0.0 {
-        if let Ok(mut g) = card_toks().lock() { g.insert(gpu, toks_per_s); }
+        if let Ok(mut g) = card_toks().lock() {
+            g.insert(gpu, toks_per_s);
+        }
     }
 }
 
@@ -1294,35 +1399,62 @@ fn card_toks_get(gpu: usize) -> Option<f64> {
     card_toks().lock().ok().and_then(|g| g.get(&gpu).copied())
 }
 
-/// Optional per-card PoW hashrate feed for the `PowMin` policy (H/s). The mining loop MAY call this;
-/// when a card has no reported value the policy falls back to the total-VRAM proxy (PoM is
-/// bandwidth-bound, so smaller cards ≈ lower hashrate ≈ cheapest to pause).
+/// Per-card PoW hashrate feed for the `PowMin` policy (H/s). Zero samples during startup or an
+/// inference pause do not replace the last real mining rate; otherwise the card most recently
+/// paused for inference would become artificially sticky. Until a card has a positive sample, the
+/// policy falls back to the total-VRAM proxy (PoM is bandwidth-bound, so a smaller card is usually
+/// cheaper to pause).
 static CARD_HASHRATE: OnceLock<Mutex<std::collections::HashMap<usize, f64>>> = OnceLock::new();
 fn card_hashrate() -> &'static Mutex<std::collections::HashMap<usize, f64>> {
     CARD_HASHRATE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 pub fn report_card_hashrate(gpu: usize, h_per_s: f64) {
-    if let Ok(mut g) = card_hashrate().lock() { g.insert(gpu, h_per_s); }
+    if h_per_s.is_finite() && h_per_s > 0.0 {
+        if let Ok(mut g) = card_hashrate().lock() {
+            g.insert(gpu, h_per_s);
+        }
+    }
 }
 fn card_hashrate_get(gpu: usize) -> Option<f64> {
     card_hashrate().lock().ok().and_then(|g| g.get(&gpu).copied())
 }
 
-/// nvidia-smi `memory.total` / `memory.free` (MiB) keyed by CUDA ordinal (line order == PCI_BUS_ID
-/// order, the ordinal the miner uses — see `biggest_cuda_gpu`). Empty on any failure.
+/// `memory.total` / `memory.free` (MiB) keyed by the CUDA driver's *visible logical ordinal*.
+/// nvidia-smi row numbers are physical/global and are not the same namespace under
+/// `CUDA_VISIBLE_DEVICES`; using the driver keeps routing aligned with `Device::new_cuda(gpu)`.
 fn gpu_mem_mib(query: &str) -> std::collections::HashMap<usize, u64> {
-    let mut out = std::collections::HashMap::new();
-    let Ok(o) = std::process::Command::new("nvidia-smi")
-        .args([&format!("--query-gpu={}", query), "--format=csv,noheader,nounits"])
-        .output()
-    else { return out };
-    if !o.status.success() { return out; }
-    for (i, line) in String::from_utf8_lossy(&o.stdout).lines().enumerate() {
-        if let Ok(v) = line.trim().parse::<u64>() {
-            out.insert(i, v);
-        }
+    #[cfg(feature = "pom-cuda")]
+    {
+        return match query {
+            "memory.total" => {
+                crate::pom_gpu::query_all_gpus_vram().into_iter().map(|(gpu, mib)| (gpu as usize, mib)).collect()
+            }
+            "memory.free" => crate::pom_gpu::query_all_gpus_free_vram()
+                .into_iter()
+                .map(|(gpu, free, _)| (gpu as usize, free))
+                .collect(),
+            _ => std::collections::HashMap::new(),
+        };
     }
-    out
+    #[cfg(not(feature = "pom-cuda"))]
+    {
+        let mut out = std::collections::HashMap::new();
+        let Ok(o) = std::process::Command::new("nvidia-smi")
+            .args([&format!("--query-gpu={}", query), "--format=csv,noheader,nounits"])
+            .output()
+        else {
+            return out;
+        };
+        if !o.status.success() {
+            return out;
+        }
+        for (i, line) in String::from_utf8_lossy(&o.stdout).lines().enumerate() {
+            if let Ok(v) = line.trim().parse::<u64>() {
+                out.insert(i, v);
+            }
+        }
+        out
+    }
 }
 
 /// On-disk GGUF size (bytes) of the model assigned to `gpu`, used as the `Reward` tier-magnitude
@@ -1345,24 +1477,27 @@ fn eligible_cards(model_id: &[u8; 32]) -> Vec<usize> {
     {
         let restrict = inference_cards_restrict();
         let allowed = |g: usize| restrict.is_empty() || restrict.contains(&g);
-        let cards: Vec<usize> = crate::pom_gpu::walk_devices()
-            .into_iter()
-            .map(|d| d as usize)
-            .filter(|g| allowed(*g))
-            .collect();
+        let cards: Vec<usize> =
+            crate::pom_gpu::walk_devices().into_iter().map(|d| d as usize).filter(|g| allowed(*g)).collect();
         if cards.is_empty() {
             // Walk not installed yet (inference before the first PoM job), or every walk card
             // filtered out — fall back to the legacy single-card choice (respecting the restrict
             // set if it names a card).
-            let d = inference_gpu_ordinal();
+            let d = inference_gpu_for_model(model_id);
             return if allowed(d) { vec![d] } else { cards };
+        }
+        // Once at least one route has passed the real generation self-test, never send a request to
+        // a merely assumed card. A model-wide pass on a large GPU does not prove that a smaller card
+        // can load the same model. Additional cards become eligible after their own successful live
+        // generation/self-test records the exact pair.
+        let proven: Vec<usize> = cards.iter().copied().filter(|g| model_serveable_on(model_id, *g)).collect();
+        if !proven.is_empty() {
+            return proven;
         }
         let matched: Vec<usize> = cards
             .iter()
             .copied()
-            .filter(|g| {
-                crate::pom_gpu::device_model(*g as u32).map_or(false, |(mid, _)| &mid == model_id)
-            })
+            .filter(|g| crate::pom_gpu::device_model(*g as u32).map_or(false, |(mid, _)| &mid == model_id))
             .collect();
         if !matched.is_empty() {
             return matched;
@@ -1372,7 +1507,7 @@ fn eligible_cards(model_id: &[u8; 32]) -> Vec<usize> {
     #[cfg(not(feature = "pom-cuda"))]
     {
         let _ = model_id;
-        vec![inference_gpu_ordinal()]
+        vec![inference_gpu_for_model(model_id)]
     }
 }
 
@@ -1389,12 +1524,17 @@ fn rank_cards(mut cards: Vec<usize>, policy: InferencePolicy) -> Vec<usize> {
         InferencePolicy::Reward => cfg!(not(feature = "pom-cuda")),
     };
     let total = if need_total { gpu_mem_mib("memory.total") } else { std::collections::HashMap::new() };
-    let free = if matches!(policy, InferencePolicy::Memory) { gpu_mem_mib("memory.free") } else { std::collections::HashMap::new() };
+    let free = if matches!(policy, InferencePolicy::Memory) {
+        gpu_mem_mib("memory.free")
+    } else {
+        std::collections::HashMap::new()
+    };
     // f64 sort key; higher == preferred. We negate for "lowest first" policies.
     let key = |g: usize| -> f64 {
         match policy {
-            InferencePolicy::Speed => card_toks_get(g)
-                .unwrap_or_else(|| total.get(&g).copied().unwrap_or(0) as f64 / 1.0e6),
+            InferencePolicy::Speed => {
+                card_toks_get(g).unwrap_or_else(|| total.get(&g).copied().unwrap_or(0) as f64 / 1.0e6)
+            }
             InferencePolicy::Memory => free.get(&g).copied().unwrap_or(0) as f64,
             #[cfg(feature = "pom-cuda")]
             InferencePolicy::Reward => card_assigned_model_bytes(g) as f64,
@@ -1402,18 +1542,12 @@ fn rank_cards(mut cards: Vec<usize>, policy: InferencePolicy) -> Vec<usize> {
             InferencePolicy::Reward => total.get(&g).copied().unwrap_or(0) as f64,
             InferencePolicy::PowMin => {
                 // Lowest hashrate preferred ⇒ negate. Fallback proxy: lowest total VRAM.
-                let h = card_hashrate_get(g)
-                    .unwrap_or_else(|| total.get(&g).copied().unwrap_or(0) as f64);
+                let h = card_hashrate_get(g).unwrap_or_else(|| total.get(&g).copied().unwrap_or(0) as f64);
                 -h
             }
         }
     };
-    cards.sort_by(|&a, &b| {
-        key(b)
-            .partial_cmp(&key(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
+    cards.sort_by(|&a, &b| key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
     cards
 }
 
@@ -1430,8 +1564,7 @@ pub fn pick_inference_device(model_id: &[u8; 32]) -> Option<usize> {
 /// reports busy — NOT a hard reject). The request is pinned to the leased card for its whole life.
 pub fn acquire_inference_card(model_id: &[u8; 32], deadline_ms: u64) -> Option<InferenceLease> {
     let policy = inference_policy();
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(if deadline_ms == 0 { 30_000 } else { deadline_ms });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bounded_deadline_ms(deadline_ms));
     loop {
         let eligible = eligible_cards(model_id);
         if eligible.is_empty() {
@@ -1450,6 +1583,29 @@ pub fn acquire_inference_card(model_id: &[u8; 32], deadline_ms: u64) -> Option<I
     }
 }
 
+/// Async router used by network handlers. Unlike `acquire_inference_card`, waiting for a busy card
+/// yields the Tokio worker instead of blocking one of the miner's small async-worker pool. Card
+/// ranking is resolved once per request; busy state is still checked atomically on every wake.
+pub async fn acquire_inference_card_async(model_id: &[u8; 32], deadline_ms: u64) -> Option<InferenceLease> {
+    let cards = rank_cards(eligible_cards(model_id), inference_policy());
+    if cards.is_empty() {
+        return None;
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(bounded_deadline_ms(deadline_ms));
+    loop {
+        for &gpu in &cards {
+            if try_claim_card(gpu) {
+                return Some(InferenceLease { gpu });
+            }
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        tokio::time::sleep((deadline - now).min(std::time::Duration::from_millis(25))).await;
+    }
+}
+
 /// CUDA ordinal to place OPoI inference on.
 ///
 /// The tricky case is MANY per-GPU processes (one `--cuda-device N` process per card, each a
@@ -1463,54 +1619,139 @@ pub fn acquire_inference_card(model_id: &[u8; 32], deadline_ms: u64) -> Option<I
 ///     mixed-rig optimization: resident model + zero-dup shared walk on the big card).
 /// `walk_devices()` = the CUDA ordinals this process's PoM walk is installed on (its `--cuda-device`
 /// set). Ordinal == CUDA ordinal because the miner runs with `CUDA_DEVICE_ORDER=PCI_BUS_ID`. If the
-/// chosen GPU still can't serve inference, `load_engine` flips to CPU (emergency fallback).
-/// Self-test failover override: when the designated inference GPU FAILS a model self-test but
-/// another walk GPU PASSES it, the winner is recorded here so every later inference site follows
-/// it. -1 = no override. Without this, one bad/mispicked serving card withdrew the model rig-wide
-/// and suspended EVERY card ("no inference = no mining") even though a healthy host existed.
-static INFERENCE_GPU_OVERRIDE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
+/// If the chosen GPU cannot serve inference, the route is withdrawn rather than moved to CPU.
+/// Self-test failover is model-specific. A process-global ordinal made a successful failover for a
+/// small model silently reroute every larger model to the same (often incapable) card.
+fn inference_gpu_overrides() -> &'static RwLock<std::collections::HashMap<[u8; 32], usize>> {
+    static OVERRIDES: OnceLock<RwLock<std::collections::HashMap<[u8; 32], usize>>> = OnceLock::new();
+    OVERRIDES.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Move a model's serving route only while the destination proof is still present. Keep the proof
+/// read lock through override publication: exact-route invalidation takes the same locks in this
+/// order, so it either removes an older override first or waits and removes the newly published one.
+/// This prevents a child exit between generation and failover bookkeeping from leaving a stale
+/// model-specific override behind.
+fn set_inference_override_if_proven(model_id: &[u8; 32], gpu: usize) -> bool {
+    let state = match self_test_state().read() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if state.get(&(*model_id, gpu)).copied() != Some(true) || model_is_unavailable(model_id) {
+        return false;
+    }
+    let mut overrides = match inference_gpu_overrides().write() {
+        Ok(overrides) => overrides,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    overrides.insert(*model_id, gpu);
+    true
+}
+
+fn restrict_inference_gpu(candidate: usize) -> usize {
+    let restrict = inference_cards_restrict();
+    if restrict.is_empty() || restrict.contains(&candidate) {
+        candidate
+    } else {
+        // Configuration is already initialized before warmers. Prefer the first explicitly allowed
+        // ordinal over ever probing/loading on a forbidden device.
+        restrict[0]
+    }
+}
+
+fn inference_card_allowed(gpu: usize) -> bool {
+    let restrict = inference_cards_restrict();
+    restrict.is_empty() || restrict.contains(&gpu)
+}
 
 pub fn inference_gpu_ordinal() -> usize {
     if let Ok(s) = std::env::var("KERYX_INFERENCE_GPU") {
         if let Ok(n) = s.trim().parse::<usize>() {
-            return n;
+            return restrict_inference_gpu(n);
         }
     }
-    let ov = INFERENCE_GPU_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
-    if ov >= 0 {
-        return ov as usize;
+    // OpenCL/Vulkan owns one process-wide inference engine and records it as one logical route;
+    // physical placement is tracked separately by pom_opencl's full-PCI mapping. Never let an
+    // unrelated NVIDIA card discovered via nvidia-smi change this logical key on a mixed host.
+    #[cfg(feature = "pom-opencl")]
+    {
+        return restrict_inference_gpu(0);
     }
-    // `pom_gpu` (the CUDA walk driver) only exists on the pom-cuda build. On non-CUDA builds
-    // (default, and AMD/pom-opencl which places inference via llama_vulkan/KERYX_LLAMA_VK_DEVICE)
-    // there are no CUDA walk devices, so fall back to an empty set → ordinal 0 (never used at
-    // runtime there: cpu_inference_enabled()/llama_vulkan take over). Fixes the v0.6.5.3 non-CUDA
-    // build break (slm.rs referenced crate::pom_gpu unconditionally).
-    #[cfg(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
-    let walk = crate::pom_gpu::walk_devices();
-    #[cfg(not(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal"))))]
-    let walk: Vec<u32> = Vec::new();
-    if NO_SHARED_INFERENCE.load(std::sync::atomic::Ordering::Relaxed) {
-        return walk.first().copied().map(|d| d as usize).unwrap_or(0);
+
+    #[cfg(not(feature = "pom-opencl"))]
+    {
+        // `pom_gpu` (the CUDA walk driver) only exists on the pom-cuda build. On non-CUDA builds
+        // (default, and AMD/pom-opencl which places inference via llama_vulkan/KERYX_LLAMA_VK_DEVICE)
+        // there are no CUDA walk devices, so fall back to an empty set → ordinal 0 (never used at
+        // runtime there: llama_vulkan takes over). Fixes the v0.6.5.3 non-CUDA
+        // build break (slm.rs referenced crate::pom_gpu unconditionally).
+        #[cfg(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
+        let walk = crate::pom_gpu::walk_devices();
+        #[cfg(not(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal"))))]
+        let walk: Vec<u32> = Vec::new();
+        if NO_SHARED_INFERENCE.load(std::sync::atomic::Ordering::Relaxed) {
+            return restrict_inference_gpu(walk.first().copied().map(|d| d as usize).unwrap_or(0));
+        }
+        let selected = match walk.len() {
+            1 => walk[0] as usize,
+            n if n > 1 => biggest_cuda_gpu_within(&walk.iter().map(|d| *d as usize).collect::<Vec<_>>())
+                .unwrap_or(walk[0] as usize),
+            // Walk not installed yet. This is the STARTUP case, and picking the globally-biggest card
+            // here used to deadlock a process that does not own it: with `--cuda-device 0` on a rig whose
+            // biggest card is 2, every staging attempt on 0 saw inference_gpu=2, the serveability gate
+            // refused to mine a tier nothing could serve, so no miner ever installed — which is what
+            // keeps `walk` empty. The card would sit at 0 h/s, "preparing", logging once a second forever.
+            // Our own --cuda-device set is knowable without the walk: it is in this process's argv.
+            _ => {
+                let own = cli_cuda_devices();
+                match own.len() {
+                    0 => biggest_cuda_gpu_within(&[]).unwrap_or(0),
+                    1 => own[0],
+                    _ => biggest_cuda_gpu_within(&own).unwrap_or(own[0]),
+                }
+            }
+        };
+        restrict_inference_gpu(selected)
     }
-    match walk.len() {
-        1 => walk[0] as usize,
-        n if n > 1 => biggest_cuda_gpu_within(&walk.iter().map(|d| *d as usize).collect::<Vec<_>>())
-            .unwrap_or(walk[0] as usize),
-        // Walk not installed yet. This is the STARTUP case, and picking the globally-biggest card
-        // here used to deadlock a process that does not own it: with `--cuda-device 0` on a rig whose
-        // biggest card is 2, every staging attempt on 0 saw inference_gpu=2, the serveability gate
-        // refused to mine a tier nothing could serve, so no miner ever installed — which is what
-        // keeps `walk` empty. The card would sit at 0 h/s, "preparing", logging once a second forever.
-        // Our own --cuda-device set is knowable without the walk: it is in this process's argv.
-        _ => {
-            let own = cli_cuda_devices();
-            match own.len() {
-                0 => biggest_cuda_gpu_within(&[]).unwrap_or(0),
-                1 => own[0],
-                _ => biggest_cuda_gpu_within(&own).unwrap_or(own[0]),
+}
+
+/// Resolve the serving card for one model, including only that model's proven failover override.
+pub fn inference_gpu_for_model(model_id: &[u8; 32]) -> usize {
+    if std::env::var("KERYX_INFERENCE_GPU").is_err() {
+        if let Ok(overrides) = inference_gpu_overrides().read() {
+            if let Some(&gpu) = overrides.get(model_id) {
+                return restrict_inference_gpu(gpu);
+            }
+        }
+
+        // During mixed-rig startup the walk map is still empty, but per-device mining models are
+        // already known. Prefer a card actually assigned this exact model instead of sending every
+        // tier's warmer to the globally-largest GPU. Apart from wasting VRAM, the old choice could
+        // prove a small tier only on the large card while leaving the small card's real route
+        // untested. Explicit per-process isolation keeps its historical own-card behavior.
+        #[cfg(feature = "pom-cuda")]
+        if !NO_SHARED_INFERENCE.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut candidates: Vec<usize> =
+                crate::pom_gpu::walk_devices().into_iter().map(|gpu| gpu as usize).collect();
+            if candidates.is_empty() {
+                candidates = cli_cuda_devices();
+            }
+            if candidates.is_empty() {
+                candidates = crate::pom_gpu::query_all_gpus_vram().into_iter().map(|(gpu, _)| gpu as usize).collect();
+            }
+            candidates.retain(|gpu| {
+                inference_card_allowed(*gpu)
+                    && crate::pom_gpu::device_model(*gpu as u32)
+                        .map(|(assigned, _)| assigned == *model_id)
+                        .unwrap_or(false)
+            });
+            if !candidates.is_empty() {
+                candidates.sort_unstable();
+                return biggest_cuda_gpu_within(&candidates).unwrap_or(candidates[0]);
             }
         }
     }
+    inference_gpu_ordinal()
 }
 
 /// The CUDA ordinals this process was told to mine on, read straight from its own argv
@@ -1529,12 +1770,7 @@ fn parse_cuda_devices<I: IntoIterator<Item = String>>(args: I) -> Vec<usize> {
         }
         (a == "--cuda-device").then(|| args.get(i + 1).cloned()).flatten()
     });
-    raw.map(|v| {
-        v.split(',')
-            .filter_map(|s| s.trim().parse::<usize>().ok())
-            .collect()
-    })
-    .unwrap_or_default()
+    raw.map(|v| v.split(',').filter_map(|s| s.trim().parse::<usize>().ok()).collect()).unwrap_or_default()
 }
 
 /// The largest-VRAM CUDA ordinal, restricted to `pool` (empty = consider every visible GPU). `None`
@@ -1542,23 +1778,13 @@ fn parse_cuda_devices<I: IntoIterator<Item = String>>(args: I) -> Vec<usize> {
 /// ordinal. Logged ONCE per chosen ordinal: this is called from the staging retry loop, and logging
 /// unconditionally produced a line every second for as long as staging kept failing.
 fn biggest_cuda_gpu_within(pool: &[usize]) -> Option<usize> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
     let mut best: Option<(usize, u64)> = None;
-    for (i, line) in text.lines().enumerate() {
+    for (i, mib) in gpu_mem_mib("memory.total") {
         if !pool.is_empty() && !pool.contains(&i) {
             continue;
         }
-        if let Ok(mib) = line.trim().parse::<u64>() {
-            if best.map_or(true, |(_, m)| mib > m) {
-                best = Some((i, mib));
-            }
+        if best.map_or(true, |(_, m)| mib > m) {
+            best = Some((i, mib));
         }
     }
     let (ord, _) = best?;
@@ -1577,25 +1803,25 @@ fn biggest_cuda_gpu_within(pool: &[usize]) -> Option<usize> {
     Some(ord)
 }
 
-/// Device for OPoI inference: `Device::Cpu` when `cpu_inference_enabled()` (emergency fallback /
-/// AMD build), else the GPU — the Apple Metal device on macOS, otherwise the largest-VRAM CUDA GPU
-/// (NVIDIA). Single chokepoint for the inference sites. If GPU init here fails,
-/// `load_engine_with_fallback` degrades to CPU rather than crashing.
+/// Candle device used only by the CUDA readiness probe and dormant legacy models. Active H6
+/// serving uses llama.cpp; CPU remains an explicit, deprecated final emergency fallback only.
 fn inference_device() -> candle_core::Result<Device> {
-    if cpu_inference_enabled() {
-        return Ok(Device::Cpu);
-    }
     // Apple Silicon (Phase 3d — candle-Metal is out of the build entirely): the primary GPU
     // inference path is the in-process llama.cpp Metal engine (`libkeryx-llama.dylib`, wired
     // through `crate::llama_engine` in `load_and_run_inference`). This `candle` device is only
-    // reached as the ULTIMATE fallback when the .dylib isn't present, and in that case we want
-    // CPU inference — `Device::new_metal` no longer exists (candle-core is built without the
-    // `metal` feature on this platform).
+    // intentionally disabled; `Device::new_metal` no longer exists because candle-core is built
+    // without the `metal` feature on this platform.
     #[cfg(all(target_os = "macos", feature = "pom-metal"))]
     {
-        return Ok(Device::Cpu);
+        return Err(candle_core::Error::Msg("candle inference is disabled on Metal; use the llama.cpp engine".into()));
     }
-    #[cfg(not(all(target_os = "macos", feature = "pom-metal")))]
+    #[cfg(feature = "pom-opencl")]
+    {
+        return Err(candle_core::Error::Msg(
+            "candle inference is disabled on OpenCL; use the Vulkan llama.cpp engine".into(),
+        ));
+    }
+    #[cfg(all(not(feature = "pom-opencl"), not(all(target_os = "macos", feature = "pom-metal"))))]
     {
         Device::new_cuda(inference_gpu_ordinal())
     }
@@ -1655,11 +1881,7 @@ pub fn advance_lineup_if_due(daa: u64) {
         );
     } else {
         // Started up already past H — nothing is "swapped", we just serve the uncensored lineup.
-        log::info!(
-            "OPoI v2 already active (DAA {} ≥ H) — serving the uncensored lineup ({} model(s)).",
-            daa,
-            v2.len()
-        );
+        log::info!("OPoI v2 already active (DAA {} ≥ H) — serving the uncensored lineup ({} model(s)).", daa, v2.len());
     }
     *SUPPORTED_SPECS.write().unwrap() = v2;
     evict_engine();
@@ -1669,7 +1891,7 @@ pub fn advance_lineup_if_due(daa: u64) {
 pub enum GpuProbe {
     /// A GPU matmul succeeded — cuBLAS is loaded and full-speed inference is available.
     Ok,
-    /// No CUDA device present — inference will fall back to CPU (acceptable for small models only).
+    /// No CUDA device present — H6 inference is unavailable.
     NoCuda,
     /// A CUDA device exists but cuBLAS could not be loaded — GPU inference is impossible.
     CublasMissing,
@@ -1691,10 +1913,8 @@ pub fn probe_gpu_inference() -> GpuProbe {
     //   Ok(Err) -> no usable CUDA device (clean error) -> inference is GPU-only, cannot mine
     //   Err     -> panic -> cuBLAS missing
     //
-    // Silence the default panic hook for the probe so its scary backtrace doesn't pollute
-    // the logs; we report a clean, actionable message ourselves from the caller.
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    // Keep the process-global panic hook untouched. Probe/model loads may overlap with unrelated
+    // worker panics, and swapping the global hook is not thread-safe as a scoped operation.
     let probe = std::panic::catch_unwind(|| {
         let device = inference_device()?;
         let a = Tensor::new(&[[1f32, 2.0], [3.0, 4.0]], &device)?;
@@ -1702,7 +1922,6 @@ pub fn probe_gpu_inference() -> GpuProbe {
         a.matmul(&b)?.to_vec2::<f32>()?;
         anyhow::Ok(())
     });
-    std::panic::set_hook(prev_hook);
     match probe {
         Ok(Ok(())) => GpuProbe::Ok,
         Ok(Err(_)) => GpuProbe::NoCuda,
@@ -1731,10 +1950,15 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
         log::debug!("SlmEngine: prefetching model '{}'…", spec.name);
         let result = match spec.format {
             ModelFormat::Safetensors => ensure_safetensors(spec).map(|_| ()),
-            ModelFormat::Gguf | ModelFormat::GgufQwen2 | ModelFormat::GgufQwen3 | ModelFormat::GgufGemma3
-            | ModelFormat::GgufExaone4 | ModelFormat::GgufGlm4 | ModelFormat::GgufQwen35 | ModelFormat::GgufKimiLinear
-            | ModelFormat::GgufGemma4
-                => ensure_gguf(spec).map(|_| ()),
+            ModelFormat::Gguf
+            | ModelFormat::GgufQwen2
+            | ModelFormat::GgufQwen3
+            | ModelFormat::GgufGemma3
+            | ModelFormat::GgufExaone4
+            | ModelFormat::GgufGlm4
+            | ModelFormat::GgufQwen35
+            | ModelFormat::GgufKimiLinear
+            | ModelFormat::GgufGemma4 => ensure_gguf(spec).map(|_| ()),
         };
         match result {
             Ok(()) => log::debug!("SlmEngine: '{}' files ready.", spec.name),
@@ -1755,27 +1979,80 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
 // bring-up, not every mining cycle. A transient GPU fault reset clears the entry so it re-probes.
 const SELF_TEST_MAX_TOKENS: usize = 8;
 
-fn self_test_state() -> &'static RwLock<std::collections::HashMap<[u8; 32], bool>> {
-    static S: OnceLock<RwLock<std::collections::HashMap<[u8; 32], bool>>> = OnceLock::new();
+/// A route may only recover from a withdrawal when this probe produced a fresh, non-empty
+/// response.  A cached success belongs to an older engine generation and must never turn a
+/// failed/empty probe back into a capability declaration.
+fn current_probe_passed(out: Option<&str>) -> bool {
+    out.is_some_and(|text| !text.trim().is_empty())
+}
+
+type SelfTestKey = ([u8; 32], usize);
+
+fn self_test_state() -> &'static RwLock<std::collections::HashMap<SelfTestKey, bool>> {
+    static S: OnceLock<RwLock<std::collections::HashMap<SelfTestKey, bool>>> = OnceLock::new();
     S.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
 
+fn self_test_failures() -> &'static RwLock<std::collections::HashMap<SelfTestKey, std::time::Instant>> {
+    static FAILURES: OnceLock<RwLock<std::collections::HashMap<SelfTestKey, std::time::Instant>>> = OnceLock::new();
+    FAILURES.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+const SELF_TEST_FAILURE_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// True once `model_id` PASSED its inference self-test on this rig and has not since been withdrawn.
 /// This is the gate for both declaring the model to the pool and mining its tier.
+fn any_proven_route(model_id: &[u8; 32]) -> bool {
+    self_test_state()
+        .read()
+        .map(|m| m.iter().any(|((mid, gpu), passed)| mid == model_id && *passed && inference_card_allowed(*gpu)))
+        .unwrap_or(false)
+}
+
 pub fn model_serveable(model_id: &[u8; 32]) -> bool {
-    let passed = self_test_state().read().map(|m| m.get(model_id).copied() == Some(true)).unwrap_or(false);
-    passed && !model_is_unavailable(model_id)
+    any_proven_route(model_id) && !model_is_unavailable(model_id)
+}
+
+/// Whether this exact card has proven it can load and generate the requested model.
+pub fn model_serveable_on(model_id: &[u8; 32], gpu: usize) -> bool {
+    if !inference_card_allowed(gpu) {
+        return false;
+    }
+    self_test_state().read().map(|m| m.get(&(*model_id, gpu)).copied() == Some(true)).unwrap_or(false)
+        && !model_is_unavailable(model_id)
 }
 
 /// Whether a self-test has already been attempted (pass or fail) for `model_id`.
 pub fn self_test_attempted(model_id: &[u8; 32]) -> bool {
-    self_test_state().read().map(|m| m.contains_key(model_id)).unwrap_or(false)
+    self_test_state().read().map(|m| m.keys().any(|(mid, _)| mid == model_id)).unwrap_or(false)
 }
 
 /// Record that `model_id` is proven serveable (self-test passed, OR a real OPoI generation just
 /// succeeded — a live answer is the strongest possible proof). Idempotent.
 pub fn record_serveable(model_id: &[u8; 32]) {
-    if let Ok(mut m) = self_test_state().write() { m.insert(*model_id, true); }
+    record_serveable_on(model_id, inference_gpu_for_model(model_id));
+}
+
+pub fn record_serveable_on(model_id: &[u8; 32], gpu: usize) {
+    if !inference_card_allowed(gpu) {
+        log::warn!("OPoI: refusing to record model {:.8} on disallowed GPU {}", hex::encode(model_id), gpu);
+        return;
+    }
+    if let Ok(mut m) = self_test_state().write() {
+        m.insert((*model_id, gpu), true);
+    }
+    if let Ok(mut failures) = self_test_failures().write() {
+        failures.remove(&(*model_id, gpu));
+    }
+}
+
+fn record_unserveable_on(model_id: &[u8; 32], gpu: usize) {
+    if let Ok(mut m) = self_test_state().write() {
+        m.insert((*model_id, gpu), false);
+    }
+    if let Ok(mut failures) = self_test_failures().write() {
+        failures.insert((*model_id, gpu), std::time::Instant::now());
+    }
 }
 
 /// The honest declare set: staged models that have PROVEN they can serve inference on this rig.
@@ -1783,9 +2060,22 @@ pub fn record_serveable(model_id: &[u8; 32]) {
 /// request for a tier we cannot answer — and we never mine a tier we cannot serve (the walk install
 /// gates on the same `model_serveable`).
 ///
-/// The self-test gate is wired in the CUDA walk bring-up (`pom_gpu::ensure_installed_inner`). The
-/// AMD/OpenCL (CPU/vk inference) and macOS/Metal builds don't run it yet, so they keep the prior
-/// declaration semantics — gating them here would stop them declaring anything.
+/// Every backend uses the same proof gate. A staged file proves only bytes on disk; it says nothing
+/// about whether CUDA, Vulkan, or Metal can load and generate on the selected GPU.
+fn proven_serveable_model_ids() -> Vec<[u8; 32]> {
+    loaded_model_ids().into_iter().filter(|m| model_serveable(m)).collect()
+}
+
+/// Whether this process has at least one staged model with a live GPU-route proof, independent of
+/// the optional `--wait-ready` declaration latch. Job handlers use this for the core
+/// no-inference/no-PoW gate: while the latch is closed they must still feed templates to workers so
+/// each worker can install its walk, after which the worker-side gate keeps actual hashing idle.
+/// Using `serveable_model_ids()` there creates a startup deadlock because that public declaration
+/// set is intentionally empty until every walk reports ready.
+pub fn has_proven_serveable_model() -> bool {
+    !proven_serveable_model_ids().is_empty()
+}
+
 pub fn serveable_model_ids() -> Vec<[u8; 32]> {
     // --wait-ready: declare NOTHING until every card is set up — an early declaration is what
     // invites OPoI challenges into the fragile bring-up window on low-RAM rigs. The pool sees
@@ -1794,16 +2084,130 @@ pub fn serveable_model_ids() -> Vec<[u8; 32]> {
     if crate::wait_ready::holds() {
         return Vec::new();
     }
-    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
-    { loaded_model_ids().into_iter().filter(|m| model_serveable(m)).collect() }
-    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
-    { loaded_model_ids() }
+    proven_serveable_model_ids()
 }
 
 /// Forget a model's self-test result so it re-probes (used after a transient GPU-fault reset that
 /// rebuilds the card's engine — the prior pass no longer necessarily holds).
 pub fn clear_self_test(model_id: &[u8; 32]) {
-    if let Ok(mut m) = self_test_state().write() { m.remove(model_id); }
+    if let Ok(mut m) = self_test_state().write() {
+        m.retain(|(mid, _), _| mid != model_id);
+    }
+    if let Ok(mut failures) = self_test_failures().write() {
+        failures.retain(|(mid, _), _| mid != model_id);
+    }
+}
+
+/// The AMD/Vulkan engine is a process-wide singleton. If it is evicted so the OpenCL walk can own
+/// VRAM, every cached card-keyed proof for that model belongs to the destroyed engine generation.
+/// Withdraw model-wide; the durable warmer is the only path that may restore capability after a
+/// fresh non-empty GPU generation.
+pub fn withdraw_model_after_amd_engine_eviction(model_id: &[u8; 32]) {
+    clear_self_test(model_id);
+    mark_model_unavailable(model_id, "amd_inference_evicted_for_mining_vram");
+}
+
+/// Resolve the model identity while publishing a subprocess route. Capturing it in the server
+/// identity avoids depending on a later active-lineup swap when the child eventually exits.
+pub fn model_id_for_gguf(path: &str) -> Option<[u8; 32]> {
+    let wanted = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let specs = *SUPPORTED_SPECS.read().ok()?;
+    if let Some(spec) = specs.iter().find(|spec| {
+        let candidate = gguf_path_for(spec);
+        std::fs::canonicalize(&candidate).unwrap_or(candidate) == wanted
+    }) {
+        return Some(spec.model_id);
+    }
+    #[cfg(feature = "pom-cuda")]
+    for (model_id, candidate) in crate::pom_gpu::assigned_models() {
+        let candidate = std::fs::canonicalize(&candidate).unwrap_or_else(|_| std::path::PathBuf::from(candidate));
+        if candidate == wanted {
+            return Some(model_id);
+        }
+    }
+    None
+}
+
+/// Invalidate one exact `(model, GPU)` serving proof after that backend fails. Clean planned
+/// server swaps deliberately do not call this: cached ability proofs for other warmed models on
+/// the same card remain valid and must not oscillate as a singleton server changes residency.
+pub fn invalidate_inference_route(model_id: &[u8; 32], gpu: usize, reason: &str) {
+    let removed = self_test_state().write().map(|mut state| state.remove(&(*model_id, gpu))).unwrap_or(None).is_some();
+    if let Ok(mut failures) = self_test_failures().write() {
+        failures.remove(&(*model_id, gpu));
+    }
+    if let Ok(mut overrides) = inference_gpu_overrides().write() {
+        if overrides.get(model_id).copied() == Some(gpu) {
+            overrides.remove(model_id);
+        }
+    }
+    if any_proven_route(model_id) {
+        mark_model_available(model_id, "alternate_inference_route_still_proven");
+    } else {
+        mark_model_unavailable(model_id, reason);
+    }
+    if removed {
+        log::warn!(
+            "OPoI: invalidated model {:.8} route proof on GPU {} ({}); durable warmer will re-probe",
+            hex::encode(model_id),
+            gpu,
+            reason
+        );
+    }
+}
+
+/// Invalidate every inference proof tied to one GPU after its runtime/context is torn down.
+/// Proofs are `(model, GPU)` facts: retaining one after a sticky CUDA fault would let the router
+/// advertise and select a route whose engine no longer exists. Other cards' proofs remain valid,
+/// so a multi-GPU rig withdraws a model only when this was its final proven route.
+pub fn invalidate_inference_routes_on_gpu(gpu: usize, reason: &str) {
+    let mut affected = std::collections::HashSet::<[u8; 32]>::new();
+    if let Ok(mut state) = self_test_state().write() {
+        state.retain(|(model_id, route_gpu), _| {
+            if *route_gpu == gpu {
+                affected.insert(*model_id);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    if let Ok(mut failures) = self_test_failures().write() {
+        failures.retain(|(model_id, route_gpu), _| {
+            if *route_gpu == gpu {
+                affected.insert(*model_id);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    if let Ok(mut overrides) = inference_gpu_overrides().write() {
+        overrides.retain(|model_id, route_gpu| {
+            if *route_gpu == gpu {
+                affected.insert(*model_id);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    for model_id in &affected {
+        if any_proven_route(model_id) {
+            mark_model_available(model_id, "alternate_inference_route_still_proven");
+        } else {
+            mark_model_unavailable(model_id, reason);
+        }
+    }
+    if !affected.is_empty() {
+        log::warn!(
+            "OPoI: invalidated {} model route proof(s) on GPU {} ({}); durable warmers will re-probe",
+            affected.len(),
+            gpu,
+            reason
+        );
+    }
 }
 
 /// Run ONE tiny inference on `gpu` to prove `model_id` can actually serve OPoI before we declare or
@@ -1812,9 +2216,28 @@ pub fn clear_self_test(model_id: &[u8; 32]) {
 /// cannot serve). Budgeted by nature: a warm short generation is ~1-2 s; a model that needs far
 /// longer would miss the on-chain service window anyway, so slow/empty == not serveable.
 pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
+    if !inference_card_allowed(gpu) {
+        log::warn!("OPoI self-test: GPU {} is excluded by --inference-cards; probe refused", gpu);
+        return false;
+    }
     if let Ok(m) = self_test_state().read() {
-        if let Some(&passed) = m.get(model_id) {
-            return passed && !model_is_unavailable(model_id);
+        if let Some(&passed) = m.get(&(*model_id, gpu)) {
+            if passed && !model_is_unavailable(model_id) {
+                return true;
+            }
+            if !passed {
+                let still_cooling_down = self_test_failures()
+                    .read()
+                    .ok()
+                    .and_then(|failures| failures.get(&(*model_id, gpu)).copied())
+                    .map(|at| at.elapsed() < SELF_TEST_FAILURE_RETRY)
+                    .unwrap_or(false);
+                if still_cooling_down {
+                    return false;
+                }
+            }
+            // A later global withdrawal invalidated the cached success. Re-run a real generation
+            // so recovery is earned, rather than leaving a once-good route wedged forever.
         }
     }
     let name = {
@@ -1836,12 +2259,40 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
     }
     log::info!(
         "OPoI self-test: probing '{}' on GPU {} — a model must prove it can generate before we \
-         declare/mine its tier (the network exists to serve inference).", name, gpu
+         declare/mine its tier (the network exists to serve inference).",
+        name,
+        gpu
     );
     let t0 = std::time::Instant::now();
-    let out = load_and_run_inference_on(gpu, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS);
+    // Self-tests participate in the same per-card lease as live serving. Without this, parallel GPU
+    // bring-up can run two model swaps on one card and clear the non-refcounted pause bit too early.
+    let Some(_lease) = acquire_specific_inference_card(gpu, DEFAULT_INFERENCE_DEADLINE_MS) else {
+        // Busy is not a capability verdict. Do not cache/withdraw a route merely because another
+        // legitimate inference held the card during startup; the next staging cycle will retry.
+        log::warn!("OPoI self-test: GPU {} remained busy for the probe deadline — deferring", gpu);
+        return false;
+    };
+    let out = {
+        // A previous waiter may have completed the same probe while we waited for the card.
+        if let Ok(m) = self_test_state().read() {
+            if !model_is_unavailable(model_id) {
+                if let Some(&passed) = m.get(&(*model_id, gpu)) {
+                    if passed {
+                        return true;
+                    }
+                }
+            }
+        }
+        load_and_run_inference_on(gpu, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS)
+    };
+    drop(_lease);
     let secs = t0.elapsed().as_secs_f64();
-    let mut passed = matches!(&out, Some(t) if !t.trim().is_empty());
+    // Every successful backend publishes its own route proof before returning. Do not publish a
+    // second time here: a subprocess can exit and have its monitor invalidate the proof between the
+    // backend return and this coordinator, and a late unconditional write would resurrect a dead
+    // route permanently. A non-empty response counts only while the backend-owned proof survives.
+    let initial_passed = current_probe_passed(out.as_deref()) && model_serveable_on(model_id, gpu);
+    let mut passed = initial_passed;
     // ── INFERENCE-HOST FAILOVER ──
     // A failed probe on the DESIGNATED host must not condemn the model (and with it the whole
     // rig: withdrawal → every card demotes/halts → zero declared models → mining suspended).
@@ -1857,18 +2308,27 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
         && !cpu_inference_enabled()
     {
         #[cfg(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
-        let candidates: Vec<usize> = crate::pom_gpu::walk_devices()
-            .into_iter().map(|d| d as usize).filter(|&d| d != gpu).collect();
+        let mut candidates: Vec<usize> = crate::pom_gpu::walk_devices().into_iter().map(|d| d as usize).collect();
         #[cfg(not(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal"))))]
-        let candidates: Vec<usize> = Vec::new();
+        let mut candidates: Vec<usize> = Vec::new();
+        #[cfg(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
+        if candidates.is_empty() {
+            candidates = cli_cuda_devices();
+        }
+        #[cfg(feature = "pom-cuda")]
+        if candidates.is_empty() {
+            candidates = crate::pom_gpu::query_all_gpus_vram().into_iter().map(|(d, _)| d as usize).collect();
+        }
+        candidates.retain(|&d| d != gpu && inference_card_allowed(d));
         for alt in candidates {
             log::warn!(
                 "OPoI self-test: '{}' failed on GPU {} — FAILING OVER: retrying the probe on GPU {}                  (a healthy alternate host keeps the rig mining).", name, gpu, alt
             );
             let t1 = std::time::Instant::now();
-            let out2 = load_and_run_inference_on(alt, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS);
-            if matches!(&out2, Some(t) if !t.trim().is_empty()) {
-                INFERENCE_GPU_OVERRIDE.store(alt as isize, std::sync::atomic::Ordering::Relaxed);
+            let out2 = acquire_specific_inference_card(alt, DEFAULT_INFERENCE_DEADLINE_MS).and_then(|_lease| {
+                load_and_run_inference_on(alt, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS)
+            });
+            if matches!(&out2, Some(t) if !t.trim().is_empty()) && set_inference_override_if_proven(model_id, alt) {
                 log::warn!(
                     "OPoI self-test: '{}' PASSED on GPU {} in {:.1}s — inference host MOVED {} → {}                      (GPU {} failed its probe; it keeps mining PoM, GPU {} now serves).",
                     name, alt, t1.elapsed().as_secs_f64(), gpu, alt, gpu, alt
@@ -1879,10 +2339,22 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
             log::warn!("OPoI self-test: '{}' also failed on GPU {} ({:.1}s).", name, alt, t1.elapsed().as_secs_f64());
         }
     }
-    if let Ok(mut m) = self_test_state().write() { m.insert(*model_id, passed); }
+    if !initial_passed {
+        record_unserveable_on(model_id, gpu);
+    }
     if passed {
-        mark_model_available(model_id, "inference_self_test_passed");
         log::info!("OPoI self-test: '{}' PASSED in {:.1}s — serveable; its tier will be declared + mined.", name, secs);
+    } else if model_serveable(model_id) {
+        // Another card may have proved this model while this card was waiting/probing. Keep the
+        // model-level capability alive; only this exact route remains marked false.
+        log::warn!(
+            "OPoI self-test: '{}' FAILED on GPU {} after {:.1}s, but another GPU still has a proven route; \
+             keeping the model declared and excluding GPU {} from serving it.",
+            name,
+            gpu,
+            secs,
+            gpu
+        );
     } else {
         mark_model_unavailable(model_id, "inference_self_test_failed");
         log::warn!(
@@ -1890,10 +2362,43 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
              from ai:cap and NOT mining this tier (mining a tier we cannot serve would strike the pool). \
              Cause is above: GPU inference could not load/run — usually the card lacks VRAM for this \
              model, an old driver, or a missing CUDA runtime / keryx-llama engine next to the miner.",
-            name, secs
+            name,
+            secs
         );
     }
     passed
+}
+
+/// Durable startup proof coordinator. Capability/job gates intentionally remain closed until a
+/// real GPU generation succeeds, so there may be no mining callback available to retry a transient
+/// driver/server/card-busy failure. A lightweight warmer owns that retry responsibility with a
+/// capped backoff; cached success is cheap, while cached failure's own cooldown prevents load
+/// thrash. The coordinator deliberately remains alive after success: a later GPU-context reset
+/// invalidates the exact route proof and this same thread then earns it again without a restart.
+pub fn warm_inference_route(model_id: [u8; 32], initial_gpu: usize) {
+    let mut delay = std::time::Duration::from_secs(30);
+    let mut target_gpu = initial_gpu;
+    loop {
+        // A failed probe may establish a model-specific failover override. Resolve placement every
+        // round so the durable warmer follows that proven card instead of repeatedly retrying the
+        // failed original and evicting/reloading both GPUs forever.
+        let passed = run_inference_self_test(&model_id, target_gpu);
+        if passed {
+            delay = std::time::Duration::from_secs(30);
+        } else {
+            log::warn!(
+                "OPoI startup proof for model {:.8} on GPU {} failed/deferred; retrying in {}s",
+                hex::encode(model_id),
+                target_gpu,
+                delay.as_secs()
+            );
+        }
+        std::thread::sleep(delay);
+        if !passed {
+            delay = (delay * 2).min(std::time::Duration::from_secs(300));
+        }
+        target_gpu = inference_gpu_for_model(&model_id);
+    }
 }
 
 /// VRAM headroom (MiB) required ON TOP of a smaller tier's `min_vram_mb` when demoting a card that
@@ -1907,7 +2412,8 @@ const DEMOTE_VRAM_HEADROOM_MB: u64 = 2_000;
 pub fn next_smaller_ready_spec(current: &[u8; 32], vram_mb: u64) -> Option<&'static ModelSpec> {
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let cur_budget = specs.iter().find(|s| &s.model_id == current).map(|s| s.min_vram_mb)?;
-    specs.iter()
+    specs
+        .iter()
         .copied()
         .filter(|s| s.min_vram_mb < cur_budget)
         .filter(|s| spec_files_ready(s))
@@ -1966,17 +2472,17 @@ fn model_is_unavailable(model_id: &[u8; 32]) -> bool {
 
 pub fn loaded_model_ids() -> Vec<[u8; 32]> {
     let specs = *SUPPORTED_SPECS.read().unwrap();
-    let mut ids: Vec<[u8; 32]> = specs.iter()
-        .filter(|s| model_dir(s).join(".ok").exists() && !model_is_unavailable(&s.model_id))
+    let mut ids: Vec<[u8; 32]> = specs
+        .iter()
+        .filter(|s| spec_files_ready(s) && !model_is_unavailable(&s.model_id))
         .map(|s| s.model_id)
         .collect();
     // Per-card assignments (mixed rig / --force-model): add any assigned tier whose GGUF is staged
     // (its dir's `.ok` present) and not already listed. pom-cuda only — the map is empty elsewhere.
     #[cfg(feature = "pom-cuda")]
     for (mid, gguf) in crate::pom_gpu::assigned_models() {
-        let ready = std::path::Path::new(&gguf)
-            .parent()
-            .map_or(false, |d| d.join(".ok").exists());
+        let marker_ready = std::path::Path::new(&gguf).parent().map_or(false, |d| d.join(".ok").exists());
+        let ready = marker_ready && crate::gguf::is_complete_file(std::path::Path::new(&gguf));
         if ready && !ids.contains(&mid) && !model_is_unavailable(&mid) {
             ids.push(mid);
         }
@@ -1998,26 +2504,32 @@ pub fn spec_files_ready(spec: &ModelSpec) -> bool {
 /// instead of looping silently. Empty when the lineup hasn't been installed yet.
 pub fn staging_diagnostics() -> Vec<String> {
     let specs = *SUPPORTED_SPECS.read().unwrap();
-    specs.iter().map(|s| {
-        let dir = model_dir(s);
-        let gguf = dir.join("model.gguf");
-        let ok = dir.join(".ok").exists();
-        match crate::gguf::completeness_reason(&gguf) {
-            None if ok => format!("  '{}': READY ({})", s.name, gguf.display()),
-            None => format!(
-                "  '{}': GGUF complete but not yet adopted at {} (miner will write .ok on next staging pass)",
-                s.name, gguf.display()
-            ),
-            Some(reason) => format!("  '{}': NOT ready — {} [{}]", s.name, gguf.display(), reason),
-        }
-    }).collect()
+    specs
+        .iter()
+        .map(|s| {
+            let dir = model_dir(s);
+            let gguf = dir.join("model.gguf");
+            let ok = dir.join(".ok").exists();
+            match crate::gguf::completeness_reason(&gguf) {
+                None if ok => format!("  '{}': READY ({})", s.name, gguf.display()),
+                None => format!(
+                    "  '{}': GGUF complete but not yet adopted at {} (miner will write .ok on next staging pass)",
+                    s.name,
+                    gguf.display()
+                ),
+                Some(reason) => format!("  '{}': NOT ready — {} [{}]", s.name, gguf.display(), reason),
+            }
+        })
+        .collect()
 }
 
 /// True only when the model is supported, its files are completely downloaded, and it is not
 /// currently withdrawn from `ai:cap` (upstream 0795e92).
 pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     let specs = *SUPPORTED_SPECS.read().unwrap();
-    let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else { return false; };
+    let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else {
+        return false;
+    };
     model_dir(spec).join(".ok").exists() && !model_is_unavailable(model_id)
 }
 
@@ -2027,9 +2539,13 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
 /// or pause PoW BEFORE dispatch should instead `acquire_inference_card(..)` themselves and call
 /// `load_and_run_inference_on(lease.gpu(), ..)` (see the stratum handlers).
 pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
+    if let Err(reason) = validate_inference_request(prompt, max_tokens, DEFAULT_INFERENCE_DEADLINE_MS) {
+        log::warn!("OPoI: rejected inference request: {}", reason);
+        return None;
+    }
     // Default deadline for callers that don't pass one (grpc solo path, capability challenge):
     // wait up to 30s for a free card, else give up (None → skipped, no hard reject upstream).
-    let lease = acquire_inference_card(model_id, 30_000)?;
+    let lease = acquire_inference_card(model_id, DEFAULT_INFERENCE_DEADLINE_MS)?;
     load_and_run_inference_on(lease.gpu(), model_id, prompt, max_tokens)
     // lease drops here → card released on every exit path.
 }
@@ -2038,8 +2554,10 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
 /// in-process llama.cpp engine branch is card-aware (its own resident model per card + per-card
 /// generate); the candle/vk fallbacks remain the single-card dormant path.
 pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
-    let _ = gpu; // the leased card is used by the in-process llama branch (CUDA/Metal); the
-                 // vk/candle fallbacks below are single-card by design and ignore it.
+    if let Err(reason) = validate_inference_request(prompt, max_tokens, DEFAULT_INFERENCE_DEADLINE_MS) {
+        log::warn!("OPoI: rejected inference request for GPU {}: {}", gpu, reason);
+        return None;
+    }
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
 
@@ -2048,16 +2566,43 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
     // downloading/loading it; serving now would uninstall+reload mid-prefetch. Drop the request —
     // the pool re-challenges once the model is ready (loaded_model_ids / ai:cap track readiness).
     if !crate::gguf::is_complete_file(&gguf_path_for(spec)) {
-        log::warn!("OPoI: model '{}' not fully staged yet — skipping inference (avoids a load race); will serve once ready.", spec.name);
+        log::warn!(
+            "OPoI: model '{}' not fully staged yet — skipping inference (avoids a load race); will serve once ready.",
+            spec.name
+        );
+        record_unserveable_on(model_id, gpu);
+        if !any_proven_route(model_id) {
+            mark_model_unavailable(model_id, "model_file_incomplete");
+        }
         return None;
     }
+
+    // GPU inference and the possession walk must never overlap on the serving card. Publishing a
+    // stopped job is not itself a completion barrier: a worker may already be inside a long kernel.
+    // The backend guard raises its per-card pause before draining that transient walk owner, then
+    // keeps the bit raised through model load/generation. This also covers the same-model zero-dup
+    // fast path, which does not uninstall the walk and was previously left unprotected.
+    #[cfg(any(
+        all(feature = "pom-cuda", not(feature = "pom-opencl")),
+        all(target_os = "macos", feature = "pom-metal"),
+    ))]
+    let _walk_drain = match crate::pom_gpu::pause_and_drain_for_inference(gpu) {
+        Some(guard) => guard,
+        None => return None,
+    };
+    #[cfg(feature = "pom-opencl")]
+    let _walk_drain = match crate::pom_opencl::pause_and_drain_for_inference(gpu) {
+        Some(guard) => guard,
+        None => return None,
+    };
 
     // Prefer a running llama.cpp llama-server: AMD always (candle has no AMD-GPU backend; Vulkan
     // server), NVIDIA when a CUDA llama-server is bundled/env-pointed (Phase 1 of candle-
     // independence — llama.cpp tracks new GGUF archs faster than candle). The OPoI text is
     // user-facing only (consensus checks the fixed-point `model_fixed` commitment separately), so
     // a non-candle engine is fine. Falls through to the candle engine below when the server isn't
-    // available — on NVIDIA that is the exact pre-Phase-1 behavior (candle-GPU → candle-CPU).
+    // available. CPU is considered only afterward when the operator explicitly enabled the
+    // deprecated emergency fallback.
     // Highest priority: the IN-PROCESS llama.cpp engine (Phase 2 on CUDA, Phase 3b on Apple
     // Silicon Metal). Ranks above the candle path so any host that bundles the .so/.dylib
     // gets fully candle-independent inference.
@@ -2066,82 +2611,181 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
         all(target_os = "macos", feature = "pom-metal"),
     ))]
     {
-        let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
-        // If this card doesn't already host the requested model, free ITS walk (per-card — other
-        // cards keep mining) so the inference model fits, then load it on this card. When the model
-        // is ALREADY resident here (the zero-dup mining tier) this is a no-op: no uninstall, no
-        // reload — byte-identical to the pre-router single-card path.
-        if !crate::llama_engine::active_for(&gguf, gpu) {
-            // Hard inference gate (upstream d35f85fc, adapted): pause + drain this process's PoM
-            // walks so uninstall() frees the card's walk WITHOUT racing a live batch, then reload
-            // the inference model and resume. A guard clears the pause on every exit (incl. panic).
-            // Pause ONLY this card (the one whose weights are about to be freed + reloaded); the
-            // rest of the rig keeps mining. The guard clears the bit on every exit, panic included.
-            struct PauseGuard(usize);
-            impl Drop for PauseGuard {
-                fn drop(&mut self) { crate::pom_gpu::set_inference_paused_on(self.0, false); }
-            }
-            crate::pom_gpu::set_inference_paused_on(gpu, true);
-            let _resume = PauseGuard(gpu);
-            crate::pom_gpu::uninstall(gpu as u32);
-            crate::llama_engine::ensure_loaded_on(&gguf, gpu);
-        }
-        if crate::llama_engine::available_on(gpu) {
-            let t0 = std::time::Instant::now();
-            // --only-inference: yield the card to the request. Returns None (no-op) on a normal rig,
-            // where mining continues through the generation as it always has.
-            let _serving = crate::pom_gpu::serving_now(gpu);
-            if let Some(text) = crate::llama_engine::generate_on(gpu, prompt, max_tokens) {
-                let secs = t0.elapsed().as_secs_f64();
-                if secs > 0.0 {
-                    record_card_toks(gpu, text.split_whitespace().count() as f64 / secs);
+        if !cpu_inference_enabled() {
+            let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
+            // A healthy exact subprocess already has the requested model resident. Reuse it in
+            // the server branch below instead of evicting the mining walk and allocating a second
+            // copy in-process. Conversely, stop/reap any live non-matching child before the
+            // higher-priority in-process engine allocates: an unhealthy or mismatched server can
+            // still own VRAM even though it is not a serveable route.
+            #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+            let exact_server_ready = crate::llama_vulkan::reuse_exact_or_stop(&gguf, gpu);
+            #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+            let exact_server_ready = false;
+            // If this card doesn't already host the requested model, free ITS walk (per-card — other
+            // cards keep mining) so the inference model fits, then load it on this card. When the model
+            // is ALREADY resident here (the zero-dup mining tier) this is a no-op: no uninstall, no
+            // reload — byte-identical to the pre-router single-card path.
+            if !exact_server_ready && !crate::llama_engine::active_for(&gguf, gpu) {
+                // `_walk_drain` above already paused this exact card and waited for its current batch.
+                // Now it is safe to remove a walk whose pointers may alias the old llama model.
+                if !crate::pom_gpu::uninstall_released(gpu as u32) {
+                    log::error!(
+                        "OPoI: GPU {} walk did not drain; refusing to free/swap llama weights underneath it",
+                        gpu
+                    );
+                    return None;
                 }
-                // Upstream 0795e92: a successful generation re-announces the model in ai:cap.
-                mark_model_available(model_id, "generation_success");
-                record_serveable(model_id); // a live answer is proof this rig can serve the tier
-                return Some(strip_think_tags(&text));
+                if !crate::llama_engine::ensure_loaded_on(&gguf, gpu) {
+                    log::warn!(
+                        "SlmEngine: in-process llama load failed on GPU {} — trying configured llama-server fallback.",
+                        gpu
+                    );
+                }
             }
-            // REVERTED in v0.12.6 — do NOT return early here.
-            //
-            // v0.12.4 made this path terminal ("upstream parity") to stop a rare cascade that
-            // wedged a rig. That fix caused a MUCH worse regression: on every MULTI-GPU rig the
-            // cards sat at "preparing" forever with "OPoI: no models ready — mining suspended".
-            // A/B on rig08 (2x 3070 + 1x 5080, same config, healthy cards):
-            //   v0.12.3 -> all three cards mine (1.31 + 1.31 + 3.26 MH/s), probes PASS on GPU 2
-            //   v0.12.5 -> all three stall, self-test FAILS on GPU 1 (a 3070)
-            // Failing fast here makes the self-test probe fail, which fires the inference-host
-            // FAILOVER onto a small card that cannot hold the 12 GB tier; the model is then
-            // withdrawn from ai:cap, loaded_model_ids() goes empty, and EVERY card stalls.
-            // Falling through gives the probe the second chance it needs. The cascade this was
-            // meant to fix hit once in hours; this broke every multi-GPU rig, so the trade is
-            // clear. A safer cascade fix must distinguish the SELF-TEST probe from real OPoI
-            // serving instead of making both terminal.
-            log::warn!("SlmEngine: in-process llama generate failed on GPU {} — trying the next engine.", gpu);
-        } else {
-            // The in-process engine could not come up for this model on this card (e.g. the .so is
-            // absent). Withdraw it from ai:cap so the pool stops routing challenges we cannot answer
-            // (upstream 0795e92). Fall through to the legacy llama-server / candle path below, which
-            // still serves the candle-loadable archs on a host without libkeryx-llama.so.
-            mark_model_unavailable(model_id, "llama_load_failed");
+            if !exact_server_ready && crate::llama_engine::active_for(&gguf, gpu) {
+                let t0 = std::time::Instant::now();
+                // --only-inference: yield the card to the request. Returns None (no-op) on a normal rig,
+                // where mining continues through the generation as it always has.
+                if let Some(text) = crate::llama_engine::generate_for(gpu, &gguf, prompt, max_tokens) {
+                    let secs = t0.elapsed().as_secs_f64();
+                    if secs > 0.0 {
+                        record_card_toks(gpu, text.split_whitespace().count() as f64 / secs);
+                    }
+                    let clean = strip_think_tags(&text);
+                    if !clean.trim().is_empty() {
+                        // Record proof only after post-processing. A response consisting solely of a
+                        // truncated <think> block is not an answer and must never enable ai:cap.
+                        record_serveable_on(model_id, gpu);
+                        mark_model_available(model_id, "generation_success");
+                        return Some(clean);
+                    }
+                    log::warn!(
+                    "SlmEngine: in-process llama output on GPU {} was empty after stripping think tags — trying the next engine.",
+                    gpu
+                );
+                }
+                // REVERTED in v0.12.6 — do NOT return early here.
+                //
+                // v0.12.4 made this path terminal ("upstream parity") to stop a rare cascade that
+                // wedged a rig. That fix caused a MUCH worse regression: on every MULTI-GPU rig the
+                // cards sat at "preparing" forever with "OPoI: no models ready — mining suspended".
+                // A/B on rig08 (2x 3070 + 1x 5080, same config, healthy cards):
+                //   v0.12.3 -> all three cards mine (1.31 + 1.31 + 3.26 MH/s), probes PASS on GPU 2
+                //   v0.12.5 -> all three stall, self-test FAILS on GPU 1 (a 3070)
+                // Failing fast here makes the self-test probe fail, which fires the inference-host
+                // FAILOVER onto a small card that cannot hold the 12 GB tier; the model is then
+                // withdrawn from ai:cap, loaded_model_ids() goes empty, and EVERY card stalls.
+                // Falling through gives the probe the second chance it needs. The cascade this was
+                // meant to fix hit once in hours; this broke every multi-GPU rig, so the trade is
+                // clear. A safer cascade fix must distinguish the SELF-TEST probe from real OPoI
+                // serving instead of making both terminal.
+                log::warn!("SlmEngine: in-process llama generate failed on GPU {} — trying the next engine.", gpu);
+            }
         }
     }
 
     // AMD (pom-opencl) in-process engine: the zero-dup host of the walk's model — its inference
     // costs no extra VRAM. Ranks above the llama-server subprocess.
     #[cfg(feature = "pom-opencl")]
-    if crate::llama_engine_vk::available() {
-        if let Some(text) = crate::llama_engine_vk::generate(prompt, max_tokens) {
-            return Some(strip_think_tags(&text));
+    {
+        let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
+        if !cpu_inference_enabled() && !crate::llama_vulkan::reuse_exact_or_stop(&gguf, gpu) {
+            // The lifecycle-locked transition above synchronously stopped/reaped any old server
+            // before the higher-priority engine claims dedication. A failed load therefore cannot
+            // clear a still-resident subprocess model's reservation.
+            if !crate::llama_engine_vk::active_for(&gguf) && crate::llama_engine_vk::available() {
+                // A singleton holding another model must be stopped before loading this one. The
+                // OpenCL drain above covers every walk while the engine frees/reallocates GPU memory.
+                crate::llama_engine_vk::unload();
+            }
+            let engine_ready =
+                crate::llama_engine_vk::active_for(&gguf) || crate::llama_engine_vk::ensure_loaded(&gguf, gpu);
+            // The loaded engine must agree with the exact PCI reservation established before
+            // allocation. Validate now, before the first generation, so a sidecar/driver mapping
+            // mismatch never earns a capability proof.
+            let engine_scoped = engine_ready && crate::pom_opencl::dedicate_loaded_engine_card_if_required();
+            if engine_ready && !engine_scoped {
+                log::error!("SlmEngine: unloading Vulkan engine whose GPU cannot be scoped safely to the selected OpenCL workers");
+                crate::llama_engine_vk::unload();
+            }
+            if engine_scoped {
+                if let Some(text) = crate::llama_engine_vk::generate_for(&gguf, prompt, max_tokens) {
+                    let clean = strip_think_tags(&text);
+                    if !clean.trim().is_empty() {
+                        record_serveable_on(model_id, gpu);
+                        mark_model_available(model_id, "llama_vk_generation_success");
+                        return Some(clean);
+                    }
+                    log::warn!("SlmEngine: in-process llama-vk output was empty after stripping think tags.");
+                }
+                log::warn!("SlmEngine: in-process llama-vk generate failed — trying the next engine.");
+            }
         }
-        log::warn!("SlmEngine: in-process llama-vk generate failed — trying the next engine.");
     }
 
     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
-    if crate::llama_vulkan::available() {
-        if let Some(text) = crate::llama_vulkan::generate(prompt, max_tokens) {
-            return Some(strip_think_tags(&text));
+    {
+        if !cpu_inference_enabled() {
+            let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
+            if !crate::llama_vulkan::available_for(&gguf, gpu) && crate::llama_vulkan::configured() {
+                // CUDA: a failed in-process engine may still own the model buffers (and the walk may
+                // alias them). Tear down the drained walk before freeing those buffers and launching
+                // the configured subprocess on the exact same logical card.
+                #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+                {
+                    if !crate::pom_gpu::uninstall_released(gpu as u32) {
+                        log::error!("OPoI: GPU {} walk remained referenced; refusing llama-server model swap", gpu);
+                        record_unserveable_on(model_id, gpu);
+                        if !any_proven_route(model_id) {
+                            mark_model_unavailable(model_id, "walk_drain_failed");
+                        }
+                        return None;
+                    }
+                    crate::llama_engine::unload_for_gpu(gpu);
+                }
+                #[cfg(feature = "pom-opencl")]
+                if crate::llama_engine_vk::active_for(&gguf) {
+                    crate::llama_engine_vk::unload();
+                }
+                // An unset/invalid/zero port asks the OS for a free per-process loopback port.
+                // Explicit ports are reserved and refused if another miner already owns them.
+                let port = std::env::var("KERYX_LLAMA_PORT").ok().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                let _ = crate::llama_vulkan::try_start_on(&gguf, port, gpu);
+            }
+            if crate::llama_vulkan::available_for(&gguf, gpu) {
+                if let Some(text) = crate::llama_vulkan::generate_for(&gguf, gpu, prompt, max_tokens) {
+                    let clean = strip_think_tags(&text);
+                    if !clean.trim().is_empty() {
+                        #[cfg(all(feature = "pom-opencl", unix))]
+                        if !crate::llama_vulkan::vulkan_server_ggml_device()
+                            .is_some_and(crate::pom_opencl::resolve_vulkan_server_dedication)
+                        {
+                            log::error!(
+                                "SlmEngine: stopping Vulkan llama-server because its GPU \
+                                 cannot be mapped safely to the selected OpenCL workers"
+                            );
+                            crate::llama_vulkan::stop();
+                            crate::pom_opencl::release_provisional_dedication_after_server_stop();
+                            return None;
+                        }
+                        if !crate::llama_vulkan::commit_route_success(&gguf, gpu, model_id) {
+                            // The response itself is still valid for this request, but its child
+                            // exited or was replaced before proof publication. Return the answer
+                            // without reopening ai:cap; the durable warmer will earn a live proof.
+                            log::warn!(
+                                "SlmEngine: llama-server answered, but its exact process was no longer live at route-proof commit"
+                            );
+                        }
+                        return Some(clean);
+                    }
+                    log::warn!("SlmEngine: llama-server output was empty after stripping think tags.");
+                }
+                log::warn!(
+                "SlmEngine: llama-server inference returned nothing; trying only explicitly enabled legacy fallbacks."
+            );
+            }
         }
-        log::warn!("SlmEngine: llama-server inference returned nothing — falling back to candle for this challenge.");
     }
 
     // catch_unwind prevents any internal panic (cudarc, candle, OOM…) from permanently
@@ -2166,14 +2810,16 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
             // weights so this model fits. Mining rebuilds (reloads its model) when it next runs.
             // (pom-cuda only — the OpenCL/AMD PoM miner has its own buffer, no candle-shared VRAM.)
             #[cfg(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
-            crate::pom_gpu::uninstall(inference_gpu_ordinal() as u32);
+            if !crate::pom_gpu::uninstall_released(gpu as u32) {
+                log::error!("OPoI: GPU {} walk did not drain; legacy inference load deferred", gpu);
+                return None;
+            }
             *guard = None;
-            let dev_str = if cpu_inference_enabled() { "CPU".to_string() } else { format!("CUDA:{}", inference_gpu_ordinal()) };
-            log::info!("SlmEngine: inference device active ({})", dev_str);
-            // Loads on CUDA, and auto-falls-back to CPU (warning + set_cpu_inference) if the GPU
-            // model load fails (wrong-arch PTX / OOM / old driver) — never crashes the miner.
-            match load_engine_with_fallback(spec) {
-                Ok(e) => { *guard = Some(e); }
+            log::info!("SlmEngine: legacy inference device active (CUDA:{})", gpu);
+            match load_legacy_engine_on(spec, gpu) {
+                Ok(e) => {
+                    *guard = Some(e);
+                }
                 Err(e) => {
                     log::error!("SlmEngine: failed to load '{}': {}", spec.name, e);
                     return None;
@@ -2190,17 +2836,45 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
             }
             Err(e) => {
                 log::warn!("SlmEngine '{}' generate error: {}", engine.name, e);
-                Some(format!("[inference error: {}]", e))
+                None
             }
         }
     });
 
     match result {
-        Ok(output) => output,
+        Ok(Some(output)) => {
+            let clean = strip_think_tags(&output);
+            if !clean.trim().is_empty() {
+                record_serveable_on(model_id, gpu);
+                mark_model_available(model_id, "legacy_generation_success");
+                Some(clean)
+            } else {
+                record_unserveable_on(model_id, gpu);
+                if !any_proven_route(model_id) {
+                    mark_model_unavailable(model_id, "empty_generation");
+                }
+                None
+            }
+        }
+        Ok(None) => {
+            record_unserveable_on(model_id, gpu);
+            if !any_proven_route(model_id) {
+                mark_model_unavailable(model_id, "all_gpu_inference_routes_failed");
+            }
+            None
+        }
         Err(_) => {
             log::error!("SlmEngine: inference panicked — engine evicted, will retry on next challenge");
-            log::error!("SlmEngine: cuBLAS missing? Run: sudo apt-get install -y libcublas-12-2 then restart the miner");
-            if let Ok(mut g) = ENGINE.lock() { *g = None; }
+            log::error!(
+                "SlmEngine: cuBLAS missing? Run: sudo apt-get install -y libcublas-12-2 then restart the miner"
+            );
+            if let Ok(mut g) = ENGINE.lock() {
+                *g = None;
+            }
+            record_unserveable_on(model_id, gpu);
+            if !any_proven_route(model_id) {
+                mark_model_unavailable(model_id, "inference_panic");
+            }
             None
         }
     }
@@ -2218,7 +2892,8 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
             // diagnosable instead of looking like a hang.
             log::warn!(
                 "SlmEngine: ensure_loaded — model {} not in the active lineup ({} spec(s)); lineup not advanced yet?",
-                hex::encode(&model_id[..4]), specs.len()
+                hex::encode(&model_id[..4]),
+                specs.len()
             );
             return false;
         }
@@ -2235,10 +2910,9 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
         return true; // already resident
     }
     *guard = None;
-    // Loads on CUDA, auto-falls-back to CPU (warn + set_cpu_inference) if the GPU model load fails.
-    // On CPU fallback the engine is no longer CUDA, so `pom_shared` returns None and the PoM walk
-    // loads its OWN GPU copy via PomGpuMiner::load — the walk keeps mining on the GPU regardless.
-    match load_engine_with_fallback(spec) {
+    // Legacy candle sharing is GPU-only. The active H6 lineup is hosted by llama_engine instead;
+    // pretending it fell back to CPU made capability and pause accounting incorrect.
+    match load_legacy_engine_on(spec, inference_gpu_for_model(model_id)) {
         Ok(e) => {
             *guard = Some(e);
             true
@@ -2253,9 +2927,7 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
 /// PoM C2: if the resident engine model is `model_id` and a CUDA qwen3-split, return its device and
 /// quantized weight tensors (by canonical GGUF name) so the possession walk reads them in place
 /// instead of loading a second copy. None ⇒ caller falls back to a standalone `PomGpuMiner::load`.
-pub fn pom_shared(
-    model_id: &[u8; 32],
-) -> Option<(Device, std::collections::HashMap<String, Arc<QTensor>>)> {
+pub fn pom_shared(model_id: &[u8; 32]) -> Option<(Device, std::collections::HashMap<String, Arc<QTensor>>)> {
     let guard = ENGINE.lock().ok()?;
     let e = guard.as_ref()?;
     if &e.model_id != model_id || !e.device.is_cuda() {
@@ -2330,5 +3002,93 @@ mod withdrawal_tests {
         let other = [0xc1u8; 32];
         mark_model_unavailable(&model_id, "again");
         assert!(!model_is_unavailable(&other));
+    }
+
+    #[test]
+    fn amd_engine_eviction_clears_every_cached_route_and_withdraws_model() {
+        let model_id = [0xd4u8; 32];
+        self_test_state().write().unwrap().insert((model_id, 0), true);
+        self_test_state().write().unwrap().insert((model_id, 7), true);
+        mark_model_available(&model_id, "test_setup");
+
+        withdraw_model_after_amd_engine_eviction(&model_id);
+
+        assert!(!self_test_state().read().unwrap().keys().any(|(mid, _)| mid == &model_id));
+        assert!(model_is_unavailable(&model_id));
+        mark_model_available(&model_id, "test_cleanup");
+    }
+
+    #[test]
+    fn exact_route_invalidation_preserves_other_models_and_cards() {
+        let model_a = [0xe1u8; 32];
+        let model_b = [0xe2u8; 32];
+        {
+            let mut state = self_test_state().write().unwrap();
+            state.insert((model_a, 0), true);
+            state.insert((model_a, 1), true);
+            state.insert((model_b, 0), true);
+        }
+
+        invalidate_inference_route(&model_a, 0, "test_exact_server_exit");
+
+        let state = self_test_state().read().unwrap();
+        assert!(!state.contains_key(&(model_a, 0)));
+        assert_eq!(state.get(&(model_a, 1)), Some(&true));
+        assert_eq!(state.get(&(model_b, 0)), Some(&true));
+        drop(state);
+
+        clear_self_test(&model_a);
+        clear_self_test(&model_b);
+        mark_model_available(&model_a, "test_cleanup");
+        mark_model_available(&model_b, "test_cleanup");
+    }
+}
+
+#[cfg(test)]
+mod inference_admission_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_bounded_request_and_normalizes_zero_deadline() {
+        assert_eq!(validate_inference_request("hello", 128, 0), Ok(DEFAULT_INFERENCE_DEADLINE_MS));
+        assert_eq!(
+            validate_inference_request(
+                &"x".repeat(MAX_INFERENCE_PROMPT_BYTES),
+                MAX_INFERENCE_TOKENS,
+                MAX_INFERENCE_DEADLINE_MS,
+            ),
+            Ok(MAX_INFERENCE_DEADLINE_MS)
+        );
+    }
+
+    #[test]
+    fn rejects_empty_or_oversized_remote_controls() {
+        assert_eq!(validate_inference_request("", 1, 1), Err("prompt is empty"));
+        assert!(validate_inference_request(&"x".repeat(MAX_INFERENCE_PROMPT_BYTES + 1), 1, 1,).is_err());
+        assert!(validate_inference_request("x", 0, 1).is_err());
+        assert!(validate_inference_request("x", MAX_INFERENCE_TOKENS + 1, 1).is_err());
+        assert!(validate_inference_request("x", 1, MAX_INFERENCE_DEADLINE_MS + 1).is_err());
+    }
+
+    #[test]
+    fn internal_wait_deadlines_are_always_bounded() {
+        assert_eq!(bounded_deadline_ms(0), DEFAULT_INFERENCE_DEADLINE_MS);
+        assert_eq!(bounded_deadline_ms(u64::MAX), MAX_INFERENCE_DEADLINE_MS);
+    }
+}
+
+#[cfg(test)]
+mod inference_probe_tests {
+    use super::current_probe_passed;
+
+    #[test]
+    fn stale_cached_success_cannot_reopen_a_failed_route() {
+        let stale_cached_success = true;
+        let current_probe_output: Option<&str> = None;
+
+        assert!(stale_cached_success, "regression setup must represent an old successful probe");
+        assert!(!current_probe_passed(current_probe_output));
+        assert!(!current_probe_passed(Some("  \n\t")));
+        assert!(current_probe_passed(Some("OK")));
     }
 }

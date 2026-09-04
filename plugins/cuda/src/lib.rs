@@ -29,6 +29,35 @@ use crate::worker::CudaGPUWorker;
 
 const DEFAULT_WORKLOAD_SCALE: f32 = 1024.;
 
+/// Optional dynamic-plugin output-contract handshake.
+///
+/// An old host does not look this symbol up, so the worker translates its raw MAX sentinel back to
+/// legacy zero. A new host calls it before workers are built and can then distinguish a genuine
+/// nonce zero from no winner without changing the Rust trait-object ABI.
+#[no_mangle]
+pub extern "C" fn keryx_plugin_enable_raw_nonce_v1() -> u64 {
+    worker::enable_raw_nonce_output_v1()
+}
+
+/// Resolve a CUDA *visible logical ordinal* to the same physical GPU in NVML.
+///
+/// NVML indices always use the machine-global ordering, while CUDA renumbers devices after
+/// `CUDA_VISIBLE_DEVICES` (and accepts UUID masks). Looking up NVML by the logical ordinal made a
+/// one-card process masked to physical GPU 1 monitor and overclock physical GPU 0 instead. PCI BDF
+/// is stable in both APIs and avoids relying on either enumeration order.
+#[cfg(feature = "overclock")]
+fn nvml_device_for_cuda(nvml: &Nvml, cuda_ordinal: u16) -> Result<NvmlDevice<'_>, Error> {
+    use cust::device::DeviceAttribute;
+
+    let cuda = Device::get_device(cuda_ordinal as u32)?;
+    let domain = cuda.get_attribute(DeviceAttribute::PciDomainId)? as u32;
+    let bus = cuda.get_attribute(DeviceAttribute::PciBusId)? as u32;
+    let device = cuda.get_attribute(DeviceAttribute::PciDeviceId)? as u32;
+    // NVML's canonical bus-id form uses an eight-digit PCI domain.
+    let bus_id = format!("{domain:08x}:{bus:02x}:{device:02x}.0");
+    Ok(nvml.device_by_pci_bus_id(bus_id)?)
+}
+
 pub struct CudaPlugin {
     specs: Vec<CudaWorkerSpec>,
     #[cfg(feature = "overclock")]
@@ -104,7 +133,7 @@ impl Plugin for CudaPlugin {
                         _ => None,
                     };
 
-                    let mut nvml_device: NvmlDevice = self.nvml_instance.device_by_index(gpus[i] as u32)?;
+                    let mut nvml_device: NvmlDevice = nvml_device_for_cuda(&self.nvml_instance, gpus[i])?;
 
                     if let Some(lmc) = lock_mem_clock {
                         match nvml_device.set_mem_locked_clocks(lmc, lmc) {
@@ -146,7 +175,7 @@ impl Plugin for CudaPlugin {
                         None => *fans.last().unwrap_or(&0),
                     };
                     let pct = pct.min(100);
-                    let mut nvml_device: NvmlDevice = self.nvml_instance.device_by_index(gpus[i] as u32)?;
+                    let mut nvml_device: NvmlDevice = nvml_device_for_cuda(&self.nvml_instance, gpus[i])?;
                     let n_fans = nvml_device.num_fans().unwrap_or(1);
                     let name = nvml_device.name().unwrap_or_else(|_| "GPU".into());
                     for f in 0..n_fans {
@@ -174,11 +203,14 @@ impl Plugin for CudaPlugin {
                         // are already cheap). Init failure is logged once.
                         let nvml = match Nvml::init() {
                             Ok(n) => n,
-                            Err(e) => { warn!("keryxcuda-monitor: NVML init failed: {:?} — monitor disabled", e); return; }
+                            Err(e) => {
+                                warn!("keryxcuda-monitor: NVML init failed: {:?} — monitor disabled", e);
+                                return;
+                            }
                         };
                         loop {
                             for (idx, &gpu_id) in gpus_for_monitor.iter().enumerate() {
-                                if let Ok(dev) = nvml.device_by_index(gpu_id as u32) {
+                                if let Ok(dev) = nvml_device_for_cuda(&nvml, gpu_id) {
                                     let temp = dev.temperature(TemperatureSensor::Gpu).ok();
                                     let n_fans = dev.num_fans().unwrap_or(0);
                                     let fan_pct: Vec<String> = (0..n_fans)
@@ -197,7 +229,11 @@ impl Plugin for CudaPlugin {
                                         core_mhz.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
                                         mem_mhz.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
                                         mem_used
-                                            .map(|m| format!("{}/{}MB", m.used / (1024 * 1024), m.total / (1024 * 1024)))
+                                            .map(|m| format!(
+                                                "{}/{}MB",
+                                                m.used / (1024 * 1024),
+                                                m.total / (1024 * 1024)
+                                            ))
                                             .unwrap_or_else(|| "?".into()),
                                     );
                                 }

@@ -9,8 +9,9 @@
 // are supplemented into a small wrapper-owned device buffer so every canonical chunk is
 // GPU-reachable; supplement bytes are reported (0 = true zero-dup).
 //
-// The miner dlopens this next to its own binary; absent = the Vulkan llama-server subprocess and
-// candle-CPU fallbacks stay active. Built by hiveos/build-keryx-llama-vk.sh against the SAME
+// The miner dlopens this next to its own binary; absent = try the Vulkan llama-server subprocess.
+// Candle-CPU is retained only as an explicit, deprecated emergency fallback. Built by
+// hiveos/build-keryx-llama-vk.sh against the SAME
 // pinned llama.cpp as the CUDA flavor.
 #include "llama.h"
 #include "llama-model.h"
@@ -18,6 +19,7 @@
 #include "gguf.h"
 #include <vulkan/vulkan.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <mutex>
@@ -454,11 +456,16 @@ bool keryx_llama_pom_pci(KeryxLlama* h, uint32_t* domain, uint32_t* bus, uint32_
 KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     llama_backend_init();
     // gpu < 0 = "auto-pick a discrete GPU" (issue #18): resolve it against ggml's OWN device
-    // list so the model never lands on an integrated GPU. main_gpu indexes ggml's device list,
-    // so no GGML_VK_VISIBLE_DEVICES is needed (and it must NOT be set — it uses a different,
-    // cross-instance index space that mislocates or asserts on iGPU rigs).
+    // list so the model never lands on an integrated GPU. When the miner publishes its selected
+    // OpenCL-worker PCI allowlist, no match is a hard failure rather than an unsafe device-0
+    // fallback. main_gpu indexes ggml's device list, so no GGML_VK_VISIBLE_DEVICES is needed (and
+    // it must NOT be set — that uses a different cross-instance index space).
     if (gpu < 0) {
         int d = keryx_vk_pick_discrete_device();
+        if (d < 0 && std::getenv("KERYX_LLAMA_VK_AUTO_PCI_ALLOWLIST") != nullptr) {
+            fprintf(stderr, "keryx-llama-vk: no Vulkan device matches the selected OpenCL worker PCI allowlist\n");
+            return nullptr;
+        }
         gpu = d >= 0 ? d : 0;
         fprintf(stderr, "keryx-llama-vk: auto-selected discrete ggml device %d\n", gpu);
     }
@@ -553,16 +560,21 @@ int64_t keryx_llama_pom_mine(KeryxLlama* h, const uint64_t p[4], const uint64_t 
 // Generate up to max_tokens; writes UTF-8 into out (cap bytes, NUL-terminated). Returns written
 // length, or -1 on error. Serialized — one generation at a time (OPoI challenges are rare).
 int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
-    if (!h || !prompt || !out || cap < 2) return -1;
+    if (!h || !prompt || !out || cap < 2 || max_tokens <= 0 || max_tokens > 2048) return -1;
+    size_t prompt_len = 0;
+    while (prompt_len <= 4096 && prompt[prompt_len] != '\0') ++prompt_len;
+    if (prompt_len == 0 || prompt_len > 4096) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
 
-    std::vector<llama_token> toks(strlen(prompt) + 16);
-    int n = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt), toks.data(), (int32_t)toks.size(), true, true);
+    std::vector<llama_token> toks(prompt_len + 16);
+    int n = llama_tokenize(vocab, prompt, (int32_t)prompt_len, toks.data(), (int32_t)toks.size(), true, true);
     if (n < 0) return -1;
     toks.resize(n);
 
     llama_memory_clear(llama_get_memory(h->ctx), true);
+    // Reset stateful penalties/DRY history together with the per-request KV cache.
+    llama_sampler_reset(h->smpl);
     llama_batch batch = llama_batch_get_one(toks.data(), (int32_t)toks.size());
     int written = 0;
     for (int i = 0; i < max_tokens; i++) {

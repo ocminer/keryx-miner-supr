@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -13,9 +13,130 @@ use tokio::task::{self, JoinHandle};
 use tokio::time::MissedTickBehavior;
 
 use crate::pow::BlockSeed;
-use keryx_miner::{PluginManager, WorkerSpec};
+use keryx_miner::{ManagedWorkerSpec, PluginManager};
 
 type MinerHandler = std::thread::JoinHandle<Result<(), Error>>;
+
+/// Process-wide OPoI pause state. Network handlers and `MinerManager`s are replaced on reconnect,
+/// while their detached inference tasks can keep running. A connection-owned counter would let a
+/// replacement manager resume over one of those old GPU calls.
+struct InferencePauseState {
+    inflight: usize,
+    current_miner: Option<Weak<InferencePauseControl>>,
+}
+
+struct InferencePauseControl {
+    block_channel: Arc<watch::Sender<Option<WorkerCommand>>>,
+    active_flag: Arc<AtomicBool>,
+    /// Last valid Stratum job for this exact `MinerManager` generation.  It is
+    /// deliberately manager-local: replacing the manager on reconnect creates
+    /// an empty slot, so an old connection's template can never be replayed to
+    /// the replacement workers.
+    resumable_stratum_job: Mutex<Option<WorkerCommand>>,
+}
+
+impl InferencePauseControl {
+    fn remember_stratum_job(&self, job: WorkerCommand) {
+        *self.resumable_stratum_job.lock().unwrap_or_else(|p| p.into_inner()) = Some(job);
+    }
+
+    fn forget_stratum_job(&self) {
+        self.resumable_stratum_job.lock().unwrap_or_else(|p| p.into_inner()).take();
+    }
+
+    /// Resume only this manager's newest retained Stratum job.  The caller
+    /// holds `inference_pause_state`, which serializes this send against both a
+    /// newer notify and manager replacement.
+    fn resume_stratum_job(&self) {
+        self.active_flag.store(false, Ordering::SeqCst);
+        let job = self.resumable_stratum_job.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(job) = job {
+            if self.block_channel.send(Some(job)).is_err() {
+                warn!("OPoI: could not resume the retained Stratum job because all workers exited");
+            }
+        }
+    }
+}
+
+fn inference_pause_state() -> &'static Mutex<InferencePauseState> {
+    static STATE: OnceLock<Mutex<InferencePauseState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(InferencePauseState { inflight: 0, current_miner: None }))
+}
+
+fn lock_inference_pause_state() -> std::sync::MutexGuard<'static, InferencePauseState> {
+    inference_pause_state().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// RAII token held from GPU acquisition until generation has actually ended. The final token clears
+/// the flag on whichever miner is live then, even if the pool reconnected during inference.
+pub struct InferencePauseGuard {
+    armed: bool,
+}
+
+impl Drop for InferencePauseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = lock_inference_pause_state();
+        debug_assert!(state.inflight > 0, "OPoI inference pause counter underflow");
+        state.inflight = state.inflight.saturating_sub(1);
+        if state.inflight == 0 {
+            if let Some(control) = state.current_miner.as_ref().and_then(Weak::upgrade) {
+                control.resume_stratum_job();
+            }
+        }
+        self.armed = false;
+    }
+}
+
+/// One slot in the bounded detached proof-builder pool. Acquisition is atomic (the old
+/// load-then-increment check could oversubscribe under simultaneous GPU hits), and Drop releases
+/// the slot even if proof I/O panics and the detached closure unwinds.
+#[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
+struct InflightProofPermit {
+    counter: Arc<AtomicUsize>,
+}
+
+#[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
+impl InflightProofPermit {
+    fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Self { counter: Arc::clone(counter) }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+#[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
+impl Drop for InflightProofPermit {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Stop the currently-live miner and hold the process-wide job gate until the returned token drops.
+/// The synchronous stop is ordered with job dispatch through the same mutex, closing the race where
+/// a notify arrives between a detached task deciding to pause and its GPU call beginning.
+pub fn begin_inference_pause() -> InferencePauseGuard {
+    let mut state = lock_inference_pause_state();
+    state.inflight = state.inflight.saturating_add(1);
+    if let Some(control) = state.current_miner.as_ref().and_then(Weak::upgrade) {
+        control.active_flag.store(true, Ordering::SeqCst);
+        let _ = control.block_channel.send(None);
+    }
+    InferencePauseGuard { armed: true }
+}
+
+pub fn inference_pause_active() -> bool {
+    lock_inference_pause_state().inflight != 0
+}
 
 // How long to wait for a worker to exit after it is asked to Close before we
 // assume it is frozen and force-kill it with SIGUSR1. Must comfortably exceed a
@@ -74,7 +195,10 @@ fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -
             waited += FREEZE_POLL;
         }
         if kill_switch.load(Ordering::SeqCst) {
-            warn!("Worker did not exit within {}s of shutdown — force-killing (assumed frozen)", FREEZE_GRACE.as_secs());
+            warn!(
+                "Worker did not exit within {}s of shutdown — force-killing (assumed frozen)",
+                FREEZE_GRACE.as_secs()
+            );
             match nix::sys::pthread::pthread_kill(pthread_handle, nix::sys::signal::Signal::SIGUSR1) {
                 Ok(()) => {
                     info!("Thread killed successfully")
@@ -152,7 +276,7 @@ pub struct MinerStats {
 #[allow(dead_code)]
 pub struct MinerManager {
     handles: Vec<MinerHandler>,
-    block_channel: watch::Sender<Option<WorkerCommand>>,
+    block_channel: Arc<watch::Sender<Option<WorkerCommand>>>,
     send_channel: Sender<BlockSeed>,
     logger_handle: JoinHandle<()>,
     is_synced: bool,
@@ -160,6 +284,7 @@ pub struct MinerManager {
     hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
     current_state_id: AtomicUsize,
     opoi_challenge_active: Arc<AtomicBool>,
+    pause_control: Arc<InferencePauseControl>,
     stats: Arc<Mutex<MinerStats>>,
 }
 
@@ -173,6 +298,19 @@ impl MinerManager {
 impl Drop for MinerManager {
     fn drop(&mut self) {
         info!("Closing miner");
+        // Stop routing new global pauses to workers that are being torn down. Detached guards remain
+        // live and will operate on the replacement manager registered by `new`.
+        {
+            let mut state = lock_inference_pause_state();
+            let is_current = state
+                .current_miner
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .map_or(false, |current| Arc::ptr_eq(&current, &self.pause_control));
+            if is_current {
+                state.current_miner = None;
+            }
+        }
         self.logger_handle.abort();
         match self.block_channel.send(Some(WorkerCommand::Close)) {
             Ok(_) => {}
@@ -210,6 +348,19 @@ impl MinerManager {
         let opoi_challenge_active = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Mutex::new(MinerStats::default()));
         let (send, recv) = watch::channel(None);
+        let send = Arc::new(send);
+        let pause_control = Arc::new(InferencePauseControl {
+            block_channel: Arc::clone(&send),
+            active_flag: Arc::clone(&opoi_challenge_active),
+            resumable_stratum_job: Mutex::new(None),
+        });
+        {
+            let mut state = lock_inference_pause_state();
+            if state.inflight != 0 {
+                opoi_challenge_active.store(true, Ordering::SeqCst);
+            }
+            state.current_miner = Some(Arc::downgrade(&pause_control));
+        }
         let mut handles =
             Self::launch_cpu_threads(send_channel.clone(), Arc::clone(&hashes_tried), recv.clone(), n_cpus)
                 .collect::<Vec<MinerHandler>>();
@@ -237,6 +388,7 @@ impl MinerManager {
             current_state_id: AtomicUsize::new(0),
             hashes_by_worker,
             opoi_challenge_active,
+            pause_control,
             stats,
         }
     }
@@ -283,11 +435,45 @@ impl MinerManager {
     pub async fn process_block(&mut self, block: Option<BlockSeed>) -> Result<(), Error> {
         let state = match block {
             Some(b) => {
-                self.is_synced = true;
+                // Only Stratum jobs are `PartialBlock`s.  Retaining a solo/gRPC
+                // `FullBlock` would change its template lifecycle: gRPC already
+                // requests one fresh template after inference completes.
+                let is_stratum_job = matches!(&b, BlockSeed::PartialBlock { .. });
                 let id = self.current_state_id.fetch_add(1, Ordering::SeqCst);
-                Some(WorkerCommand::Job(Box::new(pow::State::new(id, b)?)))
+                let command = WorkerCommand::Job(Box::new(pow::State::new(id, b)?));
+                // Serialize job publication with `begin_inference_pause`. If inference already owns
+                // the gate, retain the newest valid Stratum command and keep workers on `None`. If
+                // inference begins immediately after this send, its begin path publishes `None`
+                // while holding this same mutex, so either order ends paused before generation.
+                let pause_state = lock_inference_pause_state();
+                if is_stratum_job {
+                    self.pause_control.remember_stratum_job(command.clone());
+                } else {
+                    self.pause_control.forget_stratum_job();
+                }
+                if pause_state.inflight != 0 {
+                    self.opoi_challenge_active.store(true, Ordering::SeqCst);
+                    // A valid Stratum template is resumable when the outermost
+                    // guard drops.  Solo/gRPC deliberately retains its old
+                    // behavior: it remains unsynced and waits for the fresh
+                    // template its client requests after inference.
+                    self.is_synced = is_stratum_job;
+                    self.block_channel.send(None).map_err(|_e| "Failed sending block to threads")?;
+                    return Ok(());
+                }
+                self.is_synced = true;
+                let state = Some(command);
+                self.block_channel.send(state).map_err(|_e| "Failed sending block to threads")?;
+                drop(pause_state);
+                return Ok(());
             }
             None => {
+                // A real Stratum suspension (unsynced/unserveable), unlike the
+                // inference pause's direct channel send, invalidates the replay
+                // candidate. Serialize it with final-guard replay so whichever
+                // event is newer is the command workers observe last.
+                let _pause_state = lock_inference_pause_state();
+                self.pause_control.forget_stratum_job();
                 if !self.is_synced {
                     return Ok(());
                 }
@@ -310,16 +496,26 @@ impl MinerManager {
         send_channel: Sender<BlockSeed>,
         mut block_channel: watch::Receiver<Option<WorkerCommand>>,
         hashes_tried: Arc<AtomicU64>,
-        spec: Box<dyn WorkerSpec>,
+        spec: ManagedWorkerSpec,
         worker_hashes_tried: Arc<AtomicU64>,
     ) -> MinerHandler {
         std::thread::spawn(move || {
+            let no_winner = spec.no_winner();
+            #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
+            let worker_ordinal = spec
+                .id()
+                .strip_prefix('#')
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            #[cfg(feature = "pom-opencl")]
+            let opencl_device_id = spec.opencl_device_id();
             let mut box_ = spec.build();
             // AMD multi-GPU PoM: bind this thread to its own card so the possession tier is made
             // resident per-GPU and every card mines (and submits) its own shares — instead of all
             // GPU threads funneling onto device 0 through one global lock (3 cards ran like 1).
             #[cfg(feature = "pom-opencl")]
-            if let Some(dev) = spec.opencl_device_id() {
+            if let Some(dev) = opencl_device_id {
                 keryx_miner::pom_opencl::bind_thread_device(dev);
             }
             let gpu_work = box_.as_mut();
@@ -327,14 +523,20 @@ impl MinerManager {
                 info!("Spawned Thread for GPU {}", gpu_work.id());
                 // --wait-ready: announce this worker so the gate knows the full card set before
                 // the first card can finish staging (see wait_ready.rs).
+                #[cfg(feature = "pom-opencl")]
+                if let Some(d) = opencl_device_id {
+                    // cl_device_id is an opaque pointer-sized handle. Preserve every bit in the
+                    // readiness key so two OpenCL workers can never alias on 64-bit hosts.
+                    keryx_miner::wait_ready::register_device(d as u64);
+                }
                 #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                 if let Some(d) = gpu_work.id().strip_prefix('#')
                     .and_then(|s| s.split_whitespace().next())
                     .and_then(|s| s.parse::<u32>().ok())
                 {
-                    keryx_miner::wait_ready::register_device(d);
+                    keryx_miner::wait_ready::register_device(d as u64);
                 }
-                let mut nonces = vec![0u64; 1];
+                let mut nonces = vec![no_winner; 1];
 
                 let mut state = None;
                 // AMD PoM: cap on proof-builds running concurrently on detached threads (the async
@@ -342,8 +544,9 @@ impl MinerManager {
                 // per batch means ~1-2 in flight normally; the cap only guards a pathological
                 // low-difficulty burst from spawning unbounded threads (excess winners are dropped —
                 // the grind found more than the CPU can prove, which is fine).
+                #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
                 let inflight_proofs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                #[allow(dead_code)]
+                #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
                 const MAX_INFLIGHT_PROOFS: usize = 6;
                 // PoM (post-fork): nonce cursor + per-launch batch. The kernel grinds the whole
                 // batch before returning, so blocks/sec is capped at hashrate / POM_BATCH.
@@ -444,14 +647,16 @@ impl MinerManager {
                         // still only ~25 ms on a mid Blackwell card — well under the 100 ms block time.
                         // NVIDIA (CUDA) + Apple Silicon (Metal): per-device v4 grind. Device id = the
                         // worker's "#N (name)" label (per-device MINERS map → no CUDA_VISIBLE_DEVICES).
-                        #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
-                        let wdid = gpu_work.id().strip_prefix('#')
-                            .and_then(|s| s.split_whitespace().next())
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .unwrap_or(0);
+                        #[cfg(any(feature = "pom-opencl", all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
+                        let wdid = worker_ordinal;
                         // Batch: env override wins, else SM-derived per this card (PR #37) — keeps a
                         // launch inside the ~100ms template window at 10 BPS even on small cards.
-                        #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
+                        #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+                        let batch = std::env::var("KERYX_POM_V4_BATCH").ok()
+                            .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0)
+                            .map(|b| keryx_miner::pom_gpu::cap_v4_batch(wdid, b))
+                            .unwrap_or_else(|| keryx_miner::pom_gpu::v4_batch_for_device(wdid));
+                        #[cfg(all(target_os = "macos", feature = "pom-metal", not(feature = "pom-cuda")))]
                         let batch = std::env::var("KERYX_POM_V4_BATCH").ok()
                             .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0)
                             .unwrap_or_else(|| keryx_miner::pom_gpu::v4_batch_for_device(wdid));
@@ -581,6 +786,14 @@ impl MinerManager {
                                     continue;
                                 }
                             }
+                            // Match the CUDA/Metal contract above: installation must be allowed to
+                            // finish while the latch is closed, but no OpenCL worker may hash or
+                            // submit until every registered card is ready. This is intentionally
+                            // after ensure_installed(), otherwise --wait-ready would deadlock.
+                            if keryx_miner::wait_ready::holds() {
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                continue;
+                            }
                             pom_driver::mine_v4(&pph, time, &target_le, range.start, range.len, daa)
                         };
                         // A failed/paused backend has done no accountable work. Keep the cursor on
@@ -630,9 +843,9 @@ impl MinerManager {
                         if let Some(nonce) = found {
                             // NVIDIA/Apple: recompute the PoM tier per block (H2-boundary correct).
                             // POOL SHARES: overlap the host proof re-walk with grinding, like the AMD
-                            // path below. The re-walk is ~15 ms (96% of it the sparse tree's Merkle
-                            // sibling recompute — measured; --resident-tree cuts it to ~0.9 ms), and
-                            // doing it inline stalled THIS card's grind for that long on every share.
+                            // path below. Even with the optimized sparse-checkpoint tree, doing the
+                            // proof re-walk inline stalls THIS card's grind on every share; the
+                            // resident-tree option lowers it further at a substantial RAM cost.
                             // The template clone is cheap (Arc-backed) and the thread re-fetches the
                             // index, so the worker loops straight back into the next batch. SOLO
                             // (FullBlock) stays synchronous below: it must clear `state` so the card
@@ -642,41 +855,55 @@ impl MinerManager {
                             // and safety valve: on a CPU-starved rig the detached builds could in
                             // principle contend with the launch loop).
                             let overlap_pool_proof = std::env::var("KERYX_POM_PROOF_OVERLAP").ok().as_deref() != Some("0")
-                                && state.as_ref().map_or(false, |s| s.is_pool_share())
-                                && inflight_proofs.load(Ordering::Acquire) < MAX_INFLIGHT_PROOFS;
+                                && state.as_ref().map_or(false, |s| s.is_pool_share());
+                            #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
+                            let mut proof_spawned = false;
                             #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                             if overlap_pool_proof {
                                 if let Some(s) = state.as_ref() {
-                                    if let (Some((proof_index, _)), Some(tier)) = (
+                                    if let (Some(proof_index), Some(tier)) = (
                                         keryx_miner::pom::active_index_for(wdid),
                                         keryx_miner::pom_gpu::current_tier(wdid, s.daa_score),
                                     ) {
-                                        inflight_proofs.fetch_add(1, Ordering::AcqRel);
-                                        let s_clone = s.clone();
-                                        let tx = send_channel.clone();
-                                        let counter = std::sync::Arc::clone(&inflight_proofs);
-                                        std::thread::spawn(move || {
-                                            if let Some(mut block_seed) =
-                                                s_clone.generate_block_if_pom(nonce, proof_index, tier)
-                                            {
-                                                if let crate::pow::BlockSeed::PartialBlock { device_id, .. } = &mut block_seed {
-                                                    *device_id = wdid;
+                                        if let Some(permit) =
+                                            InflightProofPermit::try_acquire(&inflight_proofs, MAX_INFLIGHT_PROOFS)
+                                        {
+                                            let s_clone = s.clone();
+                                            let tx = send_channel.clone();
+                                            proof_spawned = true;
+                                            std::thread::spawn(move || {
+                                                let _permit = permit;
+                                                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                    if let Some(mut block_seed) =
+                                                        s_clone.generate_block_if_pom(nonce, &proof_index.0, tier)
+                                                    {
+                                                        if let crate::pow::BlockSeed::PartialBlock { device_id, .. } =
+                                                            &mut block_seed
+                                                        {
+                                                            *device_id = wdid;
+                                                        }
+                                                        match tx.blocking_send(block_seed.clone()) {
+                                                            Ok(()) => block_seed.report_block(),
+                                                            Err(e) => warn!("Could not submit PoM block — pool connection dropped ({}); reconnecting", e),
+                                                        }
+                                                    }
+                                                }));
+                                                if outcome.is_err() {
+                                                    warn!(
+                                                        "PoM proof builder for GPU {} panicked during proof I/O; share dropped and proof slot recovered",
+                                                        wdid
+                                                    );
                                                 }
-                                                match tx.blocking_send(block_seed.clone()) {
-                                                    Ok(()) => block_seed.report_block(),
-                                                    Err(e) => warn!("Could not submit PoM block — pool connection dropped ({}); reconnecting", e),
-                                                }
-                                            }
-                                            counter.fetch_sub(1, Ordering::AcqRel);
-                                        });
+                                            });
+                                        }
                                     }
                                 }
                             }
                             #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
-                            let built = if overlap_pool_proof { None } else { state.as_ref().and_then(|s| {
-                                keryx_miner::pom::active_index_for(wdid).and_then(|(idx, _)| {
+                            let built = if proof_spawned { None } else { state.as_ref().and_then(|s| {
+                                keryx_miner::pom::active_index_for(wdid).and_then(|index| {
                                     let tier = keryx_miner::pom_gpu::current_tier(wdid, s.daa_score)?;
-                                    s.generate_block_if_pom(nonce, idx, tier)
+                                    s.generate_block_if_pom(nonce, &index.0, tier)
                                 })
                             }) };
                             // SOLO (and the overlap-declined fallback) keep the synchronous submit.
@@ -705,22 +932,35 @@ impl MinerManager {
                             #[cfg(feature = "pom-opencl")]
                             if let Some(s) = state.as_ref() {
                                 if let Some((proof_index, tier)) = keryx_miner::pom::active_index() {
-                                    if inflight_proofs.load(Ordering::Acquire) < MAX_INFLIGHT_PROOFS {
-                                        inflight_proofs.fetch_add(1, Ordering::AcqRel);
+                                    if let Some(permit) =
+                                        InflightProofPermit::try_acquire(&inflight_proofs, MAX_INFLIGHT_PROOFS)
+                                    {
                                         let s_clone = s.clone();
                                         let tier = *tier;
                                         let tx = send_channel.clone();
-                                        let counter = std::sync::Arc::clone(&inflight_proofs);
                                         std::thread::spawn(move || {
-                                            if let Some(block_seed) =
-                                                s_clone.generate_block_if_pom(nonce, proof_index, tier)
-                                            {
-                                                match tx.blocking_send(block_seed.clone()) {
-                                                    Ok(()) => block_seed.report_block(),
-                                                    Err(e) => warn!("Could not submit PoM block — pool connection dropped ({}); reconnecting", e),
+                                            let _permit = permit;
+                                            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                if let Some(mut block_seed) =
+                                                    s_clone.generate_block_if_pom(nonce, proof_index, tier)
+                                                {
+                                                    if let crate::pow::BlockSeed::PartialBlock { device_id, .. } =
+                                                        &mut block_seed
+                                                    {
+                                                        *device_id = wdid;
+                                                    }
+                                                    match tx.blocking_send(block_seed.clone()) {
+                                                        Ok(()) => block_seed.report_block(),
+                                                        Err(e) => warn!("Could not submit PoM block — pool connection dropped ({}); reconnecting", e),
+                                                    }
                                                 }
+                                            }));
+                                            if outcome.is_err() {
+                                                warn!(
+                                                    "PoM proof builder for OpenCL GPU {} panicked during proof I/O; share dropped and proof slot recovered",
+                                                    wdid
+                                                );
                                             }
-                                            counter.fetch_sub(1, Ordering::AcqRel);
                                         });
                                     }
                                 }
@@ -754,7 +994,7 @@ impl MinerManager {
                     }
 
                     gpu_work.copy_output_to(&mut nonces)?;
-                    if nonces[0] != 0 {
+                    if nonces[0] != no_winner {
                         if let Some(block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
                             match send_channel.blocking_send(block_seed.clone()) {
                                 Ok(()) => block_seed.report_block(),
@@ -768,7 +1008,7 @@ impl MinerManager {
                             if let BlockSeed::FullBlock(_) = block_seed {
                                 state = None;
                             }
-                            nonces[0] = 0;
+                            nonces[0] = no_winner;
                             hashes_tried.fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
                             worker_hashes_tried.fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
                             continue;
@@ -925,8 +1165,14 @@ impl MinerManager {
             // esp. with --resident-tree). Report that plainly instead of "workers stalled or
             // crashed", which alarms users who simply haven't finished the one-time model download.
             let preparing = keryx_miner::slm::mining_preparing() || {
-                #[cfg(feature = "pom-cuda")] { keryx_miner::pom_gpu::is_loading() }
-                #[cfg(not(feature = "pom-cuda"))] { false }
+                #[cfg(feature = "pom-cuda")]
+                {
+                    keryx_miner::pom_gpu::is_loading()
+                }
+                #[cfg(not(feature = "pom-cuda"))]
+                {
+                    false
+                }
             };
             let stall_or_prep: &str = if preparing {
                 if keryx_miner::slm::is_downloading() {
@@ -945,7 +1191,9 @@ impl MinerManager {
                             warn!("model staging: no model lineup installed yet (waiting for chain tip / tier selection).");
                         } else {
                             warn!("model staging status (no model is ready yet — mining is suspended until one is):");
-                            for line in diags { warn!("{}", line); }
+                            for line in diags {
+                                warn!("{}", line);
+                            }
                         }
                     }
                     prep_diag_ticks = prep_diag_ticks.wrapping_add(1);
@@ -986,15 +1234,16 @@ impl MinerManager {
                 #[cfg(all(feature = "pom-opencl", unix))]
                 if health.is_none() {
                     if let Some(ord) = crate::gpu_health::ordinal_from_label(device) {
-                        health = keryx_miner::pom_opencl::amd_health(ord as usize).map(|a| crate::gpu_health::GpuHealth {
-                            temp_c: a.temp_c,
-                            fan_pct: a.fan_pct,
-                            power_w: a.power_w,
-                            core_mhz: a.core_mhz,
-                            mem_mhz: None,
-                            vram_used_mb: a.vram_used_mb,
-                            vram_total_mb: a.vram_total_mb,
-                        });
+                        health =
+                            keryx_miner::pom_opencl::amd_health(ord as usize).map(|a| crate::gpu_health::GpuHealth {
+                                temp_c: a.temp_c,
+                                fan_pct: a.fan_pct,
+                                power_w: a.power_w,
+                                core_mhz: a.core_mhz,
+                                mem_mhz: None,
+                                vram_used_mb: a.vram_used_mb,
+                                vram_total_mb: a.vram_total_mb,
+                            });
                     }
                 }
                 let mut suffix = match &health {
@@ -1004,7 +1253,11 @@ impl MinerManager {
                             power_seen = true;
                         }
                         let frag = h.to_log_fragment();
-                        if frag.is_empty() { String::new() } else { format!(" | {}", frag) }
+                        if frag.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" | {}", frag)
+                        }
                     }
                     None => String::new(),
                 };
@@ -1025,10 +1278,14 @@ impl MinerManager {
                     health.as_ref().and_then(|h| h.power_w),
                     preparing,
                 );
-                let eff = crate::gpu_health::efficiency_mhs_per_w(
-                    r,
-                    health.as_ref().and_then(|h| h.power_w),
-                );
+                // Feed the inference router the same measured per-card rate shown to the
+                // operator. Worker labels carry the backend's logical ordinal (`#N ...`) on both
+                // CUDA and OpenCL. The router ignores zero samples from setup/inference pauses and
+                // retains its documented VRAM proxy until a real mining interval exists.
+                if let Some(ord) = crate::gpu_health::ordinal_from_label(device) {
+                    keryx_miner::slm::report_card_hashrate(ord as usize, r);
+                }
+                let eff = crate::gpu_health::efficiency_mhs_per_w(r, health.as_ref().and_then(|h| h.power_w));
                 devices.push(DeviceRate { label: device.clone(), hashrate: r, health, efficiency_mhs_per_w: eff });
             }
             let total_power_w = if power_seen { Some(power_sum) } else { None };
@@ -1103,6 +1360,161 @@ impl MinerManager {
             n if n < 1_000_000_000_000_000.0 => (n / 1_000_000_000_000.0, "Thash/s"),
             _ => (n, "hash/s"),
         }
+    }
+}
+
+#[cfg(test)]
+mod inference_pause_tests {
+    use super::*;
+
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    struct ResetPauseState;
+
+    impl Drop for ResetPauseState {
+        fn drop(&mut self) {
+            let mut state = lock_inference_pause_state();
+            state.inflight = 0;
+            state.current_miner = None;
+        }
+    }
+
+    fn enter_test() -> (std::sync::MutexGuard<'static, ()>, ResetPauseState) {
+        let serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let mut state = lock_inference_pause_state();
+            state.inflight = 0;
+            state.current_miner = None;
+        }
+        (serial, ResetPauseState)
+    }
+
+    fn control() -> (Arc<InferencePauseControl>, watch::Receiver<Option<WorkerCommand>>, Arc<AtomicBool>) {
+        let (sender, mut receiver) = watch::channel(None);
+        // Consume the channel's initial value so subsequent `get_changed`
+        // assertions describe an actual pause or resume publication.
+        assert!(matches!(receiver.get_changed(), Ok(Some(None))));
+        let active = Arc::new(AtomicBool::new(false));
+        let control = Arc::new(InferencePauseControl {
+            block_channel: Arc::new(sender),
+            active_flag: Arc::clone(&active),
+            resumable_stratum_job: Mutex::new(None),
+        });
+        (control, receiver, active)
+    }
+
+    fn register(control: &Arc<InferencePauseControl>) {
+        let mut state = lock_inference_pause_state();
+        if state.inflight != 0 {
+            control.active_flag.store(true, Ordering::SeqCst);
+        }
+        state.current_miner = Some(Arc::downgrade(control));
+    }
+
+    fn job(id: usize) -> WorkerCommand {
+        let seed = BlockSeed::PartialBlock {
+            id: format!("test-{id}"),
+            header_hash: [id as u64, 1, 2, 3],
+            timestamp: id as u64,
+            daa_score: 0,
+            nonce: 0,
+            target: Default::default(),
+            nonce_mask: u64::MAX,
+            nonce_fixed: 0,
+            hash: None,
+            pom_proof: Vec::new(),
+            device_id: 0,
+        };
+        WorkerCommand::Job(Box::new(pow::State::new(id, seed).expect("test job must be valid")))
+    }
+
+    fn assert_pause(receiver: &mut watch::Receiver<Option<WorkerCommand>>) {
+        assert!(matches!(receiver.get_changed(), Ok(Some(None))));
+    }
+
+    fn assert_resumed_job(receiver: &mut watch::Receiver<Option<WorkerCommand>>, expected_id: usize) {
+        match receiver.get_changed().expect("worker channel must remain open") {
+            Some(Some(WorkerCommand::Job(state))) => assert_eq!(state.id, expected_id),
+            _ => panic!("expected retained Stratum job {expected_id} to be replayed"),
+        }
+    }
+
+    #[test]
+    fn nested_pause_resumes_only_after_outer_guard() {
+        let (_serial, _reset) = enter_test();
+        let (control, mut receiver, active) = control();
+        control.remember_stratum_job(job(11));
+        register(&control);
+
+        let outer = begin_inference_pause();
+        assert_pause(&mut receiver);
+        let inner = begin_inference_pause();
+        assert_pause(&mut receiver);
+
+        drop(inner);
+        assert!(active.load(Ordering::SeqCst));
+        assert!(matches!(receiver.get_changed(), Ok(None)), "inner guard must not resume mining");
+
+        drop(outer);
+        assert!(!active.load(Ordering::SeqCst));
+        assert_resumed_job(&mut receiver, 11);
+    }
+
+    #[test]
+    fn final_guard_resumes_current_stratum_job_without_a_new_notify() {
+        let (_serial, _reset) = enter_test();
+        let (control, mut receiver, active) = control();
+        control.remember_stratum_job(job(21));
+        register(&control);
+
+        let pause = begin_inference_pause();
+        assert_pause(&mut receiver);
+        drop(pause);
+
+        assert!(!active.load(Ordering::SeqCst));
+        assert_resumed_job(&mut receiver, 21);
+    }
+
+    #[test]
+    fn reconnect_resumes_only_the_new_managers_newest_job() {
+        let (_serial, _reset) = enter_test();
+        let (old, mut old_receiver, _) = control();
+        old.remember_stratum_job(job(31));
+        register(&old);
+
+        let pause = begin_inference_pause();
+        assert_pause(&mut old_receiver);
+
+        // A reconnect installs a fresh control/generation while the detached
+        // inference is still running. Its newer notify is the sole candidate;
+        // the old connection's retained job is unreachable from global state.
+        let (new, mut new_receiver, new_active) = control();
+        new.remember_stratum_job(job(32));
+        register(&new);
+        assert!(new_active.load(Ordering::SeqCst));
+
+        drop(pause);
+
+        assert_resumed_job(&mut new_receiver, 32);
+        assert!(matches!(old_receiver.get_changed(), Ok(None)), "old connection must not receive a replay");
+        assert!(!new_active.load(Ordering::SeqCst));
+    }
+
+    #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
+    #[test]
+    fn detached_proof_permit_enforces_cap_and_recovers_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let first = InflightProofPermit::try_acquire(&counter, 2).expect("first permit");
+        let second = InflightProofPermit::try_acquire(&counter, 2).expect("second permit");
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        assert!(InflightProofPermit::try_acquire(&counter, 2).is_none(), "cap must be atomic");
+
+        drop(first);
+        let replacement = InflightProofPermit::try_acquire(&counter, 2).expect("drop must release a slot");
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        drop(second);
+        drop(replacement);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
     }
 }
 

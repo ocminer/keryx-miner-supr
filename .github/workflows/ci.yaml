@@ -1,6 +1,9 @@
-name: Tests
+name: "RETIRED upstream Kaspa CI (do not run)"
 
-on: [push, pull_request]
+# This workflow still targets the removed kaspa-miner/kaspaopencl packages. Keep it only as
+# upstream history; the active vendor/release workflows own Keryx validation. In particular it
+# must not make every push/PR red while pretending to test this repository.
+on: workflow_dispatch
 
 jobs:
 

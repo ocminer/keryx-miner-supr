@@ -13,6 +13,8 @@ include = [
     "src/**/*.s",
     "src/**/*.cu",
     "cuda/pom_mine.fatbin",
+    "cuda/POM_FATBIN_MANIFEST.md",
+    "cuda/regenerate-pom-fatbin.sh",
     "metal/pom_mine.metal",
     "plugins/opencl/resources/pom_mine.cl",
     "proto/**",
@@ -70,11 +72,9 @@ keryx-plugin-api = { path = "plugin-api" }
 keryxcuda = { path = "plugins/cuda", optional = true }
 secp256k1 = { version = "0.29.0", features = ["global-context"] }
 semver = "1.0"
-# Phase-3 OPoI: SLM inference via candle.
-# suprnova test-fork: dropped `features = ["cuda"]` so the binary builds on a CUDA-less
-# host. At runtime the miner already detects no-CUDA via `GpuProbe::NoCuda` and falls back
-# to CPU. Only matters for LLM inference on AiRequest tasks; per-share `tag_fixed` MLP is
-# baked in from `inference/` and works either way.
+# Legacy candle engine support. GPU inference is the normal OPoI route; candle CPU inference is
+# deprecated and disabled unless the operator explicitly enables the emergency fallback.
+# Per-share `tag_fixed` MLP verification remains device-independent.
 candle-core = { version = "0.9" }
 candle-transformers = { version = "0.9" }
 candle-nn = { version = "0.9" }
@@ -111,7 +111,8 @@ static-cuda = ["keryxcuda"]
 pom-opencl = ["dep:opencl3"]
 # NVIDIA PoM (full parity): upstream's candle-CUDA `pom_gpu` driver (per-tensor gather + zero-dup
 # VRAM sharing with the inference engine) + build.rs compiles src/pom_mine.cu -> PTX. Enables
-# candle's CUDA backend (candle 0.9 -> cudarc 0.16). AMD/default stays candle-CPU.
+# candle's CUDA backend (candle 0.9 -> cudarc 0.16). AMD/default uses the llama.cpp Vulkan
+# inference routes; candle-CPU is a deprecated, explicit emergency fallback only.
 pom-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 # Apple Silicon PoM (Metal): the walk runs as a Metal compute kernel over a self-packed MTLBuffer
 # (Phase 3a) and OPoI inference runs via the in-process llama.cpp Metal engine (Phase 3b —
@@ -119,9 +120,9 @@ pom-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 # no longer used on the Metal build for either the walk or inference. `candle-metal-kernels` and
 # `objc2-metal` stay (see the macOS-only dependency table below) — those are the MTL wrappers
 # `pom_gpu_metal` uses directly, independent of `candle-core`. macOS-only — never combine with
-# pom-cuda, and never enable on Linux/Windows. Ultimate fallback: if `libkeryx-llama.dylib` isn't
-# next to the binary, `slm::inference_device()` returns `Device::Cpu` so candle-CPU inference is
-# still available (slow, but never crashes for lack of a GPU inference path).
+# pom-cuda, and never enable on Linux/Windows. If `libkeryx-llama.dylib` is unavailable, the miner
+# withholds its inference capability and mining cannot pass the OPoI gate. Candle-CPU is attempted
+# only when the operator explicitly enables the deprecated emergency fallback.
 pom-metal = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -156,6 +157,7 @@ codegen-units = 1
 tonic-build = { version = "0.8", default-features = false, features = ["prost", "transport"] }
 cc = "1"
 time = { version = "0.3", features = ["formatting"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }

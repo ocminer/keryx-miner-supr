@@ -9,6 +9,10 @@
 // pipeline on THIS VkDevice and submits through the queue-mutex-guarded hook so it never races
 // ggml's own submissions.
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 extern "C" bool keryx_vk_raw_handles(size_t dev_num, void ** vk_instance_out,
                                      void ** vk_physical_device_out, void ** vk_device_out,
                                      uint32_t * compute_queue_family_index) {
@@ -71,28 +75,135 @@ extern "C" void * keryx_vk_tensor_device(const struct ggml_tensor * tensor) {
 // DEVICES computed elsewhere) is NOT guaranteed to map to the same device — on a rig with an
 // integrated GPU the orders differ, so such an index silently resolves to the iGPU (model into
 // UMA system RAM) or trips a GGML_ASSERT. Resolving it HERE, against ggml's exact device_indices,
-// is correct by construction. Prefers a discrete AMD GPU; else any discrete; -1 if none found.
+// is correct by construction. When the miner publishes KERYX_LLAMA_VK_AUTO_PCI_ALLOWLIST, only
+// physical devices whose `dddd:bb:dd.f` PCI identity occurs in that selected-OpenCL-worker list are
+// eligible. An explicitly empty allowlist therefore has no auto candidate (fail closed). Without
+// the variable, retain direct-library compatibility and consider every discrete device. Among the
+// eligible devices prefer the LARGEST discrete AMD GPU (stable tie: lowest ggml index), else the
+// largest discrete GPU of any vendor.
+static bool keryx_vk_physical_device_pci(
+        vk::PhysicalDevice physical,
+        uint32_t * domain, uint32_t * bus, uint32_t * device, uint32_t * function) {
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pci{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT
+    };
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    properties.pNext = &pci;
+    vkGetPhysicalDeviceProperties2((VkPhysicalDevice) physical, &properties);
+    if (pci.pciBus == 0 && pci.pciDevice == 0 && pci.pciDomain == 0 && pci.pciFunction == 0) {
+        return false;
+    }
+    *domain = pci.pciDomain;
+    *bus = pci.pciBus;
+    *device = pci.pciDevice;
+    *function = pci.pciFunction;
+    return true;
+}
+
+// Resolve a ggml `main_gpu` index back to its physical PCI identity. The Rust host calls this
+// before model allocation/spawn so a selected non-largest card is dedicated and its resident walk
+// released in time; an explicitly pinned inference-only card outside the mining subset instead
+// releases the provisional reservation. The index is resolved inside ggml's own filtered list.
+extern "C" bool keryx_vk_device_pci(
+        int dev_num, uint32_t * domain, uint32_t * bus, uint32_t * device, uint32_t * function) {
+    if (domain == nullptr || bus == nullptr || device == nullptr || function == nullptr) {
+        return false;
+    }
+    try {
+        ggml_vk_instance_init();
+        if (dev_num < 0 || (size_t) dev_num >= vk_instance.device_indices.size()) {
+            return false;
+        }
+        std::vector<vk::PhysicalDevice> phys = vk_instance.instance.enumeratePhysicalDevices();
+        size_t raw = vk_instance.device_indices[(size_t) dev_num];
+        if (raw >= phys.size()) {
+            return false;
+        }
+        return keryx_vk_physical_device_pci(phys[raw], domain, bus, device, function);
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool keryx_vk_auto_pci_allowed(vk::PhysicalDevice physical) {
+    const char * allowed = std::getenv("KERYX_LLAMA_VK_AUTO_PCI_ALLOWLIST");
+    if (allowed == nullptr) {
+        return true;
+    }
+    if (*allowed == '\0') {
+        return false;
+    }
+
+    uint32_t domain = 0, bus = 0, device = 0, function = 0;
+    if (!keryx_vk_physical_device_pci(physical, &domain, &bus, &device, &function)) {
+        return false;
+    }
+
+    char key[32];
+    std::snprintf(
+        key, sizeof(key), "%04x:%02x:%02x.%x",
+        domain, bus, device, function);
+    const size_t key_len = std::strlen(key);
+    const char * cursor = allowed;
+    while (*cursor != '\0') {
+        const char * comma = std::strchr(cursor, ',');
+        const char * end = comma;
+        if (comma == nullptr) {
+            end = cursor + std::strlen(cursor);
+        }
+        while (cursor < end && (*cursor == ' ' || *cursor == '\t')) {
+            cursor++;
+        }
+        while (end > cursor && (end[-1] == ' ' || end[-1] == '\t')) {
+            end--;
+        }
+        if ((size_t) (end - cursor) == key_len && std::strncmp(cursor, key, key_len) == 0) {
+            return true;
+        }
+        cursor = comma != nullptr ? comma + 1 : end;
+    }
+    return false;
+}
+
+// Optional capability probe used by a new miner with an older sidecar. Auto-placement is allowed
+// to proceed under an active PCI allowlist only when this symbol is present and >= 1; otherwise the
+// Rust host refuses to trust an old picker which can still select an unrelated platform/card.
+extern "C" int keryx_vk_picker_abi() {
+    return 1;
+}
+
 extern "C" int keryx_vk_pick_discrete_device() {
     try {
         ggml_vk_instance_init();
         std::vector<vk::PhysicalDevice> phys = vk_instance.instance.enumeratePhysicalDevices();
-        int first_discrete = -1, first_amd_discrete = -1;
+        int largest_discrete = -1, largest_amd_discrete = -1;
+        uint64_t largest_discrete_bytes = 0, largest_amd_discrete_bytes = 0;
         for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
             size_t raw = vk_instance.device_indices[i];
             if (raw >= phys.size()) {
                 continue;
             }
             vk::PhysicalDeviceProperties props = phys[raw].getProperties();
-            if (props.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
-                if (first_discrete < 0) {
-                    first_discrete = (int) i;
+            if (props.deviceType == vk::PhysicalDeviceType::eDiscreteGpu && keryx_vk_auto_pci_allowed(phys[raw])) {
+                vk::PhysicalDeviceMemoryProperties memory = phys[raw].getMemoryProperties();
+                uint64_t device_local_bytes = 0;
+                for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++) {
+                    if (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                        device_local_bytes += (uint64_t) memory.memoryHeaps[heap].size;
+                    }
                 }
-                if (props.vendorID == 0x1002 && first_amd_discrete < 0) {
-                    first_amd_discrete = (int) i;
+                if (largest_discrete < 0 || device_local_bytes > largest_discrete_bytes) {
+                    largest_discrete = (int) i;
+                    largest_discrete_bytes = device_local_bytes;
+                }
+                if (props.vendorID == 0x1002
+                    && (largest_amd_discrete < 0 || device_local_bytes > largest_amd_discrete_bytes)) {
+                    largest_amd_discrete = (int) i;
+                    largest_amd_discrete_bytes = device_local_bytes;
                 }
             }
         }
-        return first_amd_discrete >= 0 ? first_amd_discrete : first_discrete;
+        return largest_amd_discrete >= 0 ? largest_amd_discrete : largest_discrete;
     } catch (...) {
         return -1;
     }

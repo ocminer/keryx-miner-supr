@@ -4,7 +4,7 @@
 //! DEFAULT engine for the primary model on the inference GPU: llama.cpp owns the single resident
 //! VRAM copy, the PoM walk gathers straight over its tensor pointers (zero-dup — byte-identity
 //! proven by tools/llama_zerodup_spike), and OPoI text generation runs in-process. Absent .so =
-//! the candle paths stay active as the (dormant) fallback, byte-identical to before.
+//! the legacy candle path remains only for architectures it can actually serve on a GPU.
 //!
 //! Consensus safety: this module only changes WHO HOSTS the model bytes and WHO GENERATES the
 //! user-facing OPoI text. The walk kernel, the host possession index, proofs and `tag_fixed` are
@@ -24,7 +24,8 @@ use libloading::Library;
 type AbiFn = unsafe extern "C" fn() -> c_int;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
 type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
-type InfoFn = unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
+type InfoFn =
+    unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
 type FreeFn = unsafe extern "C" fn(*mut c_void);
 // CUDA ordinal owning tensor i's bytes, or -1 (host/unified/unknown). Upstream aa29fd2 — optional
@@ -73,9 +74,7 @@ fn slot_for(gpu: usize) -> Arc<EngineSlot> {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    g.entry(gpu)
-        .or_insert_with(|| Arc::new(EngineSlot { inner: Mutex::new(None) }))
-        .clone()
+    g.entry(gpu).or_insert_with(|| Arc::new(EngineSlot { inner: Mutex::new(None) })).clone()
 }
 
 /// Snapshot of the currently-populated GPU ordinals (a slot may exist but be empty; only ordinals
@@ -85,11 +84,7 @@ fn loaded_gpus() -> Vec<usize> {
         Ok(g) => g.iter().map(|(k, v)| (*k, v.clone())).collect(),
         Err(_) => return Vec::new(),
     };
-    slots
-        .into_iter()
-        .filter(|(_, s)| s.inner.lock().map(|g| g.is_some()).unwrap_or(false))
-        .map(|(k, _)| k)
-        .collect()
+    slots.into_iter().filter(|(_, s)| s.inner.lock().map(|g| g.is_some()).unwrap_or(false)).map(|(k, _)| k).collect()
 }
 
 /// Actually dlopen the .so, resolve symbols, load the model for (gguf, gpu). Returns the Engine or
@@ -151,16 +146,19 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
                 // (12B model on a 10 GB card, ~200-400 MB slack) must be ATTEMPTED, not
                 // refused — a 1200 MiB margin here broke exactly that working config.
                 let need_mib = md.len() / (1024 * 1024) + 128;
-                if let Some((_, free_mib, total_mib)) = crate::pom_gpu::query_all_gpus_free_vram()
-                    .into_iter()
-                    .find(|(o, _, _)| *o as usize == gpu)
+                if let Some((_, free_mib, total_mib)) =
+                    crate::pom_gpu::query_all_gpus_free_vram().into_iter().find(|(o, _, _)| *o as usize == gpu)
                 {
                     if free_mib < need_mib {
                         log::warn!(
                             "llama engine: '{}' needs ~{} MiB on GPU {} but only {} of {} MiB are free — \
                              not attempting the load (a failed multi-GiB load can poison the card for the \
                              next engine load; this model is simply unavailable on this card).",
-                            gguf, need_mib, gpu, free_mib, total_mib
+                            gguf,
+                            need_mib,
+                            gpu,
+                            free_mib,
+                            total_mib
                         );
                         return None;
                     }
@@ -183,7 +181,10 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             log::warn!("llama engine: model load failed on GPU {} (VRAM? arch? driver?) — OPoI inference unavailable on this card.", gpu);
             return None;
         }
-        log::info!("llama engine: ✓ active on GPU {} — llama.cpp hosts the model + serves OPoI inference in-process.", gpu);
+        log::info!(
+            "llama engine: ✓ active on GPU {} — llama.cpp hosts the model + serves OPoI inference in-process.",
+            gpu
+        );
         Some(Engine { model, count, info, generate: gen, free, tensor_device, gguf: gguf.to_string() })
     }
 }
@@ -225,8 +226,7 @@ fn so_path() -> Option<std::path::PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let want_noavx = !simd_ok
-        || std::env::var("KERYX_LLAMA_FORCE_NOAVX").map_or(false, |v| v == "1");
+    let want_noavx = !simd_ok || std::env::var("KERYX_LLAMA_FORCE_NOAVX").map_or(false, |v| v == "1");
     if want_noavx {
         #[cfg(target_os = "windows")]
         let p = dir.join("keryx-llama-noavx.dll");
@@ -241,7 +241,7 @@ fn so_path() -> Option<std::path::PathBuf> {
             return Some(p);
         }
         log::warn!(
-            "llama engine: this CPU lacks the AVX2/FMA/F16C/BMI2 set baked into libkeryx-llama.so and no {} exists in {} — NOT loading it (would SIGILL). FIX: copy libkeryx-llama-noavx.so from the release tarball into that exact directory (every release since 0.7.2 ships it next to the binary — partial/binary-only upgrades lose it), or set KERYX_LLAMA_SO=<absolute path to the -noavx .so>. Candle fallback stays active meanwhile.",
+            "llama engine: this CPU lacks the AVX2/FMA/F16C/BMI2 set baked into libkeryx-llama.so and no {} exists in {} — NOT loading it (would SIGILL). FIX: copy libkeryx-llama-noavx.so from the release tarball into that exact directory (every release since 0.7.2 ships it next to the binary — partial/binary-only upgrades lose it), or set KERYX_LLAMA_SO=<absolute path to the -noavx .so>. No in-process GPU inference route is available meanwhile.",
             p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(), dir.display()
         );
         return None;
@@ -300,12 +300,7 @@ fn preload_bundled_cuda_deps(so: &std::path::Path) {
     // Dependency order matters: load each lib AFTER everything it itself NEEDs, so its own
     // DT_NEEDED entries resolve against the already-global earlier ones. cudart is the leaf;
     // cublas needs cublasLt + cudart; curand needs cudart.
-    const DEPS: [&str; 4] = [
-        "libcudart.so.12",
-        "libcublasLt.so.12",
-        "libcublas.so.12",
-        "libcurand.so.10",
-    ];
+    const DEPS: [&str; 4] = ["libcudart.so.12", "libcublasLt.so.12", "libcublas.so.12", "libcurand.so.10"];
     for name in DEPS {
         let p = lib_dir.join(name);
         if !p.exists() {
@@ -329,25 +324,30 @@ fn preload_bundled_cuda_deps(so: &std::path::Path) {
 fn preload_bundled_cuda_deps(_so: &std::path::Path) {}
 
 fn engine_lib() -> Option<&'static Library> {
-    static LIB: OnceLock<Option<Library>> = OnceLock::new();
-    LIB.get_or_init(|| {
-        let so = so_path()?;
-        // Make the bundled CUDA runtime (lib/ next to the .so) resolvable WITHOUT LD_LIBRARY_PATH.
-        preload_bundled_cuda_deps(&so);
-        // SAFETY: loading a trusted, self-shipped library next to our own binary; no init routine
-        // of it runs Rust code. Any load error (missing dep DLL, arch mismatch) is caught below.
-        match unsafe { Library::new(&so) } {
-            Ok(l) => {
-                log::info!("llama engine: loaded {} (in-process llama.cpp engine).", so.display());
-                Some(l)
-            }
-            Err(e) => {
-                log::warn!("llama engine: failed to load {}: {} — OPoI inference engine unavailable.", so.display(), e);
-                None
-            }
+    static LIB: OnceLock<Library> = OnceLock::new();
+    if let Some(lib) = LIB.get() {
+        return Some(lib);
+    }
+    let so = so_path()?;
+    // Make the bundled CUDA runtime (lib/ next to the .so) resolvable WITHOUT LD_LIBRARY_PATH.
+    preload_bundled_cuda_deps(&so);
+    // Do not cache a failed dlopen. Startup can probe before an automatic CUDA-runtime install has
+    // completed; caching `None` made the newly installed dependency unusable until process restart.
+    let loaded = match unsafe { Library::new(&so) } {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!(
+                "llama engine: failed to load {}: {} — will retry when inference is requested.",
+                so.display(),
+                e
+            );
+            return None;
         }
-    })
-    .as_ref()
+    };
+    if LIB.set(loaded).is_ok() {
+        log::info!("llama engine: loaded {} (in-process llama.cpp engine).", so.display());
+    }
+    LIB.get()
 }
 
 /// Resolve a nul-terminated symbol name to a fn pointer. `T` must be an `extern "C"` fn-pointer type.
@@ -400,7 +400,10 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
 /// Engine active for exactly this (gguf, gpu)?
 pub fn active_for(gguf: &str, gpu: usize) -> bool {
     let slot = slot_for(gpu);
-    let g = match slot.inner.lock() { Ok(g) => g, Err(_) => return false };
+    let g = match slot.inner.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
     g.as_ref().map_or(false, |e| e.gguf == gguf)
 }
 
@@ -425,7 +428,10 @@ pub fn unload() {
         Err(p) => p.into_inner().values().cloned().collect(),
     };
     for slot in slots {
-        let mut g = match slot.inner.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut g = match slot.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         if let Some(e) = g.take() {
             unsafe { (e.free)(e.model) };
         }
@@ -438,7 +444,10 @@ pub fn unload() {
 /// model. Per-GPU slots make this scope-exact by construction. (upstream Keryx-Labs/keryx-miner@278098b)
 pub fn unload_for_gpu(gpu: usize) {
     let slot = slot_for(gpu);
-    let mut g = match slot.inner.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    let mut g = match slot.inner.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
     if let Some(e) = g.take() {
         unsafe { (e.free)(e.model) };
     }
@@ -455,7 +464,10 @@ pub fn unload_for_gpu(gpu: usize) {
 /// than aborting. Returns whether a handle was actually abandoned.
 pub fn abandon_for_gpu(gpu: usize) -> bool {
     let slot = slot_for(gpu);
-    let mut g = match slot.inner.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    let mut g = match slot.inner.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
     // `Engine` has no Drop impl — the free is always explicit — so simply dropping it frees nothing.
     g.take().is_some()
 }
@@ -526,11 +538,44 @@ pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
 /// different cards run concurrently. None on any failure (caller falls back).
 pub fn generate_on(gpu: usize, prompt: &str, max_tokens: usize) -> Option<String> {
     let slot = slot_for(gpu);
-    let g = match slot.inner.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    let g = match slot.inner.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
     let e = g.as_ref()?;
+    generate_locked(e, prompt, max_tokens)
+}
+
+/// Generate only when the exact requested GGUF is still resident on this GPU. The identity check
+/// and FFI call share one slot-lock epoch, closing the active_for/available/generate TOCTOU where a
+/// concurrent self-test could swap models between those calls.
+pub fn generate_for(gpu: usize, gguf: &str, prompt: &str, max_tokens: usize) -> Option<String> {
+    let slot = slot_for(gpu);
+    let g = match slot.inner.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let e = g.as_ref()?;
+    if e.gguf != gguf {
+        log::warn!("llama engine: refusing generation on GPU {}: requested model is not resident", gpu);
+        return None;
+    }
+    generate_locked(e, prompt, max_tokens)
+}
+
+fn generate_locked(e: &Engine, prompt: &str, max_tokens: usize) -> Option<String> {
+    if prompt.is_empty()
+        || prompt.len() > crate::slm::MAX_INFERENCE_PROMPT_BYTES
+        || max_tokens == 0
+        || max_tokens > crate::slm::MAX_INFERENCE_TOKENS
+    {
+        return None;
+    }
     let cp = CString::new(prompt).ok()?;
+    let max_tokens = c_int::try_from(max_tokens).ok()?;
     let mut buf = vec![0u8; 64 * 1024];
-    let n = unsafe { (e.generate)(e.model, cp.as_ptr(), max_tokens as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int) };
+    let n =
+        unsafe { (e.generate)(e.model, cp.as_ptr(), max_tokens, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int) };
     if n <= 0 {
         return None;
     }

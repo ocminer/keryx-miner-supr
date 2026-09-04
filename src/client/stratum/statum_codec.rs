@@ -7,6 +7,10 @@ use std::fmt::{Display, Formatter};
 use std::{fmt, io};
 use tokio_util::codec::{Decoder, Encoder, LinesCodec};
 
+/// Stratum messages are small JSON records. Keeping a finite frame cap prevents a peer from making
+/// `LinesCodec` buffer an unbounded prompt/line before a newline arrives.
+pub(crate) const MAX_STRATUM_LINE_BYTES: usize = 64 * 1024;
+
 #[derive(Serialize_repr, Deserialize_repr, Debug, Clone)]
 #[repr(u8)]
 pub enum ErrorCode {
@@ -245,7 +249,7 @@ pub(crate) struct NewLineJsonCodec {
 
 impl NewLineJsonCodec {
     pub fn new() -> Self {
-        Self { lines_codec: LinesCodec::new() }
+        Self { lines_codec: LinesCodec::new_with_max_length(MAX_STRATUM_LINE_BYTES) }
     }
 }
 
@@ -295,6 +299,13 @@ impl Default for NewLineJsonCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_oversized_unterminated_lines() {
+        let mut codec = NewLineJsonCodec::new();
+        let mut bytes = BytesMut::from(vec![b'x'; MAX_STRATUM_LINE_BYTES + 1].as_slice());
+        assert!(codec.decode(&mut bytes).is_err());
+    }
 
     /// H6 unsigned AiResponse submit: the wire must be exactly
     /// [address, job_id, nonce, opoi_tag, ipfs_cid, pom_proof_hex, reqId, response_length]
@@ -358,9 +369,7 @@ mod tests {
         let raw = r#"{"id":1,"method":"mining.submit","params":["addr","job","nonce","tag","","aabb"],"error":null}"#;
         let line: StratumLine = serde_json::from_str(raw).unwrap();
         match line.payload {
-            StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
-                MiningSubmit::MiningSubmitWithPom(_),
-            )) => {}
+            StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(MiningSubmit::MiningSubmitWithPom(_))) => {}
             other => panic!("expected MiningSubmitWithPom, got {:?}", other),
         }
     }
@@ -389,16 +398,14 @@ mod tests {
         // success
         let ok = StratumLine {
             id: None,
-            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceResult(
-                InferenceResultParams {
-                    req_id: "c-1".to_string(),
-                    ok: true,
-                    text: Some("hello world".to_string()),
-                    tokens: Some(2),
-                    ms: Some(42),
-                    error: None,
-                },
-            )),
+            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceResult(InferenceResultParams {
+                req_id: "c-1".to_string(),
+                ok: true,
+                text: Some("hello world".to_string()),
+                tokens: Some(2),
+                ms: Some(42),
+                error: None,
+            })),
             jsonrpc: None,
             error: None,
         };
@@ -426,16 +433,14 @@ mod tests {
         // failure
         let err = StratumLine {
             id: None,
-            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceResult(
-                InferenceResultParams {
-                    req_id: "c-2".to_string(),
-                    ok: false,
-                    text: None,
-                    tokens: None,
-                    ms: None,
-                    error: Some("model not ready".to_string()),
-                },
-            )),
+            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceResult(InferenceResultParams {
+                req_id: "c-2".to_string(),
+                ok: false,
+                text: None,
+                tokens: None,
+                ms: None,
+                error: Some("model not ready".to_string()),
+            })),
             jsonrpc: None,
             error: None,
         };

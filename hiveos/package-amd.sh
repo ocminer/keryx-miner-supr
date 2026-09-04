@@ -15,9 +15,12 @@ PKG="$REPO/hiveos/pkg-amd/keryx-miner-supr-amd"
 NAME=keryx-miner-supr-amd            # HiveOS custom-miner name (install dir)
 BIN=keryx-miner-supr                 # the actual executable inside the package
 VERSION=$(grep -m1 '^CUSTOM_VERSION=' "$PKG/h-manifest.conf" | cut -d= -f2)
+# shellcheck source=hiveos/amd-inference-route.sh
+source "$REPO/hiveos/amd-inference-route.sh"
 
 [[ -f "$DIST/$BIN" ]]               || { echo "ERROR: $DIST/$BIN missing — run hiveos/build-amd-glibc.sh first"; exit 1; }
 [[ -f "$DIST/libkeryxopencl.so" ]] || { echo "ERROR: $DIST/libkeryxopencl.so missing — run hiveos/build-amd-glibc.sh first"; exit 1; }
+keryx_require_amd_inference_route "$DIST"
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
@@ -28,41 +31,10 @@ mkdir -p "$DEST"
 cp "$PKG"/h-manifest.conf "$PKG"/h-config.sh "$PKG"/h-run.sh "$PKG"/h-stats.sh "$DEST/"
 cp "$DIST/$BIN" "$DEST/"
 cp "$DIST/libkeryxopencl.so" "$DEST/"
-# Zero-dup in-process engine (optional): the miner dlopens libkeryx-llama-vk.so — llama.cpp hosts
-# the model in VRAM, serves OPoI inference in-process, AND (on RDNA cards) hosts the PoM walk over
-# the same resident weights so that card needs no OpenCL blob. Absent = the llama-server subprocess
-# + candle-CPU fallbacks below stay active. Built by hiveos/build-keryx-llama-vk.sh.
-if [[ -f "$DIST/libkeryx-llama-vk.so" ]]; then
-  cp -P "$DIST/libkeryx-llama-vk.so" "$DEST/"
-  echo ">> bundled zero-dup in-process engine (libkeryx-llama-vk.so)"
-fi
-# Baseline CPU-ISA build for pre-AVX rig CPUs — auto-selected by the miner when the host CPU
-# lacks the AVX2/FMA/F16C/BMI2 set baked into the default .so (v0.7.2 SIGILL fix).
-if [[ -f "$DIST/libkeryx-llama-vk-noavx.so" ]]; then
-  cp -P "$DIST/libkeryx-llama-vk-noavx.so" "$DEST/"
-  echo ">> bundled no-AVX in-process engine (libkeryx-llama-vk-noavx.so)"
-fi
-# Vulkan loader (libvulkan.so.1): our vk .so + ggml-vulkan + llama-server all NEED it, but it's a
-# SYSTEM library (the libvulkan1 package) — absent on stock HiveOS, where users can't apt-install,
-# so the miner died with "libvulkan.so.1: cannot open shared object file". Bundle the glibc-2.29
-# loader (extracted from the ubuntu-20.04 build image = the exact one the .so was linked against;
-# a host loader would drag in a newer glibc). h-run.sh puts this dir first on LD_LIBRARY_PATH so it
-# resolves without touching the system. NOTE: the loader only satisfies the link — reaching the GPU
-# still needs an AMD ICD (mesa RADV) on the rig; if absent the miner falls back to CPU inference and
-# keeps mining (the PoM walk runs off the OpenCL blob, independent of Vulkan).
-if [[ -f "$DIST/libvulkan.so.1" ]]; then
-  cp -P "$DIST"/libvulkan.so.1* "$DEST/"
-  echo ">> bundled Vulkan loader (libvulkan.so.1 -> $(readlink "$DIST/libvulkan.so.1"))"
-fi
-# Vulkan GPU inference (fallback): bundle llama-server + its ggml/llama .so. The miner spawns it
-# for OPoI inference only when the in-process engine above is unavailable; if that is also absent
-# (or no Vulkan ICD on the rig), it falls back to CPU.
-if [[ -f "$DIST/llama-server" ]]; then
-  cp -P "$DIST/llama-server" "$DEST/"
-  cp -P "$DIST"/lib{ggml,llama,mtmd}*.so* "$DEST/" 2>/dev/null || true
-  chmod +x "$DEST/llama-server"
-  echo ">> bundled Vulkan GPU inference (llama-server + $(ls "$DEST"/lib{ggml,llama,mtmd}*.so* 2>/dev/null | wc -l) libs)"
-fi
+# A source-matched Vulkan sidecar is mandatory: it serves inference and provides the exact
+# ggml-index -> selected-OpenCL-worker PCI mapping needed even by an optional llama-server fallback.
+# The shared helper also requires the portable Vulkan loader and rejects incomplete server deps.
+keryx_copy_amd_inference_route "$DIST" "$DEST"
 chmod +x "$DEST"/h-*.sh "$DEST/$BIN"
 
 # HiveOS custom-get derives the miner NAME by stripping the LAST hyphen-delimited
@@ -76,4 +48,6 @@ TARBALL="$DIST/${NAME}-${VERSION}.tar.gz"
 tar -czf "$TARBALL" -C "$STAGE" "$NAME"
 echo ">> Wrote $TARBALL"
 tar -tzf "$TARBALL"
-echo ">> sha256:"; sha256sum "$TARBALL"
+sha256sum "$TARBALL" > "$TARBALL.sha256"
+echo ">> sha256:"; cat "$TARBALL.sha256"
+echo ">> checksum: $TARBALL.sha256"

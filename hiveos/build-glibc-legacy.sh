@@ -32,9 +32,9 @@ docker run --rm --network host \
     export CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda
     export CUDA_COMPUTE_CAP=70                  # sm_70 PTX (candle inference) JITs across the fleet (Volta..Blackwell)
     # PoM walk PTX at compute_70 too (build.rs default is compute_75, which CANNOT JIT down to sm_70).
-    # The walk is pure u64 + gather (no dp4a/fp16/tensor), so it compiles at sm_70 and forward-JITs to
-    # sm_75..sm_120 with identical (memory-bound) perf. This is what makes Volta sm_70 cards run the
-    # walk: Tesla V100 AND the CMP 100-210 (GV100 mining card). Without it the walk kernel won't load.
+    # The integer walk compiles at sm_70 and its PTX forward-JITs to sm_75..sm_120. This is what
+    # makes Volta sm_70 cards run the
+    # walk: Tesla V100 AND the CMP 100-210 (GV100 mining card). Without it the walk kernel cannot load.
     export POM_CUDA_ARCH=compute_70
     export PATH=/usr/local/cuda/bin:$PATH
     export RUSTFLAGS="-L /usr/local/cuda/lib64/stubs"
@@ -45,15 +45,16 @@ docker run --rm --network host \
            target-hiveos-legacy/release/.fingerprint/candle-kernels-* \
            target-hiveos-legacy/release/deps/*candle_kernels* 2>/dev/null || true
 
-    # Dynamic build first (binary + CUDA/OpenCL plugins) — needed for the generic-Linux package.
-    echo "=== dynamic build (binary + plugins) ==="
-    cargo build --release --features pom-cuda
+    # NVIDIA dynamic build first — needed for the generic-Linux package.
+    echo "=== NVIDIA dynamic build (pom-cuda host + CUDA plugin) ==="
+    cargo build --locked --release -p keryxcuda
+    cargo build --locked --release -p keryx-miner-supr --features pom-cuda
     cp target-hiveos-legacy/release/keryx-miner-supr /src/hiveos/dist-legacy/keryx-miner-supr-dynamic
-    cp target-hiveos-legacy/release/libkeryxcuda.so target-hiveos-legacy/release/libkeryxopencl.so /src/hiveos/dist-legacy/
+    cp target-hiveos-legacy/release/libkeryxcuda.so /src/hiveos/dist-legacy/
 
     # Static build (single self-contained binary) — used for HiveOS/SMOS/mmpOS packages.
     echo "=== static build (single binary) ==="
-    cargo build --release --features static-cuda,pom-cuda
+    cargo build --locked --release -p keryx-miner-supr --features static-cuda,pom-cuda
 
     cp target-hiveos-legacy/release/keryx-miner-supr /src/hiveos/dist-legacy/
 

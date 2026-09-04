@@ -24,10 +24,10 @@ use crate::miner::MinerManager;
 use crate::target::Uint256;
 
 mod api;
-mod gpu_health;
 mod cli;
 mod client;
 mod escrow;
+mod gpu_health;
 mod ipfs;
 mod keryxd_messages;
 #[cfg(all(target_os = "macos", feature = "pom-metal"))]
@@ -66,11 +66,7 @@ type Hash = Uint256;
 fn install_cuda_libs() -> bool {
     use std::process::Command;
     // Only meaningful where apt-get exists (Debian/Ubuntu, incl. HiveOS).
-    let has_apt = Command::new("sh")
-        .args(["-c", "command -v apt-get"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let has_apt = Command::new("sh").args(["-c", "command -v apt-get"]).status().map(|s| s.success()).unwrap_or(false);
     if !has_apt {
         error!("CUDA lib auto-install needs apt-get (Debian/Ubuntu) — not found on this system.");
         return false;
@@ -91,11 +87,7 @@ ldconfig
 ldconfig -p | grep -q libcublas.so.12 || { echo "libcublas still not in loader cache"; exit 1; }
 ldconfig -p | grep -q libcurand.so   || { echo "libcurand still not in loader cache"; exit 1; }
 rm -f cuda-keyring.deb"#;
-    Command::new("bash")
-        .args(["-c", script])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    Command::new("bash").args(["-c", script]).status().map(|s| s.success()).unwrap_or(false)
 }
 
 #[cfg(target_os = "windows")]
@@ -127,19 +119,32 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
 
 /// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
 ///
-/// VRAM requirements (GGUF weights only, not counting CUDA workspace):
-///   TinyLlama-1.1B  →  ~1.5 GB
-///   DeepSeek-R1-8B  →  ~5 GB
-///   DeepSeek-R1-32B → ~19 GB   (requires ≥24 GB card)
-///   LLaMA-3.3-70B   → ~28 GB   (requires ≥40 GB card — does NOT fit on RTX 3090)
+/// Current H6 auto-select floors (weights + KV/workspace allowance): Qwen3.5-9B 7 GB,
+/// GLM-4-9B 11 GB, Gemma-4-12B 15 GB, Qwen3.6-27B 22 GB, Kimi-Linear-48B 28 GB.
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
+fn first_visible_cuda_device(visible: Option<&str>) -> Option<&str> {
+    visible?.split(',').next().map(str::trim).filter(|token| !token.is_empty())
+}
+
+fn pin_nvidia_smi_to_device(command: &mut std::process::Command, visible: Option<&str>) {
+    if let Some(device) = first_visible_cuda_device(visible) {
+        // `Command::arg` passes the UUID/index verbatim without a shell. UUIDs are important here:
+        // production pins by `GPU-...`, and silently accepting only numeric tokens queried physical
+        // GPU 0 instead of the process's logical GPU 0 on heterogeneous rigs.
+        command.arg("-i").arg(device);
+    }
+}
+
+fn pin_nvidia_smi_to_visible_device(command: &mut std::process::Command) {
+    pin_nvidia_smi_to_device(command, std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref());
+}
+
 fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
-    let output = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=power.limit,power.max_limit,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
+    let mut command = std::process::Command::new("nvidia-smi");
+    pin_nvidia_smi_to_visible_device(&mut command);
+    let output = command
+        .args(["--query-gpu=power.limit,power.max_limit,memory.total", "--format=csv,noheader,nounits"])
         .output();
 
     let (current_w, vram_mb) = match output {
@@ -159,71 +164,79 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
         _ => return,
     };
 
-    // VRAM check for 70B: 28 GB weights + ~2.5 GB KV cache → requires ≥32 GB card (RTX 5090+).
-    // On 24 GB cards (RTX 3090 / 4090), loading will OOM and crash the miner.
+    // VRAM check for the current top tier. On 24 GB cards the Kimi-Linear-48B
+    // model cannot coexist with its KV/workspace and will OOM.
     if needs_very_high && vram_mb < 30_000 {
         log::error!(
-            "✗  LLaMA-3.3-70B requires ≥32 GB VRAM (RTX 5090 or equivalent) — \
+            "✗  Kimi-Linear-48B requires about 30 GB VRAM — \
              this GPU has only {} MB ({} GB).",
             vram_mb,
             vram_mb / 1024
         );
-        log::error!(
-            "   Use --high (DeepSeek-R1-32B, fits in 24 GB) or --light (TinyLlama only)."
-        );
+        log::error!("   Use --high (Qwen3.6-27B) or a smaller H6 tier.");
         // Non-fatal: let candle fail with its own OOM so the miner logs the actual error.
     }
 
     let model_label = if needs_very_high {
-        "Llama-3.3-70B (very-high)"
+        "Kimi-Linear-48B (very-high)"
     } else if needs_high {
-        "Qwen3-32B (high)"
+        "Qwen3.6-27B (high)"
     } else {
-        "Gemma-3-4B / Dolphin-8B (light/default)"
+        "Qwen3.5-9B / GLM-9B / Gemma-12B"
     };
     log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
 }
 
-/// GPU 0 total VRAM (MB): nvidia-smi (NVIDIA), else OpenCL CL_DEVICE_GLOBAL_MEM_SIZE (AMD, when the
-/// pom-opencl driver is linked). None on CPU-only machines.
+/// Primary mining GPU VRAM (MB). An OpenCL build must ask the OpenCL driver first because
+/// `nvidia-smi` ignores the plugin's platform/device subset and can report an unrelated NVIDIA GPU
+/// on a mixed-vendor host. The OpenCL helper is already scoped to the exact selected worker list.
+/// NVIDIA-only builds retain the CUDA-visible `nvidia-smi` query below.
 fn query_vram_mb() -> Option<u64> {
-    // One process per GPU (CUDA_VISIBLE_DEVICES=<n>): query THIS process's visible GPU, not GPU 0.
-    // nvidia-smi without `-i` always lists GPU 0 first regardless of CUDA_VISIBLE_DEVICES, so on a
-    // mixed rig (e.g. a 5090 at slot 0 + a 3070 at slot 1) the 3070's process would wrongly read the
-    // 5090's 32 GB and auto-pick a tier that OOMs. Pin nvidia-smi to the first visible device id.
-    // (Miners launch with CUDA_DEVICE_ORDER=PCI_BUS_ID, so CUDA's index == nvidia-smi's index.)
-    let mut cmd = std::process::Command::new("nvidia-smi");
-    if let Ok(vis) = std::env::var("CUDA_VISIBLE_DEVICES") {
-        // CUDA_VISIBLE_DEVICES may be a list ("2,3"); the process's GPU 0 is the FIRST entry.
-        if let Some(first) = vis.split(',').next().map(str::trim).filter(|s| !s.is_empty()) {
-            // Only a plain numeric index is safe to forward to `nvidia-smi -i` (UUIDs also work,
-            // but ignore anything unexpected and fall back to the default GPU-0 query).
-            if first.chars().all(|c| c.is_ascii_digit()) {
-                cmd.args(["-i", first]);
-            }
-        }
-    }
-    if let Ok(output) = cmd
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-    {
-        if output.status.success() {
-            if let Some(mb) = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .and_then(|l| l.trim().parse::<u64>().ok())
-            {
-                return Some(mb);
-            }
-        }
-    }
-    // AMD: query the OpenCL GPU's global memory so the capability gate works without nvidia-smi.
     #[cfg(feature = "pom-opencl")]
     {
-        return keryx_miner::pom_opencl::gpu0_global_mem_mb();
+        keryx_miner::pom_opencl::gpu0_global_mem_mb()
     }
-    #[allow(unreachable_code)]
-    None
+    #[cfg(not(feature = "pom-opencl"))]
+    {
+        // One process per GPU (CUDA_VISIBLE_DEVICES=<n>): query THIS process's visible GPU, not GPU 0.
+        // nvidia-smi without `-i` always lists GPU 0 first regardless of CUDA_VISIBLE_DEVICES, so on a
+        // mixed rig (e.g. a 5090 at slot 0 + a 3070 at slot 1) the 3070's process would wrongly read the
+        // 5090's 32 GB and auto-pick a tier that OOMs. Pin nvidia-smi to the first visible device id.
+        // (Miners launch with CUDA_DEVICE_ORDER=PCI_BUS_ID, so CUDA's index == nvidia-smi's index.)
+        let mut cmd = std::process::Command::new("nvidia-smi");
+        pin_nvidia_smi_to_visible_device(&mut cmd);
+        if let Ok(output) = cmd.args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"]).output() {
+            if output.status.success() {
+                if let Some(mb) =
+                    String::from_utf8_lossy(&output.stdout).lines().next().and_then(|l| l.trim().parse::<u64>().ok())
+                {
+                    return Some(mb);
+                }
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod device_query_tests {
+    use super::{first_visible_cuda_device, pin_nvidia_smi_to_device};
+
+    #[test]
+    fn visible_device_parser_accepts_uuid_and_preserves_first_mapping() {
+        assert_eq!(first_visible_cuda_device(Some(" GPU-deadbeef ,2")), Some("GPU-deadbeef"));
+        assert_eq!(first_visible_cuda_device(Some("3,1")), Some("3"));
+        assert_eq!(first_visible_cuda_device(Some(" ,2")), None);
+        assert_eq!(first_visible_cuda_device(None), None);
+    }
+
+    #[test]
+    fn nvidia_smi_pin_passes_uuid_as_one_literal_argument() {
+        let mut command = std::process::Command::new("nvidia-smi");
+        pin_nvidia_smi_to_device(&mut command, Some("GPU-deadbeef,2"));
+        let args = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(args, vec!["-i", "GPU-deadbeef"]);
+    }
 }
 
 /// GPU VRAM per device `(device_id, MiB)` via the CUDA/Metal `pom_gpu` driver when it is linked in,
@@ -237,12 +250,16 @@ fn all_gpus_vram() -> Vec<(u32, u64)> {
         all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))),
         all(target_os = "macos", feature = "pom-metal")
     ))]
-    { keryx_miner::pom_gpu::query_all_gpus_vram() }
+    {
+        keryx_miner::pom_gpu::query_all_gpus_vram()
+    }
     #[cfg(not(any(
         all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))),
         all(target_os = "macos", feature = "pom-metal")
     )))]
-    { Vec::new() }
+    {
+        Vec::new()
+    }
 }
 
 /// OPoI capability gate (layer A): drop models GPU 0 cannot serve, so `ai:cap` never promises a
@@ -270,7 +287,9 @@ fn filter_specs_by_vram(
             } else {
                 log::warn!(
                     "✗  '{}' needs ≥{} MB VRAM but only {} MB on GPU 0 — not announced/downloaded.",
-                    spec.name, spec.min_vram_mb, gpu0_mb
+                    spec.name,
+                    spec.min_vram_mb,
+                    gpu0_mb
                 );
                 false
             }
@@ -285,7 +304,8 @@ fn filter_specs_by_vram(
         log::warn!(
             "VRAM capability gate would drop ALL {} model(s) (GPU VRAM read as {} MB — likely an \
              unreliable query) — keeping the lineup so the model still downloads and mining can start.",
-            specs.len(), gpu0_mb
+            specs.len(),
+            gpu0_mb
         );
         return specs;
     }
@@ -304,30 +324,31 @@ fn filter_specs_by_vram(
 #[cfg(not(feature = "pom-opencl"))]
 const AUTO_TIER_HEADROOM_MB: u64 = 2_048;
 
-/// AMD auto-tier VRAM headroom (MiB) — LARGER than NVIDIA's 2 GB. The AMD/OpenCL path holds the PoM
-/// possession blob (≈ the model's raw chunk bytes) resident in VRAM AND the llama.cpp inference
-/// context; on a non-zero-dup (GCN/older) card that is roughly TWO model copies on the inference
-/// card (zero-dup on RDNA shares one copy — this margin is conservative there, favouring no-OOM over
-/// max tier). `auto_select_tier` already budgets `min_vram_mb` (weights+KV+ctx); this ~5 GB margin
-/// covers the extra resident blob + fragmentation, so an 8 GB card stays on EXAONE (not Mistral) and
-/// a 16 GB card safely reaches Mistral (tier 1).
+/// Legacy call-site headroom value retained for API compatibility. The current H6 tier floors in
+/// `auto_select_tier` already include the field-proven weights/KV/workspace allowance, so that
+/// function intentionally does not add this value a second time. The OpenCL residency planner
+/// separately decides whether an inference card must be dedicated when walk + inference do not fit.
 #[cfg(feature = "pom-opencl")]
 const AUTO_TIER_HEADROOM_MB: u64 = 5_120;
 
-/// `--tier auto` for the AMD/OpenCL path: pick the largest H4 tier that fits card 0's VRAM
+/// `--tier auto` for the AMD/OpenCL path: pick the largest H6 tier that fits the first selected
+/// worker card's VRAM
 /// (`CL_DEVICE_GLOBAL_MEM_SIZE` via `pom_opencl::gpu0_global_mem_mb`) with the AMD margin above.
 /// The tier is PROCESS-WIDE on AMD (one resident model for all cards — no per-card map), so it is
-/// gated on card 0. Falls back to VeryLight (EXAONE, fits any card) if VRAM can't be queried.
+/// gated on that primary worker. Falls back to VeryLight (Qwen3.5-9B) if VRAM cannot be
+/// queried.
 #[cfg(feature = "pom-opencl")]
 fn select_tier_auto() -> keryx_miner::models::Tier {
     use keryx_miner::models::{self, Tier};
     let Some(vram_mb) = query_vram_mb() else {
-        warn!("AMD/OpenCL --tier auto: cannot query GPU 0 VRAM — falling back to --very-light (EXAONE, fits any card).");
+        warn!(
+            "AMD/OpenCL --tier auto: cannot query the selected primary worker's VRAM — falling back to --very-light (Qwen3.5-9B)."
+        );
         return Tier::VeryLight;
     };
     let (picked, need) = models::auto_select_tier(vram_mb, AUTO_TIER_HEADROOM_MB);
     info!(
-        "AMD/OpenCL tier auto: {} MiB VRAM (card 0) -> {} ({:?}, tier {}) — budget {} MiB \
+        "AMD/OpenCL tier auto: {} MiB VRAM (selected primary worker) -> {} ({:?}, tier {}) — budget {} MiB \
          (model weights+KV+ctx + resident PoM blob + {} MiB AMD margin). Pin a tier with \
          --light/--high/--force-model to override.",
         vram_mb,
@@ -358,23 +379,23 @@ fn select_tier_nvidia(opt: &cli::Opt) -> keryx_miner::models::Tier {
         match t.as_str() {
             "auto" => return select_tier_auto(),
             "very-light" | "verylight" | "very_light" => {
-                info!("--tier very-light: smallest tier — mines Qwen3-1.7B under PoM (post-H2).");
+                info!("--tier very-light: tier 0 — mines Qwen3.5-9B under PoM.");
                 return Tier::VeryLight;
             }
             "light" => {
-                info!("--tier light: baseline tier — mines Gemma-3-4B under PoM.");
+                info!("--tier light: tier 1 — mines GLM-4-9B under PoM.");
                 return Tier::Light;
             }
             "default" => {
-                info!("--tier default: mines Dolphin-8B under PoM.");
+                info!("--tier default: tier 2 — mines Gemma-4-12B under PoM.");
                 return Tier::Default;
             }
             "high" => {
-                info!("--tier high: high tier — mines Qwen3-32B under PoM.");
+                info!("--tier high: tier 3 — mines Qwen3.6-27B under PoM.");
                 return Tier::High;
             }
             "very-high" | "veryhigh" | "very_high" => {
-                info!("--tier very-high: top tier — mines Llama-3.3-70B under PoM.");
+                info!("--tier very-high: tier 4 — mines Kimi-Linear-48B under PoM.");
                 return Tier::VeryHigh;
             }
             other => {
@@ -389,16 +410,16 @@ fn select_tier_nvidia(opt: &cli::Opt) -> keryx_miner::models::Tier {
 
     // Legacy bool flags pin an explicit tier (override auto).
     if opt.very_high {
-        info!("--very-high mode: top tier — mines Llama-3.3-70B under PoM.");
+        info!("--very-high mode: tier 4 — mines Kimi-Linear-48B under PoM.");
         Tier::VeryHigh
     } else if opt.high {
-        info!("--high mode: high tier — mines Qwen3-32B under PoM.");
+        info!("--high mode: tier 3 — mines Qwen3.6-27B under PoM.");
         Tier::High
     } else if opt.light {
-        info!("--light mode: baseline tier — mines Gemma-3-4B under PoM.");
+        info!("--light mode: tier 1 — mines GLM-4-9B under PoM.");
         Tier::Light
     } else if opt.very_light {
-        info!("--very-light mode: smallest tier — mines Qwen3-1.7B under PoM (post-H2).");
+        info!("--very-light mode: tier 0 — mines Qwen3.5-9B under PoM.");
         Tier::VeryLight
     } else {
         // No tier flag given at all → AUTO is the default: pick the largest tier that fits this
@@ -457,15 +478,15 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
     for tier in Tier::DESCENDING {
         // Only consider tiers that ALSO fit this card (never downgrade VRAM-fit just to use a
         // present-but-too-big model — though by construction the present ones are smaller/equal).
-        let fits = vram_mb >= tier.pom_spec().min_vram_mb.saturating_add(AUTO_TIER_HEADROOM_MB)
-            || tier == Tier::Light;
+        let fits = vram_mb >= tier.pom_spec().min_vram_mb.saturating_add(AUTO_TIER_HEADROOM_MB) || tier == Tier::Light;
         if fits && keryx_miner::slm::spec_files_ready(tier.pom_spec()) {
             warn!(
                 "tier auto: falling back to {} ({:?}, tier {}) — largest fitting tier already on disk. \
                  ({} will download in the background; restart to use it.)",
                 tier.pom_model_name(),
                 tier,
-                models::pom_tier_index(&tier.pom_spec().model_id, keryx_miner::pom::pom_v3_activation_daa()).unwrap_or(0),
+                models::pom_tier_index(&tier.pom_spec().model_id, keryx_miner::pom::pom_v3_activation_daa())
+                    .unwrap_or(0),
                 picked.pom_model_name(),
             );
             return tier;
@@ -502,11 +523,17 @@ fn pinned_tier(opt: &cli::Opt) -> Option<keryx_miner::models::Tier> {
         let t = raw.trim().to_ascii_lowercase();
         return if t == "auto" { None } else { parse_tier_name(&t) };
     }
-    if opt.very_high { Some(Tier::VeryHigh) }
-    else if opt.high { Some(Tier::High) }
-    else if opt.light { Some(Tier::Light) }
-    else if opt.very_light { Some(Tier::VeryLight) }
-    else { None }
+    if opt.very_high {
+        Some(Tier::VeryHigh)
+    } else if opt.high {
+        Some(Tier::High)
+    } else if opt.light {
+        Some(Tier::Light)
+    } else if opt.very_light {
+        Some(Tier::VeryLight)
+    } else {
+        None
+    }
 }
 
 /// Resolve the mining tier for EACH CUDA device (CUDA-driver order): `--force-model <csv>` wins
@@ -517,20 +544,16 @@ fn pinned_tier(opt: &cli::Opt) -> Option<keryx_miner::models::Tier> {
 #[cfg(not(feature = "pom-opencl"))]
 fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier, bool)> {
     use keryx_miner::models;
-    let forced: Vec<Option<models::Tier>> = opt
-        .force_model
-        .as_deref()
-        .map(|s| s.split(',').map(|x| parse_tier_name(x)).collect())
-        .unwrap_or_default();
+    let forced: Vec<Option<models::Tier>> =
+        opt.force_model.as_deref().map(|s| s.split(',').map(|x| parse_tier_name(x)).collect()).unwrap_or_default();
     let mut vrams = all_gpus_vram(); // (device_id, TOTAL MiB), CUDA order
-    // AUTO budgets against FREE VRAM, not total: whatever is already resident on the card
-    // (another miner, a leaked context, a desktop) is memory the chosen tier can never
-    // allocate — the old total-based pick sailed past the check and died in cudaMalloc,
-    // cascading into self-test failures. Free query best-effort; total is the fallback.
+                                     // AUTO budgets against FREE VRAM, not total: whatever is already resident on the card
+                                     // (another miner, a leaked context, a desktop) is memory the chosen tier can never
+                                     // allocate — the old total-based pick sailed past the check and died in cudaMalloc,
+                                     // cascading into self-test failures. Free query best-effort; total is the fallback.
     #[cfg(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))))]
     let free_map: std::collections::HashMap<u32, (u64, u64)> =
-        keryx_miner::pom_gpu::query_all_gpus_free_vram()
-            .into_iter().map(|(d, f, t)| (d, (f, t))).collect();
+        keryx_miner::pom_gpu::query_all_gpus_free_vram().into_iter().map(|(d, f, t)| (d, (f, t))).collect();
     #[cfg(not(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal")))))]
     let free_map: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
     if vrams.is_empty() {
@@ -544,11 +567,18 @@ fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier, 
     if opt.force_model.is_some() {
         // Forced models load verbatim: no VRAM pre-check ("we simply load it, regardless of
         // what the card says — that is the reason we have it").
+        #[cfg(any(
+            all(feature = "pom-cuda", not(feature = "pom-opencl")),
+            all(target_os = "macos", feature = "pom-metal")
+        ))]
         keryx_miner::llama_engine::set_vram_check_bypass(true);
         info!("--force-model: VRAM pre-check disabled — forced models are loaded verbatim.");
     }
     if let Some(raw) = opt.force_model.as_deref() {
-        info!("--force-model: {} — per-card override (VRAM check bypassed; unlisted/extra cards use auto).", raw.trim());
+        info!(
+            "--force-model: {} — per-card override (VRAM check bypassed; unlisted/extra cards use auto).",
+            raw.trim()
+        );
     }
     let pinned = pinned_tier(opt);
     let mut out = Vec::with_capacity(vrams.len());
@@ -558,7 +588,12 @@ fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier, 
                 // --force-model means FORCE: honor the operator's choice with NO VRAM check. If it
                 // does not fit the card it will OOM — that is the user's explicit call. (Only AUTO
                 // selection below is VRAM-aware.)
-                info!("GPU {}: --force-model → {} (forced, no VRAM check; card has {} MiB).", dev, t.pom_model_name(), vram);
+                info!(
+                    "GPU {}: --force-model → {} (forced, no VRAM check; card has {} MiB).",
+                    dev,
+                    t.pom_model_name(),
+                    vram
+                );
                 (t, true)
             }
             None => {
@@ -579,7 +614,13 @@ fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier, 
                         _ => *vram,
                     };
                     let (picked, need) = models::auto_select_tier(budget_mb, AUTO_TIER_HEADROOM_MB);
-                    info!("GPU {}: auto → {} (fits {} MiB free VRAM, budget {} MiB).", dev, picked.pom_model_name(), budget_mb, need);
+                    info!(
+                        "GPU {}: auto → {} (fits {} MiB free VRAM, budget {} MiB).",
+                        dev,
+                        picked.pom_model_name(),
+                        budget_mb,
+                        need
+                    );
                     (picked, false)
                 }
             }
@@ -671,11 +712,7 @@ async fn client_main(
 /// many-core rig are pure scheduler overhead. Override with `KERYX_ASYNC_WORKERS`.
 /// (upstream Keryx-Labs/keryx-miner@9bb0d55)
 fn tokio_worker_threads() -> usize {
-    std::env::var("KERYX_ASYNC_WORKERS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(2)
-        .clamp(1, 8)
+    std::env::var("KERYX_ASYNC_WORKERS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2).clamp(1, 8)
 }
 
 /// Optional cap for the `spawn_blocking` pool (SLM inference, IPFS upload, model prefetch). Only
@@ -683,10 +720,7 @@ fn tokio_worker_threads() -> usize {
 /// tokio's default costs nothing at rest and capping it low would bottleneck parallel multi-model
 /// prefetch on multi-GPU rigs.
 fn tokio_blocking_threads() -> Option<usize> {
-    std::env::var("KERYX_BLOCKING_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.clamp(2, 64))
+    std::env::var("KERYX_BLOCKING_THREADS").ok().and_then(|s| s.parse::<usize>().ok()).map(|n| n.clamp(2, 64))
 }
 
 fn main() -> Result<(), Error> {
@@ -703,18 +737,14 @@ fn main() -> Result<(), Error> {
         std::env::set_var("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
     }
     // AMD OpenCL caps a SINGLE cl_mem buffer at CL_DEVICE_MAX_MEM_ALLOC_SIZE. On Polaris (RX 580 and
-    // kin) that cap is often ~25% of VRAM (or a hard ~4 GB), which was fine for the old ≤2.5 GB tier
-    // blobs (Gemma/EXAONE) but is TOO SMALL for the post-H5 tier-0 model: the Qwen3-8B possession
-    // blob is ~4.8 GB in one buffer. When it exceeds the cap the driver hands back a partial/broken
+    // kin) that cap is often ~25% of VRAM (or a hard ~4 GB), which is TOO SMALL for the current
+    // tier-0 Qwen3.5-9B possession blob. When it exceeds the cap the driver hands back a partial/broken
     // buffer, so the card hashes at full rate but the walk reads garbage → it NEVER finds a valid
     // share and submits nothing. Raise the single-allocation cap to ~100% of VRAM BEFORE the AMD
     // OpenCL runtime initializes (it reads these env vars at platform init). Operator overrides win.
     #[cfg(feature = "pom-opencl")]
-    for (k, v) in [
-        ("GPU_SINGLE_ALLOC_PERCENT", "100"),
-        ("GPU_MAX_ALLOC_PERCENT", "100"),
-        ("GPU_MAX_HEAP_SIZE", "100"),
-    ] {
+    for (k, v) in [("GPU_SINGLE_ALLOC_PERCENT", "100"), ("GPU_MAX_ALLOC_PERCENT", "100"), ("GPU_MAX_HEAP_SIZE", "100")]
+    {
         if std::env::var_os(k).is_none() {
             std::env::set_var(k, v);
         }
@@ -749,14 +779,12 @@ async fn run() -> Result<(), Error> {
     #[cfg(all(not(feature = "static-cuda"), not(all(target_os = "macos", feature = "pom-metal"))))]
     let plugins = if disable_gpu { Vec::new() } else { filter_plugins(path.to_str().unwrap_or(".")) };
     #[cfg(all(not(feature = "static-cuda"), not(all(target_os = "macos", feature = "pom-metal"))))]
-    let (app, mut plugin_manager): (App, PluginManager) =
-        keryx_miner::load_plugins(Opt::into_app(), &plugins)?;
+    let (app, mut plugin_manager): (App, PluginManager) = keryx_miner::load_plugins(Opt::into_app(), &plugins)?;
 
     // macOS (Apple Silicon): register the built-in Metal PoM worker. Without this the miner finds
     // 0 workers and exits ("No workers specified"). --disable-gpu leaves a CPU-only miner.
     #[cfg(all(target_os = "macos", feature = "pom-metal"))]
-    let plugins: Vec<String> =
-        if disable_gpu { Vec::new() } else { vec!["builtin:metal (Apple Silicon)".to_string()] };
+    let plugins: Vec<String> = if disable_gpu { Vec::new() } else { vec!["builtin:metal (Apple Silicon)".to_string()] };
     #[cfg(all(target_os = "macos", feature = "pom-metal"))]
     let (app, mut plugin_manager): (App, PluginManager) = {
         let mut manager = PluginManager::new();
@@ -772,17 +800,18 @@ async fn run() -> Result<(), Error> {
     // register it directly instead of dlopening a .so. (OpenCL is omitted.)
     // --disable-gpu skips registering it, leaving a CPU-only miner.
     #[cfg(feature = "static-cuda")]
-    let plugins: Vec<String> =
-        if disable_gpu { Vec::new() } else { vec!["builtin:cuda (static)".to_string()] };
+    let plugins: Vec<String> = if disable_gpu { Vec::new() } else { vec!["builtin:cuda (static)".to_string()] };
     #[cfg(feature = "static-cuda")]
     let (app, mut plugin_manager): (App, PluginManager) = {
         let mut manager = PluginManager::new();
         let app = if disable_gpu {
             Opt::into_app()
         } else {
-            manager.register_builtin(
+            let no_winner = keryxcuda::keryx_plugin_enable_raw_nonce_v1();
+            manager.register_builtin_with_output_contract(
                 Opt::into_app(),
                 Box::new(keryxcuda::CudaPlugin::new()?),
+                no_winner,
                 |a| <keryxcuda::CudaOpt as clap::Args>::augment_args(a),
             )
         };
@@ -815,12 +844,10 @@ async fn run() -> Result<(), Error> {
     #[cfg(feature = "pom-cuda")]
     if opt.delete_autotune {
         match keryx_miner::pom_gpu::delete_v4_tune_cache() {
-            Ok(true) => info!(
-                "--delete-autotune: removed the saved autotune cache — every GPU is re-tuned this run."
-            ),
-            Ok(false) => info!(
-                "--delete-autotune: no saved autotune cache to remove — every GPU is tuned from scratch anyway."
-            ),
+            Ok(true) => info!("--delete-autotune: removed the saved autotune cache — every GPU is re-tuned this run."),
+            Ok(false) => {
+                info!("--delete-autotune: no saved autotune cache to remove — every GPU is tuned from scratch anyway.")
+            }
             Err(e) => warn!(
                 "--delete-autotune: could NOT remove the autotune cache: {e}. Continuing with the \
                  existing tuning — delete ~/.keryx/v4tune.json by hand if that is not what you want."
@@ -912,9 +939,7 @@ async fn run() -> Result<(), Error> {
 
         let url_clone = url.clone();
         let api_entries: Vec<ApiEscrowEntry> = tokio::task::spawn_blocking(move || {
-            let response = ureq::get(&url_clone)
-                .call()
-                .map_err(|e| format!("HTTP request failed: {}", e))?;
+            let response = ureq::get(&url_clone).call().map_err(|e| format!("HTTP request failed: {}", e))?;
             serde_json::from_reader::<_, Vec<ApiEscrowEntry>>(response.into_reader())
                 .map_err(|e| format!("JSON parse error: {}", e))
         })
@@ -948,11 +973,7 @@ async fn run() -> Result<(), Error> {
         let json = serde_json::to_string_pretty(&state)?;
         fs::write(&opt.escrow_state_file, &json)?;
 
-        info!(
-            "Recovered {} escrow entries — claimable: {:.4} KRX",
-            count,
-            total_sompi as f64 / 1e8
-        );
+        info!("Recovered {} escrow entries — claimable: {:.4} KRX", count, total_sompi as f64 / 1e8);
         info!("State saved to '{}'.", opt.escrow_state_file);
         return Ok(());
     }
@@ -978,87 +999,156 @@ async fn run() -> Result<(), Error> {
     // (stratum) path builds and signs the coinbase itself and never uses the cert. So require/
     // resolve it only when a configured pool is solo (grpc); pool mining skips it entirely.
     // (Previously this hard-errored at startup for pool miners once H6 was active.)
-    let solo_mining = std::iter::once(&opt.keryxd_address)
-        .chain(opt.backup_pool.iter())
-        .any(|a| !a.starts_with("stratum+tcp://"));
+    let solo_mining =
+        std::iter::once(&opt.keryxd_address).chain(opt.backup_pool.iter()).any(|a| !a.starts_with("stratum+tcp://"));
     let escrow_cert: Option<String> = if !solo_mining {
         info!("Pool (stratum) mining — escrow delegation cert not required (the pool signs the coinbase).");
         None
-    } else { match (&escrow_privkey, opt.mining_address.as_deref()) {
-        (Some(privkey), Some(address)) => {
-            let escrow_pubkey_hex = escrow::pubkey_hex_from_privkey(privkey)?;
-            let prefix = address.split(':').next().unwrap_or("keryx");
-            let own_address = escrow::escrow_key_address(privkey, prefix)?;
-            // Resolution order: an explicitly supplied cert wins; otherwise the miner signs its
-            // own when the payout address is its escrow key's (nothing to set up); otherwise the
-            // file, which is the path for a payout address whose key lives in a wallet.
-            let supplied = opt.escrow_cert.as_deref().map(|c| {
-                let cert = c.trim().to_ascii_lowercase();
-                escrow::verify_escrow_cert(address, &escrow_pubkey_hex, &cert).map(|()| cert)
-            });
-            let resolved = match supplied {
-                Some(Ok(cert)) => {
-                    info!("Escrow delegation cert taken from --escrow-cert.");
-                    // Persist it so the operator does not re-pass the flag every start (signed once).
-                    match escrow::save_cert(&opt.escrow_cert_file, &cert) {
-                        Ok(true) => info!(
-                            "Escrow delegation cert saved to '{}' — future starts need no --escrow-cert.",
-                            opt.escrow_cert_file
-                        ),
-                        Ok(false) => {}
-                        Err(e) => warn!("Could not persist escrow cert to '{}': {} (running this session anyway).", opt.escrow_cert_file, e),
-                    }
-                    Ok(cert)
-                }
-                Some(Err(e)) => Err(e),
-                None => match escrow::self_sign_cert(privkey, address) {
-                    Some(cert) => {
-                        info!("Payout address is this miner's escrow key — delegation signed locally, nothing to set up.");
+    } else {
+        match (&escrow_privkey, opt.mining_address.as_deref()) {
+            (Some(privkey), Some(address)) => {
+                let escrow_pubkey_hex = escrow::pubkey_hex_from_privkey(privkey)?;
+                let prefix = address.split(':').next().unwrap_or("keryx");
+                let own_address = escrow::escrow_key_address(privkey, prefix)?;
+                // Resolution order: an explicitly supplied cert wins; otherwise the miner signs its
+                // own when the payout address is its escrow key's (nothing to set up); otherwise the
+                // file, which is the path for a payout address whose key lives in a wallet.
+                let supplied = opt.escrow_cert.as_deref().map(|c| {
+                    let cert = c.trim().to_ascii_lowercase();
+                    escrow::verify_escrow_cert(address, &escrow_pubkey_hex, &cert).map(|()| cert)
+                });
+                let resolved = match supplied {
+                    Some(Ok(cert)) => {
+                        info!("Escrow delegation cert taken from --escrow-cert.");
+                        // Persist it so the operator does not re-pass the flag every start (signed once).
+                        match escrow::save_cert(&opt.escrow_cert_file, &cert) {
+                            Ok(true) => info!(
+                                "Escrow delegation cert saved to '{}' — future starts need no --escrow-cert.",
+                                opt.escrow_cert_file
+                            ),
+                            Ok(false) => {}
+                            Err(e) => warn!(
+                                "Could not persist escrow cert to '{}': {} (running this session anyway).",
+                                opt.escrow_cert_file, e
+                            ),
+                        }
                         Ok(cert)
                     }
-                    None => escrow::load_cert(&opt.escrow_cert_file, address, &escrow_pubkey_hex).map(|cert| {
-                        info!("Escrow delegation cert loaded from '{}'.", opt.escrow_cert_file);
-                        cert
-                    }),
-                },
-            };
-            match resolved {
-                Ok(cert) => Some(cert),
-                Err(e) => {
-                    if keryx_miner::pom::pom_v3_activation_daa() != u64::MAX {
-                        error!("{}", e);
-                        error!("Two ways to fix it, pick one:");
-                        error!("  1. Mine to this miner's own address — nothing else to do: {}", own_address);
-                        error!("  2. Keep your payout address and authorise this miner from the wallet holding it:");
-                        error!("       keryx-cli delegate-escrow {} {}", escrow_pubkey_hex, address);
-                        error!("     then pass the 128-hex output as --escrow-cert, or save it to '{}'.", opt.escrow_cert_file);
-                        return Err(e.into());
+                    Some(Err(e)) => Err(e),
+                    None => match escrow::self_sign_cert(privkey, address) {
+                        Some(cert) => {
+                            info!("Payout address is this miner's escrow key — delegation signed locally, nothing to set up.");
+                            Ok(cert)
+                        }
+                        None => escrow::load_cert(&opt.escrow_cert_file, address, &escrow_pubkey_hex).map(|cert| {
+                            info!("Escrow delegation cert loaded from '{}'.", opt.escrow_cert_file);
+                            cert
+                        }),
+                    },
+                };
+                match resolved {
+                    Ok(cert) => Some(cert),
+                    Err(e) => {
+                        if keryx_miner::pom::pom_v3_activation_daa() != u64::MAX {
+                            error!("{}", e);
+                            error!("Two ways to fix it, pick one:");
+                            error!("  1. Mine to this miner's own address — nothing else to do: {}", own_address);
+                            error!(
+                                "  2. Keep your payout address and authorise this miner from the wallet holding it:"
+                            );
+                            error!("       keryx-cli delegate-escrow {} {}", escrow_pubkey_hex, address);
+                            error!(
+                                "     then pass the 128-hex output as --escrow-cert, or save it to '{}'.",
+                                opt.escrow_cert_file
+                            );
+                            return Err(e.into());
+                        }
+                        warn!("No usable escrow delegation cert ({}) — it becomes mandatory at H6.", e);
+                        warn!("Mining to {} would need no cert at all.", own_address);
+                        None
                     }
-                    warn!("No usable escrow delegation cert ({}) — it becomes mandatory at H6.", e);
-                    warn!("Mining to {} would need no cert at all.", own_address);
-                    None
                 }
             }
+            _ => None,
         }
-        _ => None,
-    } };
+    };
+
+    // Resolve inference routing before ANY model warmer/probe thread is spawned. Placement is part
+    // of the safety contract: a warmer that chooses first and a late --inference-cards restriction
+    // can otherwise leave a model resident/proven on a forbidden card while advertising an
+    // unproven allowed route.
+    if opt.cpu_inference || opt.enable_cpu_inference {
+        warn!(
+            "CPU inference is deprecated and extremely slow; it will be attempted only because an explicit legacy flag enabled it"
+        );
+        keryx_miner::slm::set_cpu_inference_allowed(true);
+    }
+    if opt.cpu_inference {
+        keryx_miner::slm::set_cpu_inference(true);
+    }
+    if opt.no_shared_inference {
+        info!("--no-shared-inference: OPoI inference will run on this process's own --cuda-device GPU.");
+        keryx_miner::slm::set_no_shared_inference(true);
+    }
+    if let Some(p) = keryx_miner::slm::InferencePolicy::parse(&opt.inference_policy) {
+        keryx_miner::slm::set_inference_policy(p);
+        info!("OPoI inference routing policy: {:?}", p);
+    } else {
+        warn!("--inference-policy '{}' not recognized — using default (speed).", opt.inference_policy);
+    }
+    if opt.no_shared_inference {
+        keryx_miner::slm::set_inference_cards(vec![keryx_miner::slm::inference_gpu_ordinal()]);
+    } else if let Some(list) = opt.inference_cards.clone().or_else(|| std::env::var("KERYX_INFERENCE_CARDS").ok()) {
+        let tokens: Vec<&str> = list.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
+        let mut cards = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            let gpu = token.parse::<usize>().map_err(|_| {
+                format!("invalid --inference-cards entry '{token}' (expected comma-separated GPU ordinals)")
+            })?;
+            if !cards.contains(&gpu) {
+                cards.push(gpu);
+            }
+        }
+        if cards.is_empty() {
+            return Err("--inference-cards was supplied but contains no GPU ordinals".into());
+        }
+        #[cfg(feature = "pom-cuda")]
+        {
+            let visible: Vec<usize> =
+                keryx_miner::pom_gpu::query_all_gpus_vram().into_iter().map(|(gpu, _)| gpu as usize).collect();
+            if let Some(&bad) = cards.iter().find(|gpu| !visible.contains(gpu)) {
+                return Err(format!(
+                    "--inference-cards includes CUDA ordinal {bad}, but visible ordinals are {:?}",
+                    visible
+                )
+                .into());
+            }
+        }
+        info!("--inference-cards: OPoI inference restricted to GPU ordinals {:?}; other cards are PoW-only.", cards);
+        keryx_miner::slm::set_inference_cards(cards);
+    }
+
+    // Publish low-RAM mode before any model prefetch/warmer thread starts. Setting it after those
+    // threads were spawned left a startup window where every card could load concurrently despite
+    // the operator explicitly requesting serialized bring-up.
+    #[cfg(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))))]
+    if opt.low_ram {
+        keryx_miner::pom_gpu::set_low_ram(true);
+        info!("--low-ram: loading models onto GPUs one at a time (lower peak system RAM, slower startup).");
+    }
 
     // Phase-3 OPoI: load inference models before mining starts.
     //   (no flag)    → AUTO: largest PoM tier that fits this GPU's VRAM (per-process)
-    //   --light      → Gemma-3-4B (legacy: TinyLlama)
-    //   --high       → Qwen3-32B  (legacy: + DeepSeek-R1-32B)
-    //   --very-high  → Llama-3.3-70B (legacy: all 4 models)
-
-    // PoM (OPoI v2): one flag = one tier. Each GPU mines AND serves exactly the single model it
+    // PoM: one flag = one H6 tier. Each GPU mines AND serves exactly the single model it
     // proves possession of (multi-tier coverage is a network property, not per-GPU).
-    //   --light → Gemma-3-4B   --high → Qwen3-32B   --very-high → Llama-3.3-70B   (no flag → AUTO)
+    //   --very-light → Qwen3.5-9B; --light → GLM-9B; default → Gemma-12B;
+    //   --high → Qwen3.6-27B; --very-high → Kimi-48B (no flag → AUTO).
     // AMD: ONE tier per process (the OpenCL PoM backend keeps a single resident blob — no
     // per-card model map like CUDA's set_device_model). An explicit user override (--force-model /
-    // --tier / --light etc.) is honored PROCESS-WIDE; the default stays Light (Gemma-3-4B) — the
-    // OOM-safe pick for low-VRAM cards, and inference (Vulkan llama-server, else candle-CPU) can
-    // always serve it. A forced tier SKIPS the VRAM capability gate (same power-user contract as
+    // --tier / --light etc.) is honored PROCESS-WIDE; AUTO selects from the current H6 floors. A forced
+    // tier SKIPS the VRAM capability gate (same power-user contract as
     // CUDA --force-model): an undersized card will fail/OOM loading the GPU-resident walk blob;
-    // llama-server falls back to candle-CPU if inference doesn't fit next to the blob.
+    // the model route is withdrawn if GPU inference cannot fit next to the blob.
     #[cfg(feature = "pom-opencl")]
     let (tier, tier_forced) = {
         let forced = opt.force_model.as_deref().and_then(|raw| {
@@ -1075,12 +1165,15 @@ async fn run() -> Result<(), Error> {
             info!("AMD/OpenCL: tier {} (--force-model, process-wide; VRAM check bypassed — an undersized card will fail to load the PoM blob).", t.pom_model_name());
             (t, true)
         } else if let Some(t) = pinned_tier(&opt) {
-            info!("AMD/OpenCL: tier {} (pinned by flag, process-wide — the model must fit the card's VRAM).", t.pom_model_name());
+            info!(
+                "AMD/OpenCL: tier {} (pinned by flag, process-wide — the model must fit the card's VRAM).",
+                t.pom_model_name()
+            );
             (t, false)
         } else {
             // No explicit tier, or `--tier auto` (pinned_tier returns None for "auto"): pick the
-            // largest H4 tier that fits card 0's VRAM. Heavier tier = higher PoM reward; the AMD
-            // margin keeps it OOM-safe (8 GB → EXAONE, 16 GB → Mistral). VeryLight is the floor.
+            // largest H6 tier that fits card 0's VRAM. Heavier tier = higher PoM reward;
+            // VeryLight/Qwen3.5-9B is the floor.
             (select_tier_auto(), false)
         }
     };
@@ -1099,13 +1192,12 @@ async fn run() -> Result<(), Error> {
     // The primary tier came from --force-model → skip the VRAM capability gate below. (If an AUTO
     // card independently reached the same tier it fits anyway, so the gate would pass regardless.)
     #[cfg(not(feature = "pom-opencl"))]
-    let tier_forced = device_tiers
-        .iter()
-        .any(|(_, t, forced)| *forced && *t == tier);
+    let tier_forced = device_tiers.iter().any(|(_, t, forced)| *forced && *t == tier);
 
     // Warn if GPU power limit is below safe threshold for the RESOLVED model tier (post-auto).
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads. Driven by the
     // resolved tier (not the raw flags) so an auto-picked High/VeryHigh card gets the right warning.
+    #[cfg(not(feature = "pom-opencl"))]
     {
         use keryx_miner::models::Tier;
         check_gpu_power_limit(matches!(tier, Tier::High | Tier::VeryHigh), matches!(tier, Tier::VeryHigh));
@@ -1134,9 +1226,7 @@ async fn run() -> Result<(), Error> {
         let mut extra: Vec<&'static keryx_miner::models::ModelSpec> = Vec::new();
         for (_, t, _) in &device_tiers {
             let ds = t.pom_spec();
-            if !specs_v2.iter().any(|s| s.model_id == ds.model_id)
-                && !extra.iter().any(|e| e.model_id == ds.model_id)
-            {
+            if !specs_v2.iter().any(|s| s.model_id == ds.model_id) && !extra.iter().any(|e| e.model_id == ds.model_id) {
                 extra.push(ds);
             }
         }
@@ -1161,10 +1251,7 @@ async fn run() -> Result<(), Error> {
         .max_by_key(|s| s.min_vram_mb);
     keryx_miner::slm::set_v2_lineup(specs_v2);
     keryx_miner::slm::init_supported(specs_v2);
-    info!(
-        "OPoI Phase-3 — {} uncensored model(s) staged (legacy lineup dropped, post-fork).",
-        specs_v2.len(),
-    );
+    info!("OPoI Phase-3 — {} uncensored model(s) staged (legacy lineup dropped, post-fork).", specs_v2.len(),);
     // Prefetch BOTH lineups in the BACKGROUND (suprnova: backgrounded so a worker/plugin error
     // surfaces immediately instead of after a multi-GB download — the HiveOS "black screen" fix).
     // The OPoI hard gate keeps PoW suspended until the files are ready and un-suspends itself.
@@ -1177,8 +1264,7 @@ async fn run() -> Result<(), Error> {
         // and ENOSPC it out → "index build failed: no such file or directory" on HiveOS. Downloading
         // the mining tier first guarantees mining works even if the rest later fail on a full disk.
         if let Some(ps) = pom_spec {
-            let one: &'static [&'static keryx_miner::models::ModelSpec] =
-                Box::leak(vec![ps].into_boxed_slice());
+            let one: &'static [&'static keryx_miner::models::ModelSpec] = Box::leak(vec![ps].into_boxed_slice());
             // RETRY until the mining-tier model is actually on disk. The previous build logged one
             // "will retry" line and then the task ENDED — nothing retried, so a failed download left
             // the rig stuck at "preparing…" forever with the real reason scrolled off. Now every
@@ -1247,32 +1333,28 @@ async fn run() -> Result<(), Error> {
         }
         // AMD GPU inference: bring up the Vulkan llama.cpp server once the model GGUF is on disk
         // (background — download + VRAM load is slow). If it can't come up (no bundled llama-server,
-        // no Vulkan ICD, no AMD GPU, OOM), OPoI inference transparently falls back to candle-CPU.
+        // no Vulkan ICD, no AMD GPU, OOM), the model is withdrawn from OPoI.
         #[cfg(feature = "pom-opencl")]
         {
             let gpath_llama = gpath.clone();
             std::thread::spawn(move || {
-                let port: u16 = std::env::var("KERYX_LLAMA_PORT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(18099);
                 let ok_marker = std::path::Path::new(&gpath_llama).parent().map(|d| d.join(".ok"));
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
                 loop {
-                    let ready = std::path::Path::new(&gpath_llama).exists()
-                        && ok_marker.as_ref().map_or(true, |m| m.exists());
+                    let ready =
+                        std::path::Path::new(&gpath_llama).exists() && ok_marker.as_ref().map_or(true, |m| m.exists());
                     if ready {
                         break;
                     }
                     if std::time::Instant::now() > deadline {
-                        warn!("PoM(AMD): model GGUF not ready in 30 min — OPoI inference stays on candle-CPU.");
+                        warn!("PoM(AMD): model GGUF not ready in 30 min — OPoI inference remains unavailable.");
                         return;
                     }
                     std::thread::sleep(std::time::Duration::from_secs(5));
                 }
                 // Prefer the IN-PROCESS Vulkan engine (zero-dup: it also hosts the model the PoM
                 // walk gathers over, so the inference card holds ONE resident copy). No
-                // libkeryx-llama-vk.so → the llama-server subprocess; none → candle-CPU.
+                // libkeryx-llama-vk.so → the llama-server subprocess; neither → unavailable.
                 // Device selection lives INSIDE ensure_loaded/try_start (issue #18: pin to a
                 // discrete GPU, KERYX_LLAMA_VK_DEVICE overrides) — the `0` here is only the
                 // last-resort ggml index when no discrete Vulkan device is found at all.
@@ -1290,17 +1372,18 @@ async fn run() -> Result<(), Error> {
                     info!(
                         "PoM(AMD): model ({gguf_mb} MiB) + possession blob need ~{need_mb} MiB on one                          card; largest card has {vram_mb} MiB — the inference card will be DEDICATED to                          OPoI (it will not mine); all other cards mine at full rate."
                     );
+                    keryx_miner::pom_opencl::require_dedicated_inference_card();
                 }
-                if !keryx_miner::llama_engine_vk::ensure_loaded(&gpath_llama, 0) {
-                    keryx_miner::llama_vulkan::try_start(&gpath_llama, port);
-                }
+                let inf_gpu = keryx_miner::slm::inference_gpu_for_model(&spec.model_id);
+                keryx_miner::slm::warm_inference_route(spec.model_id, inf_gpu);
             });
         }
         // Apple Silicon (Metal) — llama.cpp Metal inference via the in-process engine (Phase 3b of
         // candle-independence): if `libkeryx-llama.dylib` sits next to the miner (or
         // `KERYX_LLAMA_SO` points at one), bring it up once the GGUF is on disk — slm then prefers
-        // it over candle-Metal. No .dylib = candle-Metal inference stays active (dormant-fallback).
-        // No llama-server subprocess fallback here: Metal doesn't ship one and llama_vulkan is
+        // it as the required GPU route. No .dylib means the inference capability remains withdrawn
+        // and the OPoI mining gate stays closed (unless the deprecated CPU override is explicit).
+        // No llama-server subprocess fallback here: Metal does not ship one and llama_vulkan is
         // gated to pom-cuda/pom-opencl only.
         #[cfg(all(target_os = "macos", feature = "pom-metal"))]
         {
@@ -1309,58 +1392,24 @@ async fn run() -> Result<(), Error> {
                 let ok_marker = std::path::Path::new(&gpath_llama).parent().map(|d| d.join(".ok"));
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
                 loop {
-                    let ready = std::path::Path::new(&gpath_llama).exists()
-                        && ok_marker.as_ref().map_or(true, |m| m.exists());
+                    let ready =
+                        std::path::Path::new(&gpath_llama).exists() && ok_marker.as_ref().map_or(true, |m| m.exists());
                     if ready {
                         break;
                     }
                     if std::time::Instant::now() > deadline {
-                        warn!("PoM(Metal): model GGUF not ready in 30 min — llama engine not started; candle inference stays active.");
+                        warn!("PoM(Metal): model GGUF not ready in 30 min — GPU inference unavailable; OPoI mining remains gated.");
                         return;
                     }
                     std::thread::sleep(std::time::Duration::from_secs(5));
                 }
-                // Metal has one integrated GPU — ordinal 0 unconditionally. No slm::inference_gpu_ordinal
-                // dispatch here (that's CUDA-oriented).
-                let _ = keryx_miner::llama_engine::ensure_loaded(&gpath_llama, 0);
+                let inf_gpu = keryx_miner::slm::inference_gpu_for_model(&spec.model_id);
+                keryx_miner::slm::warm_inference_route(spec.model_id, inf_gpu);
             });
         }
-        // NVIDIA llama.cpp-CUDA inference (Phase 1 of candle-independence): if a CUDA llama-server
-        // is bundled next to the miner (or KERYX_LLAMA_SERVER points at one), bring it up once the
-        // GGUF is on disk — slm then prefers it over candle. No binary = try_start logs once and
-        // returns; candle-GPU inference is untouched. The server is pinned to ONE GPU (the same
-        // biggest-VRAM ordinal candle uses; KERYX_LLAMA_CUDA_DEVICE overrides).
-        #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
-        {
-            let gpath_llama = gpath.clone();
-            std::thread::spawn(move || {
-                let port: u16 = std::env::var("KERYX_LLAMA_PORT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(18099);
-                let ok_marker = std::path::Path::new(&gpath_llama).parent().map(|d| d.join(".ok"));
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
-                loop {
-                    let ready = std::path::Path::new(&gpath_llama).exists()
-                        && ok_marker.as_ref().map_or(true, |m| m.exists());
-                    if ready {
-                        break;
-                    }
-                    if std::time::Instant::now() > deadline {
-                        warn!("PoM(CUDA): model GGUF not ready in 30 min — llama engine not started; candle inference stays active.");
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                }
-                // Prefer the IN-PROCESS engine (Phase 2: hosts the walk's model too — zero-dup).
-                // No libkeryx-llama.so → fall back to the Phase-1 llama-server subprocess; no
-                // llama-server either → candle stays active (dormant-fallback chain).
-                let inf_gpu = keryx_miner::slm::inference_gpu_ordinal();
-                if !keryx_miner::llama_engine::ensure_loaded(&gpath_llama, inf_gpu) {
-                    keryx_miner::llama_vulkan::try_start(&gpath_llama, port);
-                }
-            });
-        }
+        // CUDA route warmers are launched below, after every per-device model assignment is
+        // published. Starting one here raced the mixed-rig map and could prove each tier on the
+        // same largest card instead of the card that actually owns it.
         #[cfg(feature = "pom-opencl")]
         keryx_miner::pom_opencl::set_mining_tier(spec.model_id, gpath, tier_idx);
         #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
@@ -1375,7 +1424,9 @@ async fn run() -> Result<(), Error> {
             // Record which cards are --force-model-pinned so the OOM auto-demotion never overrides an
             // explicit forced choice (forced = load exactly this, no VRAM check).
             for (dev, _t, is_forced) in &device_tiers {
-                if *is_forced { keryx_miner::pom_gpu::set_device_forced(*dev); }
+                if *is_forced {
+                    keryx_miner::pom_gpu::set_device_forced(*dev);
+                }
             }
             // Per-card overrides: cards whose best-fit (or --force-model) differs from the primary
             // get their OWN model, and those distinct smaller models are prefetched too.
@@ -1390,6 +1441,8 @@ async fn run() -> Result<(), Error> {
                     }
                 }
             }
+            let mut route_specs = vec![spec];
+            route_specs.extend(extra.iter().copied());
             if !extra.is_empty() {
                 info!(
                     "Per-card model selection ACTIVE: {} distinct smaller model(s) for lighter cards \
@@ -1397,11 +1450,82 @@ async fn run() -> Result<(), Error> {
                     extra.len(),
                     spec.dir_name,
                 );
-                let leaked: &'static [&'static keryx_miner::models::ModelSpec] =
-                    Box::leak(extra.into_boxed_slice());
+                let leaked: &'static [&'static keryx_miner::models::ModelSpec] = Box::leak(extra.into_boxed_slice());
                 tokio::spawn(async move {
-                    let _ = tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(leaked)).await;
+                    let mut round = 0u32;
+                    loop {
+                        match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(leaked)).await {
+                            Ok(Ok(())) => {
+                                info!("Every per-card CUDA model is staged; all assigned tier routes can be proved.");
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                round += 1;
+                                warn!("Per-card model staging failed (attempt {}): {} — retrying in 60s", round, e);
+                            }
+                            Err(e) => {
+                                round += 1;
+                                warn!(
+                                    "Per-card model staging task crashed (attempt {}): {} — retrying in 60s",
+                                    round, e
+                                );
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
                 });
+            }
+
+            // Prove one real serving route for every distinct tier assigned on a mixed CUDA rig,
+            // including the primary. Each lightweight coordinator waits for its own completed GGUF
+            // indefinitely and then stays alive so a later context reset can invalidate/re-prove the
+            // exact `(model, GPU)` route. This is intentionally launched only after set_mining_tier
+            // and every set_device_model call above, making model-aware placement deterministic.
+            let route_models: Vec<([u8; 32], String)> = route_specs
+                .into_iter()
+                .map(|route_spec| {
+                    (route_spec.model_id, keryx_miner::slm::gguf_path_for(route_spec).to_string_lossy().into_owned())
+                })
+                .collect();
+            if opt.low_ram {
+                // A single durable coordinator serializes the real generation probes. Successful
+                // entries are cached, so later rounds are cheap health checks; an invalidated route
+                // alone reloads/re-proves. Failed or not-yet-downloaded tiers cannot starve the rest.
+                std::thread::spawn(move || loop {
+                    for (model_id, route_path) in &route_models {
+                        let ok_marker = std::path::Path::new(route_path).parent().map(|dir| dir.join(".ok"));
+                        let ready = std::path::Path::new(route_path).exists()
+                            && ok_marker.as_ref().map_or(true, |marker| marker.exists());
+                        if !ready {
+                            continue;
+                        }
+                        let inf_gpu = keryx_miner::slm::inference_gpu_for_model(model_id);
+                        if !keryx_miner::slm::run_inference_self_test(model_id, inf_gpu) {
+                            warn!(
+                                "OPoI low-RAM route proof for model {:.8} on GPU {} is not ready; retrying",
+                                hex::encode(model_id),
+                                inf_gpu
+                            );
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                });
+            } else {
+                for (model_id, route_path) in route_models {
+                    std::thread::spawn(move || {
+                        let ok_marker = std::path::Path::new(&route_path).parent().map(|dir| dir.join(".ok"));
+                        loop {
+                            let ready = std::path::Path::new(&route_path).exists()
+                                && ok_marker.as_ref().map_or(true, |marker| marker.exists());
+                            if ready {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                        }
+                        let inf_gpu = keryx_miner::slm::inference_gpu_for_model(&model_id);
+                        keryx_miner::slm::warm_inference_route(model_id, inf_gpu);
+                    });
+                }
             }
         }
         // Apple Silicon (Metal): record the mining tier (global). Phase 1 loads a standalone Metal
@@ -1412,7 +1536,9 @@ async fn run() -> Result<(), Error> {
         }
         info!(
             "PoM: configured for tier {} ({}); possession index + GPU walk load lazily at DAA {}.",
-            tier_idx, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA
+            tier_idx,
+            spec.dir_name,
+            keryx_miner::pom::POM_ACTIVATION_DAA
         );
         info!(
             "H3 hardfork: this build is H3-ready. It auto-switches to the post-fork PoM convention \
@@ -1431,15 +1557,6 @@ async fn run() -> Result<(), Error> {
                 keryx_miner::pom::activation_daa()
             );
         }
-    }
-
-    // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
-    // that cannot run inference must fail fast with a clear message rather than spam panics.
-    // --low-ram / --save-ram: serialize model bring-up across GPUs (peak host RAM = one model).
-    #[cfg(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))))]
-    if opt.low_ram {
-        keryx_miner::pom_gpu::set_low_ram(true);
-        info!("--low-ram: loading models onto GPUs one at a time (lower peak system RAM, slower startup).");
     }
 
     // --wait-ready: hold mining + the OPoI declaration until every card's walk is installed
@@ -1473,7 +1590,14 @@ async fn run() -> Result<(), Error> {
         let width = own.iter().copied().max().map(|m| m + 1).unwrap_or(given.len()).max(given.len());
         let mut map: Vec<Option<u32>> = vec![None; width];
         for (pos, val) in given.iter().enumerate() {
-            let dev = if own.is_empty() { pos } else { match own.get(pos) { Some(d) => *d, None => continue } };
+            let dev = if own.is_empty() {
+                pos
+            } else {
+                match own.get(pos) {
+                    Some(d) => *d,
+                    None => continue,
+                }
+            };
             if dev < map.len() {
                 map[dev] = *val;
             }
@@ -1483,10 +1607,7 @@ async fn run() -> Result<(), Error> {
             .enumerate()
             .map(|(dev, i)| match i {
                 Some(i) => {
-                    let c = (*i).clamp(
-                        keryx_miner::pom_gpu::INTENSITY_MIN,
-                        keryx_miner::pom_gpu::INTENSITY_MAX,
-                    );
+                    let c = (*i).clamp(keryx_miner::pom_gpu::INTENSITY_MIN, keryx_miner::pom_gpu::INTENSITY_MAX);
                     let note = if c != *i { format!(" (clamped from {})", i) } else { String::new() };
                     format!("GPU{}={}{} → {} nonces", dev, c, note, 1u64 << c)
                 }
@@ -1509,87 +1630,56 @@ async fn run() -> Result<(), Error> {
         );
     }
 
-    // CPU inference is OFF by default: a card that can't run GPU inference withdraws from OPoI
-    // rather than doing futile CPU work. Either flag opts in; --cpu-inference additionally forces
-    // CPU from the start.
-    if opt.cpu_inference || opt.enable_cpu_inference {
-        keryx_miner::slm::set_cpu_inference_allowed(true);
-    }
-    if opt.cpu_inference {
-        // Explicit operator opt-out: force OPoI inference onto the CPU for the whole session.
-        keryx_miner::slm::set_cpu_inference(true);
-    }
-    if opt.no_shared_inference {
-        // One process per GPU: keep inference on this process's own card (no global-biggest pile-up).
-        info!("--no-shared-inference: OPoI inference will run on this process's own --cuda-device GPU.");
-        keryx_miner::slm::set_no_shared_inference(true);
-    }
-    // Multi-GPU OPoI router policy (default: speed). Invalid values fall back to the env/default.
-    if let Some(p) = keryx_miner::slm::InferencePolicy::parse(&opt.inference_policy) {
-        keryx_miner::slm::set_inference_policy(p);
-        info!("OPoI inference routing policy: {:?}", p);
-    } else {
-        warn!("--inference-policy '{}' not recognized — using default (speed).", opt.inference_policy);
-    }
-    // Restrict which CUDA cards serve inference (others stay PoW-only). --no-shared-inference is the
-    // single-card special case: bind inference to this process's own walk GPU.
-    if opt.no_shared_inference {
-        keryx_miner::slm::set_inference_cards(vec![keryx_miner::slm::inference_gpu_ordinal()]);
-    } else if let Some(list) = opt.inference_cards.as_ref() {
-        let cards: Vec<usize> = list.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect();
-        if !cards.is_empty() {
-            info!("--inference-cards: OPoI inference restricted to CUDA ordinals {:?}; other cards are PoW-only.", cards);
-            keryx_miner::slm::set_inference_cards(cards);
-        }
-    }
-    if opt.cpu_inference || keryx_miner::slm::cpu_inference_enabled() {
-        info!("CPU inference mode — skipping the GPU/cuBLAS probe (OPoI inference runs on the CPU).");
+    if cfg!(feature = "pom-opencl") {
+        info!("AMD/OpenCL: OPoI inference uses the GPU llama.cpp Vulkan engine; skipping the CUDA/cuBLAS probe.");
     } else if cfg!(all(target_os = "macos", feature = "pom-metal")) {
-        // Apple Silicon: inference targets the Metal GPU (candle-metal), not cuBLAS — the cuBLAS
-        // probe is meaningless here. If candle-metal can't run this model, load_engine_with_fallback
-        // degrades to CPU on its own.
-        info!("Apple Silicon: OPoI inference targets the Metal GPU (auto-falls back to CPU if candle-metal can't run this model). Skipping the cuBLAS probe.");
+        // Apple Silicon inference is hosted by the in-process llama.cpp Metal engine.
+        info!("Apple Silicon: OPoI inference targets the llama.cpp Metal GPU engine. Skipping the CUDA/cuBLAS probe.");
     } else {
-    info!("Probing GPU inference (cuBLAS) before mining…");
-    match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
-        Ok(keryx_miner::slm::GpuProbe::Ok) => info!("GPU inference verified — cuBLAS loaded successfully."),
-        Ok(keryx_miner::slm::GpuProbe::NoCuda) => {
-            warn!("No CUDA device detected — inference will run on CPU (small models only, slow).");
-        }
-        Ok(keryx_miner::slm::GpuProbe::CublasMissing) => {
-            warn!("CUDA GPU detected but a CUDA runtime lib is missing — installing them automatically (one-time)…");
-            #[cfg(target_os = "linux")]
-            {
-                let installed = tokio::task::spawn_blocking(install_cuda_libs).await.unwrap_or(false);
-                if !installed {
-                    error!("Automatic CUDA lib install failed — install them manually then restart:");
-                    error!("  apt-get install -y libcublas-12-2 libcurand-12-2");
+        info!("Probing GPU inference (cuBLAS) before mining…");
+        match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
+            Ok(keryx_miner::slm::GpuProbe::Ok) => info!("GPU inference verified — cuBLAS loaded successfully."),
+            Ok(keryx_miner::slm::GpuProbe::NoCuda) => {
+                warn!(
+                    "No CUDA device detected — H6 inference is unavailable and models will not be declared serveable."
+                );
+            }
+            Ok(keryx_miner::slm::GpuProbe::CublasMissing) => {
+                warn!(
+                    "CUDA GPU detected but a CUDA runtime lib is missing — installing them automatically (one-time)…"
+                );
+                #[cfg(target_os = "linux")]
+                {
+                    let installed = tokio::task::spawn_blocking(install_cuda_libs).await.unwrap_or(false);
+                    if !installed {
+                        error!("Automatic CUDA lib install failed — install them manually then restart:");
+                        error!("  apt-get install -y libcublas-12-2 libcurand-12-2");
+                        return Err("CUDA runtime libs missing — cannot start OPoI mining".into());
+                    }
+                    // Re-probe in-process. The dynamic loader may still hold a stale cache, so if
+                    // the freshly-installed libs aren't picked up here, exit cleanly and let the
+                    // supervisor (HiveOS/PM2) relaunch us with a fresh loader cache.
+                    match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
+                        Ok(keryx_miner::slm::GpuProbe::Ok) => {
+                            info!("CUDA libs installed — GPU inference verified, starting mining.");
+                        }
+                        _ => {
+                            info!("CUDA libs installed successfully — restarting miner to activate them.");
+                            std::process::exit(0);
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    error!("CUDA GPU detected but a CUDA runtime lib failed to load — install the CUDA 12.6 toolkit and restart.");
                     return Err("CUDA runtime libs missing — cannot start OPoI mining".into());
                 }
-                // Re-probe in-process. The dynamic loader may still hold a stale cache, so if
-                // the freshly-installed libs aren't picked up here, exit cleanly and let the
-                // supervisor (HiveOS/PM2) relaunch us with a fresh loader cache.
-                match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
-                    Ok(keryx_miner::slm::GpuProbe::Ok) => {
-                        info!("CUDA libs installed — GPU inference verified, starting mining.");
-                    }
-                    _ => {
-                        info!("CUDA libs installed successfully — restarting miner to activate them.");
-                        std::process::exit(0);
-                    }
-                }
             }
-            #[cfg(not(target_os = "linux"))]
-            {
-                error!("CUDA GPU detected but a CUDA runtime lib failed to load — install the CUDA 12.6 toolkit and restart.");
-                return Err("CUDA runtime libs missing — cannot start OPoI mining".into());
+            Err(e) => {
+                error!("GPU probe task panicked: {}", e);
+                return Err(e.into());
             }
         }
-        Err(e) => {
-            error!("GPU probe task panicked: {}", e);
-            return Err(e.into());
-        }
-    }
     }
     info!("Found plugins: {:?}", plugins);
     info!("Plugins found {} workers", worker_count);
@@ -1693,14 +1783,26 @@ async fn run() -> Result<(), Error> {
     if pools.len() > 1 {
         crate::client::stratum::set_failover_enabled(true);
         let failover_after: u64 = std::env::var("KERYX_FAILOVER_AFTER_SECS")
-            .ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 30).unwrap_or(90);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n >= 30)
+            .unwrap_or(90);
         let grace: u64 = std::env::var("KERYX_FAILBACK_GRACE_SECS")
-            .ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 10).unwrap_or(60);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n >= 10)
+            .unwrap_or(60);
         let probe_secs: u64 = std::env::var("KERYX_FAILBACK_PROBE_SECS")
-            .ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 10).unwrap_or(30);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n >= 10)
+            .unwrap_or(30);
         info!(
             "Pool failover ENABLED — primary + {} backup(s): {:?}. Failover after {}s no-job; failback grace {}s.",
-            pools.len() - 1, pools, failover_after, grace
+            pools.len() - 1,
+            pools,
+            failover_after,
+            grace
         );
 
         // FAILOVER MONITOR — steps DOWN the list when the current pool delivers no jobs.
@@ -1722,8 +1824,10 @@ async fn run() -> Result<(), Error> {
                         let cur = crate::client::stratum::desired_pool();
                         if cur + 1 < n {
                             let next = cur + 1;
-                            warn!("FAILOVER: pool[{}] ({}) delivered no jobs for {}s → switching to pool[{}] ({}).",
-                                cur, pools_dbg[cur], failover_after, next, pools_dbg[next]);
+                            warn!(
+                                "FAILOVER: pool[{}] ({}) delivered no jobs for {}s → switching to pool[{}] ({}).",
+                                cur, pools_dbg[cur], failover_after, next, pools_dbg[next]
+                            );
                             crate::client::stratum::set_desired_pool(next);
                         }
                         last_job = Instant::now(); // give the (new) pool a fresh window
@@ -1751,7 +1855,10 @@ async fn run() -> Result<(), Error> {
                     let mut switched_to: Option<usize> = None;
                     for i in 0..cur {
                         if tcp_pool_reachable(&pools[i], Duration::from_secs(10)).await {
-                            warn!("FAILBACK: higher-priority pool[{}] ({}) is reachable — switching back up.", i, pools[i]);
+                            warn!(
+                                "FAILBACK: higher-priority pool[{}] ({}) is reachable — switching back up.",
+                                i, pools[i]
+                            );
                             crate::client::stratum::set_desired_pool(i);
                             switched_to = Some(i);
                             break;
@@ -1786,7 +1893,16 @@ async fn run() -> Result<(), Error> {
         if pools.len() > 1 {
             info!("Mining pool target: pool[{}] {}", target, pool_address);
         }
-        match client_main(&opt, pool_address, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone(), escrow_cert.clone()).await {
+        match client_main(
+            &opt,
+            pool_address,
+            block_template_ctr.clone(),
+            &plugin_manager,
+            escrow_privkey.clone(),
+            escrow_cert.clone(),
+        )
+        .await
+        {
             Ok(_) => info!("Client closed gracefully"),
             Err(e) => error!("Client closed with error {:?}", e),
         }
@@ -1812,8 +1928,5 @@ async fn run() -> Result<(), Error> {
 /// touching the active mining connection or its globals. Just a connect within `timeout`.
 async fn tcp_pool_reachable(url: &str, timeout: Duration) -> bool {
     let addr = url.split_once("://").map(|(_, a)| a).unwrap_or(url);
-    matches!(
-        tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await,
-        Ok(Ok(_))
-    )
+    matches!(tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await, Ok(Ok(_)))
 }

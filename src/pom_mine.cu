@@ -520,6 +520,81 @@ __device__ __forceinline__ const ulonglong2* v4_chunk_addr(
     return q + (idx - prefix[lo]) * 2ULL;
 }
 
+// Sidecar experiment helpers. These deliberately have distinct names from the NCF helpers below:
+// the production kernels and their generated code remain untouched until the sidecar path has passed
+// exactness and performance gates. `inv_n` is floor((2^64-1) / n), matching v4_barrett_mod; the
+// quotient can undershoot by at most one, so one conditional subtraction is exact.
+__device__ __forceinline__ unsigned long long v4_sidecar_barrett_mod(
+    unsigned long long x, unsigned long long n, unsigned long long inv_n) {
+    const unsigned long long q = __umul64hi(x, inv_n);
+    unsigned long long r = x - q * n;
+    if (r >= n) r -= n;
+    return r;
+}
+
+// Resolve a canonical chunk through the same model-owned bucket LUT as NCF. The LUT entry is a
+// lower-bound segment hint; the short forward walk makes the answer identical to v4_chunk_addr's
+// binary search, including chunks near tensor boundaries.
+__device__ __forceinline__ const ulonglong2* v4_sidecar_chunk_addr_lut(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    const unsigned short* lut, unsigned int lut_sh,
+    unsigned long long tile_index, unsigned int lane) {
+    const unsigned long long idx = tile_index * (unsigned long long)V4_TILE_CHUNKS + lane;
+    unsigned int lo = __ldg(&lut[idx >> lut_sh]);
+    while (lo + 1 < T && __ldg(&prefix[lo + 1]) <= idx) lo++;
+    const ulonglong2* q = (const ulonglong2*)bases[lo];
+    return q + (idx - prefix[lo]) * 2ULL;
+}
+
+// Build one canonical snippet_fold per complete 1 KiB tile. One thread reads only the tile's first
+// 32-byte chunk and writes one u64, so the persistent sidecar costs exactly model_bytes / 128
+// (0.78125%) for the complete-tile portion of the canonical blob. Build once per model/prefix layout,
+// on the same stream that will consume it; never share it across model generations by size alone.
+extern "C" __global__ void pom_build_v4_snippet_folds_lut(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long n_tiles, const unsigned short* lut, unsigned int lut_sh,
+    unsigned long long* snippet_folds) {
+    const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (i >= n_tiles) return;
+    const ulonglong2* q = v4_sidecar_chunk_addr_lut(bases, prefix, T, lut, lut_sh, i, 0);
+    const ulonglong2 c0 = q[0], c1 = q[1];
+    unsigned long long sf = 0;
+    sf = mix64(sf ^ (unsigned int)(c0.x)); sf = mix64(sf ^ (unsigned int)(c0.x >> 32));
+    sf = mix64(sf ^ (unsigned int)(c0.y)); sf = mix64(sf ^ (unsigned int)(c0.y >> 32));
+    sf = mix64(sf ^ (unsigned int)(c1.x)); sf = mix64(sf ^ (unsigned int)(c1.x >> 32));
+    sf = mix64(sf ^ (unsigned int)(c1.y)); sf = mix64(sf ^ (unsigned int)(c1.y >> 32));
+    snippet_folds[i] = sf;
+}
+
+// Experimental sidecar chase. Output is intentionally byte/layout compatible with
+// pom_mine_v4_chase_seeded: step-major u32 offsets [K][n_nonces], ready for either the unchanged
+// pom_mine_v4_tc_seeded consumer or the LUT consumer below. Unlike the old chase it never searches
+// model segments or re-reads snippets; its only dependent memory access is snippet_folds[off].
+// The caller must guarantee n_tiles != 0, n_tiles <= UINT32_MAX, and inv_n = UINT64_MAX / n_tiles.
+extern "C" __global__ void pom_mine_v4_chase_sidecar_seeded(
+    const unsigned long long* snippet_folds, unsigned long long n_tiles,
+    unsigned long long inv_n, unsigned int K,
+    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
+    unsigned long long time_, unsigned long long nonce_base, unsigned long long n_nonces,
+    const unsigned long long* h10_seeds, unsigned int h10,
+    unsigned int* offsets) {
+    const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (i >= n_nonces) return;
+    const unsigned long long nonce = nonce_base + i;
+    const unsigned long long seed =
+        pom_seed_fold_era(h10, h10_seeds, i, nonce, time_, s0, s1, s2, s3);
+    unsigned long long off = v4_sidecar_barrett_mod(
+        mix64(seed ^ V4_OFFSET_FIRST_SALT), n_tiles, inv_n);
+    for (unsigned int step = 1; step <= K; step++) {
+        offsets[(unsigned long long)(step - 1) * n_nonces + i] = (unsigned int)off;
+        if (step == K) break;
+        const unsigned long long sf = __ldg(&snippet_folds[off]);
+        off = v4_sidecar_barrett_mod(
+            mix64(seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf),
+            n_tiles, inv_n);
+    }
+}
+
 extern "C" __global__ void pom_mine_v4_chase_seeded(
     const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
     unsigned long long n_tiles, unsigned int K,
@@ -703,6 +778,106 @@ extern "C" __global__ void pom_mine_v4_tc_seeded(
     unsigned long long, unsigned long long, unsigned long long, unsigned long long,
     unsigned long long, unsigned long long, const unsigned int*, const unsigned long long*,
     unsigned int, unsigned long long*) {}
+#endif
+
+// Optional TC consumer for the sidecar chase. This is a separate symbol so the established
+// pom_mine_v4_tc_seeded ABI/SASS remains the control. It consumes the exact same step-major offsets,
+// but replaces every per-lane prefix binary search on the full-tile fetch path with the model-owned
+// lower-bound LUT used to construct the sidecar.
+#if __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void v4_sidecar_tile_cp_async_lut(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    const unsigned short* lut, unsigned int lut_sh,
+    unsigned long long tile_index, unsigned int* s_tile, unsigned int lane) {
+    const ulonglong2* q = v4_sidecar_chunk_addr_lut(
+        bases, prefix, T, lut, lut_sh, tile_index, lane);
+    ulonglong2* dst = (ulonglong2*)(s_tile + lane * 8);
+    v4_cp_async16(dst, q);
+    v4_cp_async16(dst + 1, q + 1);
+}
+
+extern "C" __global__ void pom_mine_v4_tc_sidecar_lut_seeded(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned int K,
+    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
+    unsigned long long time_,
+    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
+    unsigned long long nonce_base, unsigned long long n_nonces,
+    const unsigned int* offsets, const unsigned short* lut, unsigned int lut_sh,
+    const unsigned long long* h10_seeds, unsigned int h10, unsigned long long* winner) {
+    extern __shared__ unsigned int s_shared[];
+    const unsigned int w = threadIdx.x >> 5;
+    const unsigned long long i = (unsigned long long)blockIdx.x * V4_TC_WARPS + w;
+    if (i >= n_nonces) return;
+    const unsigned int x = threadIdx.x & 31u;
+    unsigned int* s_buf = s_shared + w * (256u * (V4_TC_PIPE + 1));
+    unsigned int* s_state = s_buf + 256u * V4_TC_PIPE;
+    const unsigned long long nonce = nonce_base + i;
+    unsigned long long seed = (x == 0u)
+        ? pom_seed_fold_era(h10, h10_seeds, i, nonce, time_, s0, s1, s2, s3) : 0ULL;
+    seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
+
+    #pragma unroll
+    for (unsigned int p = 0; p < V4_TC_PIPE - 1; p++) {
+        if (p < K) {
+            const unsigned int off = offsets[(unsigned long long)p * n_nonces + i];
+            v4_sidecar_tile_cp_async_lut(
+                bases, prefix, T, lut, lut_sh, off, s_buf + p * 256u, x);
+        }
+        asm volatile("cp.async.commit_group;");
+    }
+    { unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)x));
+      #pragma unroll
+      for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); s_state[x * 8u + k4] = (unsigned int)h; } }
+    __syncwarp();
+
+    for (unsigned int step = 1; step <= K; step++) {
+        unsigned int* cur = s_buf + ((step - 1u) % V4_TC_PIPE) * 256u;
+        asm volatile("cp.async.wait_group %0;" :: "n"(V4_TC_PIPE - 2));
+        __syncwarp();
+        if (step + V4_TC_PIPE - 2 < K) {
+            const unsigned int off = offsets[
+                (unsigned long long)(step + V4_TC_PIPE - 2) * n_nonces + i];
+            v4_sidecar_tile_cp_async_lut(
+                bases, prefix, T, lut, lut_sh, off,
+                s_buf + ((step + V4_TC_PIPE - 2u) % V4_TC_PIPE) * 256u, x);
+        }
+        asm volatile("cp.async.commit_group;");
+        v4_imma_step(s_state, cur, step, x);
+    }
+    asm volatile("cp.async.wait_group 0;");
+    __syncwarp();
+
+    unsigned int row4[V4_D4];
+    #pragma unroll
+    for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = s_state[x * 8u + k4];
+    unsigned int* s_tile = s_buf;
+    b3_hash_row32(row4, s_tile + x * 8);
+    __syncwarp();
+    unsigned int* src = s_tile; unsigned int* dst = s_tile + V4_D * 8;
+    for (unsigned int n = V4_D; n > 1; n >>= 1) {
+        if (x < n / 2) b3_hash_pair(src + x * 16, dst + x * 8);
+        __syncwarp();
+        unsigned int* tmp = src; src = dst; dst = tmp;
+    }
+    if (x == 0) {
+        const unsigned long long fin = (unsigned long long)src[0] | ((unsigned long long)src[1] << 32);
+        unsigned long long pv[4];
+        pom_pow_fold(fin, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, i);
+    }
+}
+#else
+extern "C" __global__ void pom_mine_v4_tc_sidecar_lut_seeded(
+    const unsigned long long*, const unsigned long long*, unsigned int, unsigned int,
+    unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long,
+    const unsigned int*, const unsigned short*, unsigned int,
+    const unsigned long long*, unsigned int, unsigned long long*) {}
 #endif
 
 // ============================================================================

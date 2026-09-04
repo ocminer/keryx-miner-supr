@@ -46,26 +46,20 @@ fn first_reg() -> &'static OnceLock<Instant> {
 }
 
 /// (registered worker devices, devices with an installed walk)
-fn sets() -> &'static Mutex<(BTreeSet<u32>, BTreeSet<u32>)> {
-    static S: OnceLock<Mutex<(BTreeSet<u32>, BTreeSet<u32>)>> = OnceLock::new();
+fn sets() -> &'static Mutex<(BTreeSet<u64>, BTreeSet<u64>)> {
+    static S: OnceLock<Mutex<(BTreeSet<u64>, BTreeSet<u64>)>> = OnceLock::new();
     S.get_or_init(|| Mutex::new((BTreeSet::new(), BTreeSet::new())))
 }
 
 fn timeout_secs() -> u64 {
-    std::env::var("KERYX_WAIT_READY_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(2700)
+    std::env::var("KERYX_WAIT_READY_TIMEOUT_SECS").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(2700)
 }
 
-/// How long to hold with ZERO registered workers before concluding this backend never
-/// registers any (AMD/OpenCL until ported) and opening the gate. Generous on purpose: on a
-/// swap-thrashing low-RAM host, plugin init + worker spawn alone can take tens of seconds.
+/// How long to hold with ZERO registered workers before concluding that no GPU backend produced
+/// a worker and opening the gate. Generous on purpose: on a swap-thrashing low-RAM host, plugin
+/// initialization and worker spawn alone can take tens of seconds.
 fn noworker_secs() -> u64 {
-    std::env::var("KERYX_WAIT_READY_NOWORKER_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(120)
+    std::env::var("KERYX_WAIT_READY_NOWORKER_SECS").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(120)
 }
 
 /// Turn the gate on (from the `--wait-ready` CLI flag, before workers spawn).
@@ -80,7 +74,7 @@ pub fn enabled() -> bool {
 
 /// A GPU worker announces itself (idempotent). Called at worker-thread start, so within the
 /// startup grace every card that will ever mine is known.
-pub fn register_device(device_id: u32) {
+pub fn register_device(device_id: u64) {
     let _ = first_reg().set(Instant::now());
     if let Ok(mut g) = sets().lock() {
         g.0.insert(device_id);
@@ -88,7 +82,7 @@ pub fn register_device(device_id: u32) {
 }
 
 /// A card's walk table finished installing (idempotent). Called from the driver's `install`.
-pub fn mark_ready(device_id: u32) {
+pub fn mark_ready(device_id: u64) {
     let (ready, total) = match sets().lock() {
         Ok(mut g) => {
             g.1.insert(device_id);
@@ -108,14 +102,14 @@ pub fn holds() -> bool {
         return false;
     }
     let elapsed = started().elapsed();
-    let (missing, total): (Vec<u32>, usize) = match sets().lock() {
+    let (missing, total): (Vec<u64>, usize) = match sets().lock() {
         Ok(g) => (g.0.difference(&g.1).copied().collect(), g.0.len()),
         Err(_) => return false,
     };
     // No worker registered YET. Startup itself (config, pool connect, plugin init) can take a
     // long time on the RAM-starved rigs this flag targets, so HOLD — only after a generous
-    // window conclude this backend never registers workers at all (AMD/OpenCL until ported)
-    // and open, loudly. This must NOT latch before workers had a real chance to appear.
+    // window conclude that no GPU backend produced a worker and open, loudly. This must NOT latch
+    // before workers had a real chance to appear.
     if total == 0 {
         if elapsed.as_secs() >= noworker_secs() {
             if !OPENED.swap(true, Ordering::Relaxed) {
@@ -161,11 +155,7 @@ pub fn holds() -> bool {
     // Progress note every 30 s so a long quiet bring-up is visibly alive, not hung.
     let now = elapsed.as_secs();
     let last = LAST_LOG_SECS.load(Ordering::Relaxed);
-    if now >= last + 30
-        && LAST_LOG_SECS
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
+    if now >= last + 30 && LAST_LOG_SECS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         log::info!(
             "--wait-ready: {}/{} cards ready (waiting on {:?}) — mining and OPoI declaration \
              held until all cards are set up.",

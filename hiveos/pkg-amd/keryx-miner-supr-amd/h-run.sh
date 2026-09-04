@@ -59,13 +59,15 @@ fi
 # --- Vulkan GPU-inference preflight ----------------------------------------
 # OPoI inference runs on the AMD GPU via the bundled ./llama-server (Vulkan). That
 # needs libvulkan.so.1 + a registered AMD Vulkan ICD (RADV/Mesa or AMDVLK) on the
-# rig. If anything is missing the miner AUTO-FALLS BACK to CPU inference (slow but
-# works) — NOT fatal. Report which path this rig will take so it's visible per-rig.
-if [[ -x ./llama-server ]]; then
+# rig. Without a working GPU route the miner withholds ai:cap and the OPoI gate stops
+# mining. CPU inference is deprecated and is attempted only with the explicit
+# --enable-cpu-inference emergency flag. Report the GPU path clearly per rig.
+if [[ -f ./libkeryx-llama-vk.so || -x ./llama-server ]]; then
   vk_ok=1
-  if ! ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so\.1' \
+  if [[ ! -e ./libvulkan.so.1 ]] \
+     && ! ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so\.1' \
      && ! ls /usr/lib/x86_64-linux-gnu/libvulkan.so.1 >/dev/null 2>&1; then
-    preflight "Vulkan preflight: libvulkan.so.1 not found — OPoI inference will run on the CPU (slow)."
+    preflight "Vulkan preflight: libvulkan.so.1 not found — GPU inference is unavailable; mining will stop at the OPoI gate."
     preflight "                  For GPU inference: 'apt-get install -y libvulkan1 mesa-vulkan-drivers'."
     vk_ok=0
   fi
@@ -74,7 +76,7 @@ if [[ -x ./llama-server ]]; then
     if [[ -n "$amdvk" ]]; then
       preflight "Vulkan preflight: AMD GPU visible to Vulkan ($amdvk)."
     else
-      preflight "WARNING: no AMD GPU visible to Vulkan — OPoI inference falls back to CPU (slow)."
+      preflight "WARNING: no AMD GPU visible to Vulkan — GPU inference is unavailable; mining will stop at the OPoI gate."
       vk_ok=0
     fi
   elif [[ "$vk_ok" == 1 ]]; then
@@ -82,7 +84,8 @@ if [[ -x ./llama-server ]]; then
   fi
   [[ "$vk_ok" == 1 ]] && preflight "Vulkan GPU inference: AVAILABLE — OPoI inference will run on the AMD GPU (fast)."
 else
-  preflight "note: no bundled llama-server — OPoI inference runs on the CPU (CPU-only build)."
+  preflight "WARNING: no bundled Vulkan llama engine or llama-server — no GPU inference route is available."
+  preflight "         Mining requires another GPU route; --enable-cpu-inference is deprecated emergency use only."
 fi
 # ---------------------------------------------------------------------------
 

@@ -792,4 +792,119 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma_
         }
     }
 }
+
+// gfx1100-specialized SINGLE-PHASE one-state WMMA walk. Unlike pom_mine_v4_wmma_sp, the transition
+// updates the state in place: for one 16-row block, both 16-byte A half-row fragments are loaded
+// into registers before either output column block is stored. The two jb passes therefore reuse
+// the original A fragments even after jb=0 overwrites half of those rows. xb=1 reads disjoint rows,
+// so xb=0 may be complete before it starts. Per nonce this removes the second 1 KB state buffer and
+// halves the repeated A-fragment LDS loads: one 1 KB state + one 1 KB tile = 512 u32 (2 KB).
+#define V4W1_STRIP_U32 512
+__kernel __attribute__((reqd_work_group_size(256, 1, 1))) void pom_mine_v4_wmma_1state(
+    __global const uint* restrict b0,
+    __global const uint* restrict b1,
+    __global const uint* restrict b2,
+    __global const uint* restrict b3,
+    const u64 n_tiles,
+    const u64 slab_tiles,
+    const uint K,
+    const u64 p0, const u64 p1, const u64 p2, const u64 p3,
+    const u64 s0, const u64 s1, const u64 s2, const u64 s3,
+    const u64 time_,
+    const u64 t0, const u64 t1, const u64 t2, const u64 t3,
+    const u64 nonce_base, const u64 n_nonces, const u64 winner_base,
+    const uint h10,
+    volatile __global u64* winner,
+    __local uint* scratch)                     // V4_NPG * V4W1_STRIP_U32 u32 = 16 KB
+{
+    const uint lid  = get_local_id(0);
+    const uint sub  = lid >> 5;
+    const uint lane = lid & 31u;
+    const u64  gsub = (u64)get_group_id(0) * V4_NPG + sub;
+    const bool live  = gsub < n_nonces;
+    const u64  nonce = nonce_base + (live ? gsub : 0UL);
+    const u64  seed  = pom_seed_fold_era(h10, nonce, time_, s0, s1, s2, s3);
+    __local uint* strip = scratch + sub * V4W1_STRIP_U32;
+    __local uint* state = strip;
+    __local uint* tile  = strip + 256;
+
+    // S_0: lane writes state row `lane`.
+    {
+        u64 h = pom_mix64(seed ^ (V4_S0_ROW_SALT + (u64)lane));
+        V4_UNROLL for (int k4 = 0; k4 < V4_D4; k4++) { h = pom_mix64(h); state[lane * 8 + k4] = (uint)h; }
+    }
+    u64 off = pom_mix64(seed ^ V4_OFFSET_FIRST_SALT) % V4_NT(n_tiles);
+
+    for (uint step = 1; step <= K; step++) {
+        // Load this step's tile while the barrier below also publishes S_0/the previous transition.
+        {
+            u64 tin;
+            const __global uint* sb = v4_slab(b0, b1, b2, b3, off, slab_tiles, &tin);
+            const __global uint4* src4 = (const __global uint4*)(sb + (tin * (u64)V4_TILE_CHUNKS + lane) * 8UL);
+            __local uint4* dst4 = (__local uint4*)(tile + lane * 8);
+            dst4[0] = src4[0]; dst4[1] = src4[1];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (step < K) {
+            u64 sf = 0;
+            V4_UNROLL for (int w = 0; w < 8; w++) sf = pom_mix64(sf ^ (u64)tile[w]);
+            off = pom_mix64(seed ^ (u64)(step + 1) * V4_OFFSET_STEP_SALT ^ sf) % V4_NT(n_tiles);
+        }
+
+        __local char* Sc = (__local char*)state;
+        __local const char* Tc = (__local const char*)tile;
+        const uint xi = lane & 15u, ji = lane & 15u;
+        const uint step_base = step * 0x9E3779B9u;
+        V4_UNROLL for (uint xb = 0; xb < 2; xb++) {
+            // These values must be captured before either jb store mutates this 16-row block.
+            const uint ao0 = (16u*xb + xi) * 32;
+            const int4v a0 = *(__local const int4v*)(Sc + ao0);
+            const int4v a1 = *(__local const int4v*)(Sc + ao0 + 16u);
+            V4_UNROLL for (uint jb = 0; jb < 2; jb++) {
+                const uint bo0 = (16u*jb + ji) * 32;
+                const int4v b0v = *(__local const int4v*)(Tc + bo0);
+                const int4v b1v = *(__local const int4v*)(Tc + bo0 + 16u);
+                int8v acc = (int8v)(0);
+                acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0v, acc, false);
+                acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1v, acc, false);
+                V4_UNROLL for (int vv = 0; vv < 8; vv++) {
+                    const uint x = 16u*xb + 2u*(uint)vv + (lane >> 4);
+                    const uint j = 16u*jb + (lane & 15u);
+                    const uint tw = step_base + x * 0xC2B2AE35u + j * 0x85EBCA6Bu;
+                    Sc[x * 32 + j] = (char)v4_rho8(acc[vv], tw);
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    uint row4[V4_D4];
+    V4_UNROLL for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = state[lane * 8 + k4];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __local uint* ms = strip;                  // full 512-u32 strip is now free for Merkle ping-pong
+    b3_hash_row32(row4, ms + lane * 8);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __local uint* src = ms;
+    __local uint* dst = ms + V4_D * 8;
+    for (uint n = V4_D; n > 1; n >>= 1) {
+        if (lane < n / 2) b3_hash_pair(src + lane * 16, dst + lane * 8);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        __local uint* tmp = src; src = dst; dst = tmp;
+    }
+    if (lane == 0 && live) {
+        const u64 fin = (u64)src[0] | ((u64)src[1] << 32);
+        u64 pv[4];
+        pom_pow_fold(fin, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) {
+            const u64 candidate = nonce - winner_base;
+            u64 old = *winner;
+            while (candidate < old) {
+                u64 prev = atom_cmpxchg(winner, old, candidate);
+                if (prev == old) break;
+                old = prev;
+            }
+        }
+    }
+}
 #endif // USE_AMD_WMMA

@@ -2,8 +2,8 @@
 //! llama.cpp hosts the SINGLE resident model copy on the inference GPU, the PoM walk gathers
 //! straight over its VRAM tensors (wrapper exports `keryx_llama_pom_mine`/`_fetch` — byte-exact
 //! per the full-model spike + the startup byte gate below), and OPoI text generation runs
-//! in-process. Absent/failed .so = byte-identical fallback chain to before (Vulkan llama-server
-//! subprocess → candle-CPU), and every card keeps its own OpenCL blob.
+//! in-process. Absent/failed .so = try the Vulkan llama-server GPU route; candle-CPU is a
+//! deprecated explicit emergency fallback only, and every card keeps its own OpenCL blob.
 //!
 //! Consensus safety: this module only changes WHO HOSTS the model bytes on the inference card and
 //! WHO GENERATES the user-facing OPoI text. The walk math is byte-identical (pom_walk_vk.comp),
@@ -25,6 +25,8 @@ type FetchFn = unsafe extern "C" fn(*mut c_void, u64, *mut u8) -> bool;
 type MineFn = unsafe extern "C" fn(*mut c_void, *const u64, *const u64, *const u64, u64, u64, u32, u32, u32) -> i64;
 type PciFn = unsafe extern "C" fn(*mut c_void, *mut u32, *mut u32, *mut u32, *mut u32) -> bool;
 type PickFn = unsafe extern "C" fn() -> c_int;
+type PickAbiFn = unsafe extern "C" fn() -> c_int;
+type DevicePciFn = unsafe extern "C" fn(c_int, *mut u32, *mut u32, *mut u32, *mut u32) -> bool;
 
 const ABI: c_int = 2;
 const VK_ABI: c_int = 5; // bumped 4->5 at H5.1: keryx_llama_pom_mine gained the seed-words arg
@@ -55,6 +57,20 @@ unsafe impl Send for Engine {}
 fn engine() -> &'static Mutex<Option<Engine>> {
     static E: OnceLock<Mutex<Option<Engine>>> = OnceLock::new();
     E.get_or_init(|| Mutex::new(None))
+}
+
+/// A failed model load must not leave the mining worker selected during Vulkan preflight idle.
+/// Success disarms the guard; unload later releases the active in-process ownership explicitly.
+struct InprocessDedicationAttempt {
+    armed: bool,
+}
+
+impl Drop for InprocessDedicationAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::pom_opencl::release_inprocess_vulkan_dedication();
+        }
+    }
 }
 
 /// Same SIGILL gate as llama_engine::cpu_has_baked_simd — libkeryx-llama-vk.so is built with
@@ -91,8 +107,7 @@ fn so_path() -> Option<std::path::PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let want_noavx = !simd_ok
-        || std::env::var("KERYX_LLAMA_FORCE_NOAVX").map_or(false, |v| v == "1");
+    let want_noavx = !simd_ok || std::env::var("KERYX_LLAMA_FORCE_NOAVX").map_or(false, |v| v == "1");
     if want_noavx {
         let p = dir.join("libkeryx-llama-vk-noavx.so");
         if p.exists() {
@@ -100,7 +115,7 @@ fn so_path() -> Option<std::path::PathBuf> {
             return Some(p);
         }
         log::warn!(
-            "llama-vk engine: this CPU lacks the AVX2/FMA/F16C/BMI2 set baked into libkeryx-llama-vk.so and no libkeryx-llama-vk-noavx.so is present — NOT loading it (would SIGILL). Fallback paths stay active."
+            "llama-vk engine: this CPU lacks the AVX2/FMA/F16C/BMI2 set baked into libkeryx-llama-vk.so and no libkeryx-llama-vk-noavx.so is present — NOT loading it (would SIGILL). Remaining GPU routes will be tried."
         );
         return None;
     }
@@ -133,7 +148,13 @@ unsafe fn sym<T: Copy>(lib: *mut c_void, name: &str) -> Option<T> {
 
 /// The discrete-GPU `main_gpu` index in GGML's own device list, via the bundled engine .so.
 /// Valid for any ggml in this process tree — the in-process engine AND the bundled llama-server
-/// subprocess share the same ggml build. `None` = no .so / no discrete GPU (leave ggml's default).
+/// subprocess share the same ggml build. With a published worker PCI allowlist, `None` is a
+/// fail-closed result (no match or an old, untrusted picker); without one, it retains the legacy
+/// meaning of no sidecar/no discrete GPU.
+pub fn auto_device_allowlist_active() -> bool {
+    std::env::var_os(crate::pom_opencl::LLAMA_VK_AUTO_PCI_ALLOWLIST_ENV).is_some()
+}
+
 pub fn pick_discrete_ggml_device() -> Option<i32> {
     let so = so_path()?;
     let cso = CString::new(so.to_string_lossy().as_bytes()).ok()?;
@@ -143,13 +164,50 @@ pub fn pick_discrete_ggml_device() -> Option<i32> {
         if lib.is_null() {
             return None;
         }
-        let pick: PickFn = sym(lib, "keryx_vk_pick_discrete_device")?;
-        let d = pick();
-        if d >= 0 {
-            Some(d)
-        } else {
-            None
+        let result = (|| -> Option<i32> {
+            let pick: PickFn = sym(lib, "keryx_vk_pick_discrete_device")?;
+            if auto_device_allowlist_active() {
+                // A pre-allowlist sidecar still exports the old picker but considers every Vulkan
+                // device. Trust it only when the optional capability symbol proves it applies the
+                // selected-worker PCI filter; otherwise auto-placement must fail closed.
+                let picker_abi: PickAbiFn = sym(lib, "keryx_vk_picker_abi")?;
+                if picker_abi() < 1 {
+                    return None;
+                }
+            }
+            let d = pick();
+            (d >= 0).then_some(d)
+        })();
+        libc::dlclose(lib);
+        result
+    }
+}
+
+/// Map a ggml `main_gpu` index to its full PCI identity using the same filtered Vulkan device list
+/// which interprets that index. This optional sidecar export is required to safely resolve an
+/// explicit llama-server card against the selected OpenCL workers.
+pub fn ggml_device_pci(device: i32) -> Option<(u32, u32, u32, u32)> {
+    if device < 0 {
+        return None;
+    }
+    let so = so_path()?;
+    let cso = CString::new(so.to_string_lossy().as_bytes()).ok()?;
+    unsafe {
+        let lib = libc::dlopen(cso.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        if lib.is_null() {
+            return None;
         }
+        let result = (|| -> Option<(u32, u32, u32, u32)> {
+            let picker_abi: PickAbiFn = sym(lib, "keryx_vk_picker_abi")?;
+            if picker_abi() < 1 {
+                return None;
+            }
+            let pci: DevicePciFn = sym(lib, "keryx_vk_device_pci")?;
+            let (mut domain, mut bus, mut dev, mut function) = (0, 0, 0, 0);
+            pci(device, &mut domain, &mut bus, &mut dev, &mut function).then_some((domain, bus, dev, function))
+        })();
+        libc::dlclose(lib);
+        result
     }
 }
 
@@ -163,6 +221,37 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
     if let Some(e) = g.as_ref() {
         return e.gguf == gguf;
     }
+    // Resolve the exact ggml index and its OpenCL PCI peer before opening/allocating the model.
+    // When model + walk cannot coexist, preflight also removes an already-resident OpenCL blob
+    // while the caller's inference drain is held. Reserving only after load is too late: Vulkan
+    // would otherwise OOM on a selected non-largest (or tie-broken) target which was still mining.
+    let explicit_gpu = std::env::var("KERYX_LLAMA_VK_DEVICE")
+        .ok()
+        .and_then(|s| s.trim().parse::<c_int>().ok())
+        .filter(|gpu| *gpu >= 0);
+    let main_gpu: c_int = match explicit_gpu {
+        Some(gpu) => gpu,
+        None if auto_device_allowlist_active() => match pick_discrete_ggml_device() {
+            Some(gpu) => gpu,
+            None => {
+                crate::pom_opencl::release_provisional_vulkan_dedication();
+                log::warn!(
+                    "llama-vk engine: no trusted ggml device matches the selected OpenCL \
+                     worker PCI allowlist — automatic GPU inference placement refused. \
+                     Rebuild libkeryx-llama-vk.so or set KERYX_LLAMA_VK_DEVICE explicitly."
+                );
+                return false;
+            }
+        },
+        None => -1,
+    };
+    let mut dedication_attempt = InprocessDedicationAttempt { armed: false };
+    if main_gpu >= 0 {
+        if !crate::pom_opencl::prepare_inprocess_vulkan_device(main_gpu) {
+            return false;
+        }
+        dedication_attempt.armed = true;
+    }
     let Some(so) = so_path() else { return false };
     let cso = match CString::new(so.to_string_lossy().as_bytes()) {
         Ok(c) => c,
@@ -173,10 +262,26 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
         if lib.is_null() {
             let err = libc::dlerror();
             let msg = if err.is_null() { "?".into() } else { CStr::from_ptr(err).to_string_lossy().into_owned() };
-            log::warn!("llama-vk engine: dlopen({}) failed: {} — llama-server/candle fallbacks stay active.", so.display(), msg);
+            log::warn!(
+                "llama-vk engine: dlopen({}) failed: {} — the llama-server GPU route and any explicitly enabled deprecated CPU fallback remain available.",
+                so.display(),
+                msg
+            );
             return false;
         }
-        let (Some(abi), Some(vk_abi), Some(load), Some(free_fn), Some(gen), Some(ready), Some(nch), Some(supl), Some(fetch), Some(mine), Some(pci)) = (
+        let (
+            Some(abi),
+            Some(vk_abi),
+            Some(load),
+            Some(free_fn),
+            Some(gen),
+            Some(ready),
+            Some(nch),
+            Some(supl),
+            Some(fetch),
+            Some(mine),
+            Some(pci),
+        ) = (
             sym::<AbiFn>(lib, "keryx_llama_abi"),
             sym::<AbiFn>(lib, "keryx_llama_vk_abi"),
             sym::<LoadFn>(lib, "keryx_llama_load"),
@@ -188,14 +293,19 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
             sym::<FetchFn>(lib, "keryx_llama_pom_fetch"),
             sym::<MineFn>(lib, "keryx_llama_pom_mine"),
             sym::<PciFn>(lib, "keryx_llama_pom_pci"),
-        ) else {
+        )
+        else {
             log::warn!("llama-vk engine: {} is missing symbols — fallbacks stay active.", so.display());
             return false;
         };
         if abi() != ABI || vk_abi() != VK_ABI {
             log::warn!(
                 "llama-vk engine: {} ABI {}/{} != expected {}/{} — fallbacks stay active.",
-                so.display(), abi(), vk_abi(), ABI, VK_ABI
+                so.display(),
+                abi(),
+                vk_abi(),
+                ABI,
+                VK_ABI
             );
             return false;
         }
@@ -207,13 +317,11 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
         // the miner exits/restart-loops). The .so resolves `main_gpu < 0` to a discrete GPU
         // against GGML'S OWN device list — the only index space that is reliably valid, since a
         // separate-instance enumeration (or GGML_VK_VISIBLE_DEVICES computed from one) orders
-        // devices differently on iGPU rigs and mislocates or asserts. So we do NOT set
-        // GGML_VK_VISIBLE_DEVICES here; we pass -1 = "auto-pick discrete". `KERYX_LLAMA_VK_DEVICE`
-        // overrides with an explicit ggml device index (a `main_gpu` value).
-        let main_gpu: c_int = std::env::var("KERYX_LLAMA_VK_DEVICE")
-            .ok()
-            .and_then(|s| s.trim().parse::<c_int>().ok())
-            .unwrap_or(-1);
+        // devices differently on iGPU rigs and mislocates or asserts. The helper selects the
+        // largest selected-worker card by the exact PCI allowlist, matching the max-VRAM planner on
+        // heterogeneous/subset rigs. We do NOT set GGML_VK_VISIBLE_DEVICES here; the helper returns
+        // a `main_gpu` in ggml's own index space. `KERYX_LLAMA_VK_DEVICE` explicitly overrides the
+        // selected-worker constraint and may intentionally name an inference-only card.
         log::info!(
             "llama-vk engine: loading {gguf} (ggml GPU {}) via {} (in-process, zero-dup)…",
             if main_gpu < 0 { "auto-discrete".to_string() } else { main_gpu.to_string() },
@@ -243,6 +351,7 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
             gpu: main_gpu.max(0) as usize, // -1 = auto; the actual device is read via pom_pci
             gguf: gguf.to_string(),
         });
+        dedication_attempt.armed = false;
         true
     }
 }
@@ -254,6 +363,15 @@ pub fn available() -> bool {
     }
 }
 
+/// The Vulkan engine is a singleton. Never answer a request with a merely "available" but
+/// different resident model.
+pub fn active_for(gguf: &str) -> bool {
+    match engine().lock() {
+        Ok(g) => g.as_ref().map(|e| e.gguf.as_str()) == Some(gguf),
+        Err(_) => false,
+    }
+}
+
 /// Generate up to `max_tokens` of OPoI text in-process.
 pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
     let g = engine().lock().ok()?;
@@ -261,7 +379,28 @@ pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
     let cp = CString::new(prompt).ok()?;
     let cap: usize = 65536;
     let mut out = vec![0u8; cap];
-    let n = unsafe { (e.generate)(e.model, cp.as_ptr(), max_tokens as c_int, out.as_mut_ptr() as *mut c_char, cap as c_int) };
+    let n = unsafe {
+        (e.generate)(e.model, cp.as_ptr(), max_tokens as c_int, out.as_mut_ptr() as *mut c_char, cap as c_int)
+    };
+    if n < 0 {
+        return None;
+    }
+    out.truncate(n as usize);
+    String::from_utf8(out).ok()
+}
+
+pub fn generate_for(gguf: &str, prompt: &str, max_tokens: usize) -> Option<String> {
+    let g = engine().lock().ok()?;
+    let e = g.as_ref()?;
+    if e.gguf != gguf {
+        return None;
+    }
+    let cp = CString::new(prompt).ok()?;
+    let cap: usize = 65536;
+    let mut out = vec![0u8; cap];
+    let n = unsafe {
+        (e.generate)(e.model, cp.as_ptr(), max_tokens as c_int, out.as_mut_ptr() as *mut c_char, cap as c_int)
+    };
     if n < 0 {
         return None;
     }
@@ -344,16 +483,10 @@ pub fn pom_byte_gate(index: &crate::pom::WeightIndex) -> bool {
 /// TDR-safe sub-dispatches (ascending, early exit on the first winning sub-batch — identical
 /// semantics to `PomMiner::mine`). `p`/`t` are the pph words (era-salted by the caller) and the
 /// LE target words. Returns the lowest winning nonce, or None.
-/// Unload the in-process engine and free ALL its VRAM (model + walk/fetch buffers). Used when this
-/// engine's card must host the OpenCL possession blob instead: on a small card (e.g. 8 GB RDNA1)
-/// the resident model (~6 GB) + the post-H5 blob (~4.8 GB) cannot coexist, so a failed zero-dup
-/// (byte-gate) leaves the blob install OOM-ing and the card idle at 0 hash. Mining beats
-/// in-process inference — after unload OPoI falls back to the llama-server subprocess / CPU.
-/// Returns true if an engine was actually unloaded.
 /// True once the engine was unloaded to give its VRAM to the possession blob. The llama-server
 /// GPU fallback consults this: it would pin to the SAME discrete card (pick_discrete_ggml_device)
 /// and re-occupy the VRAM the unload just freed — recreating the small-card squeeze. With the flag
-/// set (and no explicit KERYX_LLAMA_VK_DEVICE), OPoI inference goes to CPU instead: mining wins.
+/// set (and no explicit KERYX_LLAMA_VK_DEVICE), no GPU inference route is advertised: mining wins.
 pub fn evicted_for_vram() -> bool {
     EVICTED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -367,14 +500,19 @@ pub fn mark_gpu_inference_unfit() {
     EVICTED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Unload the in-process engine and free all its Vulkan allocations. This is a generic model-swap
+/// primitive and deliberately does not mark GPU inference unfit: normal generation failure may
+/// still fall back to llama-server. The OpenCL OOM recovery path explicitly calls
+/// `mark_gpu_inference_unfit` after a successful unload because only that path has chosen mining
+/// VRAM over auto-placed inference. Returns whether an engine was present.
 pub fn unload() -> bool {
     let mut g = match engine().lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
     if let Some(e) = g.take() {
-        EVICTED.store(true, std::sync::atomic::Ordering::Relaxed);
         if DEVICE_SUSPECT.load(std::sync::atomic::Ordering::Relaxed) {
+            EVICTED.store(true, std::sync::atomic::Ordering::Relaxed);
             // The device may be hung (failed gate-fetch dispatch): freeing would vkDeviceWaitIdle
             // on it and block forever. Leak the engine's objects instead — the handle is dropped,
             // the flag stays, and the process keeps running (that card is lost until reboot anyway).
@@ -385,9 +523,10 @@ pub fn unload() -> bool {
             return true;
         }
         unsafe { (e.free)(e.model) };
+        crate::pom_opencl::release_inprocess_vulkan_dedication();
         log::warn!(
-            "llama-vk engine: unloaded — VRAM freed for the OpenCL possession blob; OPoI inference \
-             falls back to the llama-server subprocess / CPU."
+            "llama-vk engine: unloaded — Vulkan model VRAM released; configured GPU inference \
+             fallbacks remain eligible."
         );
         true
     } else {
@@ -395,7 +534,15 @@ pub fn unload() -> bool {
     }
 }
 
-pub fn pom_mine(p: [u64; 4], s: [u64; 4], time: u64, t: [u64; 4], nonce_base: u64, batch: u64, walk_v2: bool) -> Option<u64> {
+pub fn pom_mine(
+    p: [u64; 4],
+    s: [u64; 4],
+    time: u64,
+    t: [u64; 4],
+    nonce_base: u64,
+    batch: u64,
+    walk_v2: bool,
+) -> Option<u64> {
     let g = engine().lock().ok()?;
     let e = g.as_ref()?;
     let wv2: u32 = walk_v2 as u32; // H5 era flag -> shader push-constant (v1 fold vs mix64-chain)

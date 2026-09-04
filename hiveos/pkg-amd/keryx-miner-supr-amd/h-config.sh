@@ -32,16 +32,15 @@ args="-a ${CUSTOM_TEMPLATE} -s ${url}"
 # prepend the default. As of v0.6.9.3 the AMD/OpenCL build HONORS these overrides (was hardcoded Light
 # — issue #7): a user override is applied PROCESS-WIDE (one resident tier for all cards; there is no
 # per-card model map on AMD, unlike CUDA), and --force-model bypasses the VRAM gate. The default is
-# --tier auto — the AMD/OpenCL build now has REAL auto-tier (as of v0.7.1): it picks the largest H4 tier
-# that fits card 0's VRAM (CL_DEVICE_GLOBAL_MEM_SIZE) with a conservative AMD margin (AMD holds the PoM
-# possession blob AND the inference context, ~2× the model on non-zero-dup cards). So an 8 GB card gets
-# EXAONE (very-light, fits any card = the floor), a 16 GB card reaches Mistral-7B (light), etc. — more
-# reward on bigger cards, never OOM. Override to PIN a specific tier regardless of fit: --light (Mistral)
-# / --high (Qwen3.6-27B, 24 GB) / --very-light (force EXAONE) / --force-model <name> (bypasses the gate).
+# --tier auto picks the largest current H6 tier that fits card 0's VRAM
+# (CL_DEVICE_GLOBAL_MEM_SIZE): Qwen3.5-9B / GLM-9B / Gemma-12B / Qwen3.6-27B /
+# Kimi-48B at the 7/11/15/22/28-GB floors. The OpenCL residency planner separately
+# dedicates the inference card if walk + inference cannot safely coexist. Override to
+# pin a process-wide tier; --force-model bypasses the VRAM gate.
 extra="$CUSTOM_USER_CONFIG"
 case " $extra " in
   *" --very-light "*|*" --light "*|*" --high "*|*" --very-high "*|*" --tier "*|*" --tier="*|*" --force-model "*|*" --force-model="*) : ;;  # model chosen
-  *) extra="--tier auto $extra" ;;   # default: --tier auto — largest H4 tier that fits card 0 VRAM (EXAONE floor); OOM-safe
+  *) extra="--tier auto $extra" ;;   # default: largest current H6 tier that fits card 0 VRAM
 esac
 
 args="$args ${extra}"

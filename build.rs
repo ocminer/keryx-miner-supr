@@ -1,5 +1,46 @@
+use sha2::{Digest, Sha256};
 use std::env;
 use time::{format_description, OffsetDateTime};
+
+fn sha256_file(path: impl AsRef<std::path::Path>) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn cuda_define(name: &str) -> String {
+    std::fs::read_to_string("src/pom_mine.cu")
+        .ok()
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                let l = l.trim();
+                l.strip_prefix(&format!("#define {name}")).and_then(|r| r.split_whitespace().next().map(str::to_owned))
+            })
+        })
+        .unwrap_or_else(|| panic!("pom-cuda: could not read #define {name} from src/pom_mine.cu"))
+}
+
+fn manifest_sha256(manifest: &str, field: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(manifest)?;
+    let prefix = format!("- {field}: `");
+    let value = text
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix).and_then(|rest| rest.strip_suffix('`')))
+        .ok_or_else(|| format!("{manifest}: missing `{field}` entry"))?;
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{manifest}: `{field}` is not a SHA-256 digest").into());
+    }
+    Ok(value.to_ascii_lowercase())
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build stamp for field diagnosis: every 0.9.5 asset repack printed the same bare "0.9.5"
@@ -62,26 +103,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let out = env::var("OUT_DIR").unwrap();
         let image = format!("{}/pom_mine.image", out); // the shipped walk image (fatbin or ptx)
         println!("cargo:rerun-if-changed=src/pom_mine.cu");
+        println!("cargo:rerun-if-changed=src/pom_gpu.rs");
+        println!("cargo:rerun-if-changed=src/miner.rs");
         println!("cargo:rerun-if-changed=cuda/pom_mine.fatbin");
+        println!("cargo:rerun-if-changed=cuda/POM_FATBIN_MANIFEST.md");
         // The tensor-core walk's warps-per-block and pipeline depth are COMPILE-TIME constants in
         // the kernel (`V4_TC_WARPS` / `V4_TC_PIPE`), and the host launch config must agree with them
         // exactly: the kernel derives its nonce index as `blockIdx.x * V4_TC_WARPS + warp`, so a
         // block launched with a different warp count silently walks the wrong nonces (or reads past
         // its shared-memory slice). Publish what the kernel was actually compiled with so the host
         // cannot drift from it.
-        for (name, var) in [("V4_TC_WARPS", "POM_V4_TC_WARPS"), ("V4_TC_PIPE", "POM_V4_TC_PIPE"),
-                            ("V4_NCF_WARPS", "POM_V4_NCF_WARPS")] {
-            let def = std::fs::read_to_string("src/pom_mine.cu")
-                .ok()
-                .and_then(|s| {
-                    s.lines()
-                        .find_map(|l| {
-                            let l = l.trim();
-                            l.strip_prefix(&format!("#define {}", name))
-                                .and_then(|r| r.split_whitespace().next().map(|v| v.to_string()))
-                        })
-                })
-                .unwrap_or_else(|| panic!("pom-cuda: could not read #define {} from src/pom_mine.cu", name));
+        let tc_warps = cuda_define("V4_TC_WARPS");
+        let tc_pipe = cuda_define("V4_TC_PIPE");
+        let ncf_warps = cuda_define("V4_NCF_WARPS");
+        for (var, def) in
+            [("POM_V4_TC_WARPS", &tc_warps), ("POM_V4_TC_PIPE", &tc_pipe), ("POM_V4_NCF_WARPS", &ncf_warps)]
+        {
             println!("cargo:rustc-env={}={}", var, def);
         }
         // Without these, switching walk image/arch silently reuses the previously built image.
@@ -106,10 +143,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if arch_override.is_none() && want_fatbin && std::path::Path::new(committed_fatbin).exists() {
             // MODERN: ship the native-SASS fatbin as-is (no nvcc needed at build time).
+            // The image contains compile-time launch constants and cannot safely drift from its
+            // source. Refuse a source-only or artifact-only edit until the protected regeneration
+            // workflow has updated both hashes in the committed manifest.
+            let manifest = "cuda/POM_FATBIN_MANIFEST.md";
+            let source_sha = sha256_file("src/pom_mine.cu")?;
+            let image_sha = sha256_file(committed_fatbin)?;
+            let expected_source_sha = manifest_sha256(manifest, "Source SHA-256")?;
+            let expected_image_sha = manifest_sha256(manifest, "Artifact SHA-256")?;
+            if source_sha != expected_source_sha || image_sha != expected_image_sha {
+                panic!(
+                    "pom-cuda: committed walk image/source do not match {manifest}\n\
+                     source expected {expected_source_sha}, got {source_sha}\n\
+                     image  expected {expected_image_sha}, got {image_sha}\n\
+                     Rebuild with cuda/regenerate-pom-fatbin.sh, pass the SASS/exactness gates, \
+                     and update the manifest before compiling."
+                );
+            }
             std::fs::copy(committed_fatbin, &image)
                 .unwrap_or_else(|e| panic!("pom-cuda: copy {committed_fatbin} -> {image}: {e}"));
             println!("cargo:rustc-env=POM_WALK_IMAGE_KIND=fatbin");
-            println!("cargo:rustc-env=POM_PTX_ARCH=sm_75..121-native+compute_80-tc"); // diagnostic
+            println!("cargo:rustc-env=POM_PTX_ARCH=sm_75..121-native+compute_80-tc");
         } else {
             // LEGACY/PASCAL or no committed fatbin: compile from source.
             //
@@ -153,11 +207,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect(),
                     None => vec!["80", "86", "89", "90"],
                 };
-                let mut args: Vec<String> = vec![
-                    "-O3".into(),
-                    "-fatbin".into(),
-                    format!("-gencode=arch={arch},code={arch}"),
-                ];
+                let mut args: Vec<String> =
+                    vec!["-O3".into(), "-fatbin".into(), format!("-gencode=arch={arch},code={arch}")];
                 // A compute_75 fallback can only contain the empty tensor-core stubs because the
                 // source guards IMMA at __CUDA_ARCH__ >= 800. Carry compute_80 PTX as well so an
                 // unlisted/future Ampere-or-newer architecture JITs real seeded TC/NCF kernels.
@@ -178,8 +229,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tc_sms.join(",")
                     );
                 } else {
-                    println!("cargo:warning=pom-cuda: fatbin build failed — falling back to {arch} PTX; \
-tensor-core walk will be unavailable (classic kernel only) on Ampere and newer.");
+                    println!(
+                        "cargo:warning=pom-cuda: fatbin build failed — falling back to {arch} PTX; \
+tensor-core walk will be unavailable (classic kernel only) on Ampere and newer."
+                    );
                     println!("cargo:rustc-env=POM_PTX_ARCH={}", arch.replace("compute_", "sm_"));
                     let status = std::process::Command::new(&nvcc)
                         .args(["-O3", "-ptx", &format!("-arch={}", arch), "-o", &image, "src/pom_mine.cu"])
@@ -192,6 +245,18 @@ tensor-core walk will be unavailable (classic kernel only) on Ampere and newer."
                 }
             }
         }
+
+        // Bind the Rust host launch ABI and its persistent autotune decisions to the exact image
+        // and source that produced this binary. Package versions are not sufficiently precise:
+        // developers routinely rebuild several kernel revisions under one version number.
+        let image_sha = sha256_file(&image)?;
+        let source_sha = sha256_file("src/pom_mine.cu")?;
+        let host_policy_sha = sha256_file("src/pom_gpu.rs")?;
+        let abi = format!("v1;tc_warps={tc_warps};tc_pipe={tc_pipe};ncf_warps={ncf_warps}");
+        println!("cargo:rustc-env=POM_WALK_IMAGE_SHA256={image_sha}");
+        println!("cargo:rustc-env=POM_WALK_SOURCE_SHA256={source_sha}");
+        println!("cargo:rustc-env=POM_HOST_POLICY_SHA256={host_policy_sha}");
+        println!("cargo:rustc-env=POM_WALK_ABI={abi}");
     }
     Ok(())
 }

@@ -1,7 +1,8 @@
 //! Proof-of-Model GPU mining — Apple Silicon (Metal) backend.
 //!
 //! Parity path for `pom_gpu.rs` (CUDA): exposes the **identical** public free-function surface
-//! (`install`/`uninstall`/`is_installed`/`is_loading`/`mine`/`set_mining_tier`/`ensure_installed`/
+//! (`install`/`uninstall`/`uninstall_released`/`is_installed`/`is_loading`/`mine`/`set_mining_tier`/
+//! `ensure_installed`/
 //! `current_tier`/`walk_devices`) so `main.rs`/`miner.rs`/`slm.rs` stay backend-agnostic — on macOS
 //! `lib.rs` aliases this module to `pom_gpu`. Nothing here compiles off macOS.
 //!
@@ -36,12 +37,11 @@ use log::info;
 
 use candle_core::quantized::gguf_file;
 use candle_metal_kernels::metal::{
-    create_command_buffer, Buffer, CommandBuffer, CommandQueue, CommandSemaphore, ComputePipeline,
-    Device as MtlDevice, MTLResourceOptions,
+    create_command_buffer, Buffer, CommandBuffer, CommandQueue, CommandSemaphore, ComputePipeline, Device as MtlDevice,
+    MTLResourceOptions,
 };
 use objc2_metal::{
-    MTLBuffer as _, MTLCommandBufferStatus, MTLResourceOptions as ObjcMTLResourceOptions,
-    MTLResourceUsage, MTLSize,
+    MTLBuffer as _, MTLCommandBufferStatus, MTLResourceOptions as ObjcMTLResourceOptions, MTLResourceUsage, MTLSize,
 };
 
 const METAL_SRC: &str = include_str!("../metal/pom_mine.metal");
@@ -52,8 +52,7 @@ const POM_V4_THREADS: usize = 32;
 
 /// Shared-storage: CPU and GPU see the same unified-memory backing, so the host writes uniforms /
 /// reads the winner with no blit — the same choice candle makes for its own transient buffers.
-const SHARED_STORAGE: MTLResourceOptions =
-    ObjcMTLResourceOptions(ObjcMTLResourceOptions::StorageModeShared.bits());
+const SHARED_STORAGE: MTLResourceOptions = ObjcMTLResourceOptions(ObjcMTLResourceOptions::StorageModeShared.bits());
 
 /// A synchronous wait alone does not mean Metal executed the buffer successfully: it also returns
 /// after an aborted/error completion. Never read a shared output buffer or account the batch until
@@ -64,13 +63,8 @@ fn wait_for_command(cmd: &CommandBuffer, context: &str) -> candle_core::Result<(
     if status == MTLCommandBufferStatus::Completed {
         return Ok(());
     }
-    let detail = cmd
-        .error()
-        .map(|e| e.into_owned())
-        .unwrap_or_else(|| "Metal supplied no NSError detail".to_string());
-    Err(candle_core::Error::Msg(format!(
-        "{context}: command buffer ended with status {status:?}: {detail}"
-    )))
+    let detail = cmd.error().map(|e| e.into_owned()).unwrap_or_else(|| "Metal supplied no NSError detail".to_string());
+    Err(candle_core::Error::Msg(format!("{context}: command buffer ended with status {status:?}: {detail}")))
 }
 
 fn words4(b: &[u8; 32]) -> [u64; 4] {
@@ -84,8 +78,8 @@ fn words4(b: &[u8; 32]) -> [u64; 4] {
 // Matches PomV4Uniforms in metal/pom_mine.metal — field order and padding are load-bearing.
 #[repr(C)]
 struct Uniforms {
-    n_tiles: u64,   // n_total_chunks / POM_V4_TILE_CHUNKS(32)
-    k_steps: u32,   // POM_V4_K = 256
+    n_tiles: u64, // n_total_chunks / POM_V4_TILE_CHUNKS(32)
+    k_steps: u32, // POM_V4_K = 256
     n_tensors: u32,
     p0: u64, // POW-fold words (H3-salted pph)
     p1: u64,
@@ -162,9 +156,8 @@ impl PomGpuMiner {
             mdev.new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: debug pipeline: {e}")))?
         };
-        let queue = mdev
-            .new_command_queue()
-            .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: command queue: {e}")))?;
+        let queue =
+            mdev.new_command_queue().map_err(|e| candle_core::Error::Msg(format!("PoM Metal: command queue: {e}")))?;
 
         Ok(Self {
             device: mdev,
@@ -195,9 +188,8 @@ impl PomGpuMiner {
         // Metal device WITHOUT candle_core — pure candle_metal_kernels wrapper over objc2-metal.
         // Ordinal is a no-op on Apple Silicon (single integrated GPU).
         let _ = device_id;
-        let mdev = MtlDevice::system_default().ok_or_else(|| {
-            candle_core::Error::Msg("PoM Metal: MTLCreateSystemDefaultDevice returned nil".into())
-        })?;
+        let mdev = MtlDevice::system_default()
+            .ok_or_else(|| candle_core::Error::Msg("PoM Metal: MTLCreateSystemDefaultDevice returned nil".into()))?;
 
         let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::wrap)?;
         let content = gguf_file::Content::read(&mut file)?;
@@ -228,10 +220,7 @@ impl PomGpuMiner {
                 continue;
             }
             let packed_bytes = n_chunks * CHUNK_BYTES; // drops the tail < 32 B (host does the same)
-            packs.push(Pack {
-                file_offset: content.tensor_data_offset + info.offset,
-                packed_bytes,
-            });
+            packs.push(Pack { file_offset: content.tensor_data_offset + info.offset, packed_bytes });
             total_bytes = total_bytes
                 .checked_add(packed_bytes)
                 .ok_or_else(|| candle_core::Error::Msg("PoM Metal: total tensor byte count overflowed usize".into()))?;
@@ -248,7 +237,9 @@ impl PomGpuMiner {
             .map_err(|e| candle_core::Error::Msg(format!("PoM Metal: alloc {total_bytes} B: {e}")))?;
         let base_ptr = weights_buf.contents();
         if base_ptr.is_null() {
-            return Err(candle_core::Error::Msg("PoM Metal: buffer.contents() is null for shared-storage buffer".into()));
+            return Err(candle_core::Error::Msg(
+                "PoM Metal: buffer.contents() is null for shared-storage buffer".into(),
+            ));
         }
 
         // Pass 2: pread raw GGUF bytes for each tensor's packed region into the Metal buffer at
@@ -361,15 +352,33 @@ impl PomGpuMiner {
     }
 
     /// Build the v4 uniform block. Shared by mine_v4 and the debug walk (which passes target=0).
-    fn v4_uniforms(&self, n_tiles: u64, p: &[u64; 4], s: &[u64; 4], timestamp: u64, t: [u64; 4], start: u64, n: u32) -> Uniforms {
+    fn v4_uniforms(
+        &self,
+        n_tiles: u64,
+        p: &[u64; 4],
+        s: &[u64; 4],
+        timestamp: u64,
+        t: [u64; 4],
+        start: u64,
+        n: u32,
+    ) -> Uniforms {
         Uniforms {
             n_tiles,
             k_steps: crate::pom_v4::POM_V4_K as u32,
             n_tensors: self.n_tensors,
-            p0: p[0], p1: p[1], p2: p[2], p3: p[3],
-            s0: s[0], s1: s[1], s2: s[2], s3: s[3],
+            p0: p[0],
+            p1: p[1],
+            p2: p[2],
+            p3: p[3],
+            s0: s[0],
+            s1: s[1],
+            s2: s[2],
+            s3: s[3],
             time_: timestamp,
-            t0: t[0], t1: t[1], t2: t[2], t3: t[3],
+            t0: t[0],
+            t1: t[1],
+            t2: t[2],
+            t3: t[3],
             nonce_base: start,
             n_nonces: n,
             _pad: 0,
@@ -424,11 +433,7 @@ impl PomGpuMiner {
 
         let mut out = vec![0u64; batch as usize];
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                states_buf.contents() as *const u64,
-                out.as_mut_ptr(),
-                batch as usize,
-            );
+            std::ptr::copy_nonoverlapping(states_buf.contents() as *const u64, out.as_mut_ptr(), batch as usize);
         }
         Ok(out)
     }
@@ -459,17 +464,74 @@ pub fn install(device_id: u32, m: PomGpuMiner) {
         g.insert(device_id, Arc::new(m));
     }
     // --wait-ready: this card's walk is resident = the card is set up (idempotent, cheap).
-    crate::wait_ready::mark_ready(device_id);
+    crate::wait_ready::mark_ready(device_id as u64);
 }
 
-fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) {
-    map.remove(&device_id);
+fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) -> Option<T> {
+    map.remove(&device_id)
 }
 
 pub fn uninstall(device_id: u32) {
-    if let Ok(mut g) = miners().lock() {
-        remove_device_entry(&mut g, device_id);
+    let _ = uninstall_released(device_id);
+}
+
+fn wait_for_sole_owner<T>(item: &Arc<T>, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while Arc::strong_count(item) > 1 {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
+    true
+}
+
+fn remove_entry_when_released<T>(
+    resident: &mut HashMap<u32, Arc<T>>,
+    device_id: u32,
+    timeout: std::time::Duration,
+) -> bool {
+    let Some(item) = remove_device_entry(resident, device_id) else {
+        return true;
+    };
+    if wait_for_sole_owner(&item, timeout) {
+        return true;
+    }
+    resident.insert(device_id, item);
+    false
+}
+
+/// Remove one Metal walk and report whether its model buffers were actually released.
+///
+/// `mine_v4` clones the resident miner before dispatching outside the registry lock. Removing the
+/// map entry alone therefore does not prove that a synchronous Metal command buffer has completed.
+/// Keep the registry locked while the removed Arc drains: that prevents a new walk from acquiring
+/// the miner (or a replacement from being installed) until every pre-existing dispatch has dropped
+/// its handle. On timeout, put the miner back so the still-live buffers remain registered and a
+/// second full model cannot be installed on top of them.
+#[must_use = "a false result means a Metal walk still owns model memory; do not reload/free it"]
+pub fn uninstall_released(device_id: u32) -> bool {
+    let mut resident = match miners().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            log::error!(
+                "PoM Metal[gpu{}]: resident-miner registry is poisoned — refusing to release model buffers",
+                device_id
+            );
+            return false;
+        }
+    };
+    if remove_entry_when_released(&mut resident, device_id, std::time::Duration::from_secs(30)) {
+        return true;
+    }
+
+    // Preserve the registry's ownership on failure. The caller must not load/free model memory,
+    // and `ensure_installed` must continue to see this table instead of allocating a duplicate.
+    log::error!(
+        "PoM Metal[gpu{}]: a walk still holds the miner after 30s — model buffers stay resident and this card will not be rebuilt",
+        device_id
+    );
+    false
 }
 
 pub fn is_installed(device_id: u32) -> bool {
@@ -486,14 +548,18 @@ pub fn is_loading() -> bool {
 /// uninstalls a device's miner to reload the inference model, so uninstall() doesn't race a live
 /// batch. On Metal the walk is a single synchronous `wait_until_completed()` dispatch (no async
 /// batch in flight to protect), so this is a plain flag kept for API symmetry.
-static INFERENCE_PAUSED: AtomicBool = AtomicBool::new(false);
+static INFERENCE_PAUSED: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_inference_paused(paused: bool) {
-    INFERENCE_PAUSED.store(paused, Ordering::Release);
+    if paused {
+        INFERENCE_PAUSED.fetch_add(1, Ordering::AcqRel);
+    } else {
+        let _ = INFERENCE_PAUSED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)));
+    }
 }
 
 pub fn is_inference_paused() -> bool {
-    INFERENCE_PAUSED.load(Ordering::Acquire)
+    INFERENCE_PAUSED.load(Ordering::Acquire) != 0
 }
 
 // ── BACKEND PARITY with the CUDA `pom_gpu` ─────────────────────────────────────────────────────
@@ -511,6 +577,83 @@ pub fn set_inference_paused_on(_gpu: usize, paused: bool) {
 
 pub fn inference_paused_for(_device_id: u32) -> bool {
     is_inference_paused()
+}
+
+/// Model staging is GPU work too. Record it before allocation begins so an inference drain cannot
+/// mistake an empty resident map for an idle Metal device. The thread id permits a staging-time
+/// self-test to enter this gate re-entrantly, matching the CUDA backend's contract.
+fn installing_devices() -> &'static Mutex<HashMap<u32, std::thread::ThreadId>> {
+    static INSTALLING: OnceLock<Mutex<HashMap<u32, std::thread::ThreadId>>> = OnceLock::new();
+    INSTALLING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct DeviceInstallGuard {
+    device_id: u32,
+    owner: std::thread::ThreadId,
+}
+
+impl DeviceInstallGuard {
+    fn begin(device_id: u32) -> Option<Self> {
+        let owner = std::thread::current().id();
+        let mut installing = installing_devices().lock().unwrap_or_else(|p| p.into_inner());
+        if inference_paused_for(device_id) || installing.contains_key(&device_id) {
+            return None;
+        }
+        installing.insert(device_id, owner);
+        Some(Self { device_id, owner })
+    }
+}
+
+impl Drop for DeviceInstallGuard {
+    fn drop(&mut self) {
+        let mut installing = installing_devices().lock().unwrap_or_else(|p| p.into_inner());
+        if installing.get(&self.device_id) == Some(&self.owner) {
+            installing.remove(&self.device_id);
+        }
+    }
+}
+
+/// Pause the Metal walk and wait for a command buffer that already passed the pause check to finish.
+/// `mine_v4` owns one cloned Arc until `wait_until_completed` returns, so map+local are the two idle
+/// owners and a third owner denotes the in-flight synchronous dispatch.
+pub struct InferenceDrainGuard(usize);
+
+impl Drop for InferenceDrainGuard {
+    fn drop(&mut self) {
+        set_inference_paused_on(self.0, false);
+    }
+}
+
+pub fn pause_and_drain_for_inference(gpu: usize) -> Option<InferenceDrainGuard> {
+    set_inference_paused_on(gpu, true);
+    let guard = InferenceDrainGuard(gpu);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let current = std::thread::current().id();
+    loop {
+        let staged_by_other_thread = installing_devices()
+            .lock()
+            .map(|installing| installing.get(&(gpu as u32)).map(|owner| owner != &current).unwrap_or(false))
+            .unwrap_or(true);
+        if !staged_by_other_thread {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            log::error!("PoM Metal[gpu{}]: model install did not drain within 30s — refusing GPU inference", gpu);
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let resident = miners().lock().ok().and_then(|map| map.get(&(gpu as u32)).cloned());
+    if let Some(miner) = resident {
+        while Arc::strong_count(&miner) > 2 {
+            if std::time::Instant::now() >= deadline {
+                log::error!("PoM Metal[gpu{}]: walk did not drain within 30s — refusing GPU inference", gpu);
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    Some(guard)
 }
 
 /// `--only-inference`: serve requests, barely mine. Same contract as the CUDA side.
@@ -573,6 +716,9 @@ pub fn mine_v4(
     batch: u64,
     daa: u64,
 ) -> crate::pom::GrindResult {
+    if inference_paused_for(device_id) {
+        return Err(crate::pom::GrindError::Paused("Metal walk paused for GPU inference"));
+    }
     // 🔴 H10 HARD SAFETY GUARD (mirrors the CUDA backend). At/after the H10 gate the walk seed is
     // the one-way cSHAKE256 PowHash (keccak-f1600 absorbing RAW pph words + timestamp + nonce),
     // which is computed INSIDE the walk kernel because the nonce varies per thread. The Metal
@@ -589,7 +735,8 @@ pub fn mine_v4(
                 "PoM[metal{}]: block DAA {} is in the H10 one-way-seed era, which the Metal walk \
                  shader does not implement — NOT mining (it would produce 100% rejected shares). \
                  Use the CUDA build for H10-era mining.",
-                device_id, daa
+                device_id,
+                daa
             );
         }
         return Err(crate::pom::GrindError::Paused("Metal H10 seed unsupported"));
@@ -603,6 +750,9 @@ pub fn mine_v4(
         };
         miner.clone()
     };
+    if inference_paused_for(device_id) {
+        return Err(crate::pom::GrindError::Paused("Metal walk paused for GPU inference"));
+    }
     match miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch) {
         Ok(winner) => Ok(crate::pom::GrindCompleted { winner, hashes_done: batch }),
         Err(e) => {
@@ -673,6 +823,10 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
     if is_installed(device_id) {
         return true;
     }
+    let _install_guard = match DeviceInstallGuard::begin(device_id) {
+        Some(guard) => guard,
+        None => return false,
+    };
     LOADING.fetch_add(1, Ordering::Relaxed);
     let ok = ensure_installed_inner(device_id, daa);
     LOADING.fetch_sub(1, Ordering::Relaxed);
@@ -704,10 +858,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         if crate::pom::active_index().is_none() {
             // The background prefetch may still be fetching the mining-tier model. Wait for the
             // `.ok` completion sentinel and retry next job rather than spamming ENOENT.
-            let ready = std::path::Path::new(gguf)
-                .parent()
-                .map(|d| d.join(".ok"))
-                .map_or(false, |p| p.exists());
+            let ready = std::path::Path::new(gguf).parent().map(|d| d.join(".ok")).map_or(false, |p| p.exists());
             if !ready {
                 static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, Ordering::Relaxed) {
@@ -736,7 +887,11 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                         .unwrap_or(0);
                     if now.saturating_sub(LAST_LOG_SECS.load(Ordering::Relaxed)) >= 300 {
                         LAST_LOG_SECS.store(now, Ordering::Relaxed);
-                        log::error!("PoM Metal: possession-index build failed on gpu{}: {} (retrying each job; rate-limited).", device_id, e);
+                        log::error!(
+                            "PoM Metal: possession-index build failed on gpu{}: {} (retrying each job; rate-limited).",
+                            device_id,
+                            e
+                        );
                     }
                     return false;
                 }
@@ -751,7 +906,12 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             let n = gm.n_chunks();
             if let Some((idx, _)) = crate::pom::active_index() {
                 if n != idx.n_chunks {
-                    log::error!("PoM Metal[gpu{}]: gather N={} != shared index N={} — refusing to mine", device_id, n, idx.n_chunks);
+                    log::error!(
+                        "PoM Metal[gpu{}]: gather N={} != shared index N={} — refusing to mine",
+                        device_id,
+                        n,
+                        idx.n_chunks
+                    );
                     return false;
                 }
             }
@@ -770,6 +930,51 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
 mod tests {
     use super::*;
     use crate::{pom, pom_v4};
+
+    #[test]
+    fn release_barrier_waits_for_an_existing_walk_owner() {
+        let miner = Arc::new(());
+        let in_flight = Arc::clone(&miner);
+        let walk = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(in_flight);
+        });
+
+        assert!(wait_for_sole_owner(&miner, std::time::Duration::from_secs(1)));
+        walk.join().unwrap();
+        assert_eq!(Arc::strong_count(&miner), 1);
+    }
+
+    #[test]
+    fn release_barrier_times_out_while_a_walk_owner_survives() {
+        let miner = Arc::new(());
+        let _in_flight = Arc::clone(&miner);
+
+        assert!(!wait_for_sole_owner(&miner, std::time::Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn remove_device_entry_returns_only_the_target_owner() {
+        let mut resident = HashMap::from([(0, "gpu0"), (1, "gpu1")]);
+
+        assert_eq!(remove_device_entry(&mut resident, 0), Some("gpu0"));
+        assert_eq!(resident.get(&1), Some(&"gpu1"));
+        assert_eq!(remove_device_entry(&mut resident, 0), None);
+    }
+
+    #[test]
+    fn timed_out_release_restores_the_resident_entry() {
+        let miner = Arc::new(());
+        let in_flight = Arc::clone(&miner);
+        let mut resident = HashMap::from([(0, miner)]);
+
+        assert!(!remove_entry_when_released(&mut resident, 0, std::time::Duration::from_millis(10)));
+        assert!(resident.contains_key(&0), "a busy miner must remain registered");
+
+        drop(in_flight);
+        assert!(remove_entry_when_released(&mut resident, 0, std::time::Duration::from_millis(10)));
+        assert!(!resident.contains_key(&0));
+    }
 
     /// Build a miner from multiple synthetic tensor buffers — exercises the same multi-buffer
     /// bindless plumbing the real GGUF path uses (`upper_bound_prefix` non-trivial, `use_resource`
@@ -802,9 +1007,8 @@ mod tests {
         assert!(bytes.len() % CHUNK_BYTES == 0 && !bytes.is_empty());
         let n_chunks = (bytes.len() / CHUNK_BYTES) as u64;
         let mdev = MtlDevice::system_default().expect("Metal device 0");
-        let buf = mdev
-            .new_buffer_with_data(bytes.as_ptr() as *const _, bytes.len(), SHARED_STORAGE)
-            .expect("blob buffer");
+        let buf =
+            mdev.new_buffer_with_data(bytes.as_ptr() as *const _, bytes.len(), SHARED_STORAGE).expect("blob buffer");
         let addr = buf.as_ref().gpuAddress();
         let prefix = [0u64, n_chunks];
         let addrs = [addr];
@@ -875,7 +1079,9 @@ mod tests {
         // (1) packed buffer vs host WeightIndex at sampled offsets.
         eprintln!("── packed buffer vs host WeightIndex ──");
         let mut sample_offs: Vec<u64> = vec![0, 1, n - 1, n / 2];
-        for i in 1..16 { sample_offs.push((n * i) / 16); }
+        for i in 1..16 {
+            sample_offs.push((n * i) / 16);
+        }
         sample_offs.sort_unstable();
         sample_offs.dedup();
         let base_ptr = miner.resources[0].contents() as *const u8;
@@ -886,7 +1092,9 @@ mod tests {
             let host = pom::words_to_bytes(&idx.read_chunk(off));
             let ok = buf == host;
             eprintln!("  off={off:>10}  {}  {}", hex32(&buf), if ok { "OK" } else { "MISMATCH" });
-            if !ok { mismatches += 1; }
+            if !ok {
+                mismatches += 1;
+            }
         }
         assert_eq!(mismatches, 0, "packed buffer differs from host WeightIndex");
 
@@ -898,8 +1106,10 @@ mod tests {
             let seed = pom::pom_block_seed_v4(&pph, ts, nonce);
             let (_, host_fs) = pom_v4::build_proof_v4(1, seed, &idx).expect("host build_proof_v4");
             let gpu = miner.debug_walk_states_v4(&pph, ts, nonce, 1).expect("debug_walk_states_v4")[0];
-            eprintln!("  nonce={nonce:<10} host=0x{host_fs:016x} metal=0x{gpu:016x} {}",
-                      if host_fs == gpu { "OK" } else { "MISMATCH" });
+            eprintln!(
+                "  nonce={nonce:<10} host=0x{host_fs:016x} metal=0x{gpu:016x} {}",
+                if host_fs == gpu { "OK" } else { "MISMATCH" }
+            );
             assert_eq!(host_fs, gpu, "v4 walk diverges for nonce {nonce}");
         }
 
@@ -910,7 +1120,9 @@ mod tests {
         for i in 0..sweep_batch {
             let seed = pom::pom_block_seed_v4(&pph, ts, sweep_start + i);
             let (_, host_fs) = pom_v4::build_proof_v4(1, seed, &idx).expect("host");
-            if host_fs != gpu[i as usize] { diverge += 1; }
+            if host_fs != gpu[i as usize] {
+                diverge += 1;
+            }
         }
         assert_eq!(diverge, 0, "v4 batch sweep diverges ({diverge}/{sweep_batch})");
 
@@ -936,16 +1148,32 @@ mod tests {
     #[test]
     fn metal_walk_matches_host_reference_multi_tensor() {
         let per_tensor: [usize; 12] = [
-            5 * 32, 17 * 32, 41 * 32, 128 * 32, 257 * 32, 511 * 32,
-            1024 * 32, 2001 * 32, 4096 * 32, 512 * 32, 91 * 32, 331 * 32,
+            5 * 32,
+            17 * 32,
+            41 * 32,
+            128 * 32,
+            257 * 32,
+            511 * 32,
+            1024 * 32,
+            2001 * 32,
+            4096 * 32,
+            512 * 32,
+            91 * 32,
+            331 * 32,
         ];
         let total_bytes: usize = per_tensor.iter().sum();
         let mut bytes = vec![0u8; total_bytes];
         let mut s = 0xdead_beef_cafe_babeu64;
-        for b in bytes.iter_mut() { s = pom::mix64(s); *b = (s & 0xff) as u8; }
+        for b in bytes.iter_mut() {
+            s = pom::mix64(s);
+            *b = (s & 0xff) as u8;
+        }
         let mut tensors: Vec<&[u8]> = Vec::with_capacity(per_tensor.len());
         let mut off = 0usize;
-        for &sz in &per_tensor { tensors.push(&bytes[off..off + sz]); off += sz; }
+        for &sz in &per_tensor {
+            tensors.push(&bytes[off..off + sz]);
+            off += sz;
+        }
         let n_chunks = (total_bytes / CHUNK_BYTES) as u64;
         let miner = miner_from_tensor_blobs(&tensors);
         assert_eq!(miner.n_chunks(), n_chunks);
@@ -960,7 +1188,9 @@ mod tests {
         let mut diverge = 0usize;
         for i in 0..wbatch {
             let seed = pom::pom_block_seed_v4(&pph, ts, wstart + i);
-            if v4_final_state(&bytes, n_chunks, seed) != gpu[i as usize] { diverge += 1; }
+            if v4_final_state(&bytes, n_chunks, seed) != gpu[i as usize] {
+                diverge += 1;
+            }
         }
         assert_eq!(diverge, 0, "multi-tensor v4 walk final_state diverges ({diverge}/{wbatch})");
 
@@ -968,8 +1198,8 @@ mod tests {
         let (start, batch) = (777u64, 8192u64);
         let n_star = start + batch / 2;
         let target = v4_pow_value(&bytes, n_chunks, &pph, ts, n_star);
-        let expected = (start..start + batch)
-            .find(|&nn| pom::le_leq(&v4_pow_value(&bytes, n_chunks, &pph, ts, nn), &target));
+        let expected =
+            (start..start + batch).find(|&nn| pom::le_leq(&v4_pow_value(&bytes, n_chunks, &pph, ts, nn), &target));
         let got = miner.mine_v4(&pph, ts, &target, start, batch).expect("metal mine_v4");
         assert_eq!(got, expected, "multi-tensor v4 Metal winner != host reference");
         assert!(got.is_some(), "n_star must be a winner");
@@ -982,7 +1212,10 @@ mod tests {
         let n_chunks = 4096u64; // 128 tiles
         let mut bytes = vec![0u8; n_chunks as usize * CHUNK_BYTES];
         let mut s = 0x1234_5678_9abc_def0u64;
-        for b in bytes.iter_mut() { s = pom::mix64(s); *b = (s & 0xff) as u8; }
+        for b in bytes.iter_mut() {
+            s = pom::mix64(s);
+            *b = (s & 0xff) as u8;
+        }
         let miner = miner_from_blob(&bytes);
         assert_eq!(miner.n_chunks(), n_chunks);
 
@@ -1001,8 +1234,8 @@ mod tests {
         let (start, batch) = (1_000u64, 4_000u64);
         let n_star = start + batch / 2;
         let target = v4_pow_value(&bytes, n_chunks, &pph, ts, n_star);
-        let expected = (start..start + batch)
-            .find(|&nn| pom::le_leq(&v4_pow_value(&bytes, n_chunks, &pph, ts, nn), &target));
+        let expected =
+            (start..start + batch).find(|&nn| pom::le_leq(&v4_pow_value(&bytes, n_chunks, &pph, ts, nn), &target));
         let got = miner.mine_v4(&pph, ts, &target, start, batch).expect("metal mine_v4");
         assert_eq!(got, expected, "v4 Metal winner != host reference");
         assert!(got.is_some() && got.unwrap() <= n_star);

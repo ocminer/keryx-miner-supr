@@ -4,12 +4,12 @@ use libloading::{Library, Symbol};
 pub mod gguf;
 pub mod inference;
 pub mod integrity;
+pub mod keccak;
 pub mod models;
 pub mod slm;
 /// Stratum miner-telemetry (mining.hello / mining.telemetry) — display/ops only, best-effort.
 pub mod telemetry;
 pub mod wait_ready;
-pub mod keccak;
 // Device-mapped quantized model forks (OPoI v2 archs) — used by slm inference and the
 // PoM zero-dup gather. Device-agnostic (candle Device = CPU or CUDA), so they build
 // regardless of the cuda feature.
@@ -23,31 +23,66 @@ pub mod quantized_qwen3_split;
 // `keryx_miner::Error`, `keryx_miner::xoshiro256starstar` and
 // `keryx_miner::declare_plugin!` keep resolving for the rest of the tree.
 pub mod pom;
-pub mod pom_v4;
 #[cfg(feature = "pom-opencl")]
 pub mod pom_opencl;
+pub mod pom_v4;
 // llama.cpp llama-server inference: AMD (Vulkan) always; NVIDIA (CUDA server) since Phase 1 of
 // candle-independence — the module self-disables when no server binary is bundled/env-pointed.
 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
 pub mod llama_vulkan;
 // AMD in-process llama.cpp engine (dlopen'd libkeryx-llama-vk.so): zero-dup — llama hosts the
 // model on the inference card, the PoM walk gathers over its VRAM, OPoI text runs in-process.
-// Absent .so = the llama-server subprocess + candle-CPU fallbacks and per-card OpenCL blobs.
+// Absent .so = the llama-server subprocess, then only an explicitly enabled deprecated candle-CPU
+// emergency fallback, plus per-card OpenCL blobs.
 #[cfg(all(feature = "pom-opencl", unix))]
 pub mod llama_engine_vk;
 // Windows AMD: no dlopen — stub keeps call sites identical (OpenCL blob + llama-server paths).
 #[cfg(all(feature = "pom-opencl", not(unix)))]
 pub mod llama_engine_vk {
-    pub fn ensure_loaded(_gguf: &str, _gpu: usize) -> bool { false }
-    pub fn pick_discrete_ggml_device() -> Option<i32> { None }
-    pub fn available() -> bool { false }
-    pub fn generate(_prompt: &str, _max_tokens: usize) -> Option<String> { None }
-    pub fn pom_ready() -> bool { false }
-    pub fn pom_pci() -> Option<(u32, u32, u32, u32)> { None }
-    pub fn pom_byte_gate(_index: &crate::pom::WeightIndex) -> bool { false }
-    pub fn pom_mine(_p: [u64; 4], _s: [u64; 4], _time: u64, _t: [u64; 4], _nonce_base: u64, _batch: u64, _walk_v2: bool) -> Option<u64> { None }
-    pub fn unload() -> bool { false }
-    pub fn evicted_for_vram() -> bool { false }
+    pub fn ensure_loaded(_gguf: &str, _gpu: usize) -> bool {
+        false
+    }
+    pub fn pick_discrete_ggml_device() -> Option<i32> {
+        None
+    }
+    pub fn available() -> bool {
+        false
+    }
+    pub fn active_for(_gguf: &str) -> bool {
+        false
+    }
+    pub fn generate(_prompt: &str, _max_tokens: usize) -> Option<String> {
+        None
+    }
+    pub fn generate_for(_gguf: &str, _prompt: &str, _max_tokens: usize) -> Option<String> {
+        None
+    }
+    pub fn pom_ready() -> bool {
+        false
+    }
+    pub fn pom_pci() -> Option<(u32, u32, u32, u32)> {
+        None
+    }
+    pub fn pom_byte_gate(_index: &crate::pom::WeightIndex) -> bool {
+        false
+    }
+    pub fn pom_mine(
+        _p: [u64; 4],
+        _s: [u64; 4],
+        _time: u64,
+        _t: [u64; 4],
+        _nonce_base: u64,
+        _batch: u64,
+        _walk_v2: bool,
+    ) -> Option<u64> {
+        None
+    }
+    pub fn unload() -> bool {
+        false
+    }
+    pub fn evicted_for_vram() -> bool {
+        false
+    }
     pub fn mark_gpu_inference_unfit() {}
 }
 // In-process llama.cpp engine (dlopen'd libkeryx-llama.{so,dylib}): candle-independence — when
@@ -57,23 +92,55 @@ pub mod llama_engine_vk {
 // dylib} via `libloading` (dlopen / LoadLibrary), so it is now a REAL module on Windows too (it was
 // previously stubbed there, which left Windows NVIDIA rigs unable to serve H4/H6 models — they only
 // load via llama.cpp). The stub below only remains for exotic non-unix, non-windows targets.
-#[cfg(all(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")), any(unix, windows)))]
+#[cfg(all(
+    any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")),
+    any(unix, windows)
+))]
 pub mod llama_engine;
 // Fallback stub for any target that is neither unix nor windows — keeps call sites identical.
-#[cfg(all(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")), not(any(unix, windows))))]
+#[cfg(all(
+    any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")),
+    not(any(unix, windows))
+))]
 pub mod llama_engine {
-    pub fn ensure_loaded(_gguf: &str, _gpu: usize) -> bool { false }
-    pub fn ensure_loaded_on(_gguf: &str, _gpu: usize) -> bool { false }
-    pub fn active_for(_gguf: &str, _gpu: usize) -> bool { false }
-    pub fn available() -> bool { false }
-    pub fn available_on(_gpu: usize) -> bool { false }
+    pub fn ensure_loaded(_gguf: &str, _gpu: usize) -> bool {
+        false
+    }
+    pub fn ensure_loaded_on(_gguf: &str, _gpu: usize) -> bool {
+        false
+    }
+    pub fn active_for(_gguf: &str, _gpu: usize) -> bool {
+        false
+    }
+    pub fn available() -> bool {
+        false
+    }
+    pub fn available_on(_gpu: usize) -> bool {
+        false
+    }
     pub fn unload() {}
     pub fn unload_for_gpu(_gpu: usize) {}
-    pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> { None }
-    pub fn tensors_for(_gpu: usize) -> Option<Vec<(String, u64, usize, bool)>> { None }
-    pub fn foreign_device_tensor(_expected_gpu: usize) -> Option<(String, i32)> { None }
-    pub fn generate(_prompt: &str, _max_tokens: usize) -> Option<String> { None }
-    pub fn generate_on(_gpu: usize, _prompt: &str, _max_tokens: usize) -> Option<String> { None }
+    pub fn abandon_for_gpu(_gpu: usize) -> bool {
+        false
+    }
+    pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> {
+        None
+    }
+    pub fn tensors_for(_gpu: usize) -> Option<Vec<(String, u64, usize, bool)>> {
+        None
+    }
+    pub fn foreign_device_tensor(_expected_gpu: usize) -> Option<(String, i32)> {
+        None
+    }
+    pub fn generate(_prompt: &str, _max_tokens: usize) -> Option<String> {
+        None
+    }
+    pub fn generate_on(_gpu: usize, _prompt: &str, _max_tokens: usize) -> Option<String> {
+        None
+    }
+    pub fn generate_for(_gpu: usize, _gguf: &str, _prompt: &str, _max_tokens: usize) -> Option<String> {
+        None
+    }
 }
 // PoM GPU driver aliased to `pom_gpu` per platform so main.rs/miner.rs/slm.rs stay backend-agnostic:
 // NVIDIA CUDA on Linux/Windows, Apple-Silicon Metal on macOS. Mutually exclusive by construction
@@ -87,8 +154,39 @@ pub use keryx_plugin_api::{declare_plugin, xoshiro256starstar, Error, Plugin, Wo
 
 #[derive(Default)]
 pub struct PluginManager {
-    plugins: Vec<Box<dyn Plugin>>,
+    plugins: Vec<ManagedPlugin>,
     loaded_libraries: Vec<Library>,
+}
+
+struct ManagedPlugin {
+    plugin: Box<dyn Plugin>,
+    no_winner: u64,
+}
+
+/// Host-owned metadata around an unchanged plugin `WorkerSpec` trait object. The wrapper is kept on
+/// the host side deliberately: extending the Rust trait vtable would make a new miner unsafe when
+/// an older `.so` remains next to it after a partial upgrade.
+pub struct ManagedWorkerSpec {
+    inner: Box<dyn WorkerSpec + 'static>,
+    no_winner: u64,
+}
+
+impl ManagedWorkerSpec {
+    pub fn id(&self) -> String {
+        self.inner.id()
+    }
+
+    pub fn build(&self) -> Box<dyn Worker> {
+        self.inner.build()
+    }
+
+    pub fn opencl_device_id(&self) -> Option<usize> {
+        self.inner.opencl_device_id()
+    }
+
+    pub fn no_winner(&self) -> u64 {
+        self.no_winner
+    }
 }
 
 /**
@@ -105,8 +203,10 @@ impl PluginManager {
         app: clap::App<'help>,
         path: &str,
     ) -> Result<clap::App<'help>, (clap::App<'help>, Error)> {
+        #[allow(improper_ctypes_definitions)] // legacy Rust-trait-object plugin ABI
         type PluginCreate<'help> =
-            unsafe fn(*const clap::App<'help>) -> (*mut clap::App<'help>, *mut dyn Plugin, *mut Error);
+            unsafe extern "C" fn(*mut clap::App<'help>) -> (*mut clap::App<'help>, *mut dyn Plugin, *const Error);
+        type EnableRawNonceV1 = unsafe extern "C" fn() -> u64;
 
         let lib = match Library::new(path) {
             Ok(l) => l,
@@ -115,6 +215,14 @@ impl PluginManager {
 
         self.loaded_libraries.push(lib); // Save library so it persists in memory
         let lib = self.loaded_libraries.last().unwrap();
+
+        // Optional, ABI-safe capability negotiation. Absence means the historical zero sentinel,
+        // so an old plugin beside this host remains safe. The new CUDA plugin only exposes raw MAX
+        // after this call; without it, it translates MAX back to zero for an old host.
+        let no_winner = match lib.get::<EnableRawNonceV1>(b"keryx_plugin_enable_raw_nonce_v1") {
+            Ok(enable) => enable(),
+            Err(_) => 0,
+        };
 
         let constructor: Symbol<PluginCreate> = match lib.get(b"_plugin_create") {
             Ok(cons) => cons,
@@ -125,10 +233,10 @@ impl PluginManager {
         let app = *Box::from_raw(app);
 
         if boxed_raw.is_null() {
-            return Err((app, *Box::from_raw(error)));
+            return Err((app, *Box::from_raw(error as *mut Error)));
         }
         let plugin = Box::from_raw(boxed_raw);
-        self.plugins.push(plugin);
+        self.plugins.push(ManagedPlugin { plugin, no_winner });
 
         Ok(app)
     }
@@ -144,15 +252,36 @@ impl PluginManager {
         augment: impl FnOnce(clap::App<'help>) -> clap::App<'help>,
     ) -> clap::App<'help> {
         let app = augment(app);
-        self.plugins.push(plugin);
+        self.plugins.push(ManagedPlugin { plugin, no_winner: 0 });
         app
     }
 
-    pub fn build(&self) -> Result<Vec<Box<dyn WorkerSpec + 'static>>, Error> {
-        let mut specs = Vec::<Box<dyn WorkerSpec + 'static>>::new();
-        for plugin in &self.plugins {
-            if plugin.enabled() {
-                specs.extend(plugin.get_worker_specs());
+    /// Register an in-process plugin whose worker output uses a negotiated no-winner sentinel.
+    /// Dynamic plugins discover this through the optional symbol above; static CUDA calls the same
+    /// negotiation function and passes its result here.
+    pub fn register_builtin_with_output_contract<'help>(
+        &mut self,
+        app: clap::App<'help>,
+        plugin: Box<dyn Plugin>,
+        no_winner: u64,
+        augment: impl FnOnce(clap::App<'help>) -> clap::App<'help>,
+    ) -> clap::App<'help> {
+        let app = augment(app);
+        self.plugins.push(ManagedPlugin { plugin, no_winner });
+        app
+    }
+
+    pub fn build(&self) -> Result<Vec<ManagedWorkerSpec>, Error> {
+        let mut specs = Vec::<ManagedWorkerSpec>::new();
+        for managed in &self.plugins {
+            if managed.plugin.enabled() {
+                specs.extend(
+                    managed
+                        .plugin
+                        .get_worker_specs()
+                        .into_iter()
+                        .map(|inner| ManagedWorkerSpec { inner, no_winner: managed.no_winner }),
+                );
             }
         }
         Ok(specs)
@@ -163,19 +292,32 @@ impl PluginManager {
     */
     pub fn process_options(&mut self, matchs: &ArgMatches) -> Result<usize, Error> {
         let mut count = 0usize;
-        self.plugins.iter_mut().for_each(|plugin| {
-            count += match plugin.process_option(matchs) {
+        self.plugins.iter_mut().for_each(|managed| {
+            count += match managed.plugin.process_option(matchs) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!(
                         "WARNING: Failed processing options for {} (ignore if you do not intend to use): {}",
-                        plugin.name(),
+                        managed.plugin.name(),
                         e
                     );
                     0
                 }
             }
         });
+        // The OpenCL PoM/inference driver lives in the host library, while CLI selection lives in
+        // the worker plugin. Publish the plugin's exact post-filter `cl_device_id` list before any
+        // VRAM sizing or inference placement runs. Global OpenCL enumeration is not equivalent on
+        // mixed-platform rigs or with `--opencl-device` subsets/reordering.
+        #[cfg(feature = "pom-opencl")]
+        crate::pom_opencl::set_selected_worker_devices(
+            self.plugins
+                .iter()
+                .filter(|managed| managed.plugin.enabled())
+                .flat_map(|managed| managed.plugin.get_worker_specs())
+                .filter_map(|spec| spec.opencl_device_id())
+                .collect(),
+        );
         Ok(count)
     }
 

@@ -6,7 +6,7 @@
 # Usage: build-llama-server.sh <modern|legacy|pascal> [JOBS]
 #   modern: container CUDA 12.9, archs 75;80;86;89;90;120  (Turing+ .. Blackwell)
 #   legacy: /tmp/cuda124 (12.4), archs 70;75;80;86;89;90   (Volta+ .. Hopper)
-#   pascal: /tmp/cuda124 (12.4), archs 60;61               (GTX 10-series / P100)
+#   pascal: /tmp/cuda124 (12.4), arch 61                    (GTX 10-series; no P100)
 # Output: hiveos/dist-<line>/llama-server  (package-line.sh bundles it when present)
 #
 # llama.cpp is PINNED to release tag b10015 (2026-07). Bump deliberately, then re-run all lines.
@@ -17,7 +17,7 @@ TAG=b10015
 case "$LINE" in
   modern) ARCHS="75;80;86;89;90;120"; CUDAMOUNT=(); KCUDA=/usr/local/cuda ;;
   legacy) ARCHS="70;75;80;86;89;90";  CUDAMOUNT=(-v /tmp/cuda124:/opt/cuda:ro); KCUDA=/opt/cuda ;;
-  pascal) ARCHS="60;61";              CUDAMOUNT=(-v /tmp/cuda124:/opt/cuda:ro); KCUDA=/opt/cuda ;;
+  pascal) ARCHS="61";                 CUDAMOUNT=(-v /tmp/cuda124:/opt/cuda:ro); KCUDA=/opt/cuda ;;
   *) echo "usage: $0 <modern|legacy|pascal> [JOBS]"; exit 1 ;;
 esac
 OUT="$REPO/hiveos/dist-$LINE"

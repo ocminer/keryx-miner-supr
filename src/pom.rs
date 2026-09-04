@@ -11,11 +11,11 @@
 //! same challenges and recomputes the same transitions). See POM_CONSENSUS_SPEC.md.
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(target_family = "unix")]
@@ -42,7 +42,7 @@ use std::sync::OnceLock;
 /// Resident-tree switch. Resolved ONCE at startup from the CLI (`--resident-tree` /
 /// `--no-resident-tree`) with `KERYX_RESIDENT_TREE` as a back-compat fallback, then read by
 /// both the CUDA (`pom_gpu`) and OpenCL (`pom_opencl`) index-build paths. OFF by default:
-/// building the full Merkle tree in RAM (~9.6 GB at tier 0) is only worth it for solo mining.
+/// building the full Merkle tree in RAM (~12 GiB at the current tier 0) is only worth it for solo mining.
 static RESIDENT_TREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Set the resident-tree switch (call once, from main after CLI parse).
@@ -106,13 +106,7 @@ impl MaskedNonceCursor {
         // A bit set in `fixed` cannot vary even if a malformed assignment also sets it in `mask`.
         let variable = mask & !fixed;
         let domain = 1u128 << variable.count_ones(); // deliberately supports a 2^64 domain
-        Self {
-            fixed,
-            variable,
-            rank: (seed as u128) & (domain - 1),
-            remaining: domain,
-            domain,
-        }
+        Self { fixed, variable, rank: (seed as u128) & (domain - 1), remaining: domain, domain }
     }
 
     #[inline]
@@ -140,10 +134,7 @@ impl MaskedNonceCursor {
         let period = 1u128 << low_width;
         let to_low_wrap = period - (self.rank & (period - 1));
         let to_domain_wrap = self.domain - self.rank;
-        let len = (requested as u128)
-            .min(self.remaining)
-            .min(to_low_wrap)
-            .min(to_domain_wrap);
+        let len = (requested as u128).min(self.remaining).min(to_low_wrap).min(to_domain_wrap);
         let start = self.fixed | Self::deposit(self.rank as u64, self.variable);
         debug_assert!(start as u128 + len - 1 <= u64::MAX as u128);
         Some(NonceRange { start, len: len as u64 })
@@ -254,7 +245,7 @@ pub fn words_to_bytes(w: &[u64; CHUNK_WORDS]) -> [u8; 32] {
 }
 
 #[inline]
-fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(left);
     buf[32..].copy_from_slice(right);
@@ -338,8 +329,7 @@ pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32], h3: bool) -> [u8
 // --- H3-salted pph words (`pph_words_for_era(.., true)`), i.e. "v4 pow uses the h3 fold". ---
 
 /// v4 seed salt. MUST equal the node's `POM_V4_PPH_SALT` (consensus/core/src/pom.rs @ v1.5.1).
-pub const POM_V4_PPH_SALT: [u64; 4] =
-    [0x7D7BC84C8D18DE80, 0xDE48EE16AE3F1541, 0x3305F1952B30384A, 0xF78C133968D388B7];
+pub const POM_V4_PPH_SALT: [u64; 4] = [0x7D7BC84C8D18DE80, 0xDE48EE16AE3F1541, 0x3305F1952B30384A, 0xF78C133968D388B7];
 
 /// v4 seed pph words = raw pph XOR the v4 salt (does NOT touch the pow fold).
 #[inline]
@@ -439,15 +429,18 @@ pub fn is_h10_seed_era(daa: u64) -> bool {
 pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     assert!(!leaves.is_empty(), "merkle_root: empty leaves");
     let mut level = leaves.to_vec();
-    while level.len() > 1 {
-        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+    let mut len = level.len();
+    while len > 1 {
         let mut i = 0;
-        while i < level.len() {
-            let r = if i + 1 < level.len() { level[i + 1] } else { level[i] };
-            next.push(hash_pair(&level[i], &r));
+        let mut out = 0;
+        while i < len {
+            let left = level[i];
+            let right = if i + 1 < len { level[i + 1] } else { left };
+            level[out] = hash_pair(&left, &right);
+            out += 1;
             i += 2;
         }
-        level = next;
+        len = out;
     }
     level[0]
 }
@@ -508,8 +501,10 @@ enum ChunkSource {
 /// (`ChunkSource::Gguf`), so the index holds no full host copy of the weights.
 /// Sparse Merkle tree checkpoint interval: only every K-th level is stored on disk (level 0 = leaves
 /// is NEVER stored — recomputed from the GGUF on demand; the root is always stored). Cuts tree
-/// storage from ~2N nodes to ~N/(2^K − 1) (~63× for K=6). Ported from upstream e1811a0 + d70678a.
-const CHECKPOINT_INTERVAL: u32 = 6;
+/// storage from ~2N nodes to ~N/(2^K − 1). K=5 deliberately stores the tile-subtree level used by
+/// every v4 range proof: it roughly doubles the sparse sidecar (about 3.2% of model bytes) but turns
+/// 256 repeated 1 KiB sibling rehashes per accepted share into direct 32-byte checkpoint reads.
+const CHECKPOINT_INTERVAL: u32 = 5;
 
 /// One checkpoint level stored on disk in the sparse Merkle tree file.
 struct StoredLevel {
@@ -536,9 +531,9 @@ pub struct WeightIndex {
     /// the same inode and the next restart reuses it. A PRIVATE/test tree is `persistent = false`.
     persistent: bool,
     /// Optional in-RAM dense tree (all levels). When present, `merkle_path` is a pure lookup
-    /// instead of the sparse recompute — removes the ~30-40 ms proof-build latency after a hit,
-    /// which at 10 BPS is a real solo block-race edge (upstream 7a6e7a0). Costs ~2N*32 B of RAM
-    /// (~9.6 GB at tier-0's N=150M), so it is OPT-IN via KERYX_RESIDENT_TREE=1.
+    /// instead of the optimized sparse-checkpoint path, removing its remaining proof-build
+    /// latency after a hit. At high solo block rates that can be a block-race edge. Costs ~2N*32 B of RAM
+    /// (~12 GiB at the current tier-0's N≈203M), so it is OPT-IN via KERYX_RESIDENT_TREE=1.
     dense: Option<Vec<Vec<[u8; 32]>>>,
     /// Memo for UPPER-level Merkle siblings (see `merkle_path`). A proof re-walk does 256 path
     /// lookups over random offsets; the tree's upper levels hold so few nodes that those siblings
@@ -558,7 +553,8 @@ const SIBLING_MEMO_MAX_NODES_DEFAULT: u64 = 65_536;
 fn sibling_memo_max_nodes() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("KERYX_POM_PATH_MEMO_MAX").ok()
+        std::env::var("KERYX_POM_PATH_MEMO_MAX")
+            .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(SIBLING_MEMO_MAX_NODES_DEFAULT)
     })
@@ -605,9 +601,9 @@ struct PomTreeMeta {
 }
 
 /// v2 = sparse checkpoint tree (was v1 = dense all-levels tree). v3 (upstream e69461d) adds
-/// model-id binding + full-tree SHA-256 to the sidecar — bumping invalidates every legacy
-/// unauthenticated `pom-tree.bin`/`.meta` so it is rebuilt with the authenticated sidecar.
-const POM_TREE_CACHE_VERSION: u32 = 3;
+/// model-id binding + full-tree SHA-256. v4 changes the checkpoint interval from six to five so
+/// the v4 tile-subtree level is resident; old layouts cannot be interpreted with the new interval.
+const POM_TREE_CACHE_VERSION: u32 = 4;
 
 /// A build lock older than this with no published tree is treated as abandoned (a crashed builder).
 const POM_TREE_LOCK_STALE_SECS: u64 = 90 * 60;
@@ -664,8 +660,7 @@ fn write_pom_tree_meta(
         table: tflat,
         checkpoints: cflat,
     };
-    let bytes = borsh::to_vec(&meta)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let bytes = borsh::to_vec(&meta).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let tmp = meta_path.with_extension("meta.tmp");
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, meta_path)?; // atomic publish
@@ -702,10 +697,8 @@ fn sweep_dead_pom_trees(dir: &std::path::Path) {
     for ent in rd.flatten() {
         let name = ent.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(pid) = name
-            .strip_prefix("pom-tree-")
-            .and_then(|s| s.strip_suffix(".bin"))
-            .and_then(|s| s.parse::<u32>().ok())
+        let Some(pid) =
+            name.strip_prefix("pom-tree-").and_then(|s| s.strip_suffix(".bin")).and_then(|s| s.parse::<u32>().ok())
         else {
             continue;
         };
@@ -735,7 +728,10 @@ impl WeightIndex {
         // all GPUs, and NO rebuild on restart. (Was: pom-tree-<PID>.bin = one identical copy + a full
         // rebuild PER process PER restart → N× host RAM, which OOM'd the 4th GPU under WSL's cap.)
         if let Some(idx) = Self::reuse_cached_tree(&cache_path, &meta_path, path, model_id) {
-            log::info!("PoM: reusing cached possession tree {} — shared across GPUs, no rebuild.", cache_path.display());
+            log::info!(
+                "PoM: reusing cached possession tree {} — shared across GPUs, no rebuild.",
+                cache_path.display()
+            );
             return Ok(idx);
         }
 
@@ -753,24 +749,30 @@ impl WeightIndex {
             match OpenOptions::new().write(true).create_new(true).open(&lock_path) {
                 Ok(mut lock) => {
                     let _ = writeln!(lock, "{}", std::process::id());
-                    log::info!("PoM: building shared possession tree (first GPU to reach PoM) — this can take a while…");
+                    log::info!(
+                        "PoM: building shared possession tree (first GPU to reach PoM) — this can take a while…"
+                    );
                     let tmp = dir.join("pom-tree.bin.building");
                     let out = match Self::build_tree_to(path, tmp.clone(), true) {
-                        Ok((mut idx, table)) => match std::fs::rename(&tmp, &cache_path) {
-                            Ok(()) => {
-                                idx.tree_path = cache_path.clone();
-                                if let Err(e) = write_pom_tree_meta(&meta_path, path, model_id, &idx, &table) {
-                                    log::warn!("PoM: tree built but meta sidecar write failed ({e}); other GPUs will rebuild.");
+                        Ok((mut idx, table)) => {
+                            match std::fs::rename(&tmp, &cache_path) {
+                                Ok(()) => {
+                                    idx.tree_path = cache_path.clone();
+                                    if let Err(e) = write_pom_tree_meta(&meta_path, path, model_id, &idx, &table) {
+                                        log::warn!("PoM: tree built but meta sidecar write failed ({e}); other GPUs will rebuild.");
+                                    }
+                                    Ok(idx)
                                 }
-                                Ok(idx)
+                                Err(e) => {
+                                    // Couldn't publish (e.g. Windows sharing) — keep it as a private tree.
+                                    log::warn!(
+                                        "PoM: could not publish shared tree ({e}); using a private per-process tree."
+                                    );
+                                    idx.persistent = false;
+                                    Ok(idx)
+                                }
                             }
-                            Err(e) => {
-                                // Couldn't publish (e.g. Windows sharing) — keep it as a private tree.
-                                log::warn!("PoM: could not publish shared tree ({e}); using a private per-process tree.");
-                                idx.persistent = false;
-                                Ok(idx)
-                            }
-                        },
+                        }
                         Err(e) => Err(e),
                     };
                     let _ = std::fs::remove_file(&lock_path);
@@ -813,13 +815,19 @@ impl WeightIndex {
             .map_err(|e| candle_core::Error::Msg(format!("PoM: GGUF header parse failed: {e}")))?;
         let names = meta.sorted_names(); // canonical order
 
-        // DISK PRE-CHECK (best-effort). The sparse tree is only ~N/63 of the leaves (≈ gguf/32), so
+        // This target is either the shared `.building` file or a process-private tree, never the
+        // published cache. Reclaim a crashed builder's partial output before checking free space;
+        // otherwise an ENOSPC-created partial can consume the very headroom required to retry and
+        // permanently wedge every subsequent startup at the pre-check below.
+        let _ = std::fs::remove_file(&tree_path);
+
+        // DISK PRE-CHECK (best-effort). At K=5 the sparse tree is ~N/31 of the leaf bytes, so
         // this almost never trips now — but a truly tiny/full disk still gets a clear message instead
         // of an ENOSPC loop. Skipped on Windows / when free space can't be queried.
         let gguf_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let tree_dir = tree_path.parent().unwrap_or_else(|| std::path::Path::new("."));
         if let Some(avail) = available_disk_bytes(tree_dir) {
-            let need = (gguf_len / 30).saturating_add(256 << 20); // ~sparse tree + 256 MB headroom
+            let need = (gguf_len / 30).saturating_add(256 << 20); // sparse tree + 256 MB headroom
             if avail < need {
                 return Err(candle_core::Error::Msg(format!(
                     "not enough free disk to build the PoM possession tree (needs ~{} MB free next to \
@@ -830,8 +838,6 @@ impl WeightIndex {
             }
         }
 
-        let _ = std::fs::remove_file(&tree_path); // clear a stale/partial file from a crashed run
-
         // Phase 0: hash chunks → leaves, fold each batch of 2^K leaves up K levels and write ONLY the
         // resulting level-K node. `fold_levels` carries the duplicate-last `hash(x,x)` every round
         // (the d70678a fix), so partial tails match the dense root. The raw chunks are NOT retained;
@@ -840,8 +846,13 @@ impl WeightIndex {
         let k = CHECKPOINT_INTERVAL;
         let batch_size = 1u64 << k;
         let mut writer = BufWriter::new(
-            OpenOptions::new().read(true).write(true).create(true).truncate(true)
-                .open(&tree_path).map_err(candle_core::Error::wrap)?,
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tree_path)
+                .map_err(candle_core::Error::wrap)?,
         );
         let mut table: Vec<(u64, u64)> = Vec::with_capacity(names.len());
         let mut n_chunks: u64 = 0;
@@ -888,7 +899,11 @@ impl WeightIndex {
                     log::info!(
                         "PoM: building possession index — {}/{} chunks ({}%), {:.0}s elapsed, ETA ~{:.0}s — \
                          mining starts automatically when done, this is NOT a stall.",
-                        n_chunks, total_chunks, pct, el, eta,
+                        n_chunks,
+                        total_chunks,
+                        pct,
+                        el,
+                        eta,
                     );
                 }
             }
@@ -926,7 +941,12 @@ impl WeightIndex {
     /// Reconstruct a byte-identical `WeightIndex` from an existing shared cache + meta sidecar, or
     /// `None` if the cache is absent/stale/corrupt (→ caller rebuilds). Validated FOUR ways: cache
     /// version, GGUF length+mtime, tree-file size, and the on-disk root hash == the meta's `r_t`.
-    fn reuse_cached_tree(cache_path: &std::path::Path, meta_path: &std::path::Path, gguf_path: &str, expected_model_id: [u8; 32]) -> Option<Self> {
+    fn reuse_cached_tree(
+        cache_path: &std::path::Path,
+        meta_path: &std::path::Path,
+        gguf_path: &str,
+        expected_model_id: [u8; 32],
+    ) -> Option<Self> {
         let bytes = std::fs::read(meta_path).ok()?;
         let meta = PomTreeMeta::try_from_slice(&bytes).ok()?;
         if meta.version != POM_TREE_CACHE_VERSION {
@@ -1089,12 +1109,11 @@ impl WeightIndex {
             bytes.chunks_exact(32).map(blake).collect()
         } else {
             let cp = self.find_checkpoint(src_level);
-            (start..end)
-                .map(|i| {
-                    let mut buf = [0u8; 32];
-                    read_exact_at(&self.tree_file, &mut buf, cp.offset + i * 32).expect("PoM checkpoint read subtree");
-                    buf
-                })
+            let mut bytes = vec![0u8; ((end - start) * 32) as usize];
+            read_exact_at(&self.tree_file, &mut bytes, cp.offset + start * 32).expect("PoM checkpoint read subtree");
+            bytes
+                .chunks_exact(32)
+                .map(|chunk| <[u8; 32]>::try_from(chunk).expect("checkpoint node is 32 bytes"))
                 .collect()
         };
         fold_levels(&nodes, rounds)
@@ -1111,7 +1130,21 @@ impl WeightIndex {
         if self.dense.is_some() {
             return;
         }
-        let mut levels: Vec<Vec<[u8; 32]>> = vec![(0..self.n_chunks).map(|i| blake(&self.read_chunk_bytes(i))).collect()];
+        // Hash sequential slabs instead of issuing one 32-byte pread per leaf. Keep the slab modest:
+        // dense mode already intentionally allocates the full Merkle tree, but it need not allocate
+        // a second model-sized byte buffer while constructing level zero.
+        const LEAF_SLAB_CHUNKS: u64 = 8192;
+        let mut leaves = Vec::with_capacity(self.n_chunks as usize);
+        let mut bytes = Vec::with_capacity((LEAF_SLAB_CHUNKS * 32) as usize);
+        let mut first = 0u64;
+        while first < self.n_chunks {
+            let take = LEAF_SLAB_CHUNKS.min(self.n_chunks - first);
+            bytes.resize((take * 32) as usize, 0);
+            self.read_chunks_into(first, &mut bytes);
+            leaves.extend(bytes.chunks_exact(32).map(blake));
+            first += take;
+        }
+        let mut levels: Vec<Vec<[u8; 32]>> = vec![leaves];
         while levels.last().unwrap().len() > 1 {
             let cur = levels.last().unwrap();
             let mut next = Vec::with_capacity(cur.len().div_ceil(2));
@@ -1198,6 +1231,7 @@ impl WeightIndex {
 /// (checkpoints, total_levels). Stores only multiples of CHECKPOINT_INTERVAL + the root; level 0
 /// (leaves) is never stored (recomputed from the GGUF on demand).
 fn compute_checkpoint_offsets(n_chunks: u64) -> (Vec<StoredLevel>, u32) {
+    assert!(n_chunks > 0, "checkpoint tree requires at least one chunk");
     let mut checkpoints = Vec::new();
     let mut count = n_chunks;
     let mut off: u64 = 0;
@@ -1228,15 +1262,21 @@ fn compute_checkpoint_offsets(n_chunks: u64) -> (Vec<StoredLevel>, u32) {
 fn fold_levels(batch: &[[u8; 32]], rounds: u32) -> [u8; 32] {
     debug_assert!(!batch.is_empty());
     let mut level = batch.to_vec();
+    let mut len = level.len();
     for _ in 0..rounds {
-        let mut next = Vec::with_capacity(level.len().div_ceil(2));
         let mut i = 0;
-        while i < level.len() {
-            let r = if i + 1 < level.len() { level[i + 1] } else { level[i] };
-            next.push(hash_pair(&level[i], &r));
+        let mut out = 0;
+        while i < len {
+            // In-place is safe: `out <= i`, and every future input starts at i+2. Copy the two
+            // hashes before overwriting the lower slot. This removes a Vec allocation/copy at every
+            // checkpoint fold level while retaining canonical duplicate-last behaviour.
+            let left = level[i];
+            let right = if i + 1 < len { level[i + 1] } else { left };
+            level[out] = hash_pair(&left, &right);
+            out += 1;
             i += 2;
         }
-        level = next;
+        len = out;
     }
     level[0]
 }
@@ -1264,16 +1304,21 @@ fn finalize_checkpoint_upper(
         let rounds = cp.level - prev_level;
         let batch_size = 1u64 << rounds;
         let mut batch: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
+        let mut node_bytes = vec![0u8; (batch_size * 32) as usize];
         let mut read_idx: u64 = 0;
         while read_idx < prev_count {
             let take = batch_size.min(prev_count - read_idx);
             batch.clear();
-            for i in 0..take {
-                let index = read_idx + i;
-                let mut node = [0u8; 32];
-                read_exact_at(&file_for_read, &mut node, prev_offset + index * 32).map_err(candle_core::Error::wrap)?;
-                batch.push(node);
-            }
+            // Stored checkpoint nodes are contiguous. One slab pread avoids up to 64 individual
+            // 32-byte syscalls for every parent node while preserving the exact fold order.
+            let used = (take * 32) as usize;
+            read_exact_at(&file_for_read, &mut node_bytes[..used], prev_offset + read_idx * 32)
+                .map_err(candle_core::Error::wrap)?;
+            batch.extend(
+                node_bytes[..used]
+                    .chunks_exact(32)
+                    .map(|chunk| <[u8; 32]>::try_from(chunk).expect("checkpoint node is 32 bytes")),
+            );
             let parent_node = fold_levels(&batch, rounds);
             buf_writer.write_all(&parent_node).map_err(candle_core::Error::wrap)?;
             read_idx += take;
@@ -1417,18 +1462,18 @@ pub fn passthrough_enabled() -> bool {
 static PASSTHROUGH: OnceLock<bool> = OnceLock::new();
 
 /// The resident tier weight index + tier id, installed once at startup when PoM is enabled.
-static POM_INDEX: OnceLock<(WeightIndex, u8)> = OnceLock::new();
+static POM_INDEX: OnceLock<Arc<(WeightIndex, u8)>> = OnceLock::new();
 
 /// Install the possession index (built from the resident model) and its tier. Call once.
 pub fn set_index(index: WeightIndex, tier: u8) {
-    let _ = POM_INDEX.set((index, tier));
+    let _ = POM_INDEX.set(Arc::new((index, tier)));
 }
 
 /// The active possession index + tier, if installed. This is the PROCESS-WIDE SHARED index used by
 /// single-model rigs (every device mines the same model). Mixed-rig per-card models use the
 /// per-device variants below; those fall back here when a device has no override.
 pub fn active_index() -> Option<&'static (WeightIndex, u8)> {
-    POM_INDEX.get()
+    POM_INDEX.get().map(Arc::as_ref)
 }
 
 /// Per-device possession index plus the model identity it was built from. Keeping the identity next
@@ -1437,35 +1482,35 @@ pub fn active_index() -> Option<&'static (WeightIndex, u8)> {
 /// N-only check but produce invalid paths.
 struct DevicePomIndex {
     model_id: [u8; 32],
-    index: &'static (WeightIndex, u8),
+    index: Arc<(WeightIndex, u8)>,
 }
 
-/// Per-CUDA-device possession indices (mixed-rig per-card models). Index values are `Box::leak`'d →
-/// `&'static`, matching the OnceLock "lives forever" semantics and allowing detached proof builders
-/// to finish safely while a demotion installs a replacement entry.
+/// Per-CUDA-device possession indices (mixed-rig per-card models). A lookup clones the entry's
+/// `Arc`, allowing an in-flight detached proof builder to finish against exactly the index it
+/// selected while a demotion atomically installs a replacement. The old model is reclaimed after
+/// the map and the last in-flight user release it.
 fn pom_indices() -> &'static std::sync::Mutex<std::collections::HashMap<u32, DevicePomIndex>> {
-    static POM_INDICES: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, DevicePomIndex>>> =
-        OnceLock::new();
+    static POM_INDICES: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, DevicePomIndex>>> = OnceLock::new();
     POM_INDICES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Install a possession index for one device (per-card model). Leaked to `&'static` (models live
-/// for the whole process, same as the global `POM_INDEX`).
+/// Install or replace a possession index for one device (per-card model).
 pub fn set_index_for(device_id: u32, model_id: [u8; 32], index: WeightIndex, tier: u8) {
-    let leaked: &'static (WeightIndex, u8) = Box::leak(Box::new((index, tier)));
-    if let Ok(mut m) = pom_indices().lock() {
-        m.insert(device_id, DevicePomIndex { model_id, index: leaked });
-    }
+    let replacement = DevicePomIndex { model_id, index: Arc::new((index, tier)) };
+    let replaced = if let Ok(mut m) = pom_indices().lock() { m.insert(device_id, replacement) } else { None };
+    // A dense index can own gigabytes. Release the map lock before the old entry's final Arc drop.
+    drop(replaced);
 }
 
 /// This device's possession index + tier: its per-device entry if set, else the shared global one.
-pub fn active_index_for(device_id: u32) -> Option<&'static (WeightIndex, u8)> {
+/// The returned owner must remain live for as long as its `WeightIndex` is borrowed.
+pub fn active_index_for(device_id: u32) -> Option<Arc<(WeightIndex, u8)>> {
     if let Ok(m) = pom_indices().lock() {
         if let Some(v) = m.get(&device_id) {
-            return Some(v.index);
+            return Some(Arc::clone(&v.index));
         }
     }
-    active_index()
+    POM_INDEX.get().cloned()
 }
 
 /// Whether this device has its own per-device index installed (vs falling back to the global one).
@@ -1475,30 +1520,31 @@ pub fn has_device_index(device_id: u32) -> bool {
 
 /// Whether the per-device index is for this exact model, not merely a model of the same size.
 pub fn device_index_matches(device_id: u32, model_id: &[u8; 32]) -> bool {
-    pom_indices()
-        .lock()
-        .map(|m| m.get(&device_id).map(|v| &v.model_id == model_id).unwrap_or(false))
-        .unwrap_or(false)
+    pom_indices().lock().map(|m| m.get(&device_id).map(|v| &v.model_id == model_id).unwrap_or(false)).unwrap_or(false)
 }
 
 /// Test-only WeightIndex over arbitrary RAM chunks (`data` = chunk-aligned canonical bytes) — real
 /// checkpoint tree + merkle paths, no GGUF. Shared by the pom.rs synth tests AND the pom_v3 mirror
 /// test (which pins the node's R_T + walk vectors over a synthetic blob).
 #[cfg(test)]
+fn unique_test_tree_path(namespace: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("keryx-pom-{namespace}-{}-{id}.bin", std::process::id()))
+}
+
+#[cfg(test)]
 pub(crate) fn index_from_ram(data: Vec<u8>) -> WeightIndex {
-    use std::sync::atomic::{AtomicU64, Ordering as O};
-    static UNIQ: AtomicU64 = AtomicU64::new(0);
-    let uid = UNIQ.fetch_add(1, O::Relaxed);
-    let tree_path = std::env::temp_dir().join(format!("keryx-pom-synth-{}-{}.bin", std::process::id(), uid));
+    let tree_path = unique_test_tree_path("ram-index");
     let _ = std::fs::remove_file(&tree_path);
 
     let n = (data.len() / 32) as u64;
     let k = CHECKPOINT_INTERVAL;
-    let batch_size = 1u64 << k; // 64 for K=6
+    let batch_size = 1u64 << k;
 
-    let mut writer = BufWriter::new(
-        OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tree_path).unwrap(),
-    );
+    let mut writer =
+        BufWriter::new(OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tree_path).unwrap());
     let mut batch: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
     for o in 0..n as usize {
         batch.push(blake(&data[o * 32..o * 32 + 32]));
@@ -1533,6 +1579,38 @@ pub(crate) fn index_from_ram(data: Vec<u8>) -> WeightIndex {
 mod tests {
     use super::*;
 
+    #[test]
+    fn device_index_replacement_reclaims_after_last_owner() {
+        // No production device can have this id. Clear a prior failed test run defensively because
+        // the registry is process-global, just like it is in the miner.
+        const DEVICE_ID: u32 = u32::MAX;
+        drop(pom_indices().lock().unwrap().remove(&DEVICE_ID));
+
+        let old = index_from_ram(vec![0x11; 32 * 32]);
+        let old_root = old.r_t;
+        set_index_for(DEVICE_ID, [0x11; 32], old, 1);
+        let held_old = active_index_for(DEVICE_ID).expect("old per-device index");
+        let weak_old = Arc::downgrade(&held_old);
+
+        let replacement = index_from_ram(vec![0x22; 32 * 32]);
+        set_index_for(DEVICE_ID, [0x22; 32], replacement, 2);
+        assert_eq!(held_old.0.r_t, old_root, "in-flight reader changed models");
+        assert_eq!(Arc::strong_count(&held_old), 1, "replaced map still owns old index");
+        assert!(device_index_matches(DEVICE_ID, &[0x22; 32]));
+
+        drop(held_old);
+        assert!(weak_old.upgrade().is_none(), "old index leaked after its last user");
+
+        // Remove the synthetic replacement so its private test tree is reclaimed as well.
+        let held_new = active_index_for(DEVICE_ID).expect("replacement per-device index");
+        let weak_new = Arc::downgrade(&held_new);
+        let removed = pom_indices().lock().unwrap().remove(&DEVICE_ID).unwrap();
+        drop(held_new);
+        assert!(weak_new.upgrade().is_some(), "removed entry outlived by no owner");
+        drop(removed);
+        assert!(weak_new.upgrade().is_none(), "replacement cleanup leaked its index");
+    }
+
     /// Production chunk storage is split across independently aligned GGUF tensors. Bulk reads
     /// must advance both the canonical chunk index and each tensor's unrelated file offset without
     /// copying gap/alignment bytes into a proof tile or Merkle leaf span.
@@ -1541,27 +1619,15 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering as O};
         static UNIQ: AtomicU64 = AtomicU64::new(0);
         let uid = UNIQ.fetch_add(1, O::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "keryx-pom-bulk-gguf-{}-{uid}.bin",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("keryx-pom-bulk-gguf-{}-{uid}.bin", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
-        let expected: Vec<u8> = (0..8 * 32)
-            .map(|i| (mix64(i as u64 + 1) >> 24) as u8)
-            .collect();
+        let expected: Vec<u8> = (0..8 * 32).map(|i| (mix64(i as u64 + 1) >> 24) as u8).collect();
         let layout = [(0u64, 17u64, 2u64), (2, 173, 3), (5, 401, 3)];
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
+        let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
         for &(first, file_off, count) in &layout {
             file.seek(SeekFrom::Start(file_off)).unwrap();
-            file.write_all(&expected[(first * 32) as usize..((first + count) * 32) as usize])
-                .unwrap();
+            file.write_all(&expected[(first * 32) as usize..((first + count) * 32) as usize]).unwrap();
         }
         file.flush().unwrap();
 
@@ -1586,7 +1652,10 @@ mod tests {
         index.read_chunks_into(1, &mut across);
         assert_eq!(across, expected[32..7 * 32]);
         for chunk in 0..8u64 {
-            assert_eq!(index.read_chunk_bytes(chunk).as_slice(), &expected[(chunk * 32) as usize..((chunk + 1) * 32) as usize]);
+            assert_eq!(
+                index.read_chunk_bytes(chunk).as_slice(),
+                &expected[(chunk * 32) as usize..((chunk + 1) * 32) as usize]
+            );
         }
     }
 
@@ -1630,15 +1699,9 @@ mod tests {
         assert_eq!(full.peek(5), Some(NonceRange { start: 0, len: 5 }));
 
         let mut standard = MaskedNonceCursor::new(0xffff_ffff, 0x1234_5678_0000_0000, 0xffff_fffe);
-        assert_eq!(
-            standard.peek(8),
-            Some(NonceRange { start: 0x1234_5678_ffff_fffe, len: 2 })
-        );
+        assert_eq!(standard.peek(8), Some(NonceRange { start: 0x1234_5678_ffff_fffe, len: 2 }));
         standard.commit(2);
-        assert_eq!(
-            standard.peek(8),
-            Some(NonceRange { start: 0x1234_5678_0000_0000, len: 8 })
-        );
+        assert_eq!(standard.peek(8), Some(NonceRange { start: 0x1234_5678_0000_0000, len: 8 }));
 
         let mut sparse = MaskedNonceCursor::new(0b1_0111, 0, 6);
         assert_eq!(sparse.peek(8), Some(NonceRange { start: 6, len: 2 }));
@@ -1662,17 +1725,13 @@ mod tests {
 
     // Synthetic WeightIndex (no GGUF) — exercises the real read_chunk + O(log N) merkle_path.
     fn synth_index(n: u64) -> WeightIndex {
-        use std::sync::atomic::{AtomicU64, Ordering as O};
-        static UNIQ: AtomicU64 = AtomicU64::new(0);
-        let uid = UNIQ.fetch_add(1, O::Relaxed);
-        let tree_path = std::env::temp_dir().join(format!("keryx-pom-synth-{}-{}.bin", std::process::id(), uid));
+        let tree_path = unique_test_tree_path("synth-index");
         let _ = std::fs::remove_file(&tree_path);
 
         let k = CHECKPOINT_INTERVAL;
         let batch_size = 1u64 << k;
         let mut writer = BufWriter::new(
-            OpenOptions::new().read(true).write(true).create(true).truncate(true)
-                .open(&tree_path).unwrap(),
+            OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tree_path).unwrap(),
         );
         let mut data = Vec::new();
         let mut batch: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
@@ -1712,16 +1771,14 @@ mod tests {
     /// including the non-power-of-two sizes whose short tails used to drop the hash(x,x) carries.
     #[test]
     fn dense_merkle_path_matches_sparse() {
-        for n in [64u64, 65, 100, 1000, 2000, 4096, 4968, 12345, 65536, 100000, 131072] {
+        for n in [32u64, 33, 63, 64, 65, 100, 1000, 2000, 4096, 4968, 12345, 65536, 100000, 131072] {
             let mut idx = synth_index(n);
             let step = (n as usize / 37).max(1);
             let offs: Vec<u64> = (0..n).step_by(step).collect();
             let sparse: Vec<Vec<[u8; 32]>> = offs.iter().map(|&o| idx.merkle_path(o)).collect();
             let first_level = 5u32.min(idx.total_levels - 1);
-            let sparse_suffix: Vec<Vec<[u8; 32]>> = offs
-                .iter()
-                .map(|&o| idx.merkle_path_from_level(o, first_level))
-                .collect();
+            let sparse_suffix: Vec<Vec<[u8; 32]>> =
+                offs.iter().map(|&o| idx.merkle_path_from_level(o, first_level)).collect();
             for (k, path) in sparse.iter().enumerate() {
                 assert_eq!(sparse_suffix[k], path[first_level as usize..]);
             }
@@ -1749,8 +1806,7 @@ mod tests {
         let idx = synth_index(100);
         let seed = 0x6b65_7279_782d_7634;
         let (proof, built_final) = crate::pom_v4::build_proof_v4(2, seed, &idx).unwrap();
-        let verified_final =
-            crate::pom_v4::verify_proof_v4(seed, &proof, &idx.r_t, idx.n_chunks).unwrap();
+        let verified_final = crate::pom_v4::verify_proof_v4(seed, &proof, &idx.r_t, idx.n_chunks).unwrap();
         assert_eq!(verified_final, built_final);
         assert_eq!(proof.tiles.len(), crate::pom_v4::POM_V4_K);
         assert_eq!(proof.merkle.len(), crate::pom_v4::POM_V4_K);
@@ -1758,7 +1814,7 @@ mod tests {
 
     #[test]
     fn sparse_build_root_matches_dense_root() {
-        for n in [64u64, 65, 100, 1000, 2000, 4096, 4968, 12345, 65536, 100000, 131072] {
+        for n in [32u64, 33, 63, 64, 65, 100, 1000, 2000, 4096, 4968, 12345, 65536, 100000, 131072] {
             let leaves: Vec<[u8; 32]> = (0..n).map(|o| blake(&words_to_bytes(&synth_chunk(o)))).collect();
             let dense = merkle_root_mini(&leaves);
             let idx = synth_index(n);
@@ -1891,5 +1947,4 @@ mod tests {
         assert!(!super::is_h10_seed_era(super::POM_H10_SEED_ACTIVATION_DAA - 1));
         assert_eq!(super::POM_H10_SEED_ACTIVATION_DAA, 87_360_000, "H10 gate must equal the node's");
     }
-
 }

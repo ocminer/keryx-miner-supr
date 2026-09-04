@@ -15,8 +15,8 @@ http://127.0.0.1:4067/mmpos
 ```
 It returns the mmpOS custom-miner JSON directly — no `mmp-stats.sh` needed:
 ```json
-{"busid":[0,1],"hash":[3280000000,190000000],"units":"hs",
- "air":["42","0","0"],"miner_name":"keryx-miner-supr","miner_version":"0.5.2"}
+{"busid":[0,1],"hash":[1781200,520900],"units":"hs",
+ "air":["42","0","0"],"miner_name":"keryx-miner-supr","miner_version":"0.13.0"}
 ```
 (`/` or `/stats` on the same port returns a richer generic JSON for dashboards.)
 
@@ -27,8 +27,8 @@ log, emitting the same mmpOS JSON. Drop it next to the miner binary in your mmpo
 custom-miner package.
 
 ## Notes
-- `units` is `hs` (hashes/sec); keryx runs at GH/s scale, so values are ~3.3e9.
+- `units` is `hs` (hashes/sec); current PoM v4 rates are typically reported in MH/s.
 - `busid` is the CUDA device index (stable ordinal). `air` = `[accepted, invalid, rejected]`.
 - Temps/fans are read by the mmpos agent itself (not reported by the miner).
-- keryx is OPoI: it won't mine until model weights are present (`--light` =
-  TinyLlama, auto-downloaded on first run) — expect a startup delay before stats.
+- keryx is OPoI: it will not mine until the selected H6 GGUF is present and a GPU
+  inference route is proven. `--very-light` selects Qwen3.5-9B; expect a first-run delay.

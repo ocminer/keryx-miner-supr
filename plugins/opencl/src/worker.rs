@@ -1,6 +1,5 @@
 use crate::cli::NonceGenEnum;
 use crate::Error;
-use include_dir::{include_dir, Dir};
 use keryx_miner::xoshiro256starstar::Xoshiro256StarStar;
 use keryx_miner::Worker;
 use log::{info, warn};
@@ -17,10 +16,40 @@ use rand::{thread_rng, Fill, RngCore};
 use std::borrow::Borrow;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-static BINARY_DIR: Dir = include_dir!("./plugins/opencl/resources/bin/");
 static PROGRAM_SOURCE: &str = include_str!("../resources/keryx-opencl.cl");
+
+/// Raw device/host no-winner sentinel. A real nonce 0 is valid, so zero cannot
+/// also represent absence. MAX is the identity for the kernel's atomic-min
+/// publication contract.
+pub const OPENCL_NO_WINNER: u64 = u64::MAX;
+
+// Worker is part of the legacy Rust trait-object plugin ABI, so adding a method
+// would be ABI-breaking. New hosts negotiate raw-MAX output through the optional
+// C symbol exported by lib.rs. With an old host, translate MAX back to its
+// historical zero sentinel at the plugin boundary.
+static RAW_NONCE_OUTPUT_V1: AtomicBool = AtomicBool::new(false);
+
+pub fn enable_raw_nonce_output_v1() -> u64 {
+    RAW_NONCE_OUTPUT_V1.store(true, Ordering::Release);
+    OPENCL_NO_WINNER
+}
+
+fn output_for_host(raw: u64, raw_contract: bool) -> u64 {
+    if !raw_contract && raw == OPENCL_NO_WINNER {
+        0
+    } else {
+        raw
+    }
+}
+
+fn supports_int64_atomics(extensions: &str) -> bool {
+    extensions
+        .split_ascii_whitespace()
+        .any(|ext| matches!(ext, "cl_khr_int64_base_atomics" | "cl_khr_int64_extended_atomics"))
+}
 
 /// Capability-driven default for the `--opencl-workload` ratio when the user
 /// didn't set it. The ratio is multiplied by (max_work_group_size * compute_units)
@@ -77,12 +106,6 @@ impl Worker for OpenCLGPUWorker {
             false => matrix.iter().flat_map(|row| row.map(|v| v as cl_uchar)).collect::<Vec<cl_uchar>>(),
         };
         self.queue
-            .enqueue_write_buffer(&mut self.final_nonce, CL_BLOCKING, 0, &[0], &[])
-            .map_err(|e| e.to_string())
-            .unwrap()
-            .wait()
-            .unwrap();
-        self.queue
             .enqueue_write_buffer(&mut self.hash_header, CL_BLOCKING, 0, hash_header, &[])
             .map_err(|e| e.to_string())
             .unwrap()
@@ -119,6 +142,16 @@ impl Worker for OpenCLGPUWorker {
             NonceGenEnum::Lean => 0,
             NonceGenEnum::Xoshiro => 1,
         };
+
+        // Reset on the host immediately before every launch. A reset performed
+        // by one kernel work-item would race other work-groups that can publish
+        // first. MAX also preserves nonce zero as a valid result.
+        self.queue
+            .enqueue_write_buffer(&mut self.final_nonce, CL_BLOCKING, 0, &[OPENCL_NO_WINNER], &[])
+            .map_err(|e| e.to_string())
+            .unwrap()
+            .wait()
+            .unwrap();
         let kernel_event = ExecuteKernel::new(&self.heavy_hash)
             .set_arg(&(self.local_size as u64))
             .set_arg(&nonce_mask)
@@ -168,6 +201,9 @@ impl Worker for OpenCLGPUWorker {
             .enqueue_read_buffer(&self.final_nonce, CL_BLOCKING, 0, nonces, &[])
             .map_err(|e| e.to_string())
             .unwrap();
+        if let Some(nonce) = nonces.first_mut() {
+            *nonce = output_for_host(*nonce, RAW_NONCE_OUTPUT_V1.load(Ordering::Acquire));
+        }
         Ok(())
     }
 }
@@ -185,23 +221,20 @@ impl OpenCLGPUWorker {
             device.board_name_amd().unwrap_or_else(|_| device.name().unwrap_or_else(|_| "Unknown Device".into()));
         info!("{}: Using OpenCL", name);
         let version = device.version().unwrap_or_else(|_| "unkown version".into());
-        info!(
-            "{}: Device supports {} with extensions: {}",
-            name,
-            version,
-            device.extensions().unwrap_or_else(|_| "NA".into())
-        );
+        let extensions = device.extensions().unwrap_or_else(|_| "NA".into());
+        info!("{}: Device supports {} with extensions: {}", name, version, extensions);
+        if !supports_int64_atomics(&extensions) {
+            return Err(format!(
+                "{}: Keryx OpenCL mining requires a 64-bit global atomics extension; refusing an unsafe winner-publication fallback",
+                name
+            )
+            .into());
+        }
 
         // Normalised arch string ("gfx906", "gfx1102", …) — ROCm reports it as
         // e.g. "gfx906:sramecc+:xnack-", so strip the feature suffix. Used both for
         // the capability-driven workload default and the v_dot8 gate below.
-        let arch = device
-            .name()
-            .unwrap_or_else(|_| "Unknown".into())
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
+        let arch = device.name().unwrap_or_else(|_| "Unknown".into()).split(':').next().unwrap_or("").to_lowercase();
 
         let local_size = device.max_work_group_size().map_err(|e| e.to_string())?;
         let chosen_workload = match is_absolute {
@@ -237,8 +270,18 @@ impl OpenCLGPUWorker {
         // so they stay on v_dot4 until those binaries are regenerated.
         let vdot8_default = matches!(
             arch.as_str(),
-            "gfx906" | "gfx908" | "gfx90a" | "gfx940" | "gfx941" | "gfx942"
-                | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1200" | "gfx1201"
+            "gfx906"
+                | "gfx908"
+                | "gfx90a"
+                | "gfx940"
+                | "gfx941"
+                | "gfx942"
+                | "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1103"
+                | "gfx1200"
+                | "gfx1201"
         );
         // Also v_dot8-capable, but only opt-in (they have a shipped v_dot4 .bin).
         let vdot8_capable = vdot8_default
@@ -262,38 +305,20 @@ impl OpenCLGPUWorker {
         };
         let options: &str = &options_str;
 
-        let program = match use_binary {
-            true => {
-                let mut device_name = device.name().unwrap_or_else(|_| "Unknown".into()).to_lowercase();
-                if device_name.contains(':') {
-                    device_name = device_name.split_once(':').expect("We checked for `:`").0.to_string();
-                }
-                info!("{}: Looking for binary for {}", name, device_name);
-                match BINARY_DIR.get_file(format!("{}_keryx-opencl.bin", device_name)) {
-                    Some(binary) => {
-                        Program::create_and_build_from_binary(&context, &[binary.contents()], "").unwrap_or_else(|e|{
-                        //Program::create_and_build_from_binary(&context, &[include_bytes!("../resources/keryx-opencl-linked.bc")], "").unwrap_or_else(|e|{
-                            warn!("{}::Program::create_and_build_from_source failed: {}. Reverting to compiling from source", name, e);
-                            from_source(&context, &device, options).unwrap_or_else(|e| panic!("{}::Program::create_and_build_from_binary failed: {}", name, e))
-                        })
-                    }
-                    None => {
-                        warn!("Binary file not found for {}. Reverting to compiling from source.", device_name);
-                        from_source(&context, &device, options)
-                            .unwrap_or_else(|e| panic!("{}::Program::create_and_build_from_binary failed: {}", name, e))
-                    }
-                }
-            }
-            false => {
-                info!(
-                    "{}: JIT-compiling OpenCL kernel from source{}",
-                    name,
-                    if options.is_empty() { "" } else { " (v_dot8)" }
-                );
-                from_source(&context, &device, options)
-                    .unwrap_or_else(|e| panic!("{}::Program::create_and_build_from_source failed: {}", name, e))
-            }
-        };
+        // The archived AMD binaries predate the MAX/atomic-min winner ABI and
+        // cannot safely be mixed with this host reset. Until every architecture
+        // can be regenerated and validated on matching hardware, always compile
+        // the canonical source. Keep accepting the legacy flag so old launch
+        // scripts do not fail argument parsing.
+        if use_binary {
+            warn!(
+                "{}: --opencl-use-amd-binary is retired for correctness; JIT-compiling the canonical kernel source",
+                name
+            );
+        }
+        info!("{}: JIT-compiling OpenCL kernel from source{}", name, if options.is_empty() { "" } else { " (v_dot8)" });
+        let program = from_source(&context, &device, options)
+            .unwrap_or_else(|e| panic!("{}::Program::create_and_build_from_source failed: {}", name, e));
         info!("Kernels: {:?}", program.kernel_names());
         let heavy_hash =
             Kernel::create(&program, "heavy_hash").unwrap_or_else(|_| panic!("{}::Kernel::create failed", name));
@@ -450,4 +475,57 @@ fn from_source(context: &Context, device: &Device, options: &str) -> Result<Prog
     info!("Build OpenCL with {}", compile_options);
 
     Program::create_and_build_from_source(context, PROGRAM_SOURCE, compile_options.as_str())
+}
+
+#[cfg(test)]
+mod winner_contract_tests {
+    use super::*;
+
+    #[test]
+    fn max_sentinel_preserves_nonce_zero() {
+        assert_eq!(OPENCL_NO_WINNER, u64::MAX);
+        assert_ne!(OPENCL_NO_WINNER, 0);
+        assert_eq!(output_for_host(OPENCL_NO_WINNER, false), 0, "old hosts retain their sentinel");
+        assert_eq!(
+            output_for_host(OPENCL_NO_WINNER, true),
+            OPENCL_NO_WINNER,
+            "negotiated hosts receive the raw sentinel"
+        );
+        assert_eq!(output_for_host(0, false), 0);
+        assert_eq!(output_for_host(0, true), 0, "nonce zero survives the negotiated contract");
+    }
+
+    #[test]
+    fn atomic_min_contract_selects_lowest_winner() {
+        let mut slot = OPENCL_NO_WINNER;
+        for nonce in [91u64, 7, 42, 0, 13] {
+            slot = slot.min(nonce);
+        }
+        assert_eq!(slot, 0);
+    }
+
+    #[test]
+    fn int64_atomic_capability_is_an_exact_extension_token() {
+        assert!(supports_int64_atomics("cl_khr_fp64 cl_khr_int64_base_atomics cl_khr_subgroups"));
+        assert!(supports_int64_atomics("cl_khr_int64_extended_atomics"));
+        assert!(!supports_int64_atomics("vendor_cl_khr_int64_base_atomics_suffix"));
+    }
+
+    #[test]
+    fn canonical_opencl_source_has_consensus_winner_contract() {
+        assert!(PROGRAM_SOURCE.contains("#define LE_U256"));
+        assert!(PROGRAM_SOURCE.contains("X.x <= Y->x"));
+        assert!(PROGRAM_SOURCE.contains("atom_min(final_nonce, nonce)"));
+        assert!(PROGRAM_SOURCE.contains("#error \"Keryx OpenCL mining requires 64-bit global atomics\""));
+        assert!(!PROGRAM_SOURCE.contains("global int lock"));
+        assert!(!PROGRAM_SOURCE.contains("atom_xchg(&lock"));
+        assert!(!PROGRAM_SOURCE.contains("atom_cmpxchg(final_nonce, 0, nonce)"));
+    }
+
+    #[test]
+    fn archived_precompiled_binaries_are_not_loaded() {
+        let worker_source = include_str!("worker.rs");
+        assert!(!worker_source.contains(concat!("create_and", "_build_from_binary")));
+        assert!(!worker_source.contains(concat!("include_", "dir!")));
+    }
 }
