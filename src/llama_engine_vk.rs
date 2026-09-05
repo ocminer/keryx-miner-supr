@@ -209,7 +209,48 @@ pub fn pick_discrete_ggml_device() -> Option<i32> {
                 }
             }
             let d = pick();
-            (d >= 0).then_some(d)
+            if d >= 0 {
+                return Some(d);
+            }
+            // The strict allowlist pick found nothing. Distinguish two causes:
+            //   * PCI IS readable but no Vulkan device matched a mining GPU → a genuine wrong-card
+            //     hazard on a multi-GPU/mixed-vendor rig; stay fail-closed (return None below).
+            //   * The mining GPUs expose NO verifiable PCI identity anywhere (the AMD OpenCL platform
+            //     reported none → the published allowlist is empty, or no Vulkan device answers
+            //     VK_EXT_pci_bus_info) → the allowlist is unenforceable either way, so refusing to
+            //     mine is strictly worse than v0.13.0's largest-discrete auto-pick. Fall back to it.
+            // Both new probes are optional: on a pre-fallback sidecar `sym` returns None, `pci_verifiable`
+            // defaults to true, and behaviour is exactly the old strict fail-closed.
+            if auto_device_allowlist_active() {
+                let allowlist_empty = std::env::var(crate::pom_opencl::LLAMA_VK_AUTO_PCI_ALLOWLIST_ENV)
+                    .map(|v| v.trim().is_empty())
+                    .unwrap_or(false);
+                let pci_verifiable = sym::<PickFn>(lib, "keryx_vk_any_discrete_pci_verifiable")
+                    .map(|f| f() > 0)
+                    .unwrap_or(true);
+                if allowlist_empty || !pci_verifiable {
+                    if let Some(any) = sym::<PickFn>(lib, "keryx_vk_pick_discrete_device_unfiltered") {
+                        let fallback = any();
+                        if fallback >= 0 {
+                            log::warn!(
+                                "llama-vk engine: the selected mining GPUs expose no verifiable PCI \
+                                 identity ({}), so the OpenCL worker allowlist cannot be enforced — \
+                                 falling back to the largest discrete GPU (ggml device {}) for \
+                                 inference, restoring pre-0.13.1 behaviour. Pin a specific card with \
+                                 KERYX_LLAMA_VK_DEVICE to override.",
+                                if allowlist_empty {
+                                    "the AMD OpenCL platform reported none"
+                                } else {
+                                    "no Vulkan device answers VK_EXT_pci_bus_info"
+                                },
+                                fallback
+                            );
+                            return Some(fallback);
+                        }
+                    }
+                }
+            }
+            None
         })()
     }
 }

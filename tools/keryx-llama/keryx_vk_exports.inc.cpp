@@ -209,6 +209,76 @@ extern "C" int keryx_vk_pick_discrete_device() {
     }
 }
 
+// v0.13.0-compatible pick: the largest discrete GPU (preferring AMD) IGNORING the PCI allowlist.
+// The Rust host uses this ONLY as a last resort when the selected mining GPUs expose no verifiable
+// PCI identity on this system, so the allowlist cannot be enforced either way and a strict
+// fail-closed would needlessly suspend an all-AMD rig that served inference fine before. Never used
+// when PCI is available (the strict keryx_vk_pick_discrete_device governs then).
+extern "C" int keryx_vk_pick_discrete_device_unfiltered() {
+    try {
+        ggml_vk_instance_init();
+        std::vector<vk::PhysicalDevice> phys = vk_instance.instance.enumeratePhysicalDevices();
+        int largest_discrete = -1, largest_amd_discrete = -1;
+        uint64_t largest_discrete_bytes = 0, largest_amd_discrete_bytes = 0;
+        for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
+            size_t raw = vk_instance.device_indices[i];
+            if (raw >= phys.size()) {
+                continue;
+            }
+            vk::PhysicalDeviceProperties props = phys[raw].getProperties();
+            if (props.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) {
+                continue;
+            }
+            vk::PhysicalDeviceMemoryProperties memory = phys[raw].getMemoryProperties();
+            uint64_t device_local_bytes = 0;
+            for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++) {
+                if (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                    device_local_bytes += (uint64_t) memory.memoryHeaps[heap].size;
+                }
+            }
+            if (largest_discrete < 0 || device_local_bytes > largest_discrete_bytes) {
+                largest_discrete = (int) i;
+                largest_discrete_bytes = device_local_bytes;
+            }
+            if (props.vendorID == 0x1002
+                && (largest_amd_discrete < 0 || device_local_bytes > largest_amd_discrete_bytes)) {
+                largest_amd_discrete = (int) i;
+                largest_amd_discrete_bytes = device_local_bytes;
+            }
+        }
+        return largest_amd_discrete >= 0 ? largest_amd_discrete : largest_discrete;
+    } catch (...) {
+        return -1;
+    }
+}
+
+// 1 if at least one discrete Vulkan GPU reports a usable VK_EXT_pci_bus_info identity, else 0.
+// The Rust host consults this to distinguish "PCI is readable but no device matched the allowlist"
+// (a genuine wrong-card hazard — stay fail-closed) from "no device can report PCI at all" (the
+// allowlist is unenforceable, so fall back to the unfiltered pick).
+extern "C" int keryx_vk_any_discrete_pci_verifiable() {
+    try {
+        ggml_vk_instance_init();
+        std::vector<vk::PhysicalDevice> phys = vk_instance.instance.enumeratePhysicalDevices();
+        for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
+            size_t raw = vk_instance.device_indices[i];
+            if (raw >= phys.size()) {
+                continue;
+            }
+            if (phys[raw].getProperties().deviceType != vk::PhysicalDeviceType::eDiscreteGpu) {
+                continue;
+            }
+            uint32_t domain = 0, bus = 0, device = 0, function = 0;
+            if (keryx_vk_physical_device_pci(phys[raw], &domain, &bus, &device, &function)) {
+                return 1;
+            }
+        }
+        return 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
 extern "C" void keryx_vk_queue_submit(size_t dev_num, const void * submit_info, void * fence) {
     vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
     // The same lock every internal ggml submission takes -> external dispatches serialize

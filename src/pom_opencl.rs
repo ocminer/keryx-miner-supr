@@ -1109,14 +1109,47 @@ fn prepare_vulkan_device(device: i32, owner: DedicationOwner, route: &str) -> bo
         return true;
     }
     let Some(pci) = crate::llama_engine_vk::ggml_device_pci(device) else {
-        if dedication_required {
-            clear_dedicated_device();
+        // No resolvable PCI identity for this ggml device — the same PCI-unavailable condition the
+        // picker falls back on (Vulkan lacks VK_EXT_pci_bus_info, or the AMD OpenCL platform exposed
+        // no PCI). We cannot correlate the inference GPU to an OpenCL worker by PCI, so mirror
+        // v0.13.0's best effort instead of refusing to mine.
+        if !dedication_required {
+            // Model + walk coexist — there is no card to dedicate or evict; just load inference.
+            log::warn!(
+                "PoM: {route} ggml device {device} has no resolvable PCI identity; proceeding \
+                 without card dedication (model + walk coexist). Pin with KERYX_LLAMA_VK_DEVICE to \
+                 select a specific inference card."
+            );
+            return true;
         }
-        log::error!(
-            "PoM: cannot map {route} ggml device {device} to full PCI identity; refusing GPU \
-             inference before model allocation"
+        // Dedication IS required (model + walk cannot coexist). The picker chose the largest discrete
+        // Vulkan GPU and require_dedicated_inference_card() already reserved the largest scoped
+        // OpenCL worker — on a single-vendor rig these are the same physical card. Evict that
+        // provisional worker so the model can allocate, and keep the reservation.
+        let provisional = DEDICATED_DEV.lock().unwrap_or_else(|p| p.into_inner()).device;
+        let Some(id) = provisional else {
+            clear_dedicated_device();
+            log::error!(
+                "PoM: {route} ggml device {device} has no resolvable PCI identity and no provisional \
+                 inference worker is reserved; refusing GPU inference. Pin with KERYX_LLAMA_VK_DEVICE."
+            );
+            return false;
+        };
+        *DEDICATED_DEV.lock().unwrap_or_else(|p| p.into_inner()) =
+            DedicationState { device: Some(id), owner };
+        if let Err(error) = evict_resident_for_dedication(id) {
+            clear_dedication_owned_by(owner);
+            log::error!(
+                "PoM: cannot dedicate OpenCL card {id:#x} to {route} without PCI verification: \
+                 {error}; refusing model load"
+            );
+            return false;
+        }
+        log::warn!(
+            "PoM: {route} ggml device {device} has no resolvable PCI identity; dedicating the largest \
+             OpenCL worker {id:#x} to inference (single-vendor best effort) so model + walk don't collide"
         );
-        return false;
+        return true;
     };
     let matched = scoped_gpu_devices().into_iter().find(|id| device_pci_full(*id) == Some(pci));
     match classify_vulkan_device_scope(matched, explicit_override) {
