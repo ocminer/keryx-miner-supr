@@ -120,6 +120,12 @@ fn should_enable_with(
     {
         return false;
     }
+    // --force-tui: always request the dashboard, bypassing the interactive-terminal and
+    // TERM=dumb checks. It is placed after the hard disables above so --no-tui, help/version
+    // and escrow recovery still win (--no-tui is also declared conflicts_with in the CLI).
+    if has("--force-tui") {
+        return true;
+    }
     if term.is_some_and(|value| value.eq_ignore_ascii_case("dumb")) {
         return false;
     }
@@ -1178,6 +1184,17 @@ mod tests {
         assert!(!should_enable_with(&args(&["miner", "--recover-escrow"]), true, true, true, Some("xterm"), false));
         assert!(!should_enable_with(&args(&["miner"]), true, true, true, Some("dumb"), false));
         assert!(!should_enable_with(&args(&["miner"]), true, true, true, Some("xterm"), true));
+    }
+
+    #[test]
+    fn force_tui_bypasses_the_interactive_and_dumb_checks() {
+        // --force-tui enables the dashboard even with no TTY on any stream and TERM=dumb.
+        assert!(should_enable_with(&args(&["miner", "--force-tui"]), false, false, false, Some("dumb"), false));
+        assert!(should_enable_with(&args(&["miner", "--force-tui"]), false, true, false, None, false));
+        // But the hard disables still win over --force-tui.
+        assert!(!should_enable_with(&args(&["miner", "--force-tui", "--no-tui"]), true, true, true, Some("xterm"), false));
+        assert!(!should_enable_with(&args(&["miner", "--force-tui"]), false, false, false, Some("dumb"), true)); // KERYX_TUI=0 off
+        assert!(!should_enable_with(&args(&["miner", "--force-tui", "--help"]), true, true, true, Some("xterm"), false));
     }
 
     #[test]

@@ -247,6 +247,14 @@ pub struct Opt {
     )]
     pub no_tui: bool,
 
+    #[clap(
+        long = "force-tui",
+        conflicts_with = "no_tui",
+        help = "Always start the interactive dashboard, even when stdin/stdout/stderr are not a TTY (e.g. under a wrapper, tmux/screen without full TTY, or a non-'dumb' redirected terminal). Bypasses the automatic interactive-terminal check; --no-tui still wins and is mutually exclusive. A matching (non-legacy) GPU plugin is still required.",
+        help_heading = "Mining"
+    )]
+    pub force_tui: bool,
+
     #[clap(short = 'a', long = "mining-address", help = "The Keryx address for the miner reward")]
     pub mining_address: Option<String>,
 
