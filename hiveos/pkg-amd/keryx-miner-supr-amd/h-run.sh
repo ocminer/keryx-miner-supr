@@ -102,7 +102,7 @@ esac
 # HiveOS consumes line-oriented logs through tee/h-stats; do not emit alternate-screen TUI escape
 # sequences into the parser log. Preserve an explicitly supplied flag without duplication.
 case " $CLI_ARGS " in
-  *" --no-tui "*) ;;
+  *" --no-tui "*|*" --force-tui "*) ;;
   *) CLI_ARGS="$CLI_ARGS --no-tui" ;;
 esac
 

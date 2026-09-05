@@ -17,7 +17,7 @@ export LD_LIBRARY_PATH="$(dirname $0):${LD_LIBRARY_PATH:-}:/usr/local/cuda/lib64
 
 CLI_ARGS="$(< "$CUSTOM_CONFIG_FILENAME") $*"
 case " $CLI_ARGS " in
-  *" --no-tui "*) ;;
+  *" --no-tui "*|*" --force-tui "*) ;;
   *) CLI_ARGS="--no-tui $CLI_ARGS" ;;
 esac
 # Intentional word splitting: HiveOS stores the complete miner command line in this config file.

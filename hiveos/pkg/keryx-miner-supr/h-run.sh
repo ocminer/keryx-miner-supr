@@ -35,7 +35,7 @@ esac
 # invisible to the agent and would corrupt its parser input. Keep this idempotent so an operator's
 # explicit extra arg is not duplicated.
 case " $CLI_ARGS " in
-  *" --no-tui "*) ;;
+  *" --no-tui "*|*" --force-tui "*) ;;
   *) CLI_ARGS="$CLI_ARGS --no-tui" ;;
 esac
 

@@ -65,7 +65,7 @@ CMD+=( "${FINAL_ARGS[@]}" )
 # it in the flight sheet's extra arguments (Clap rejects repeated boolean flags).
 HAS_NO_TUI=0
 for arg in "${CMD[@]:1}"; do
-    [[ "$arg" == "--no-tui" ]] && HAS_NO_TUI=1
+    [[ "$arg" == "--no-tui" || "$arg" == "--force-tui" ]] && HAS_NO_TUI=1
 done
 [[ "$HAS_NO_TUI" == "0" ]] && CMD+=( --no-tui )
 
