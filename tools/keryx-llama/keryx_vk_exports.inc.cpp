@@ -279,6 +279,40 @@ extern "C" int keryx_vk_any_discrete_pci_verifiable() {
     }
 }
 
+// Map a ggml-vulkan device index (a position in vk_instance.device_indices, the space the picker
+// and keryx_vk_device_pci use) to llama.cpp's `main_gpu` value. Since llama.cpp b10015,
+// llama_prepare_model_devices builds model->devices from DISCRETE GPUs only — integrated GPUs
+// (VK_PHYSICAL_DEVICE_TYPE_INTEGRATED / ggml TYPE_IGPU) and CPU backends are filtered out — so
+// main_gpu is the target's ordinal AMONG DISCRETE GPUs in enumeration order, NOT its raw ggml
+// device index. On a rig with an integrated GPU enumerated before the discrete cards (common on
+// AMD/Intel desktop CPUs) the two disagree and llama rejects "invalid value for main_gpu". Returns
+// the discrete ordinal, or -1 if the index is invalid or does not name a discrete GPU.
+extern "C" int keryx_vk_ggml_index_to_discrete_ordinal(int ggml_index) {
+    try {
+        ggml_vk_instance_init();
+        if (ggml_index < 0 || (size_t) ggml_index >= vk_instance.device_indices.size()) {
+            return -1;
+        }
+        std::vector<vk::PhysicalDevice> phys = vk_instance.instance.enumeratePhysicalDevices();
+        int ordinal = 0;
+        for (int i = 0; i < ggml_index; i++) {
+            size_t raw = vk_instance.device_indices[(size_t) i];
+            if (raw < phys.size()
+                && phys[raw].getProperties().deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+                ordinal++;
+            }
+        }
+        size_t raw_target = vk_instance.device_indices[(size_t) ggml_index];
+        if (raw_target >= phys.size()
+            || phys[raw_target].getProperties().deviceType != vk::PhysicalDeviceType::eDiscreteGpu) {
+            return -1;
+        }
+        return ordinal;
+    } catch (...) {
+        return -1;
+    }
+}
+
 extern "C" void keryx_vk_queue_submit(size_t dev_num, const void * submit_info, void * fence) {
     vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
     // The same lock every internal ggml submission takes -> external dispatches serialize

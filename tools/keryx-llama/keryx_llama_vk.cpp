@@ -50,6 +50,7 @@ extern "C" bool keryx_vk_tensor_addr(const struct ggml_tensor * tensor, uint64_t
 extern "C" void * keryx_vk_tensor_device(const struct ggml_tensor * tensor);
 extern "C" void keryx_vk_queue_submit(size_t dev_num, const void * submit_info, void * fence);
 extern "C" int keryx_vk_pick_discrete_device();
+extern "C" int keryx_vk_ggml_index_to_discrete_ordinal(int ggml_index);
 
 static constexpr uint64_t CHUNK_BYTES = 32;
 static constexpr uint32_t NO_WINNER = 0xFFFFFFFFu;
@@ -486,10 +487,22 @@ KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
         gpu = d >= 0 ? d : 0;
         KERYX_LOG_INFO("keryx-llama-vk: auto-selected discrete ggml device %d\n", gpu);
     }
+    // `gpu` is a ggml-vulkan device index (device_indices space). llama.cpp's main_gpu, however,
+    // indexes model->devices, which since b10015 holds DISCRETE GPUs only (integrated GPUs + CPU are
+    // filtered out) — so on a rig with an iGPU enumerated before the discrete cards the two indices
+    // differ and llama rejects "invalid value for main_gpu: N (available devices: M)". Translate to
+    // the discrete-GPU ordinal; keep the raw index if translation is unavailable (older sidecar or a
+    // genuinely non-discrete pick, in which case the old behaviour is no worse).
+    int main_gpu = keryx_vk_ggml_index_to_discrete_ordinal(gpu);
+    if (main_gpu < 0) {
+        main_gpu = gpu;
+    } else if (main_gpu != gpu) {
+        KERYX_LOG_INFO("keryx-llama-vk: ggml device %d -> llama main_gpu %d (integrated/filtered devices skipped)\n", gpu, main_gpu);
+    }
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 999;
     mp.split_mode   = LLAMA_SPLIT_MODE_NONE; // ONE GPU — never layer-split across mining cards
-    mp.main_gpu     = gpu;
+    mp.main_gpu     = main_gpu;
     mp.use_mmap     = true;
     llama_model* model = llama_model_load_from_file(gguf_path, mp);
     if (!model) return nullptr;
