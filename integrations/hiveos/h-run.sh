@@ -23,3 +23,5 @@ esac
 # Intentional word splitting: HiveOS stores the complete miner command line in this config file.
 # shellcheck disable=SC2086
 ./$CUSTOM_MINERBIN $CLI_ARGS 2>&1 | tee "$CUSTOM_LOG_BASENAME.log"
+# Propagate the MINER's exit code, not tee's — else a crash/OOM is masked as exitcode=0.
+exit "${PIPESTATUS[0]}"

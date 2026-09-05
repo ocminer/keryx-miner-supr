@@ -42,3 +42,6 @@ esac
 echo "[keryx-miner-supr] launching: ./keryx-miner-supr $CLI_ARGS"
 # tee (not exec) so the log file exists for h-stats.sh.
 ./keryx-miner-supr $CLI_ARGS 2>&1 | tee "$CUSTOM_LOG_BASENAME.log"
+# Propagate the MINER's exit code, not tee's — else a miner crash/OOM (non-zero) is masked as
+# exitcode=0 and HiveOS can't tell it failed. PIPESTATUS[0] is the first pipe stage (the miner).
+exit "${PIPESTATUS[0]}"

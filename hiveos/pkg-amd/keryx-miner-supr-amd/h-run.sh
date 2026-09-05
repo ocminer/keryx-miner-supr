@@ -109,3 +109,5 @@ esac
 echo "[keryx-miner-supr-amd] launching: ./keryx-miner-supr $CLI_ARGS" | tee -a "$LOG"
 # tee -a (not exec) so the log keeps the preflight lines + miner output for h-stats.sh.
 ./keryx-miner-supr $CLI_ARGS 2>&1 | tee -a "$LOG"
+# Propagate the MINER's exit code, not tee's — else a crash/OOM is masked as exitcode=0.
+exit "${PIPESTATUS[0]}"
