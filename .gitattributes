@@ -1,0 +1,10 @@
+# Hash-gated build inputs must keep LF endings on every platform. build.rs and the
+# plugin build compute SHA-256 over these sources and compare against committed
+# manifests (cuda/POM_FATBIN_MANIFEST.md, plugins/cuda/resources/PTX_MANIFEST.txt).
+# Without this, a Windows checkout converts LF->CRLF (autocrlf) and the source hash
+# no longer matches the manifest, failing the build ("committed walk image/source do
+# not match"). Force LF for the CUDA/PTX sources and treat the fatbin as binary.
+*.cu   text eol=lf
+*.cuh  text eol=lf
+*.ptx  text eol=lf
+*.fatbin binary
