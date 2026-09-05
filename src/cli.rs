@@ -249,8 +249,7 @@ pub struct Opt {
 
     #[clap(
         long = "force-tui",
-        conflicts_with = "no_tui",
-        help = "Always start the interactive dashboard, even when stdin/stdout/stderr are not a TTY (e.g. under a wrapper, tmux/screen without full TTY, or a non-'dumb' redirected terminal). Bypasses the automatic interactive-terminal check; --no-tui still wins and is mutually exclusive. A matching (non-legacy) GPU plugin is still required.",
+        help = "Always start the interactive dashboard, even when stdin/stdout/stderr are not a TTY (e.g. under a wrapper, tmux/screen without a full TTY, or a non-'dumb' redirected terminal). Bypasses the automatic interactive-terminal check. If both --force-tui and --no-tui are given, --no-tui wins. A matching (non-legacy) GPU plugin is still required.",
         help_heading = "Mining"
     )]
     pub force_tui: bool,
