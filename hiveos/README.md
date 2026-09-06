@@ -8,8 +8,8 @@ custom-miner format.
 
 ## Build the release archives
 
-The maintained entry point performs a network-isolated modern NVIDIA build and
-then creates every supported distribution package:
+The maintained entry points perform network-isolated NVIDIA builds and then
+create every supported distribution package:
 
 ```bash
 hiveos/build-release.sh
@@ -18,12 +18,20 @@ hiveos/build-release.sh
 # -> hiveos/dist-modern/keryx-miner-supr-modern-mmpos_<ver>.tar.gz
 # -> hiveos/dist-modern/keryx-miner-supr-modern-<ver>-linux-x86_64.tar.gz
 # -> hiveos/dist-modern/SHA256SUMS-modern.txt
+
+# GTX 10-series/Pascal through newer cards; requires a CUDA 12.4 toolkit at
+# /tmp/cuda124 (or KERYX_HOST_CUDA_DIR=<path>).
+hiveos/build-release-legacy.sh
+# -> the equivalent four legacy archives + SHA256SUMS-legacy.txt
 ```
 
 It requires a clean llama.cpp `b10015` checkout and portable CMake >= 3.18 as
 documented at the top of `build-offline.sh`. Both AVX2 and baseline-ISA CUDA
 llama engines are built inside the same `--network none` container; packaging
-fails if either engine, the CUDA worker, or any CUDA runtime library is missing.
+fails if either engine, the CUDA worker, or any CUDA runtime library is missing. The
+legacy path additionally refuses anything except CUDA 12.4, a compute_61 PoM walk,
+sm_61 Candle PTX and native sm_61 llama images. `package-line.sh` verifies the build
+provenance and artifact hashes before creating archives.
 
 - **linux-x86_64** = NVIDIA dynamic host plus `libkeryxcuda.so` for general Linux.
 - **HiveOS/SMOS/mmpOS** = static CUDA worker host plus the relevant integration scripts.

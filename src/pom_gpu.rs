@@ -32,7 +32,7 @@ const WALK_SOURCE_SHA256: &str = env!("POM_WALK_SOURCE_SHA256");
 const HOST_POLICY_SHA256: &str = env!("POM_HOST_POLICY_SHA256");
 const WALK_ABI: &str = env!("POM_WALK_ABI");
 /// The arch the walk image targets (build.rs bakes it in) — "sm_75..120-native" for the modern
-/// fatbin, or sm_70/sm_60 for legacy/pascal PTX. Used to explain arch-mismatch load failures.
+/// fatbin, or sm_61 for legacy/Pascal. Used to explain arch-mismatch load failures.
 const PTX_ARCH: &str = env!("POM_PTX_ARCH");
 const CHUNK_BYTES: usize = 32;
 
@@ -244,12 +244,12 @@ fn walk_load_err(e: impl std::fmt::Display) -> candle_core::Error {
          (2) CUDA_ERROR_UNSUPPORTED_PTX_VERSION ('unsupported toolchain') = your NVIDIA DRIVER is \
          too OLD for this build's PTX toolchain — UPDATE THE DRIVER (MODERN needs 575+), it is NOT \
          a GPU-arch problem. \
-         Pick the build line for your GPU: LEGACY = sm_70+ (Volta/V100, CMP 100-210, Turing+), \
-         PASCAL = sm_60/61 (GTX 10-series), MODERN = sm_75+ with driver 575+. If you built from \
-         source: CUDA 13.x cannot compile for Volta or Pascal — use a CUDA 12.x toolkit and set \
-         POM_CUDA_ARCH=compute_70 (Volta) or compute_61 (Pascal/GTX-10xx; compute_60/P100 CANNOT \
-          build the walk — __dp4a is sm_61+), plus CUDA_COMPUTE_CAP to match. Pascal also needs a \
-          CUDA 12.4 toolkit specifically: 12.5+ emits PTX ISA 8.5 which driver 550 rejects with \
+         Pick the build line for your GPU: LEGACY = sm_61+ (GTX 10-series, Volta/V100, CMP \
+         100-210, Turing+) with driver 550+; MODERN = sm_75+ with driver 575+. P100/sm_60 is not \
+         supported because the walk requires __dp4a. If you built from source: CUDA 13.x cannot \
+         compile for Volta or Pascal — use CUDA 12.4 and set POM_CUDA_ARCH=compute_61 plus \
+         CUDA_COMPUTE_CAP=61. The exact CUDA 12.4 requirement matters: 12.5+ emits PTX ISA 8.5 \
+         which driver 550 rejects with \
           CUDA_ERROR_UNSUPPORTED_PTX_VERSION."
     ))
 }

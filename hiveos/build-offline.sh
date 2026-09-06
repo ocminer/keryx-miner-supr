@@ -6,8 +6,8 @@
 #
 # Usage: build-offline.sh <IMAGE> <OUTDIR-name> <SUFFIX> [HOST_CUDA_DIR]
 #   e.g. build-offline.sh keryx-build:offline dist-modern modern
-#   HOST_CUDA_DIR: optional host path to a CUDA toolkit to mount at /opt/cuda and
-#   build against (e.g. an extracted 12.4 toolkit) instead of the image's CUDA.
+#   HOST_CUDA_DIR: host CUDA toolkit mounted at /opt/cuda. Optional for modern (but if
+#   supplied it must be 12.9); required and exactly 12.4 for legacy/Pascal.
 # Offline inference-build prerequisites (override these defaults with environment variables):
 #   KERYX_LLAMA_SRC=/tmp/llama-src-b10015
 #     Clean, exact checkout of https://github.com/ggml-org/llama.cpp tag b10015.
@@ -18,16 +18,18 @@
 #   git clone --depth 1 --branch b10015 https://github.com/ggml-org/llama.cpp /tmp/llama-src-b10015
 #   curl -fsSLO https://github.com/Kitware/CMake/releases/download/v3.28.6/cmake-3.28.6-linux-x86_64.tar.gz
 #   tar -xzf cmake-3.28.6-linux-x86_64.tar.gz -C /tmp
-# Per-line arch overrides (env): BOFF_POM_CUDA_ARCH (walk PTX; default compute_75 via
-# build.rs; legacy=compute_70, pascal=compute_61) and BOFF_CUDA_COMPUTE_CAP (candle
-# inference PTX; default 70; pascal=61).
+# Per-line arch overrides (env): BOFF_POM_CUDA_ARCH (walk image) and
+# BOFF_CUDA_COMPUTE_CAP (candle inference PTX). Release-safe defaults are selected from
+# SUFFIX: modern=committed fatbin/sm_70 candle on CUDA 12.9; legacy and the one-off
+# pascal line=compute_61/sm_61 candle on CUDA 12.4. Legacy/Pascal overrides that would
+# raise the Pascal floor are rejected rather than producing a mislabeled archive.
 #
 # PASCAL MUST BE compute_61, NOT compute_60: the v4 walk uses __dp4a (src/pom_mine.cu),
 # which is sm_61+. compute_60 (P100) fails to compile outright:
 #   src/pom_mine.cu(303): error: identifier "__dp4a" is undefined
 # So the pascal line covers GTX 10-series (1080 Ti = sm_61), not P100. It also needs a
-# CUDA 12.x toolkit mounted via HOST_CUDA_DIR — CUDA 13 dropped Pascal entirely
-# ("nvcc fatal: Unsupported gpu architecture 'compute_61'").
+# CUDA 12.4 toolkit mounted via HOST_CUDA_DIR — later PTX can exceed the legacy driver
+# floor, and CUDA 13 dropped Pascal entirely.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="$1"; OUTDIR="$2"; SUF="$3"; CUDADIR="${4:-}"
@@ -35,7 +37,6 @@ IMAGE="$1"; OUTDIR="$2"; SUF="$3"; CUDADIR="${4:-}"
   echo "ERROR: OUTDIR must be a simple dist-* directory name below hiveos/: $OUTDIR" >&2
   exit 2
 }
-POMARCH="${BOFF_POM_CUDA_ARCH:-}"; CCAP="${BOFF_CUDA_COMPUTE_CAP:-70}"
 OUT="$REPO/hiveos/$OUTDIR"
 SCRATCH=/tmp/koffcargo-$SUF
 TGT="target-offline-$SUF"
@@ -45,13 +46,40 @@ CMAKE_ROOT="${KERYX_CMAKE_ROOT:-/tmp/cmake-3.28.6-linux-x86_64}"
 LLAMA_JOBS="${KERYX_LLAMA_JOBS:-16}"
 
 case "$SUF" in
-  modern) LLAMA_ARCHS="75;80;86;89;90;120" ;;
-  legacy) LLAMA_ARCHS="61;70;75;80;86;89;90" ;;
+  modern)
+    LLAMA_ARCHS="75;80;86;89;90;120"
+    POMARCH="${BOFF_POM_CUDA_ARCH:-}"
+    CCAP="${BOFF_CUDA_COMPUTE_CAP:-70}"
+    EXPECTED_CUDA_RELEASE=12.9
+    ;;
+  legacy)
+    LLAMA_ARCHS="61;70;75;80;86;89;90"
+    POMARCH="${BOFF_POM_CUDA_ARCH:-compute_61}"
+    CCAP="${BOFF_CUDA_COMPUTE_CAP:-61}"
+    EXPECTED_CUDA_RELEASE=12.4
+    ;;
   # One-off only: the v4 walk itself still requires sm_61, but retain the established
   # Pascal inference-engine images for both sm_60 and sm_61.
-  pascal) LLAMA_ARCHS="60;61" ;;
+  pascal)
+    LLAMA_ARCHS="60;61"
+    POMARCH="${BOFF_POM_CUDA_ARCH:-compute_61}"
+    CCAP="${BOFF_CUDA_COMPUTE_CAP:-61}"
+    EXPECTED_CUDA_RELEASE=12.4
+    ;;
   *) echo "ERROR: unsupported NVIDIA line '$SUF' (expected modern, legacy, or pascal)" >&2; exit 2 ;;
 esac
+if [[ "$SUF" != modern ]]; then
+  [[ "$POMARCH" == compute_61 && "$CCAP" == 61 ]] || {
+    echo "ERROR: the $SUF line must use walk compute_61 and candle sm_61 (got walk=${POMARCH:-default}, candle=$CCAP)." >&2
+    echo "       Raising either target silently drops GTX 10-series support." >&2
+    exit 2
+  }
+  [[ -n "$CUDADIR" ]] || {
+    echo "ERROR: the $SUF line requires an explicit CUDA 12.4 HOST_CUDA_DIR." >&2
+    echo "       Example: hiveos/build-offline.sh keryx-build:offline $OUTDIR $SUF /tmp/cuda124" >&2
+    exit 2
+  }
+fi
 [[ "$LLAMA_JOBS" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: KERYX_LLAMA_JOBS must be a positive integer" >&2; exit 2; }
 [[ -d "$LLAMA_SRC/.git" && -f "$LLAMA_SRC/CMakeLists.txt" ]] || {
   echo "ERROR: pinned llama.cpp source missing at $LLAMA_SRC" >&2
@@ -80,9 +108,24 @@ CMAKE_VERSION=$("$CMAKE_ROOT/bin/cmake" --version | awk 'NR == 1 { print $3 }')
 CUDAMOUNT=(); KCUDA=/usr/local/cuda
 if [ -n "$CUDADIR" ]; then
   [[ -x "$CUDADIR/bin/nvcc" ]] || { echo "ERROR: HOST_CUDA_DIR has no executable bin/nvcc: $CUDADIR" >&2; exit 2; }
+  [[ -x "$CUDADIR/bin/cuobjdump" ]] || { echo "ERROR: HOST_CUDA_DIR has no executable bin/cuobjdump: $CUDADIR" >&2; exit 2; }
   CUDAMOUNT=(-v "$CUDADIR":/opt/cuda:ro)
   KCUDA=/opt/cuda
 fi
+
+cuda_release() {
+  sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1
+}
+if [ -n "$CUDADIR" ]; then
+  ACTUAL_CUDA_RELEASE=$("$CUDADIR/bin/nvcc" --version | cuda_release)
+else
+  ACTUAL_CUDA_RELEASE=$(docker run --rm --network none "$IMAGE" nvcc --version | cuda_release)
+fi
+[[ "$ACTUAL_CUDA_RELEASE" == "$EXPECTED_CUDA_RELEASE" ]] || {
+  echo "ERROR: $SUF release requires CUDA $EXPECTED_CUDA_RELEASE exactly; found ${ACTUAL_CUDA_RELEASE:-unknown}." >&2
+  echo "       Refusing to erase/repopulate $OUT with a mislabeled build." >&2
+  exit 2
+}
 
 # host crate cache -> scratch (so the container, running as root, never pollutes ~/.cargo)
 if [ ! -d "$SCRATCH/registry" ]; then echo ">> copying crate cache to scratch..."; rm -rf "$SCRATCH"; cp -a "$HOME/.cargo" "$SCRATCH"; fi
@@ -95,11 +138,17 @@ docker run --rm --network none \
   -v "$LLAMA_SRC":/llama:ro -v "$CMAKE_ROOT":/opt/keryx-cmake:ro \
   -e CARGO_HOME=/root/.cargo -e CARGO_NET_OFFLINE=true -e RUSTUP_HOME=/usr/local/rustup \
   -e KCUDA="$KCUDA" -e POMARCH="$POMARCH" -e CCAP="$CCAP" \
+  -e KERYX_LINE="$SUF" -e EXPECTED_CUDA_RELEASE="$EXPECTED_CUDA_RELEASE" \
   -e KERYX_TARGET_DIR="$TGT" -e KERYX_OUTDIR="$OUTDIR" \
   -e LLAMA_ARCHS="$LLAMA_ARCHS" -e LLAMA_JOBS="$LLAMA_JOBS" \
   "$IMAGE" bash -euo pipefail -c '
     export CUDA_HOME=$KCUDA CUDA_PATH=$KCUDA CUDA_COMPUTE_CAP=$CCAP
-    if [ -n "$POMARCH" ]; then export POM_CUDA_ARCH="$POMARCH"; fi
+    export NVCC="$KCUDA/bin/nvcc" CUDACXX="$KCUDA/bin/nvcc" POM_WALK_IMAGE=fatbin
+    if [ -n "$POMARCH" ]; then
+      export POM_CUDA_ARCH="$POMARCH"
+    else
+      unset POM_CUDA_ARCH
+    fi
     export PATH=$KCUDA/bin:/usr/local/cargo/bin:/root/.cargo/bin:$PATH
     # -rpath $ORIGIN/lib so the binary finds the bundled CUDA runtime (libcurand/libcublas/…) next
     # to itself on a clean rig (NVIDIA driver only, no system CUDA), without needing a launcher to
@@ -107,7 +156,13 @@ docker run --rm --network none \
     export RUSTFLAGS="-L $KCUDA/lib64/stubs -C link-arg=-Wl,-rpath,\$ORIGIN/lib"
     export CARGO_TARGET_DIR="/src/$KERYX_TARGET_DIR"
     O="/src/hiveos/$KERYX_OUTDIR"
-    echo "building against CUDA: $(nvcc --version | grep -oE "release [0-9.]+") walk-arch=${POMARCH:-default} candle-cap=$CCAP"
+    CUDA_RELEASE=$(nvcc --version | sed -n "s/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p" | head -1)
+    [ "$CUDA_RELEASE" = "$EXPECTED_CUDA_RELEASE" ] || {
+      echo "ERROR: mounted CUDA changed after preflight: expected $EXPECTED_CUDA_RELEASE, got ${CUDA_RELEASE:-unknown}" >&2
+      exit 2
+    }
+    printf "%s\n" "$CUDA_RELEASE" > "$O/.cuda-release"
+    echo "building against CUDA: release $CUDA_RELEASE walk-arch=${POMARCH:-committed-fatbin} candle-cap=$CCAP"
     rm -rf "$KERYX_TARGET_DIR"/release/build/candle-kernels-* \
            "$KERYX_TARGET_DIR"/release/.fingerprint/candle-kernels-* \
            "$KERYX_TARGET_DIR"/release/deps/*candle_kernels* 2>/dev/null || true
@@ -120,6 +175,31 @@ docker run --rm --network none \
     echo "=== static build (single binary) ==="
     cargo build --locked --offline --release -p keryx-miner-supr --features static-cuda,pom-cuda
     cp "$KERYX_TARGET_DIR/release/keryx-miner-supr" "$O/keryx-miner-supr"
+
+    # A generic `.target sm_61` string is not proof of a Pascal release: unrelated embedded
+    # worker images also contain it. Check every freshly generated candle PTX and the exact
+    # PoM walk metadata before spending time on the llama engines.
+    if [ "$KERYX_LINE" = legacy ] || [ "$KERYX_LINE" = pascal ]; then
+      shopt -s nullglob
+      candle_ptx=("$KERYX_TARGET_DIR"/release/build/candle-kernels-*/out/*.ptx)
+      [ "${#candle_ptx[@]}" -gt 0 ] || { echo "ERROR: no generated candle PTX found" >&2; exit 1; }
+      for ptx in "${candle_ptx[@]}"; do
+        grep -Eq "^\\.target[[:space:]]+sm_61([,[:space:]]|$)" "$ptx" || {
+          echo "ERROR: Pascal-incompatible candle target in $ptx" >&2
+          grep -m1 "^\\.target" "$ptx" >&2 || true
+          exit 1
+        }
+      done
+      expected_walk=sm_61+sm_80
+    else
+      expected_walk=sm_75..121-native+compute_80-tc
+    fi
+    for miner in "$O/keryx-miner-supr" "$O/keryx-miner-supr-dynamic"; do
+      grep -aFq "$expected_walk" "$miner" || {
+        echo "ERROR: $KERYX_LINE $(basename "$miner") lacks expected PoM walk metadata $expected_walk" >&2
+        exit 1
+      }
+    done
 
     echo "=== CUDA llama.cpp engines (AVX2 + no-AVX) ==="
     git config --global --add safe.directory /llama
@@ -165,18 +245,64 @@ docker run --rm --network none \
   '
 echo ">> done. static fallback=$(strings "$OUT/keryx-miner-supr" 2>/dev/null | grep -c KERYX_FORCE_GPU_INFER_FAIL) glibc=$(objdump -T "$OUT/keryx-miner-supr" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1)"
 echo ">> bundled libs ($(du -sh "$OUT/lib"|cut -f1)): $(ls "$OUT/lib")"
-for engine in libkeryx-llama.so libkeryx-llama-noavx.so; do
-  [[ -s "$OUT/$engine" ]] || { echo "ERROR: required inference engine was not produced: $OUT/$engine" >&2; exit 1; }
-  ENGINE_GLIBC=$(objdump -T "$OUT/$engine" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1 || true)
-  ENGINE_SYMS=$(nm -D "$OUT/$engine" 2>/dev/null | grep -c keryx_llama || true)
-  [[ -n "$ENGINE_GLIBC" && "$(printf '%s\n' GLIBC_2.31 "$ENGINE_GLIBC" | sort -V | tail -1)" == GLIBC_2.31 ]] || {
-    echo "ERROR: $engine requires ${ENGINE_GLIBC:-an unknown glibc}, above/without the GLIBC_2.31 release ceiling" >&2
+check_glibc_ceiling() {
+  local file="$1" ceiling="$2" actual
+  actual=$(objdump -T "$file" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1 || true)
+  [[ -n "$actual" && "$(printf '%s\n' "$ceiling" "$actual" | sort -V | tail -1)" == "$ceiling" ]] || {
+    echo "ERROR: $file requires ${actual:-an unknown glibc}, above/without the $ceiling release ceiling" >&2
     exit 1
   }
+  echo ">> $(basename "$file"): glibc=$actual"
+}
+for host_elf in keryx-miner-supr keryx-miner-supr-dynamic libkeryxcuda.so; do
+  check_glibc_ceiling "$OUT/$host_elf" GLIBC_2.31
+done
+for runtime in libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libcurand.so.10; do
+  check_glibc_ceiling "$OUT/lib/$runtime" GLIBC_2.31
+done
+for engine in libkeryx-llama.so libkeryx-llama-noavx.so; do
+  [[ -s "$OUT/$engine" ]] || { echo "ERROR: required inference engine was not produced: $OUT/$engine" >&2; exit 1; }
+  ENGINE_SYMS=$(nm -D "$OUT/$engine" 2>/dev/null | grep -c keryx_llama || true)
+  check_glibc_ceiling "$OUT/$engine" GLIBC_2.31
   [[ "$ENGINE_SYMS" -gt 0 ]] || { echo "ERROR: $engine exports no keryx_llama ABI symbols" >&2; exit 1; }
-  echo ">> $engine: $(stat -c %s "$OUT/$engine") bytes, glibc=$ENGINE_GLIBC, syms=$ENGINE_SYMS"
+  echo ">> $engine: $(stat -c %s "$OUT/$engine") bytes, syms=$ENGINE_SYMS"
 done
 VEX=$(objdump -d --disassemble="ggml_vec_dot_q8_0_q8_0" "$OUT/libkeryx-llama-noavx.so" 2>/dev/null \
   | awk -F'\t' 'NF >= 3 { print $3 }' | grep -cE '^v[a-z]' || true)
 [[ "$VEX" == 0 ]] || { echo "ERROR: no-AVX engine still contains AVX instructions in ggml_vec_dot_q8_0_q8_0" >&2; exit 1; }
 echo ">> no-AVX engine verification: VEX instruction count=$VEX"
+
+if [[ "$SUF" != modern ]]; then
+  for engine in libkeryx-llama.so libkeryx-llama-noavx.so; do
+    CUDA_IMAGES=$("$CUDADIR/bin/cuobjdump" --list-elf "$OUT/$engine" 2>/dev/null || true)
+    grep -q 'sm_61' <<<"$CUDA_IMAGES" || {
+      echo "ERROR: $engine has no native sm_61 inference image" >&2
+      exit 1
+    }
+  done
+fi
+
+# Package-time provenance guard. package-line.sh verifies these values and hashes before it
+# creates any archive, so copying a modern dist tree under the legacy name cannot ship again.
+WALK_ARCH=${POMARCH:-committed-fatbin}
+STATIC_SHA=$(sha256sum "$OUT/keryx-miner-supr" | awk '{print $1}')
+DYNAMIC_SHA=$(sha256sum "$OUT/keryx-miner-supr-dynamic" | awk '{print $1}')
+LLAMA_SHA=$(sha256sum "$OUT/libkeryx-llama.so" | awk '{print $1}')
+LLAMA_NOAVX_SHA=$(sha256sum "$OUT/libkeryx-llama-noavx.so" | awk '{print $1}')
+PLUGIN_SHA=$(sha256sum "$OUT/libkeryxcuda.so" | awk '{print $1}')
+{
+  printf 'line=%s\n' "$SUF"
+  printf 'cuda_release=%s\n' "$(<"$OUT/.cuda-release")"
+  printf 'pom_cuda_arch=%s\n' "$WALK_ARCH"
+  printf 'candle_compute_cap=%s\n' "$CCAP"
+  printf 'static_sha256=%s\n' "$STATIC_SHA"
+  printf 'dynamic_sha256=%s\n' "$DYNAMIC_SHA"
+  printf 'llama_sha256=%s\n' "$LLAMA_SHA"
+  printf 'llama_noavx_sha256=%s\n' "$LLAMA_NOAVX_SHA"
+  printf 'plugin_sha256=%s\n' "$PLUGIN_SHA"
+  for runtime in libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libcurand.so.10; do
+    printf 'runtime_%s_sha256=%s\n' "$runtime" "$(sha256sum "$OUT/lib/$runtime" | awk '{print $1}')"
+  done
+} > "$OUT/NVIDIA_BUILD_MANIFEST"
+rm -f "$OUT/.cuda-release"
+echo ">> wrote release provenance: $OUT/NVIDIA_BUILD_MANIFEST"

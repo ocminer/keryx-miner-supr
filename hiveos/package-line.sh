@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Package one build "line" (legacy or modern) into all distribution formats, using
 # the binaries + CUDA runtime libs already produced in hiveos/<DISTDIR>/ by
-# build-offline.sh. The bundled libs ARE the line's CUDA version (legacy=12.2/
-# floor535, modern=12.9/floor575), so each package carries its own driver floor.
+# build-offline.sh. The bundled libs ARE the line's CUDA version (legacy=12.4/
+# floor550, modern=12.9/floor575), so each package carries its own driver floor.
 #
 # HiveOS/SMOS: the line is embedded in the MINER NAME (keryx-miner-supr-<line>) so
 # HiveOS parses <name>-<version>.tar.gz correctly (it splits on the LAST '-' as the
@@ -13,11 +13,50 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DISTDIR="$1"; LABEL="$2"
+[[ "$DISTDIR" =~ ^dist-[A-Za-z0-9._-]+$ ]] || {
+  echo "ERROR: DISTDIR must be a simple dist-* directory name below hiveos/: $DISTDIR" >&2
+  exit 2
+}
 D="$REPO/hiveos/$DISTDIR"
 HPKG="$REPO/hiveos/pkg/keryx-miner-supr"
 MPKG="$REPO/mmpos/keryx-miner-supr"
 NAME=keryx-miner-supr
 VER=$(grep -m1 '^CUSTOM_VERSION=' "$HPKG/h-manifest.conf" | cut -d= -f2)
+
+[[ "$LABEL" == legacy || "$LABEL" == modern ]] || {
+  echo "ERROR: unsupported NVIDIA package label '$LABEL' (expected legacy or modern)" >&2
+  exit 2
+}
+
+# Never trust a directory name as release provenance. v0.13.1/v0.13.2 accidentally packaged a
+# CUDA 12.9 modern build as "legacy", which cannot load on the advertised sm_61 cards. The builder
+# writes this manifest only after checking the actual nvcc, Candle PTX, PoM image and llama images.
+META="$D/NVIDIA_BUILD_MANIFEST"
+[[ -s "$META" ]] || {
+  echo "ERROR: $META missing — rebuild this line with hiveos/build-offline.sh before packaging." >&2
+  exit 1
+}
+meta_value() { awk -F= -v key="$1" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$META"; }
+[[ "$(meta_value line)" == "$LABEL" ]] || {
+  echo "ERROR: build provenance line '$(meta_value line)' does not match package label '$LABEL'" >&2
+  exit 1
+}
+case "$LABEL" in
+  legacy)
+    [[ "$(meta_value cuda_release)" == 12.4 && "$(meta_value pom_cuda_arch)" == compute_61 && \
+       "$(meta_value candle_compute_cap)" == 61 ]] || {
+      echo "ERROR: legacy archives require CUDA 12.4 + compute_61 walk + sm_61 Candle PTX" >&2
+      exit 1
+    }
+    ;;
+  modern)
+    [[ "$(meta_value cuda_release)" == 12.9 && "$(meta_value pom_cuda_arch)" == committed-fatbin && \
+       "$(meta_value candle_compute_cap)" == 70 ]] || {
+      echo "ERROR: modern archives require CUDA 12.9 + committed walk fatbin + sm_70 Candle PTX" >&2
+      exit 1
+    }
+    ;;
+esac
 
 [[ -s "$D/keryx-miner-supr" ]] || { echo "ERROR: $D/keryx-miner-supr (static) missing"; exit 1; }
 [[ -s "$D/keryx-miner-supr-dynamic" ]] || { echo "ERROR: $D/keryx-miner-supr-dynamic missing"; exit 1; }
@@ -26,7 +65,6 @@ LIBS=(libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libcurand.so.10)
 for runtime in "${LIBS[@]}"; do
   [[ -s "$D/lib/$runtime" ]] || { echo "ERROR: required CUDA runtime missing: $D/lib/$runtime"; exit 1; }
 done
-
 mklib(){ mkdir -p "$1/lib"; for l in "${LIBS[@]}"; do cp -L "$D/lib/$l" "$1/lib/"; done; }
 # Both in-process llama.cpp engines are release-critical: libkeryx-llama.so is the normal
 # CUDA engine, while libkeryx-llama-noavx.so keeps that same GPU route usable on rig CPUs that
@@ -36,6 +74,29 @@ for engine in libkeryx-llama.so libkeryx-llama-noavx.so; do
   [[ -s "$D/$engine" ]] || {
     echo "ERROR: required NVIDIA GPU inference engine missing: $D/$engine" >&2
     echo "       Re-run hiveos/build-offline.sh for the $LABEL line before packaging." >&2
+    exit 1
+  }
+done
+for item in \
+  "keryx-miner-supr:static_sha256" \
+  "keryx-miner-supr-dynamic:dynamic_sha256" \
+  "libkeryx-llama.so:llama_sha256" \
+  "libkeryx-llama-noavx.so:llama_noavx_sha256" \
+  "libkeryxcuda.so:plugin_sha256"
+do
+  file=${item%%:*}; field=${item#*:}
+  expected=$(meta_value "$field")
+  actual=$(sha256sum "$D/$file" | awk '{print $1}')
+  [[ -n "$expected" && "$actual" == "$expected" ]] || {
+    echo "ERROR: $file does not match $META ($field)" >&2
+    exit 1
+  }
+done
+for runtime in "${LIBS[@]}"; do
+  expected=$(meta_value "runtime_${runtime}_sha256")
+  actual=$(sha256sum "$D/lib/$runtime" | awk '{print $1}')
+  [[ -n "$expected" && "$actual" == "$expected" ]] || {
+    echo "ERROR: lib/$runtime does not match $META" >&2
     exit 1
   }
 done

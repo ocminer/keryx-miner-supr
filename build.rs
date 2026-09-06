@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    ("limited on power"). The CUDA 13.3 fatbin is committed, so even a build toolkit that
     //    predates sm_120 can still package native Blackwell SASS; see the kernel audit document for
     //    its exact architecture list.
-    //  - LEGACY/PASCAL (POM_CUDA_ARCH set, e.g. compute_70/compute_60): compile PTX from source with
+    //  - LEGACY/PASCAL (POM_CUDA_ARCH=compute_61): compile PTX from source with
     //    the build's nvcc, as before (those old cards aren't the Blackwell-JIT case). Also the dev
     //    fallback when the committed fatbin is absent.
     if env::var("CARGO_FEATURE_POM_CUDA").is_ok() {
@@ -132,9 +132,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Linux default (compute_75 PTX, JIT'd) can only ever carry the sub-sm_80 STUB of the
         // tc kernel — Linux rigs would silently lose the +35% tc path. The historical reason
         // Linux kept PTX (its compute_75 JIT of the dp4a walk was ~9% faster than native SASS)
-        // is outweighed by the tc gain. Override with POM_WALK_IMAGE=fatbin|ptx. Legacy/pascal
-        // (POM_CUDA_ARCH set) always use PTX (old cards; the fatbin has no sm_60/70, and their
-        // cc < 8.0 dispatches the classic pom_mine_v4 anyway).
+        // is outweighed by the tc gain. Override with POM_WALK_IMAGE=fatbin|ptx. A legacy/Pascal
+        // arch override supplies its low-CC PTX floor; the default mixed-image branch also adds
+        // compute_80 PTX and native tensor-core images for newer cards in the same legacy fleet.
         let want_fatbin = match env::var("POM_WALK_IMAGE").ok().as_deref() {
             Some("fatbin") => true,
             Some("ptx") => false,

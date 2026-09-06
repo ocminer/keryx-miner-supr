@@ -6,7 +6,7 @@
 #
 # Usage: build-keryx-llama.sh <modern|legacy|pascal> [JOBS] [noavx]
 #   modern: container CUDA 12.9, archs 75;80;86;89;90;120
-#   legacy: /tmp/cuda124 (12.4), archs 70;75;80;86;89;90
+#   legacy: /tmp/cuda124 (12.4), archs 61;70;75;80;86;89;90
 #   pascal: /tmp/cuda124 (12.4), archs 60;61
 # Output: hiveos/dist-<line>/libkeryx-llama.so  (package-line.sh bundles it when present)
 #

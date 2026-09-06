@@ -11,7 +11,7 @@
 #   KERYX_CMAKE_ROOT  portable CMake >= 3.18 tree
 # Optional overrides:
 #   KERYX_BUILD_IMAGE      build image (default: keryx-build:offline)
-#   KERYX_HOST_CUDA_DIR    host CUDA toolkit mounted into the build container
+#   KERYX_HOST_CUDA_DIR    optional exact CUDA 12.9 toolkit mounted into the build container
 #   KERYX_LLAMA_JOBS       parallel jobs for each llama.cpp engine build
 #
 # Output: all modern-line tarballs plus SHA256SUMS-modern.txt in hiveos/dist-modern/.
