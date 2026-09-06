@@ -10,6 +10,16 @@ name: windows-build
 
 on:
   workflow_dispatch:        # manual run on any branch (use this to iterate the workflow)
+    inputs:
+      target:
+        description: Windows package(s) to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - amd
+          - nvidia
   push:
     tags: ['v*']            # release builds — assets attach to the GitHub release
   pull_request:
@@ -29,6 +39,7 @@ jobs:
   # ----------------------------------------------------------------------------
   windows-amd:
     name: Windows AMD/OpenCL + Vulkan PoM (MSVC)
+    if: github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'amd'
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -63,14 +74,29 @@ jobs:
           "LIB=$root\lib;$env:LIB"         | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "INCLUDE=$root\include;$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      # Pinned, known-working SDK. It supplies the Vulkan headers/import library, glslc and the
-      # SPIRV-Headers CMake package needed by llama.cpp's Vulkan backend. The user's AMD driver
-      # supplies vulkan-1.dll and the ICD at runtime; SDK DLLs are deliberately not redistributed.
+      # Use llama.cpp b10015's own pinned Windows SDK/install route. Extracting the older SDK's
+      # self-extractor with 7-Zip supplies glslc but omits the SPIRV-Headers CMake package; running
+      # the official installer supplies the complete development SDK required by ggml-vulkan.
+      # The user's AMD driver supplies vulkan-1.dll and the ICD at runtime; SDK DLLs are not shipped.
       - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff
-        with:
-          version: 1.4.309.0
-          cache: true
+        shell: pwsh
+        env:
+          VULKAN_VERSION: 1.4.313.2
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
+          $url = "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          curl.exe --fail --location --retry 3 --output $installer $url
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK download failed" }
+          & $installer --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK installation failed" }
+          $sdk = "C:\VulkanSDK\$env:VULKAN_VERSION"
+          if (-not (Test-Path "$sdk\Bin\glslc.exe")) { throw "Vulkan SDK glslc is missing" }
+          $spirvConfig = @(Get-ChildItem $sdk -Recurse -Filter "SPIRV-HeadersConfig.cmake" -ErrorAction SilentlyContinue)
+          if ($spirvConfig.Count -eq 0) { throw "Vulkan SDK SPIRV-Headers CMake package is missing" }
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Write-Host "Vulkan SDK $env:VULKAN_VERSION ready; SPIRV-Headers: $($spirvConfig[0].FullName)"
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -297,7 +323,7 @@ jobs:
   # ----------------------------------------------------------------------------
   windows-cuda:
     name: Windows NVIDIA/CUDA plugin-only check (MSVC; no release)
-    if: github.event_name != 'push'
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == 'nvidia'))
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -364,6 +390,7 @@ jobs:
   # ----------------------------------------------------------------------------
   windows-cuda-pom:
     name: Windows NVIDIA PoM (candle-CUDA, MSVC)
+    if: github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'nvidia'
     # Pinned to windows-2022 (VS 2022): CUDA 12.5 nvcc only supports VS 2017-2022,
     # and windows-latest now ships a newer VS that nvcc rejects (host_config.h check).
     runs-on: windows-2022
@@ -542,15 +569,22 @@ jobs:
           '@ | Out-File -FilePath "$out\start.bat" -Encoding ascii
           Get-ChildItem $out | Format-Table Name,Length
           Compress-Archive -Path "$out\*" -DestinationPath "keryx-miner-supr-windows-nvidia-pom.zip" -Force
+          $hash = (Get-FileHash "keryx-miner-supr-windows-nvidia-pom.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  keryx-miner-supr-windows-nvidia-pom.zip" |
+            Out-File -FilePath "SHA256SUMS-windows-nvidia.txt" -Encoding ascii
 
       - uses: actions/upload-artifact@v4
         with:
           name: keryx-miner-supr-windows-nvidia-pom
-          path: keryx-miner-supr-windows-nvidia-pom.zip
+          path: |
+            keryx-miner-supr-windows-nvidia-pom.zip
+            SHA256SUMS-windows-nvidia.txt
           if-no-files-found: error
 
       - name: Attach to release (tag builds)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: keryx-miner-supr-windows-nvidia-pom.zip
+          files: |
+            keryx-miner-supr-windows-nvidia-pom.zip
+            SHA256SUMS-windows-nvidia.txt
