@@ -79,14 +79,33 @@ with DP4A. gfx1102/gfx12 retain the exact-tested multi-state WMMA path.
 TXT
 
 mkdir -p "$OUT"
+
+# --- Standalone (manual / docker) tarball: <name>-<ver>-linux-x86_64.tar.gz (run.sh + RUN.txt) ---
+STANDALONE="$OUT/${PKGNAME}-linux-x86_64.tar.gz"
+tar -czf "$STANDALONE" -C "$OUT" "$PKGNAME"
+
+# --- HiveOS custom-miner package: bare <name>-<ver>.tar.gz ---
+# HiveOS custom-get splits the filename on the LAST '-' for the version and extracts the single
+# top-level directory (which must equal CUSTOM_NAME) into /hive/miners/custom/. So the bare name is
+# the HiveOS package: it bundles the h-* integration files from hiveos/pkg-amd next to the same
+# binary + libkeryxopencl.so + Vulkan inference route (NOT run.sh/RUN.txt — those are standalone).
+HPKG="$REPO/hiveos/pkg-amd/keryx-miner-supr-amd"
+HVN="keryx-miner-supr-amd"
+HSTAGE="$OUT/hv-amd"
+HDEST="$HSTAGE/$HVN"
+rm -rf "$HSTAGE"; mkdir -p "$HDEST"
+cp "$HPKG"/h-manifest.conf "$HPKG"/h-config.sh "$HPKG"/h-run.sh "$HPKG"/h-stats.sh "$HDEST/"
+cp "$SRC/$NAME" "$SRC/libkeryxopencl.so" "$HDEST/"
+keryx_copy_amd_inference_route "$SRC" "$HDEST"
+chmod +x "$HDEST/$NAME" "$HDEST/h-run.sh" "$HDEST/h-stats.sh" "$HDEST/h-config.sh"
 TARBALL="$OUT/${PKGNAME}.tar.gz"
-tar -czf "$TARBALL" -C "$OUT" "$PKGNAME"
+tar -czf "$TARBALL" -C "$HSTAGE" "$HVN"
 
 echo ""
-echo "[package-amd] $LABEL package ready:"
-ls -la "$DEST"
-echo ""
-echo "  archive: $TARBALL"
-sha256sum "$TARBALL" > "$TARBALL.sha256"
-echo "  sha256:  $(cut -d' ' -f1 < "$TARBALL.sha256")"
-echo "  checksum: $TARBALL.sha256"
+echo "[package-amd] $LABEL packages ready:"
+echo "  HiveOS:     $TARBALL  (top-dir $HVN/, h-* integration)"
+echo "  standalone: $STANDALONE  (run.sh / RUN.txt)"
+for t in "$TARBALL" "$STANDALONE"; do
+    sha256sum "$t" > "$t.sha256"
+    echo "  sha256 $(basename "$t"): $(cut -d' ' -f1 < "$t.sha256")"
+done
