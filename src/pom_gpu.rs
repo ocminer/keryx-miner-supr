@@ -1269,7 +1269,7 @@ impl PomGpuMiner {
     /// mma SASS (sm_80+ — below that the module carries only the stub) and not
     /// force-disabled via `KERYX_POM_V4_TC=0`. Logged once per device.
     fn v4_tc_available(&self) -> bool {
-        if std::env::var("KERYX_POM_V4_TC").ok().as_deref() == Some("0") {
+        if std::env::var("KERYX_POM_V4_TC").ok().as_deref().map(str::trim) == Some("0") {
             return false;
         }
         // The DEVICE having sm_80+ is not enough: what matters is whether the WALK IMAGE we
@@ -1541,7 +1541,9 @@ dp4a kernel.",
     }
 
     fn v4_sidecar_available(&self) -> bool {
-        std::env::var("KERYX_POM_V4_SIDECAR").ok().as_deref() != Some("0")
+        let setting = std::env::var("KERYX_POM_V4_SIDECAR").ok();
+        let cc_major = self.stream.context().compute_capability().ok().map(|(major, _)| major as u32);
+        v4_sidecar_enabled_for_cc(cc_major, setting.as_deref())
             && self.v4_tc_available()
             && self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS <= u32::MAX as u64
     }
@@ -1567,6 +1569,7 @@ dp4a kernel.",
         if let Some(ok) = cache.lock().ok().and_then(|g| g.get(&key).copied()) {
             return ok;
         }
+        log::info!("PoM[gpu{}]: autotune probing {} candidate.", ord, backend.label());
         let ok = match self.v4_sidecar_probe(backend, n_tiles, k, p, s, timestamp) {
             Ok(true) => {
                 log::info!("PoM[gpu{}]: {} candidate probe OK.", ord, backend.label());
@@ -1701,7 +1704,7 @@ dp4a kernel.",
     /// (the "force classic" escape hatch) disables it too; `KERYX_POM_V4_NCF=0` disables ONLY the
     /// chaseless solver, falling back to chase+tc.
     fn v4_ncf_available(&self) -> bool {
-        if std::env::var("KERYX_POM_V4_NCF").ok().as_deref() == Some("0") {
+        if std::env::var("KERYX_POM_V4_NCF").ok().as_deref().map(str::trim) == Some("0") {
             return false;
         }
         self.v4_tc_available() && self.t_count as u64 <= u16::MAX as u64
@@ -1720,6 +1723,7 @@ dp4a kernel.",
         if let Some(&ok) = cache.lock().unwrap().get(&ord) {
             return ok;
         }
+        log::info!("PoM[gpu{}]: autotune probing chaseless candidate.", ord);
         let ok = match self.v4_ncf_probe(n_tiles, k, p, s, timestamp) {
             Ok(true) => {
                 log::info!("PoM v4: chaseless solver PROBE OK on GPU {} (1-nonce known-win recorded).", ord);
@@ -2899,15 +2903,47 @@ fn v4_tune_key(device_id: u32, sm: u64, n_tiles: u64, k: u32, h10_era: bool) -> 
     // g3 = dedicated dense H10 seed pass. Keep pre-H10/H10 results separate because only H10 pays
     // that pass, and invalidate g2: its inline-Keccak register footprint changed the walk occupancy.
     format!(
-        "{}|sm{}|model{}|tiles{}|k{}|h10{}|g4|walk{}",
+        "{}|sm{}|model{}|tiles{}|k{}|h10{}|g4|policy{}|walk{}",
         gpu_name(device_id),
         sm,
         v4_model_identity(device_id),
         n_tiles,
         k,
         u8::from(h10_era),
+        v4_tune_policy_identity(),
         walk_image_identity()
     )
+}
+
+fn v4_policy_setting_identity(setting: Option<&str>) -> &'static str {
+    match setting.map(str::trim) {
+        None | Some("") => "auto",
+        Some("0") => "off",
+        Some(_) => "on",
+    }
+}
+
+fn v4_tune_policy_identity_from(
+    tc_setting: Option<&str>,
+    ncf_setting: Option<&str>,
+    sidecar_setting: Option<&str>,
+) -> String {
+    format!(
+        "tc{}-ncf{}-sidecar{}",
+        v4_policy_setting_identity(tc_setting),
+        v4_policy_setting_identity(ncf_setting),
+        v4_policy_setting_identity(sidecar_setting)
+    )
+}
+
+/// Operator-forced experimental kernels must never poison the normal production namespace. This
+/// also fixes the older NCF/TC override leak, where starting once with `..._NCF=0` persisted that
+/// slower choice after the override was removed.
+fn v4_tune_policy_identity() -> String {
+    let tc = std::env::var("KERYX_POM_V4_TC").ok();
+    let ncf = std::env::var("KERYX_POM_V4_NCF").ok();
+    let sidecar = std::env::var("KERYX_POM_V4_SIDECAR").ok();
+    v4_tune_policy_identity_from(tc.as_deref(), ncf.as_deref(), sidecar.as_deref())
 }
 
 /// Delete the saved autotune cache (`--delete-autotune`). Returns whether a file was actually
@@ -3096,28 +3132,233 @@ fn v4_bench_cfg(
     t: V4Tune,
     ms: u64,
     h10_era: bool,
-) -> Option<f64> {
+) -> candle_core::Result<f64> {
     let never = [0u8; 32];
     set_v4_tune(device_id, t);
-    miner.mine_v4(pph, ts, &never, 1, t.batch, h10_era).ok()?; // warm-up: JIT, buffer alloc, clocks
+    miner.mine_v4(pph, ts, &never, 1, t.batch, h10_era)?; // warm-up: JIT, buffer alloc, clocks
     let started = std::time::Instant::now();
     let mut n: u64 = 0;
     while started.elapsed() < std::time::Duration::from_millis(ms) {
-        miner.mine_v4(pph, ts, &never, 1 + n, t.batch, h10_era).ok()?;
+        miner.mine_v4(pph, ts, &never, 1 + n, t.batch, h10_era)?;
         n += t.batch;
     }
     let secs = started.elapsed().as_secs_f64();
-    (secs > 0.0 && n > 0).then(|| n as f64 / secs / 1.0e6)
+    if secs > 0.0 && n > 0 {
+        Ok(n as f64 / secs / 1.0e6)
+    } else {
+        Err(candle_core::Error::Msg("PoM v4 autotune produced no timed work".into()))
+    }
 }
 
 /// Tunes `device_id` once per process. Staged rather than exhaustive (kind → warps → batch) so the
 /// whole thing costs seconds, not minutes: the axes are close to independent in the measurements.
-/// Returns whether tuning actually completed (false = the slot was busy, try again later).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The result distinguishes a busy scheduler slot, an already-ready configuration, cache restore,
+/// fresh measurement, and an undrainable CUDA failure that needs the normal GPU reset path.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum V4AutotuneRun {
     Deferred,
     Ready,
+    Restored,
     Measured,
+    Failed(String),
+}
+
+// Small rigs keep the measured one-at-a-time policy: simultaneous candidate sweeps previously made
+// otherwise identical cards choose different batches. Large rigs need isolation from a slow device,
+// though, so they use a rolling window of at most four DISTINCT profiles. Identical cards are
+// single-flighted separately below and therefore still benchmark only once.
+const V4_AUTOTUNE_SMALL_RIG_MAX_DEVICES: usize = 4;
+const V4_AUTOTUNE_LARGE_RIG_JOBS: usize = 4;
+
+fn v4_autotune_parallelism(installed_devices: usize) -> usize {
+    if installed_devices > V4_AUTOTUNE_SMALL_RIG_MAX_DEVICES {
+        V4_AUTOTUNE_LARGE_RIG_JOBS.min(installed_devices)
+    } else {
+        1
+    }
+}
+
+#[derive(Default)]
+struct V4AutotuneGate {
+    active: AtomicUsize,
+}
+
+impl V4AutotuneGate {
+    fn try_acquire(&self, limit: usize) -> Option<V4AutotunePermit<'_>> {
+        let limit = limit.max(1);
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= limit {
+                return None;
+            }
+            match self.active.compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(V4AutotunePermit { gate: self }),
+                Err(observed) => active = observed,
+            }
+        }
+    }
+}
+
+struct V4AutotunePermit<'a> {
+    gate: &'a V4AutotuneGate,
+}
+
+impl Drop for V4AutotunePermit<'_> {
+    fn drop(&mut self) {
+        let previous = self.gate.active.fetch_sub(1, Ordering::Release);
+        debug_assert!(previous > 0, "autotune permit accounting underflow");
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum V4ProfileState {
+    Running,
+    Ready(V4Tune),
+}
+
+fn v4_profiles() -> &'static Mutex<HashMap<String, V4ProfileState>> {
+    static PROFILES: OnceLock<Mutex<HashMap<String, V4ProfileState>>> = OnceLock::new();
+    PROFILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn v4_profile_ready(key: &str) -> Option<V4Tune> {
+    let profiles = v4_profiles().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match profiles.get(key) {
+        Some(V4ProfileState::Ready(tune)) => Some(*tune),
+        _ => None,
+    }
+}
+
+fn remember_v4_profile(key: &str, tune: V4Tune) {
+    let mut profiles = v4_profiles().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    profiles.insert(key.to_owned(), V4ProfileState::Ready(tune));
+}
+
+/// One benchmark owner per persistent tune key. Ten identical 5060s have the same key, so the first
+/// card measures it while its peers mine with safe defaults; after the atomic cache publish they all
+/// restore that result. The mutex is held only while editing the set, never across CUDA work.
+struct V4ProfileClaim {
+    key: String,
+    published: bool,
+}
+
+impl V4ProfileClaim {
+    fn try_acquire(key: &str) -> Option<Self> {
+        let mut profiles = v4_profiles().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match profiles.get(key) {
+            Some(V4ProfileState::Running | V4ProfileState::Ready(_)) => None,
+            None => {
+                profiles.insert(key.to_owned(), V4ProfileState::Running);
+                Some(Self { key: key.to_owned(), published: false })
+            }
+        }
+    }
+
+    /// Publish before the persistent cache save and before advancing the rolling GPU slot.
+    /// Same-profile peers can apply the result even when HOME is unavailable or the cache write
+    /// fails.
+    fn publish(&mut self, tune: V4Tune) {
+        remember_v4_profile(&self.key, tune);
+        self.published = true;
+    }
+}
+
+impl Drop for V4ProfileClaim {
+    fn drop(&mut self) {
+        if !self.published {
+            let mut profiles = v4_profiles().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if profiles.get(&self.key) == Some(&V4ProfileState::Running) {
+                profiles.remove(&self.key);
+            }
+        }
+    }
+}
+
+fn v4_sidecar_force_enabled(setting: Option<&str>) -> bool {
+    matches!(setting.map(str::trim), Some(value) if !value.is_empty() && value != "0")
+}
+
+/// The new sidecar candidates have physical exactness/performance evidence on sm_80, but not on
+/// Blackwell. A field report from a 10x sm_120 rig shows the fresh candidate sweep can wedge during
+/// startup. Keep the proven Blackwell default free of those probes; developers may still force them
+/// explicitly when running a sacrificial validation process.
+fn v4_sidecar_enabled_for_cc(cc_major: Option<u32>, setting: Option<&str>) -> bool {
+    match setting.map(str::trim) {
+        Some("0") => false,
+        Some("") => matches!(cc_major, Some(0..=11)),
+        Some(_) => true,
+        // A failed capability query is not authority to probe experimental kernels. Future
+        // architectures likewise stay on the established set until explicitly validated.
+        None => matches!(cc_major, Some(0..=11)),
+    }
+}
+
+fn v4_blackwell_reduced_candidates(
+    cc_major: Option<u32>,
+    sidecar_setting: Option<&str>,
+    ncf_setting: Option<&str>,
+) -> bool {
+    matches!(cc_major, Some(12..))
+        && !v4_sidecar_force_enabled(sidecar_setting)
+        && ncf_setting.map(str::trim) != Some("0")
+}
+
+fn v4_autotune_requires_job_refresh(result: &V4AutotuneRun) -> bool {
+    matches!(result, V4AutotuneRun::Restored | V4AutotuneRun::Measured)
+}
+
+fn v4_classic_tune(base: u64) -> V4Tune {
+    V4Tune { ncf: false, tc: false, sidecar: false, sidecar_lut: false, batch: clamp_launch_batch(base) }
+}
+
+/// Last-resort launch state after a candidate errors or fails the winner oracle. Never spread the
+/// rejected backend to identical peers: the classic walk is slower, but it has no tensor/sidecar
+/// dependency and is the consensus reference itself. This process-local fallback is deliberately
+/// not persisted, so a clean restart gets another chance to measure the fast paths.
+fn v4_classic_fallback(device_id: u32, base: u64) -> V4Tune {
+    let mut fallback = v4_classic_tune(base);
+    set_v4_tune(device_id, fallback);
+    fallback.batch = cap_v4_batch(device_id, fallback.batch);
+    set_v4_tune(device_id, fallback);
+    fallback
+}
+
+/// Resolve an autotune CUDA error without freeing stream-owned memory early. A missing optional
+/// symbol or allocation failure can leave the context healthy: if the stream drains, publish the
+/// exact classic reference as this profile's process-local fallback and keep inference resident.
+/// Only an undrainable/poisoned context escapes as `Failed`, which the public wrapper sends through
+/// the existing per-GPU reset/quarantine transaction.
+fn finish_v4_autotune_error(
+    device_id: u32,
+    miner: &PomGpuMiner,
+    base: u64,
+    mut profile: V4ProfileClaim,
+    permit: V4AutotunePermit<'_>,
+    failure: String,
+) -> V4AutotuneRun {
+    match miner.stream.synchronize() {
+        Ok(()) => {
+            let fallback = v4_classic_fallback(device_id, base);
+            profile.publish(fallback);
+            drop(profile);
+            drop(permit);
+            miner.v4_release_snippet_folds();
+            log::warn!(
+                "PoM[gpu{}]: {failure}; CUDA stream drained cleanly, so mining continues on the \
+                 classic fallback without disturbing inference.",
+                device_id
+            );
+            V4AutotuneRun::Measured
+        }
+        Err(drain_error) => {
+            // Host-only choice for the eventual rebuild. Do not query/free any device allocation
+            // while synchronization is unproven.
+            set_v4_tune(device_id, v4_classic_tune(base));
+            drop(profile);
+            drop(permit);
+            V4AutotuneRun::Failed(format!("{failure}; CUDA stream did not drain: {drain_error}"))
+        }
+    }
 }
 
 fn largest_batch_near_peak(batches: &[u64], rates: &[Option<f64>]) -> Option<(u64, f64)> {
@@ -3172,16 +3413,6 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
     if intensity_batch_for(device_id).is_some() || only_inference() {
         return V4AutotuneRun::Ready;
     }
-    // ONE CARD AT A TIME. Every device starts grinding at once, so without this the cards benchmark
-    // on top of each other and contend for the host, PCIe and power budget — enough noise that two
-    // identical 5080s in the same rig picked different batches from the same candidate set.
-    // try_lock, never lock: this runs inside the grind call, so BLOCKING here would stall a card's
-    // mining until its turn came (measured: the whole rig's hashrate sagged during startup). A card
-    // that finds the slot busy simply mines on at the default geometry and tunes on a later batch.
-    static TUNING: OnceLock<Mutex<()>> = OnceLock::new();
-    let Ok(_one_at_a_time) = TUNING.get_or_init(|| Mutex::new(())).try_lock() else {
-        return V4AutotuneRun::Deferred;
-    };
     let n_tiles = miner.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
     if n_tiles == 0 {
         return V4AutotuneRun::Ready;
@@ -3191,9 +3422,35 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
     let base = if sm > 0 { v4_batch_for_sm_count(sm) } else { POM_V4_BATCH_FALLBACK };
     let key = v4_tune_key(device_id, sm, n_tiles, k, h10_era);
 
+    // `force` ignores DISK, not a result measured seconds ago by an identical card in this same
+    // process. A 10x rig therefore remeasures once per exact profile, never ten times serially.
+    if let Some(t) = v4_profile_ready(&key) {
+        set_v4_tune(device_id, t);
+        log::info!(
+            "PoM[gpu{}]: launch tuning shared from an identical in-process profile — {} walk, batch {}.",
+            device_id,
+            t.requested_label(),
+            t.batch
+        );
+        if t.sidecar_backend().is_none() {
+            miner.v4_release_snippet_folds();
+        }
+        return V4AutotuneRun::Restored;
+    }
+
+    // Claim the exact profile BEFORE touching the disk cache. On a ten-card identical rig, the old
+    // ordering made all nine peers parse (and, for a stale cache, warn about) the same file on every
+    // batch while the owner was benchmarking or wedged. Only the owner performs cache I/O; peers
+    // mine with the architecture-safe defaults and retry the cheap in-memory check later.
+    let Some(mut profile) = V4ProfileClaim::try_acquire(&key) else {
+        return V4AutotuneRun::Deferred;
+    };
+
     if mode != "force" {
         if let Some(t) = v4_tune_load(&key) {
             set_v4_tune(device_id, t);
+            profile.publish(t);
+            drop(profile);
             log::info!(
                 "PoM[gpu{}]: launch tuning restored from cache — {} walk, batch {} ({}).",
                 device_id,
@@ -3204,7 +3461,28 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
             if t.sidecar_backend().is_none() {
                 miner.v4_release_snippet_folds();
             }
-            return V4AutotuneRun::Ready;
+            return V4AutotuneRun::Restored;
+        }
+    }
+
+    // The old process-global Mutex wrapped every blocking CUDA synchronization; one wedged/panicked
+    // candidate therefore made every other profile return Deferred forever. Use a non-poisoning
+    // rolling permit instead. Losers keep mining and retry later; dropping `profile` below makes the
+    // exact key claimable again as soon as capacity opens.
+    let installed_devices = miners().lock().map(|miners| miners.len()).unwrap_or(1).max(1);
+    let parallelism = v4_autotune_parallelism(installed_devices);
+    static TUNING: OnceLock<V4AutotuneGate> = OnceLock::new();
+    let Some(permit) = TUNING.get_or_init(V4AutotuneGate::default).try_acquire(parallelism) else {
+        return V4AutotuneRun::Deferred;
+    };
+    if parallelism > 1 {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            log::info!(
+                "PoM: large-rig autotune scheduler enabled — at most {} distinct GPU profiles tune \
+                 concurrently; identical cards share one measured result.",
+                parallelism
+            );
         }
     }
 
@@ -3218,26 +3496,39 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
     // one 5080 and 2.98 for its twin on the same batch, which is enough noise to flip the choice.
     // Interleaving cancels slow drift (clocks ramping, neighbours' load) because every candidate
     // sees the same conditions in every round.
-    let bench_all = |cands: &[V4Tune], reps: usize, ms: u64| -> Vec<Option<f64>> {
-        let mut samples: Vec<Vec<f64>> = vec![Vec::new(); cands.len()];
-        for _ in 0..reps {
-            for (i, c) in cands.iter().enumerate() {
-                if let Some(m) = v4_bench_cfg(device_id, miner, &pph, ts, *c, ms, h10_era) {
+    let bench_all =
+        |labels: &[String], cands: &[V4Tune], reps: usize, ms: u64| -> candle_core::Result<Vec<Option<f64>>> {
+            debug_assert_eq!(labels.len(), cands.len());
+            let mut samples: Vec<Vec<f64>> = vec![Vec::new(); cands.len()];
+            for round in 0..reps {
+                for (i, c) in cands.iter().enumerate() {
+                    if round == 0 {
+                        log::info!(
+                            "PoM[gpu{}]: autotune starting {} (candidate {}/{}, {} interleaved rounds).",
+                            device_id,
+                            labels[i],
+                            i + 1,
+                            cands.len(),
+                            reps
+                        );
+                    }
+                    let m = v4_bench_cfg(device_id, miner, &pph, ts, *c, ms, h10_era).map_err(|error| {
+                        candle_core::Error::Msg(format!("{} failed during round {}: {error}", labels[i], round + 1))
+                    })?;
                     samples[i].push(m);
                 }
             }
-        }
-        samples
-            .into_iter()
-            .map(|mut v| {
-                if v.is_empty() {
-                    return None;
-                }
-                v.sort_by(f64::total_cmp);
-                Some(v[v.len() / 2])
-            })
-            .collect()
-    };
+            Ok(samples
+                .into_iter()
+                .map(|mut v| {
+                    if v.is_empty() {
+                        return None;
+                    }
+                    v.sort_by(f64::total_cmp);
+                    Some(v[v.len() / 2])
+                })
+                .collect())
+        };
 
     // 1) Which walk? Measured rather than assumed (the tc kernel is a large win on Blackwell AND
     // on Ampere — 3070: 1.35 vs 0.84 Mh/s — and the chaseless kernel beat chase+tc on every card
@@ -3245,17 +3536,33 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
     // the host walk, so any answer is correct; only the speed differs.
     let p_words = crate::pom::pph_words_for_era(&pph, true);
     let s_words = if h10_era { crate::pom::pph_words(&pph) } else { crate::pom::pph_words_v4(&pph) };
+    let cc = miner.stream.context().compute_capability().ok();
+    let cc_major = cc.map(|(major, _)| major as u32);
+    let sidecar_setting = std::env::var("KERYX_POM_V4_SIDECAR").ok();
+    let ncf_setting = std::env::var("KERYX_POM_V4_NCF").ok();
+    let blackwell_reduced =
+        v4_blackwell_reduced_candidates(cc_major, sidecar_setting.as_deref(), ncf_setting.as_deref());
+    if blackwell_reduced {
+        log::info!(
+            "PoM[gpu{}]: sm_{} stable autotune policy — measuring the v0.13.0 classic, tensor-core \
+             and chaseless set; skipping unvalidated sidecar candidates.",
+            device_id,
+            cc.map(|(major, minor)| major * 10 + minor).unwrap_or(120)
+        );
+    }
     let mut kinds: Vec<(&str, V4Tune)> = vec![("classic", V4Tune { ncf: false, tc: false, ..defaults })];
     if miner.v4_tc_available() {
         kinds.push(("tensor-core", V4Tune { ncf: false, tc: true, ..defaults }));
     }
-    if miner.v4_sidecar_usable(V4Backend::SidecarTensorCore, n_tiles, k, &p_words, &s_words, ts) {
+    if !blackwell_reduced && miner.v4_sidecar_usable(V4Backend::SidecarTensorCore, n_tiles, k, &p_words, &s_words, ts) {
         kinds.push((
             "sidecar-chase+tensor-core",
             V4Tune { ncf: false, tc: true, sidecar: true, sidecar_lut: false, ..defaults },
         ));
     }
-    if miner.v4_sidecar_usable(V4Backend::SidecarLutTensorCore, n_tiles, k, &p_words, &s_words, ts) {
+    if !blackwell_reduced
+        && miner.v4_sidecar_usable(V4Backend::SidecarLutTensorCore, n_tiles, k, &p_words, &s_words, ts)
+    {
         kinds.push((
             "sidecar-chase+LUT-tensor-core",
             V4Tune { ncf: false, tc: true, sidecar: true, sidecar_lut: true, ..defaults },
@@ -3265,7 +3572,19 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
         kinds.push(("chaseless", V4Tune { ncf: true, tc: true, ..defaults }));
     }
     let cand_tunes: Vec<V4Tune> = kinds.iter().map(|(_, t)| *t).collect();
-    let kind_mhs = bench_all(&cand_tunes, 3, 300);
+    let kind_labels: Vec<String> = kinds.iter().map(|(name, _)| format!("{name} walk")).collect();
+    let kind_mhs = match bench_all(&kind_labels, &cand_tunes, 3, 300) {
+        Ok(rates) => rates,
+        Err(error) => {
+            let failure = format!("autotune walk benchmark failed: {error}");
+            log::error!(
+                "PoM[gpu{}]: autotune walk benchmark aborted on its first CUDA error ({error}); \
+                 stopping the sweep and checking whether the stream can drain safely.",
+                device_id
+            );
+            return finish_v4_autotune_error(device_id, miner, base, profile, permit, failure);
+        }
+    };
     for ((name, _), m) in kinds.iter().zip(&kind_mhs) {
         log::info!(
             "PoM[gpu{}]: autotune {} walk = {}",
@@ -3275,8 +3594,11 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
         );
     }
     let Some((mut best, mut best_mhs)) = select_v4_walk_kind(&cand_tunes, &kind_mhs) else {
-        log::warn!("PoM[gpu{}]: autotune could not measure the walk — keeping defaults.", device_id);
-        set_v4_tune(device_id, defaults);
+        log::warn!("PoM[gpu{}]: autotune could not measure the walk — using the classic fallback.", device_id);
+        let fallback = v4_classic_fallback(device_id, base);
+        profile.publish(fallback);
+        drop(profile);
+        drop(permit);
         miner.v4_release_snippet_folds();
         return V4AutotuneRun::Measured;
     };
@@ -3327,7 +3649,20 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
         v
     };
     let cands: Vec<V4Tune> = batches.iter().map(|&b| V4Tune { batch: b, ..best }).collect();
-    let batch_mhs = bench_all(&cands, 3, 300);
+    let batch_labels: Vec<String> =
+        batches.iter().map(|batch| format!("{} batch {batch}", best.requested_label())).collect();
+    let batch_mhs = match bench_all(&batch_labels, &cands, 3, 300) {
+        Ok(rates) => rates,
+        Err(error) => {
+            let failure = format!("autotune batch benchmark failed: {error}");
+            log::error!(
+                "PoM[gpu{}]: autotune batch benchmark aborted on its first CUDA error ({error}); \
+                 stopping the sweep and checking whether the stream can drain safely.",
+                device_id
+            );
+            return finish_v4_autotune_error(device_id, miner, base, profile, permit, failure);
+        }
+    };
     for (i, m) in batch_mhs.iter().enumerate() {
         log::info!(
             "PoM[gpu{}]: autotune batch {} = {}",
@@ -3353,20 +3688,38 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
     // 3) The chosen configuration must find the SAME winning nonce as the reference walk. Batch size
     // and kernel choice are not supposed to change results at all, so a mismatch means the candidate
     // is not walking what it claims to — the failure mode that looks like free speed and quietly
-    // costs shares. Fall back to defaults rather than mine on it.
-    if !v4_config_agrees_with_reference(device_id, miner, best, h10_era) {
-        log::error!(
-            "PoM[gpu{}]: autotune result {:?} did NOT reproduce the reference walk's winner — \
-             discarding it and keeping the defaults.",
-            device_id,
-            best
-        );
-        set_v4_tune(device_id, defaults);
-        miner.v4_release_snippet_folds();
-        return V4AutotuneRun::Measured;
+    // costs shares. Fall back to the consensus-reference classic walk rather than mine on it.
+    match v4_config_agrees_with_reference(device_id, miner, best, h10_era) {
+        Ok(true) => {}
+        Ok(false) => {
+            log::error!(
+                "PoM[gpu{}]: autotune result {:?} did NOT reproduce the reference walk's winner — \
+                 discarding it and using the classic fallback.",
+                device_id,
+                best
+            );
+            let fallback = v4_classic_fallback(device_id, base);
+            profile.publish(fallback);
+            drop(profile);
+            drop(permit);
+            miner.v4_release_snippet_folds();
+            return V4AutotuneRun::Measured;
+        }
+        Err(error) => {
+            let failure = format!("autotune reference-winner probe failed: {error}");
+            log::error!(
+                "PoM[gpu{}]: autotune reference-winner probe returned a CUDA error ({error}); \
+                 checking whether the stream can drain safely.",
+                device_id
+            );
+            return finish_v4_autotune_error(device_id, miner, base, profile, permit, failure);
+        }
     }
 
     set_v4_tune(device_id, best);
+    profile.publish(best);
+    drop(profile);
+    drop(permit);
     v4_tune_save(&key, best, best_mhs);
     log::info!(
         "PoM[gpu{}]: autotuned {} → {} walk, batch {} = {:.2} Mh/s.",
@@ -3381,7 +3734,12 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
 
 /// Verifies a candidate configuration against the classic walk at the stock batch: same seed, same
 /// nonce range, a target loose enough that a winner exists, and the winner must be identical.
-fn v4_config_agrees_with_reference(device_id: u32, miner: &PomGpuMiner, cand: V4Tune, h10_era: bool) -> bool {
+fn v4_config_agrees_with_reference(
+    device_id: u32,
+    miner: &PomGpuMiner,
+    cand: V4Tune,
+    h10_era: bool,
+) -> candle_core::Result<bool> {
     let saved = v4_tune_for(device_id);
     // Loose target: top byte 0x0f leaves roughly 1-in-16 nonces winning, so a few thousand nonces
     // are certain to contain one, and the LOWEST winner is a strict function of the walk.
@@ -3390,47 +3748,43 @@ fn v4_config_agrees_with_reference(device_id: u32, miner: &PomGpuMiner, cand: V4
     let pph = [0x5au8; 32];
     let ts = 7u64;
     let probe = 4096u64;
-    let reference = {
+    let result = (|| {
         set_v4_tune(device_id, V4Tune { ncf: false, tc: false, sidecar: false, sidecar_lut: false, batch: probe });
-        miner.mine_v4(&pph, ts, &target, 1, probe, h10_era)
-    };
-    let candidate = {
+        let reference = miner.mine_v4(&pph, ts, &target, 1, probe, h10_era)?;
         set_v4_tune(device_id, V4Tune { batch: probe, ..cand });
-        miner.mine_v4(&pph, ts, &target, 1, probe, h10_era)
-    };
-    let agrees = match (reference, candidate) {
-        (Ok(a), Ok(b)) => a == b,
-        // A launch error here is itself disqualifying.
-        _ => false,
-    };
+        let candidate = miner.mine_v4(&pph, ts, &target, 1, probe, h10_era)?;
+        Ok(reference == candidate)
+    })();
     match saved {
         Some(t) => set_v4_tune(device_id, t),
         None => clear_v4_tune(device_id),
     }
-    agrees
+    result
 }
 
 /// Runs the autotune once per device and seed era. The era belongs in this process-local key because
 /// a miner can remain alive across activation and the dense H10 seed pass changes the measured cost.
-fn ensure_v4_autotuned(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> bool {
+fn ensure_v4_autotuned(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> Result<bool, String> {
     static DONE: OnceLock<Mutex<std::collections::HashSet<(u32, bool, String)>>> = OnceLock::new();
     let done = DONE.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     let era_key = (device_id, h10_era, v4_model_identity(device_id));
     {
-        let Ok(g) = done.lock() else { return false };
+        let g = done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if g.contains(&era_key) {
-            return false;
+            return Ok(false);
         }
     }
     // Marked only when tuning actually ran, so a card that found the slot busy retries on a later
     // batch. A tune that ran and failed still counts as done — it must not retry every batch.
     match v4_autotune(device_id, miner, h10_era) {
-        V4AutotuneRun::Deferred => false,
+        V4AutotuneRun::Deferred => Ok(false),
+        V4AutotuneRun::Failed(error) => {
+            done.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(era_key);
+            Err(error)
+        }
         result => {
-            if let Ok(mut g) = done.lock() {
-                g.insert(era_key);
-            }
-            result == V4AutotuneRun::Measured
+            done.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(era_key);
+            Ok(v4_autotune_requires_job_refresh(&result))
         }
     }
 }
@@ -3452,7 +3806,13 @@ fn custom_image_is_exact(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> 
         sidecar_lut: false,
         batch: v4_batch_for_device(device_id),
     });
-    let ok = v4_config_agrees_with_reference(device_id, miner, cand, h10_era);
+    let ok = match v4_config_agrees_with_reference(device_id, miner, cand, h10_era) {
+        Ok(ok) => ok,
+        Err(error) => {
+            log::error!("PoM[gpu{}]: custom walk image reference probe returned a CUDA error: {error}", device_id);
+            false
+        }
+    };
     if let Ok(mut g) = cache.lock() {
         g.insert(key, ok);
     }
@@ -3524,12 +3884,34 @@ pub fn mine_v4(
         return Err(crate::pom::GrindError::Backend("injected CUDA runtime fault".into()));
     }
     // First grind on this card: measure its launch geometry (cached on disk, so this is a one-off).
-    if ensure_v4_autotuned(device_id, &miner, h10_era) {
-        // Tuning takes several seconds while Stratum continues publishing templates. Do not grind
-        // the job selected before it began: return an honest pause so the worker consumes the newest
-        // watch value without committing or counting this range.
+    match ensure_v4_autotuned(device_id, &miner, h10_era) {
+        Ok(true) => {
+            // Tuning takes several seconds while Stratum continues publishing templates. Do not
+            // grind the job selected before it began: return an honest pause so the worker consumes
+            // the newest watch value without committing or counting this range.
+            v4_release_chase_offsets(device_id as usize);
+            return Err(crate::pom::GrindError::Paused("autotune applied; refresh mining job"));
+        }
+        Ok(false) => {}
+        Err(error) => {
+            // A multi-launch candidate may return before its final synchronize. Drop our Arc, then
+            // let the established teardown transaction drain the stream before it frees anything;
+            // if the context is sticky-poisoned it quarantines the resident table instead. The tune
+            // map already holds classic and DONE prevents the same bad candidate in this process.
+            drop(miner);
+            reset_stale_gpu_state(device_id);
+            return Err(crate::pom::GrindError::Backend(error));
+        }
+    }
+    // The worker chooses its range before first-time model installation. Re-check the HARD VRAM cap
+    // now that the walk and its real backend are resident: a pre-install cudaMemGetInfo reading can
+    // make that first range too large. Never launch or account it; the unchanged cursor retries with
+    // a freshly capped range on the next loop.
+    if cap_v4_batch(device_id, batch) < batch {
         v4_release_chase_offsets(device_id as usize);
-        return Err(crate::pom::GrindError::Paused("autotune completed; refresh mining job"));
+        return Err(crate::pom::GrindError::Paused(
+            "installed GPU requires a smaller capped batch; refresh mining job",
+        ));
     }
     if !custom_image_is_exact(device_id, &miner, h10_era) {
         return Err(crate::pom::GrindError::Backend("custom walk image failed ABI/exactness validation".into()));
@@ -4356,6 +4738,86 @@ mod tests {
         assert!(record_sat_out(a), "after recovery, a's next sit-out logs again");
         clear_sat_out(a);
         clear_sat_out(b);
+    }
+
+    #[test]
+    fn autotune_parallelism_is_serial_on_small_rigs_and_four_wide_on_large_rigs() {
+        for devices in 0..=4 {
+            assert_eq!(v4_autotune_parallelism(devices), 1, "small-rig measurements stay isolated");
+        }
+        assert_eq!(v4_autotune_parallelism(5), 4);
+        assert_eq!(v4_autotune_parallelism(10), 4);
+    }
+
+    #[test]
+    fn autotune_gate_is_bounded_and_raii_releases_capacity() {
+        let gate = V4AutotuneGate::default();
+        let mut permits: Vec<_> = (0..4).map(|_| gate.try_acquire(4).expect("one of four slots")).collect();
+        assert!(gate.try_acquire(4).is_none(), "a fifth tuner must remain deferred");
+        // Model a 10-GPU rig: as each of the first four finishes, one of the remaining six enters.
+        // A rolling window avoids hard 4/4/2 cohort barriers, where one slow card would hold back
+        // every card in the next cohort.
+        for _ in 0..6 {
+            drop(permits.pop());
+            permits.push(gate.try_acquire(4).expect("dropping a permit must advance the rolling window"));
+            assert_eq!(gate.active.load(Ordering::Acquire), 4);
+        }
+        drop(permits);
+        assert_eq!(gate.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn identical_autotune_profiles_are_singleflight() {
+        let key = "unit-test-identical-5060-profile";
+        let distinct_key = "unit-test-distinct-profile";
+        v4_profiles().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(key);
+        v4_profiles().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(distinct_key);
+        let mut first = V4ProfileClaim::try_acquire(key).expect("first identical card owns the measurement");
+        assert!(V4ProfileClaim::try_acquire(key).is_none(), "a peer must reuse rather than duplicate the sweep");
+        let unrelated = V4ProfileClaim::try_acquire(distinct_key).expect("distinct profiles are independent");
+        drop(unrelated);
+        let shared = V4Tune { ncf: true, tc: true, sidecar: false, sidecar_lut: false, batch: 11_520 };
+        first.publish(shared);
+        drop(first);
+        assert_eq!(v4_profile_ready(key), Some(shared), "peers receive the result without relying on disk cache");
+        assert!(V4ProfileClaim::try_acquire(key).is_none(), "a peer consumes the published result");
+        v4_profiles().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(key);
+        v4_profiles().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(distinct_key);
+    }
+
+    #[test]
+    fn blackwell_uses_the_stable_candidate_set_unless_explicitly_forced() {
+        assert!(!v4_sidecar_enabled_for_cc(Some(12), None));
+        assert!(!v4_sidecar_enabled_for_cc(None, None));
+        assert!(!v4_sidecar_enabled_for_cc(Some(12), Some("")));
+        assert!(v4_sidecar_enabled_for_cc(Some(12), Some("force")));
+        assert!(v4_sidecar_enabled_for_cc(Some(12), Some("1")));
+        assert!(v4_sidecar_enabled_for_cc(Some(12), Some("true")));
+        assert!(v4_sidecar_enabled_for_cc(Some(12), Some("yes")));
+        assert!(!v4_sidecar_enabled_for_cc(Some(8), Some("0")));
+        assert!(v4_sidecar_enabled_for_cc(Some(8), None));
+        assert!(v4_sidecar_enabled_for_cc(Some(8), Some("")));
+
+        assert!(v4_blackwell_reduced_candidates(Some(12), None, None));
+        assert!(!v4_blackwell_reduced_candidates(Some(12), Some("force"), None));
+        assert!(!v4_blackwell_reduced_candidates(Some(12), None, Some("0")));
+        assert!(!v4_blackwell_reduced_candidates(Some(8), None, None));
+
+        let production = v4_tune_policy_identity_from(None, None, None);
+        assert_eq!(production, v4_tune_policy_identity_from(None, None, Some("")));
+        let forced_sidecar = v4_tune_policy_identity_from(None, None, Some("force"));
+        let forced_tc = v4_tune_policy_identity_from(Some("0"), None, None);
+        assert_ne!(production, forced_sidecar, "developer sidecar tunes need a separate cache namespace");
+        assert_ne!(production, forced_tc, "TC/NCF operator overrides need a separate cache namespace");
+    }
+
+    #[test]
+    fn cache_restore_and_measurement_both_refresh_the_preselected_job_range() {
+        assert!(!v4_autotune_requires_job_refresh(&V4AutotuneRun::Deferred));
+        assert!(!v4_autotune_requires_job_refresh(&V4AutotuneRun::Ready));
+        assert!(v4_autotune_requires_job_refresh(&V4AutotuneRun::Restored));
+        assert!(v4_autotune_requires_job_refresh(&V4AutotuneRun::Measured));
+        assert!(!v4_autotune_requires_job_refresh(&V4AutotuneRun::Failed("test".into())));
     }
 
     /// The autotune cache stores kernel-specific launch decisions, so a file written by any other

@@ -32,13 +32,18 @@ The walk is over the model, so **cards on different tiers are not doing the same
 within a tier. The CMP 170HX row is heat-limited (85 °C, clocked to 1200 MHz); the same card measured
 1.95 MH/s before it heat-soaked. The RTX 3070s carry a +250 MHz core offset.
 
-Since v0.11.13 each card **benchmarks itself once** and caches the result in `~/.keryx/v4tune.json`,
-so it uses the walk kernel and grind batch that are actually fastest on that GPU rather than a
-one-size-fits-all default. It costs a few seconds on the first grind of a new card and is free after
-that (`KERYX_POM_V4_AUTOTUNE=0` disables it, `=force` re-measures). This is worth real hashrate: an
-RTX 5080 gains ~4% over the previous SM-derived batch, while a 46-SM RTX 3070 keeps the smaller batch
-that suits it. The tensor-core walk wins on every card tested, including Ampere (RTX 3070: 1.35 MH/s
-vs 0.84 MH/s on the classic walk).
+Since v0.11.13 each distinct GPU/model profile **benchmarks itself once** and caches the result in
+`~/.keryx/v4tune.json`, so it uses the walk kernel and grind batch that are actually fastest on that
+GPU rather than a one-size-fits-all default. Identical cards in one process share that single
+measurement in memory. Rigs with more than four installed GPUs tune at most four distinct profiles
+at once in a rolling window; small rigs remain serialized for cleaner measurements. It costs a few
+seconds on the first grind of a new profile and is free after that (`KERYX_POM_V4_AUTOTUNE=0`
+disables it, `=force` ignores disk and re-measures each distinct profile once). Blackwell (`sm_120+`)
+stays on the proven classic/tensor-core/chaseless candidate set; experimental sidecar candidates are
+skipped unless `KERYX_POM_V4_SIDECAR=1` is explicitly set for validation. This is worth real
+hashrate: an RTX 5080 gains ~4% over the previous SM-derived batch, while a 46-SM RTX 3070 keeps the
+smaller batch that suits it. The tensor-core walk wins on every card tested, including Ampere
+(RTX 3070: 1.35 MH/s vs 0.84 MH/s on the classic walk).
 
 Per-card detail, the full batch sweeps behind those choices, and the historical pre-relaunch numbers:
 [BENCHMARKS.md](BENCHMARKS.md) — PRs with your own cards welcome.
