@@ -143,6 +143,10 @@ Or skip building entirely — the release page ships two prebuilt lines:
 - **legacy** — sm_61+ : **GTX 10-series (1080 Ti)**, Tesla V100/Volta, CMP 100-210, Turing and
   newer; driver 550+. Pascal is covered by this line, so there is no separate `pascal` download.
 
+Windows AMD users should download `keryx-miner-supr-windows-amd.zip`. It includes the OpenCL
+mining worker and both variants of the in-process Vulkan inference engine; keep every extracted
+file together and install a current AMD graphics driver. CPU inference is not used by default.
+
 **GTX 1080 Ti / Pascal notes.** Validated on a real 1080 Ti (sm_61, driver 550): the PoM walk is
 byte-exact (host↔GPU lockstep + H10 seed tests pass), pool shares are accepted, and solo mining
 against keryxd v1.5.7 produced blocks the node accepted. Measured ~0.457 MH/s at ~249 W on the

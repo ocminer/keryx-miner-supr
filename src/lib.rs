@@ -7,7 +7,7 @@ pub mod integrity;
 pub mod keccak;
 pub mod models;
 #[cfg(any(
-    all(feature = "pom-opencl", unix),
+    all(feature = "pom-opencl", any(unix, windows)),
     all(
         any(
             all(feature = "pom-cuda", not(feature = "pom-opencl")),
@@ -44,14 +44,14 @@ pub mod pom_v4;
 // candle-independence — the module self-disables when no server binary is bundled/env-pointed.
 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
 pub mod llama_vulkan;
-// AMD in-process llama.cpp engine (dlopen'd libkeryx-llama-vk.so): zero-dup — llama hosts the
+// AMD in-process llama.cpp engine (libkeryx-llama-vk.so / keryx-llama-vk.dll): zero-dup — llama hosts the
 // model on the inference card, the PoM walk gathers over its VRAM, OPoI text runs in-process.
-// Absent .so = the llama-server subprocess, then only an explicitly enabled deprecated candle-CPU
-// emergency fallback, plus per-card OpenCL blobs.
-#[cfg(all(feature = "pom-opencl", unix))]
+// An absent sidecar falls through to the llama-server subprocess and then only an explicitly
+// enabled deprecated candle-CPU emergency fallback, plus per-card OpenCL blobs.
+#[cfg(all(feature = "pom-opencl", any(unix, windows)))]
 pub mod llama_engine_vk;
-// Windows AMD: no dlopen — stub keeps call sites identical (OpenCL blob + llama-server paths).
-#[cfg(all(feature = "pom-opencl", not(unix)))]
+// Fallback stub for exotic targets without a native dynamic-loader implementation.
+#[cfg(all(feature = "pom-opencl", not(any(unix, windows))))]
 pub mod llama_engine_vk {
     pub fn ensure_loaded(_gguf: &str, _gpu: usize) -> bool {
         false

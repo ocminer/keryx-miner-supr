@@ -2880,7 +2880,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                 if let Some(text) = crate::llama_vulkan::generate_for(&gguf, gpu, prompt, max_tokens) {
                     let clean = strip_think_tags(&text);
                     if !clean.trim().is_empty() {
-                        #[cfg(all(feature = "pom-opencl", unix))]
+                        #[cfg(all(feature = "pom-opencl", any(unix, windows)))]
                         if !crate::llama_vulkan::vulkan_server_ggml_device()
                             .is_some_and(crate::pom_opencl::resolve_vulkan_server_dedication)
                         {

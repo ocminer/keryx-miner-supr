@@ -777,7 +777,7 @@ fn format_pci_location((domain, bus, device, function): (u32, u32, u32, u32)) ->
 /// to inference while the actual mining workers were left with an impossible memory plan.
 pub fn set_selected_worker_devices(device_ids: Vec<usize>) {
     let device_ids = normalize_device_ids(device_ids);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let pci_allowlist = device_ids
             .iter()
@@ -793,7 +793,8 @@ pub fn set_selected_worker_devices(device_ids: Vec<usize>) {
         if !device_ids.is_empty() && pci_allowlist.is_empty() {
             log::warn!(
                 "PoM[opencl]: selected workers expose no usable PCI identity; automatic Vulkan \
-                 inference placement will fail closed (KERYX_LLAMA_VK_DEVICE remains available)."
+                 inference placement cannot enforce the allowlist and will use the bundled \
+                 largest-discrete fallback (KERYX_LLAMA_VK_DEVICE remains available)."
             );
         }
     }
@@ -1024,7 +1025,7 @@ fn explicit_vulkan_device_override() -> bool {
     explicit_vulkan_device().is_some()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug, PartialEq, Eq)]
 enum VulkanDeviceScope {
     SelectedWorker(usize),
@@ -1032,7 +1033,7 @@ enum VulkanDeviceScope {
     RejectAutoExternal,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn classify_vulkan_device_scope(matched_worker: Option<usize>, explicit_override: bool) -> VulkanDeviceScope {
     match (matched_worker, explicit_override) {
         (Some(worker), _) => VulkanDeviceScope::SelectedWorker(worker),
@@ -1099,7 +1100,7 @@ fn evict_resident_for_dedication(device_id: usize) -> Result<(), String> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn prepare_vulkan_device(device: i32, owner: DedicationOwner, route: &str) -> bool {
     let dedication_required = DEDICATION_REQUIRED.load(Ordering::Acquire);
     let explicit_override = explicit_vulkan_device() == Some(device);
@@ -1205,35 +1206,35 @@ fn prepare_vulkan_device(device: i32, owner: DedicationOwner, route: &str) -> bo
 }
 
 /// Resolve and reserve the exact in-process Vulkan target before llama.cpp allocates its model.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn prepare_inprocess_vulkan_device(device: i32) -> bool {
     prepare_vulkan_device(device, DedicationOwner::InProcess, "in-process Vulkan inference")
 }
 
 /// Resolve and reserve the exact llama-server Vulkan target before spawning the subprocess.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn prepare_vulkan_server_device(device: i32) -> bool {
     prepare_vulkan_device(device, DedicationOwner::Server, "Vulkan llama-server")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn release_inprocess_vulkan_dedication() {
     clear_dedication_owned_by(DedicationOwner::InProcess);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn release_vulkan_server_dedication() {
     clear_dedication_owned_by(DedicationOwner::Server);
 }
 
 /// A sidecar/device-selection failure before a route owns the reservation must not leave the
 /// planner's provisional largest worker idle forever.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn release_provisional_vulkan_dedication() {
     clear_dedication_owned_by(DedicationOwner::Provisional);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn dedicate_loaded_engine_card_if_required() -> bool {
     let dedication_required = DEDICATION_REQUIRED.load(Ordering::Acquire);
     let explicit_override = explicit_vulkan_device_override();
@@ -1294,20 +1295,20 @@ pub fn dedicate_loaded_engine_card_if_required() -> bool {
 /// Revalidate a successfully serving Vulkan llama-server against the same exact selection used by
 /// its mandatory pre-spawn reservation. The post-generation check prevents a route proof if device
 /// identity somehow changed; it is not relied on to make VRAM available for model loading.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn resolve_vulkan_server_dedication(device: i32) -> bool {
     prepare_vulkan_server_device(device)
 }
 
 /// Call only after an inference server whose card could not be mapped has been stopped. No GPU
 /// inference remains to protect, so keeping a provisional mining worker idle would be a leak.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn release_provisional_dedication_after_server_stop() {
     release_vulkan_server_dedication();
     release_provisional_vulkan_dedication();
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn dedicate_loaded_engine_card_if_required() -> bool {
     !DEDICATION_REQUIRED.load(Ordering::Acquire)
 }
@@ -1414,7 +1415,7 @@ pub fn amd_health(_idx: usize) -> Option<AmdHealth> {
 
 /// This card's full PCI identity. Prefer standard `cl_khr_pci_bus_info` (includes domain), then
 /// fall back to AMD's legacy topology query (which exposes only bus/device/function, domain 0).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn device_pci_full(device_id: usize) -> Option<(u32, u32, u32, u32)> {
     if let Ok(v) = opencl3::device::get_device_data(
         device_id as opencl3::types::cl_device_id,
@@ -1452,7 +1453,7 @@ fn device_pci_full(device_id: usize) -> Option<(u32, u32, u32, u32)> {
 // (the Vulkan walk shader only implemented v2), but this arch/VRAM policy — RDNA1 BDA hangs, RADV
 // GTT overcommit — is the hard-won field knowledge a future v4 zero-dup shader would reuse.
 #[allow(dead_code)]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn device_is_rdna(device_id: usize) -> bool {
     let name = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id).name().unwrap_or_default();
     if name.contains("gfx101") {
@@ -1464,7 +1465,7 @@ fn device_is_rdna(device_id: usize) -> bool {
 /// Zero-dup default policy: claim only when it never costs hashrate. `KERYX_ZERO_DUP` = `force`
 /// (claim any PCI-matched card, VRAM over hashrate) / `off` (never) / unset = RDNA-only (default).
 #[allow(dead_code)]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn zero_dup_allowed(device_id: usize) -> bool {
     match std::env::var("KERYX_ZERO_DUP").ok().as_deref() {
         Some("force") => true,
@@ -1484,7 +1485,7 @@ fn zero_dup_allowed(device_id: usize) -> bool {
 /// for an hour, so the card looks permanently dead at 0 hash (RX 5700 XT 8 GB field log). So the
 /// engine must be unloaded BEFORE the install on such cards, not on install *failure*.
 #[allow(dead_code)]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn model_plus_blob_fits(device_id: usize, blob_bytes: u64) -> bool {
     let model_bytes = TIER
         .lock()
@@ -1498,7 +1499,7 @@ fn model_plus_blob_fits(device_id: usize, blob_bytes: u64) -> bool {
     total >= blob_bytes + model_bytes + (1 << 30)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn try_claim_shared(_device_id: usize) -> bool {
     // PoM v4/v3 (post-H6): the walk is ALWAYS the OpenCL pom_mine_v4 kernel over the card's own
     // resident blob. The zero-dup Vulkan walk only ever implemented the pre-H6 v2 shader (there is
@@ -1507,20 +1508,20 @@ fn try_claim_shared(_device_id: usize) -> bool {
     // and model coexist on a 24 GB card. (Kept as a stub so the install path's call site is unchanged.)
     false
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn try_claim_shared(_device_id: usize) -> bool {
     false
 }
 
 /// True if the in-process llama engine holds its model on this OpenCL card (PCI match).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn engine_hosts_card(device_id: usize) -> bool {
     matches!(
         (crate::llama_engine_vk::pom_pci(), device_pci_full(device_id)),
         (Some(engine), Some(opencl)) if engine == opencl
     )
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn engine_hosts_card(_device_id: usize) -> bool {
     false
 }
@@ -1774,9 +1775,9 @@ pub fn ensure_installed() {
                         "PoM: install on card {id:#x} failed ({e}) while the in-process llama engine \
                          holds the model on that card — unloading the engine to free VRAM and retrying."
                     );
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     let unloaded = crate::llama_engine_vk::unload();
-                    #[cfg(not(unix))]
+                    #[cfg(not(any(unix, windows)))]
                     let unloaded = false;
                     if unloaded {
                         crate::llama_engine_vk::mark_gpu_inference_unfit();
@@ -1916,7 +1917,7 @@ mod v4_wmma1_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod device_scope_tests {
     use super::{
         classify_vulkan_device_scope, format_pci_location, normalize_device_ids, resolve_device_scope,

@@ -37,12 +37,12 @@ static SERVER_EXITING_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// ggml `main_gpu` used by the active Vulkan server; -1 on CUDA/non-Vulkan or while stopped.
 static SERVER_VK_DEVICE: AtomicI32 = AtomicI32::new(-1);
 
-#[cfg(all(feature = "pom-opencl", unix))]
+#[cfg(all(feature = "pom-opencl", any(unix, windows)))]
 struct ServerDedicationAttempt {
     armed: bool,
 }
 
-#[cfg(all(feature = "pom-opencl", unix))]
+#[cfg(all(feature = "pom-opencl", any(unix, windows)))]
 impl Drop for ServerDedicationAttempt {
     fn drop(&mut self) {
         if self.armed {
@@ -338,6 +338,9 @@ fn server_binary() -> Option<std::path::PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
+    #[cfg(target_os = "windows")]
+    let bin = dir.join("llama-server.exe");
+    #[cfg(not(target_os = "windows"))]
     let bin = dir.join("llama-server");
     if bin.exists() {
         Some(bin)
@@ -429,7 +432,7 @@ pub fn try_start_on(gguf_path: &str, port: u16, logical_gpu: usize) -> bool {
     // the blob/walk again on small cards. Explicit KERYX_LLAMA_VK_DEVICE (operator pins another
     // card) still wins; otherwise no GPU inference route is advertised. The deprecated CPU
     // emergency fallback remains opt-in only. Mining VRAM takes priority.
-    #[cfg(all(feature = "pom-opencl", unix))]
+    #[cfg(all(feature = "pom-opencl", any(unix, windows)))]
     if crate::llama_engine_vk::evicted_for_vram() && explicit_vulkan_device().is_none() {
         log::warn!(
             "llama server: NOT starting the GPU inference server — the in-process engine was unloaded \
@@ -478,11 +481,11 @@ pub fn try_start_on(gguf_path: &str, port: u16, logical_gpu: usize) -> bool {
     );
 
     let mut cmd = Command::new(&server_bin);
-    #[cfg(all(feature = "pom-opencl", unix))]
+    #[cfg(all(feature = "pom-opencl", any(unix, windows)))]
     let mut vulkan_device = -1i32;
-    #[cfg(all(feature = "pom-opencl", unix))]
+    #[cfg(all(feature = "pom-opencl", any(unix, windows)))]
     let mut dedication_attempt = ServerDedicationAttempt { armed: false };
-    #[cfg(not(all(feature = "pom-opencl", unix)))]
+    #[cfg(not(all(feature = "pom-opencl", any(unix, windows))))]
     let vulkan_device = -1i32;
     cmd.args([
         "-m",
@@ -510,7 +513,7 @@ pub fn try_start_on(gguf_path: &str, port: u16, logical_gpu: usize) -> bool {
     // because it shares the same bundled ggml. Passed as --main-gpu with single-GPU split so
     // ggml never layer-splits onto the iGPU; NOT GGML_VK_VISIBLE_DEVICES (its cross-instance
     // index mislocates or asserts on iGPU rigs). Neither = llama.cpp's own default.
-    #[cfg(all(feature = "pom-opencl", unix))]
+    #[cfg(all(feature = "pom-opencl", any(unix, windows)))]
     {
         let explicit = explicit_vulkan_device();
         let dev = explicit.or_else(crate::llama_engine_vk::pick_discrete_ggml_device);
@@ -535,7 +538,7 @@ pub fn try_start_on(gguf_path: &str, port: u16, logical_gpu: usize) -> bool {
             return false;
         }
     }
-    #[cfg(not(all(feature = "pom-opencl", unix)))]
+    #[cfg(not(all(feature = "pom-opencl", any(unix, windows))))]
     if let Ok(dev) = std::env::var("KERYX_LLAMA_VK_DEVICE") {
         cmd.env("GGML_VK_VISIBLE_DEVICES", dev);
     }
@@ -605,7 +608,7 @@ pub fn try_start_on(gguf_path: &str, port: u16, logical_gpu: usize) -> bool {
                         SERVER_EXITING_GENERATION.store(generation, Ordering::Release);
                         SERVER_VK_DEVICE.store(-1, Ordering::Release);
                         PORT.store(0, Ordering::Release);
-                        #[cfg(all(feature = "pom-opencl", unix))]
+                        #[cfg(all(feature = "pom-opencl", any(unix, windows)))]
                         crate::pom_opencl::release_vulkan_server_dedication();
                         let was_up = AVAILABLE.swap(false, Ordering::AcqRel);
                         let exited_identity = take_identity_for_generation(generation);
@@ -706,7 +709,7 @@ pub fn try_start_on(gguf_path: &str, port: u16, logical_gpu: usize) -> bool {
             log::info!("llama_vulkan: ✓ AMD GPU inference ready (Vulkan llama-server on port {port}).");
             #[cfg(not(feature = "pom-opencl"))]
             log::info!("llama server: ✓ GPU inference ready (llama.cpp llama-server on port {port}).");
-            #[cfg(all(feature = "pom-opencl", unix))]
+            #[cfg(all(feature = "pom-opencl", any(unix, windows)))]
             {
                 dedication_attempt.armed = false;
             }

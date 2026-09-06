@@ -26,6 +26,16 @@
 #include <string>
 #include <vector>
 
+// GGUF models are routinely larger than 2 GiB. MSVC has no POSIX fseeko/off_t, so keep an
+// explicitly 64-bit seek on Windows and retain fseeko on Unix.
+static int keryx_file_seek(FILE* file, uint64_t offset) {
+#ifdef _WIN32
+    return _fseeki64(file, static_cast<__int64>(offset), SEEK_SET);
+#else
+    return fseeko(file, static_cast<off_t>(offset), SEEK_SET);
+#endif
+}
+
 // Keep wrapper diagnostics on the same callback-controlled path as llama.cpp/ggml. The Rust host
 // installs that callback before invoking any sidecar operation, suppressing native text only while
 // its alternate-screen dashboard is active and preserving the default stderr output in classic
@@ -329,7 +339,7 @@ static bool walk_init(KeryxLlama* h) {
         if (!f) return false;
         std::vector<uint8_t> flat(supl_total);
         for (size_t i = 0; i < supl_src.size(); i++) {
-            if (fseeko(f, (off_t)supl_src[i].first, SEEK_SET) != 0 ||
+            if (keryx_file_seek(f, supl_src[i].first) != 0 ||
                 fread(flat.data() + supl_off[i], 1, supl_src[i].second, f) != supl_src[i].second) {
                 fclose(f);
                 KERYX_LOG_ERROR("keryx-llama-vk: supplement read failed\n");

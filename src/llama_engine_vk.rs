@@ -1,4 +1,4 @@
-//! In-process llama.cpp engine, AMD/Vulkan flavor (dlopen'd `libkeryx-llama-vk.so`) — zero-dup:
+//! In-process llama.cpp engine, AMD/Vulkan flavor (dynamically loaded sidecar) — zero-dup:
 //! llama.cpp hosts the SINGLE resident model copy on the inference GPU, the PoM walk gathers
 //! straight over its VRAM tensors (wrapper exports `keryx_llama_pom_mine`/`_fetch` — byte-exact
 //! per the full-model spike + the startup byte gate below), and OPoI text generation runs
@@ -10,10 +10,10 @@
 //! and [`pom_byte_gate`] cross-checks the engine's gather against the host possession index at
 //! every startup — any mismatch refuses zero-dup and the OpenCL blob path takes over.
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::sync::{Mutex, OnceLock};
 
-use nix::libc;
+use libloading::Library;
 
 type AbiFn = unsafe extern "C" fn() -> c_int;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
@@ -28,7 +28,7 @@ type PickFn = unsafe extern "C" fn() -> c_int;
 type PickAbiFn = unsafe extern "C" fn() -> c_int;
 type DevicePciFn = unsafe extern "C" fn(c_int, *mut u32, *mut u32, *mut u32, *mut u32) -> bool;
 
-unsafe fn install_native_log_bridge(lib: *mut c_void) -> bool {
+unsafe fn install_native_log_bridge(lib: &'static Library) -> bool {
     let get = sym::<crate::native_llama_log::LogGet>(lib, "keryx_llama_log_get_v1")
         .or_else(|| sym::<crate::native_llama_log::LogGet>(lib, "llama_log_get"));
     let set = sym::<crate::native_llama_log::LogSet>(lib, "keryx_llama_log_set_v1")
@@ -43,11 +43,13 @@ const ABI: c_int = 2;
 const VK_ABI: c_int = 5; // bumped 4->5 at H5.1: keryx_llama_pom_mine gained the seed-words arg
 
 /// Max nonces per engine dispatch (ascending sub-batches, early exit on the first winner =
-/// identical lowest-nonce semantics). Larger than the OpenCL driver's 2^18: this engine is
-/// Linux-only (no Windows TDR watchdog), so the only bound is the kernel's ~10 s compute ring
-/// timeout — 2^20 is ~120 ms on an MI60-class card while quartering the per-dispatch
-/// submit+fence overhead.
+/// identical lowest-nonce semantics). Linux has no desktop TDR watchdog, so 2^20 quarters the
+/// submit+fence overhead and remains ~120 ms on an MI60-class card. Windows retains the OpenCL
+/// driver's conservative 2^18 bound so a slow card cannot trip WDDM timeout detection.
+#[cfg(not(target_os = "windows"))]
 const SUB_DISPATCH_NONCES: u64 = 1 << 20;
+#[cfg(target_os = "windows")]
+const SUB_DISPATCH_NONCES: u64 = 1 << 18;
 
 struct Engine {
     model: *mut c_void,
@@ -84,7 +86,7 @@ impl Drop for InprocessDedicationAttempt {
     }
 }
 
-/// Same SIGILL gate as llama_engine::cpu_has_baked_simd — libkeryx-llama-vk.so is built with
+/// Same SIGILL gate as llama_engine::cpu_has_baked_simd — the Vulkan sidecar is built with
 /// the same GGML_NATIVE=OFF flags that bake in AVX/AVX2/FMA/F16C/BMI2 with no runtime dispatch.
 #[cfg(target_arch = "x86_64")]
 fn cpu_has_baked_simd() -> bool {
@@ -99,8 +101,8 @@ fn cpu_has_baked_simd() -> bool {
     true
 }
 
-/// `KERYX_LLAMA_VK_SO=<path>` wins; else `libkeryx-llama-vk.so` next to our own executable.
-/// CPUs without the baked-in SIMD set get `libkeryx-llama-vk-noavx.so` if present, else no
+/// `KERYX_LLAMA_VK_SO=<path>` wins; otherwise use the platform-native Vulkan sidecar next to our
+/// executable. CPUs without the baked-in SIMD set get the `-noavx` build if present, else no
 /// engine (graceful fallback) rather than a SIGILL inside the AVX build.
 fn so_path() -> Option<std::path::PathBuf> {
     let simd_ok = cpu_has_baked_simd();
@@ -120,16 +122,23 @@ fn so_path() -> Option<std::path::PathBuf> {
     let dir = exe.parent()?;
     let want_noavx = !simd_ok || std::env::var("KERYX_LLAMA_FORCE_NOAVX").map_or(false, |v| v == "1");
     if want_noavx {
+        #[cfg(target_os = "windows")]
+        let p = dir.join("keryx-llama-vk-noavx.dll");
+        #[cfg(not(target_os = "windows"))]
         let p = dir.join("libkeryx-llama-vk-noavx.so");
         if p.exists() {
             log::info!("llama-vk engine: using baseline (no-AVX) build {}.", p.display());
             return Some(p);
         }
         log::warn!(
-            "llama-vk engine: this CPU lacks the AVX2/FMA/F16C/BMI2 set baked into libkeryx-llama-vk.so and no libkeryx-llama-vk-noavx.so is present — NOT loading it (would SIGILL). Remaining GPU routes will be tried."
+            "llama-vk engine: this CPU lacks the AVX2/FMA/F16C/BMI2 set baked into the standard sidecar and no baseline sidecar exists at {} — NOT loading it (would SIGILL). Remaining GPU routes will be tried.",
+            p.display()
         );
         return None;
     }
+    #[cfg(target_os = "windows")]
+    let p = dir.join("keryx-llama-vk.dll");
+    #[cfg(not(target_os = "windows"))]
     let p = dir.join("libkeryx-llama-vk.so");
     if p.exists() {
         Some(p)
@@ -138,38 +147,35 @@ fn so_path() -> Option<std::path::PathBuf> {
     }
 }
 
-unsafe fn sym<T: Copy>(lib: *mut c_void, name: &str) -> Option<T> {
+unsafe fn sym<T: Copy>(lib: &'static Library, name: &str) -> Option<T> {
     let c = CString::new(name).ok()?;
-    let p = libc::dlsym(lib, c.as_ptr());
-    if p.is_null() {
-        return None;
-    }
-    // fn-pointer types are pointer-sized; read the address as T.
-    Some(std::mem::transmute_copy::<*mut c_void, T>(&p))
+    lib.get::<T>(c.as_bytes_with_nul()).ok().map(|symbol| *symbol)
 }
 
-/// Open the Vulkan sidecar once and retain it for the process lifetime. Besides keeping every FFI
-/// pointer valid, this is required by the native log bridge: its saved downstream callback lives
-/// in this DSO and must never be invalidated by a probe-time `dlclose`.
-fn sidecar_lib(so: &std::path::Path) -> Option<*mut c_void> {
-    static LIB: OnceLock<usize> = OnceLock::new();
-    if let Some(address) = LIB.get() {
-        return Some(*address as *mut c_void);
+/// Open the Vulkan sidecar once and retain it for the process lifetime. `libloading` maps this to
+/// dlopen on Unix and LoadLibrary on Windows. Besides keeping every copied FFI pointer valid, the
+/// process-lifetime handle protects the downstream callback retained by the native log bridge.
+/// Failed loads are deliberately not cached: a sidecar copied into place later can still recover.
+fn sidecar_lib(so: &std::path::Path) -> Option<&'static Library> {
+    static LIB: OnceLock<Library> = OnceLock::new();
+    if let Some(lib) = LIB.get() {
+        return Some(lib);
     }
-    let cso = CString::new(so.to_string_lossy().as_bytes()).ok()?;
-    let loaded = unsafe { libc::dlopen(cso.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
-    if loaded.is_null() {
-        return None;
-    }
-    match LIB.set(loaded as usize) {
-        Ok(()) => Some(loaded),
-        Err(_) => {
-            // Another startup thread published the same sidecar first. Drop only our redundant
-            // loader reference; the retained winning handle and every saved callback stay valid.
-            unsafe { libc::dlclose(loaded) };
-            LIB.get().map(|address| *address as *mut c_void)
+    let loaded = match unsafe { Library::new(so) } {
+        Ok(lib) => lib,
+        Err(error) => {
+            log::warn!(
+                "llama-vk engine: failed to load {}: {} — will retry when inference is requested.",
+                so.display(),
+                error
+            );
+            return None;
         }
+    };
+    if LIB.set(loaded).is_ok() {
+        log::info!("llama-vk engine: loaded {} (in-process Vulkan engine).", so.display());
     }
+    LIB.get()
 }
 
 // ── Discrete-GPU selection (issue #18) ──────────────────────────────────────────────────────
@@ -324,13 +330,6 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
     let Some(so) = so_path() else { return false };
     unsafe {
         let Some(lib) = sidecar_lib(&so) else {
-            let err = libc::dlerror();
-            let msg = if err.is_null() { "?".into() } else { CStr::from_ptr(err).to_string_lossy().into_owned() };
-            log::warn!(
-                "llama-vk engine: dlopen({}) failed: {} — the llama-server GPU route and any explicitly enabled deprecated CPU fallback remain available.",
-                so.display(),
-                msg
-            );
             return false;
         };
         if !install_native_log_bridge(lib) && crate::tui_active() {

@@ -1,0 +1,30 @@
+; MSVC export list for keryx-llama-vk.dll (core ABI 2, Vulkan ABI 5).
+; The first group is implemented by keryx_llama_vk.cpp. The picker/device functions are in the
+; Keryx export block appended to llama.cpp's ggml-vulkan.cpp before configuration.
+LIBRARY keryx-llama-vk
+EXPORTS
+    keryx_llama_abi
+    keryx_llama_vk_abi
+    keryx_llama_log_get_v1
+    keryx_llama_log_set_v1
+    keryx_llama_load
+    keryx_llama_tensor_count
+    keryx_llama_pom_ready
+    keryx_llama_pom_n_chunks
+    keryx_llama_pom_supl_bytes
+    keryx_llama_pom_fetch
+    keryx_llama_pom_fetch_range
+    keryx_llama_pom_mine
+    keryx_llama_pom_pci
+    keryx_llama_generate
+    keryx_llama_free
+    keryx_vk_raw_handles
+    keryx_vk_tensor_addr
+    keryx_vk_tensor_device
+    keryx_vk_device_pci
+    keryx_vk_picker_abi
+    keryx_vk_pick_discrete_device
+    keryx_vk_pick_discrete_device_unfiltered
+    keryx_vk_any_discrete_pci_verifiable
+    keryx_vk_ggml_index_to_discrete_ordinal
+    keryx_vk_queue_submit
