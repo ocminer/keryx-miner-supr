@@ -13,16 +13,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
 WORKDIR /app
-# The full modern dist: binary + plugins (libkeryxcuda.so/libkeryxopencl.so) + bundled CUDA libs (lib/)
-# + the in-process llama.cpp engine (libkeryx-llama.so) for OPoI inference. Built by build-offline.sh.
+# NVIDIA-only modern PoM host, matching CUDA plugin and runtime closure. AMD cards need the
+# separate pom-opencl package; loading an OpenCL plugin into this host cannot change its backend.
 COPY hiveos/dist-modern/keryx-miner-supr /app/keryx-miner-supr
 COPY hiveos/dist-modern/libkeryxcuda.so /app/libkeryxcuda.so
-COPY hiveos/dist-modern/libkeryxopencl.so /app/libkeryxopencl.so
 COPY hiveos/dist-modern/lib /app/lib
 COPY docker/entrypoint.sh /app/entrypoint.sh
-# libkeryx-llama.so is staged in during packaging; copy it if present (build ignores a missing one
-# by using a wildcard that always matches at least entrypoint.sh).
-COPY hiveos/dist-modern/libkeryx-llama.s[o] docker/entrypoint.sh /app/
+# Both GPU inference engines are mandatory, just as in the Linux archives. The baseline-CPU
+# variant still uses CUDA for inference; omitting it breaks rigs whose CPUs cannot execute AVX2.
+COPY hiveos/dist-modern/libkeryx-llama.so /app/libkeryx-llama.so
+COPY hiveos/dist-modern/libkeryx-llama-noavx.so /app/libkeryx-llama-noavx.so
 RUN chmod +x /app/keryx-miner-supr /app/entrypoint.sh
 
 # Env contract — see docker/entrypoint.sh. Defaults mine keryx on suprnova, --tier auto, /models.
