@@ -1261,6 +1261,16 @@ async fn run() -> Result<(), Error> {
         keryx_miner::slm::set_inference_cards(cards);
     }
 
+    // Publish the declaration latch before ANY warmer can earn a route. Warmers must still run
+    // while it holds: their first proof allows templates through so workers can install walks.
+    if opt.wait_ready || opt.low_ram {
+        keryx_miner::wait_ready::enable();
+        info!(
+            "--wait-ready{}: mining and OPoI declaration held until ALL cards are fully set up.",
+            if opt.low_ram && !opt.wait_ready { " (implied by --low-ram)" } else { "" }
+        );
+    }
+
     // Publish low-RAM mode before any model prefetch/warmer thread starts. Setting it after those
     // threads were spawned left a startup window where every card could load concurrently despite
     // the operator explicitly requesting serialized bring-up.
@@ -1633,7 +1643,8 @@ async fn run() -> Result<(), Error> {
                             continue;
                         }
                         let inf_gpu = keryx_miner::slm::inference_gpu_for_model(model_id);
-                        if !keryx_miner::slm::run_inference_self_test(model_id, inf_gpu) {
+                        if keryx_miner::slm::run_inference_self_test(model_id, inf_gpu)
+                            == keryx_miner::slm::SelfTestOutcome::Failed {
                             warn!(
                                 "OPoI low-RAM route proof for model {:.8} on GPU {} is not ready; retrying",
                                 hex::encode(model_id),
@@ -1641,7 +1652,7 @@ async fn run() -> Result<(), Error> {
                             );
                         }
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    std::thread::sleep(std::time::Duration::from_secs(2));
                 });
             } else {
                 for (model_id, route_path) in route_models {
@@ -1690,14 +1701,6 @@ async fn run() -> Result<(), Error> {
                 keryx_miner::pom::activation_daa()
             );
         }
-    }
-
-    // --wait-ready: hold mining + the OPoI declaration until every card's walk is installed
-    // (see wait_ready.rs for the why — challenge starvation during multi-card bring-up on
-    // low-RAM rigs). Backend-neutral state; workers register + installs mark ready.
-    if opt.wait_ready {
-        keryx_miner::wait_ready::enable();
-        info!("--wait-ready: mining and OPoI declaration held until ALL cards are fully set up.");
     }
 
     // --intensity: fixed batch per card (batch = 2^intensity), CSV position = CUDA ordinal, the same

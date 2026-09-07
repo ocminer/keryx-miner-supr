@@ -9,6 +9,25 @@ use crate::proto::{
     NotifyVirtualSelectedParentChainChangedRequestMessage,
 };
 use crate::{miner::MinerManager, Error};
+use keryx_miner::slm::InferenceError;
+
+fn account_inference_result(
+    result: std::result::Result<String, InferenceError>,
+    attempt: &mut keryx_miner::runtime_stats::InferenceAttempt,
+) -> Option<String> {
+    match result {
+        Ok(text) => Some(text),
+        Err(InferenceError::Deferred(reason)) => {
+            log::info!("OPoI: inference deferred ({}) — route unchanged", reason);
+            attempt.busy();
+            None
+        }
+        Err(InferenceError::Failed) => {
+            attempt.failed();
+            None
+        }
+    }
+}
 
 /// Max boot-time escrow-validation GetBlock requests in flight at once — each answer
 /// sends the next queued one, so thousands of state entries never overwhelm the
@@ -849,8 +868,8 @@ impl KeryxdHandler {
                 Some(&model_id),
             );
             tokio::task::spawn_blocking(move || {
-                // Acquire a concrete card first, then atomically stop whichever MinerManager is
-                // current (including one created after a reconnect) before entering GPU code.
+                // Acquire a concrete card; CUDA's backend pauses only that GPU. Other workers
+                // continue consuming current solo templates throughout inference.
                 let result = match keryx_miner::slm::acquire_inference_card(
                     &model_id,
                     keryx_miner::slm::DEFAULT_INFERENCE_DEADLINE_MS,
@@ -858,8 +877,11 @@ impl KeryxdHandler {
                     Some(lease) => {
                         let gpu = lease.gpu();
                         runtime_attempt.set_gpu(gpu);
-                        let _pause = crate::miner::begin_inference_pause();
-                        keryx_miner::slm::load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens)
+                        let _pause = crate::miner::begin_network_inference_pause();
+                        account_inference_result(
+                            keryx_miner::slm::try_load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens),
+                            &mut runtime_attempt,
+                        )
                     }
                     None => {
                         runtime_attempt.busy();
@@ -1140,9 +1162,12 @@ impl KeryxdHandler {
                                         Some(lease) => {
                                             let gpu = lease.gpu();
                                             runtime_attempt.set_gpu(gpu);
-                                            let _pause = crate::miner::begin_inference_pause();
-                                            keryx_miner::slm::load_and_run_inference_on(
-                                                gpu, &model_id, &prompt, 64,
+                                            let _pause = crate::miner::begin_network_inference_pause();
+                                            account_inference_result(
+                                                keryx_miner::slm::try_load_and_run_inference_on(
+                                                    gpu, &model_id, &prompt, 64,
+                                                ),
+                                                &mut runtime_attempt,
                                             )
                                         }
                                         None => {
@@ -1187,8 +1212,8 @@ impl KeryxdHandler {
                 }
                 self.try_start_inference();
                 // A queued task may wait for another inference to release its card while PoW keeps
-                // running. Once it acquires a card, its process-global guard stops the walk and this
-                // gate keeps every later template stopped until all GPU generation has ended.
+                // running. Only backends requiring a global pause gate templates here; CUDA
+                // continues publishing them while its exact serving GPU is drained/paused.
                 if crate::miner::inference_pause_active() {
                     miner.process_block(None).await?;
                     return Ok(());

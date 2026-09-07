@@ -143,6 +143,29 @@ pub fn inference_pause_active() -> bool {
     lock_inference_pause_state().inflight != 0
 }
 
+/// CUDA already drains and pauses the exact serving card in slm's backend transaction. Keep
+/// templates flowing to every worker (also across reconnects); its per-card guard survives the
+/// connection and the paused worker polls the newest job. Other backends retain their global gate.
+pub fn begin_network_inference_pause() -> InferencePauseGuard {
+    begin_network_inference_pause_for(cfg!(all(feature = "pom-cuda", not(feature = "pom-opencl"))))
+}
+
+fn begin_network_inference_pause_for(per_card_backend: bool) -> InferencePauseGuard {
+    if per_card_backend {
+        InferencePauseGuard { armed: false }
+    } else {
+        begin_inference_pause()
+    }
+}
+
+pub fn inference_pause_scope() -> &'static str {
+    if cfg!(all(feature = "pom-cuda", not(feature = "pom-opencl"))) {
+        "serving GPU only; other GPUs continue PoW"
+    } else {
+        "backend-wide PoW pause"
+    }
+}
+
 // How long to wait for a worker to exit after it is asked to Close before we
 // assume it is frozen and force-kill it with SIGUSR1. Must comfortably exceed a
 // cold GPU-kernel JIT compile: some archs (e.g. AMD gfx1102) ship no precompiled
@@ -726,7 +749,7 @@ impl MinerManager {
                             if keryx_miner::pom_gpu::inference_paused_for(wdid) {
                                 static SWAP_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                                 if SWAP_WAIT.fetch_add(1, Ordering::Relaxed) % 200 == 0 {
-                                    log::info!("PoM[gpu{}]: holding off — llama model swap in progress on this card (walk paused, ~2 s).", wdid);
+                                    log::info!("PoM[gpu{}]: inference/model operation on this card — its walk is paused; other GPUs continue.", wdid);
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(25));
                                 continue;
@@ -1179,7 +1202,10 @@ impl MinerManager {
             // or the possession index / resident tree is being built (the latter can take minutes,
             // esp. with --resident-tree). Report that plainly instead of "workers stalled or
             // crashed", which alarms users who simply haven't finished the one-time model download.
-            let preparing = keryx_miner::slm::mining_preparing() || {
+            let preparing = keryx_miner::wait_ready::holds()
+                || !keryx_miner::slm::has_proven_serveable_model()
+                || keryx_miner::slm::mining_preparing()
+                || {
                 #[cfg(feature = "pom-cuda")]
                 {
                     keryx_miner::pom_gpu::is_loading()
@@ -1288,7 +1314,13 @@ impl MinerManager {
                     "0 hash/s (preparing)",
                     duration,
                     true,
-                    challenge_active,
+                    challenge_active || {
+                        #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+                        { crate::gpu_health::ordinal_from_label(device)
+                            .is_some_and(keryx_miner::pom_gpu::inference_paused_for) }
+                        #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+                        { false }
+                    },
                     &suffix,
                     health.as_ref().and_then(|h| h.power_w),
                     preparing,
@@ -1496,6 +1528,33 @@ mod inference_pause_tests {
         match receiver.get_changed().expect("worker channel must remain open") {
             Some(Some(WorkerCommand::Job(state))) => assert_eq!(state.id, expected_id),
             _ => panic!("expected retained Stratum job {expected_id} to be replayed"),
+        }
+    }
+
+    #[test]
+    fn per_card_inference_keeps_templates_flowing_across_reconnect() {
+        let (_serial, _reset) = enter_test();
+        let (old, receiver, active) = control();
+        register(&old);
+        let mut receivers = vec![receiver.clone(), receiver.clone(), receiver];
+        let pause = begin_network_inference_pause_for(true);
+        assert!(!inference_pause_active());
+        assert!(!active.load(Ordering::SeqCst));
+        for id in [41, 42] {
+            old.block_channel.send(Some(job(id))).unwrap();
+            for receiver in &mut receivers {
+                assert_resumed_job(receiver, id);
+            }
+        }
+        let (new, mut receiver, new_active) = control();
+        register(&new);
+        new.block_channel.send(Some(job(43))).unwrap();
+        assert_resumed_job(&mut receiver, 43);
+        drop(pause);
+        assert!(!new_active.load(Ordering::SeqCst));
+        assert!(matches!(receiver.get_changed(), Ok(None)), "no stale replay after reconnect");
+        for receiver in &mut receivers {
+            assert!(matches!(receiver.get_changed(), Ok(None)), "old connection must stay untouched");
         }
     }
 

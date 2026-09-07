@@ -21,6 +21,7 @@ use crate::pow::BlockSeed::PartialBlock;
 use crate::{miner::MinerManager, Error, Uint256};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
+use keryx_miner::slm::InferenceError;
 use log::{error, info, warn};
 use num::Float;
 use rand::{thread_rng, RngCore};
@@ -153,7 +154,17 @@ fn chat_task_key(req: &InferenceRequestParams) -> String {
 enum DetachedTaskOutcome {
     Text(Option<String>),
     Ai(Option<InferenceResult>),
+    Busy,
     Failed,
+}
+
+impl DetachedTaskOutcome {
+    fn inference_text(result: &std::result::Result<String, InferenceError>) -> Self {
+        match result {
+            Err(InferenceError::Deferred(_)) => Self::Busy,
+            _ => Self::Text(result.as_ref().ok().cloned()),
+        }
+    }
 }
 
 type DetachedTaskSender = tokio::sync::watch::Sender<Option<DetachedTaskOutcome>>;
@@ -227,6 +238,7 @@ impl DetachedTaskAdmission {
                 outcome,
                 Some(DetachedTaskOutcome::Text(None))
                     | Some(DetachedTaskOutcome::Ai(None))
+                    | Some(DetachedTaskOutcome::Busy)
                     | Some(DetachedTaskOutcome::Failed)
             );
             if !retryable_failure {
@@ -269,6 +281,33 @@ async fn await_detached_outcome(mut follower: DetachedTaskFollower) -> DetachedT
         if follower.receiver.changed().await.is_err() {
             return DetachedTaskOutcome::Failed;
         }
+    }
+}
+
+#[cfg(test)]
+mod inference_coordination_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn deferred_requests_notify_followers_and_remain_retryable() {
+        let key = "test:deferred-inference-retry".to_owned();
+        let Ok(DetachedTaskAdmission::Leader(mut leader)) = DetachedTaskAdmission::reserve(key.clone()) else {
+            panic!("first request must own the flight");
+        };
+        let Ok(DetachedTaskAdmission::Follower(follower)) = DetachedTaskAdmission::reserve(key.clone()) else {
+            panic!("duplicate must follow the existing flight");
+        };
+        leader.publish(DetachedTaskOutcome::inference_text(&Err(InferenceError::Deferred(
+            keryx_miner::slm::DeferredReason::InstallBusy,
+        ))));
+        assert!(matches!(await_detached_outcome(follower).await, DetachedTaskOutcome::Busy));
+        drop(leader);
+        let Ok(DetachedTaskAdmission::Leader(mut retry)) = DetachedTaskAdmission::reserve(key.clone()) else {
+            panic!("busy must not cache a permanent failure");
+        };
+        retry.publish(DetachedTaskOutcome::Text(Some("OK".into())));
+        drop(retry);
+        detached_inference_tasks().lock().unwrap().remove(&key);
     }
 }
 
@@ -1683,8 +1722,8 @@ impl StratumHandler {
         let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
         let send_channel = self.send_channel.clone();
         // Wait for a serving card in a detached async task. The Stratum read loop must keep handling
-        // jobs/share ACKs during that wait; once a card is acquired, the process-global pause guard
-        // atomically stops whichever MinerManager is current (even after a reconnect).
+        // jobs/share ACKs during that wait. CUDA's backend guard drains only the leased GPU;
+        // its peers keep receiving jobs, including across reconnects.
         tokio::spawn(async move {
             let lease = match keryx_miner::slm::acquire_inference_card_async(
                 &model_id,
@@ -1696,17 +1735,18 @@ impl StratumHandler {
                 None => {
                     warn!("OPoI challenge: all eligible cards busy — dropping challenge for model {:.8}", model_id_hex);
                     runtime_attempt.busy();
-                    publisher.publish(DetachedTaskOutcome::Text(None));
+                    publisher.publish(DetachedTaskOutcome::Busy);
                     send_channel.send(make_challenge_response_line(&model_id_hex, &nonce_hex, "")).await.ok();
                     return;
                 }
             };
             let gpu = lease.gpu();
             runtime_attempt.set_gpu(gpu);
-            let pause = crate::miner::begin_inference_pause();
-            info!("OPoI challenge: PoW suspended (GPU {}) — model={:.8} nonce={:.8}", gpu, model_id_hex, nonce_hex);
+            let pause = crate::miner::begin_network_inference_pause();
+            info!("OPoI challenge: inference on GPU {} ({}) — model={:.8} nonce={:.8}",
+                gpu, crate::miner::inference_pause_scope(), model_id_hex, nonce_hex);
             let result = tokio::task::spawn_blocking(move || {
-                let result = keryx_miner::slm::load_and_run_inference_on(gpu, &model_id, &prompt, CHALLENGE_MAX_TOKENS);
+                let result = keryx_miner::slm::try_load_and_run_inference_on(gpu, &model_id, &prompt, CHALLENGE_MAX_TOKENS);
                 drop(lease);
                 drop(pause);
                 result
@@ -1714,17 +1754,22 @@ impl StratumHandler {
             .await
             .unwrap_or_else(|e| {
                 warn!("OPoI challenge: inference task failed: {e}");
-                None
+                Err(InferenceError::Failed)
             });
-            publisher.publish(DetachedTaskOutcome::Text(result.clone()));
+            publisher.publish(DetachedTaskOutcome::inference_text(&result));
+            let deferred = matches!(&result, Err(InferenceError::Deferred(_)));
+            if let Err(InferenceError::Deferred(reason)) = &result {
+                info!("OPoI challenge: GPU {} deferred ({}) — route unchanged", gpu, reason);
+                runtime_attempt.busy();
+            }
             let text = result.unwrap_or_default();
-            if text.is_empty() {
+            if text.is_empty() && !deferred {
                 warn!("OPoI challenge: inference returned empty text for model {:.8}", model_id_hex);
                 runtime_attempt.failed();
-            } else {
+            } else if !text.is_empty() {
                 keryx_miner::runtime_stats::record_inference_prepared();
                 info!(
-                    "OPoI challenge: done for model {:.8} ({} chars) — retained PoW job resumed",
+                    "OPoI challenge: done for model {:.8} ({} chars) — inference pause released",
                     model_id_hex,
                     text.len()
                 );
@@ -1807,6 +1852,7 @@ impl StratumHandler {
                                 started.elapsed().as_millis() as u32,
                             )
                         }
+                        DetachedTaskOutcome::Busy => make_inference_result_err(&follower_req_id, "busy"),
                         _ => make_inference_result_err(&follower_req_id, "inference failed"),
                     };
                     let _ = send_channel.send(line).await;
@@ -1837,18 +1883,19 @@ impl StratumHandler {
                 None => {
                     warn!("chat[{}]: all eligible cards busy through deadline — replying busy", req_id);
                     runtime_attempt.busy();
-                    publisher.publish(DetachedTaskOutcome::Text(None));
+                    publisher.publish(DetachedTaskOutcome::Busy);
                     send_channel.send(make_inference_result_err(&req_id, "busy")).await.ok();
                     return;
                 }
             };
             let gpu = lease.gpu();
             runtime_attempt.set_gpu(gpu);
-            let pause = crate::miner::begin_inference_pause();
-            info!("chat[{}]: PoW suspended (GPU {}) — model={:.8}", req_id, gpu, model_hex);
+            let pause = crate::miner::begin_network_inference_pause();
+            info!("chat[{}]: inference on GPU {} ({}) — model={:.8}",
+                req_id, gpu, crate::miner::inference_pause_scope(), model_hex);
             let started = std::time::Instant::now();
             let result = tokio::task::spawn_blocking(move || {
-                let result = keryx_miner::slm::load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens);
+                let result = keryx_miner::slm::try_load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens);
                 drop(lease);
                 drop(pause);
                 result
@@ -1856,19 +1903,24 @@ impl StratumHandler {
             .await
             .unwrap_or_else(|e| {
                 warn!("chat[{}]: inference task failed: {e}", req_id);
-                None
+                Err(InferenceError::Failed)
             });
-            publisher.publish(DetachedTaskOutcome::Text(result.clone()));
+            publisher.publish(DetachedTaskOutcome::inference_text(&result));
             let ms = started.elapsed().as_millis() as u32;
             let (line, tokens) = match result {
-                Some(text) if !text.is_empty() => {
+                Ok(text) if !text.is_empty() => {
                     let tokens = text.split_whitespace().count() as u32;
                     keryx_miner::runtime_stats::record_inference_prepared();
                     info!(
-                        "chat[{}]: done model={:.8} ({} tokens, {} ms) — retained PoW job resumed",
+                        "chat[{}]: done model={:.8} ({} tokens, {} ms) — inference pause released",
                         req_id, model_hex, tokens, ms
                     );
                     (make_inference_result_ok(&req_id, text, tokens, ms), Some(tokens as usize))
+                }
+                Err(InferenceError::Deferred(reason)) => {
+                    info!("chat[{}]: GPU {} deferred ({}) — replying busy, route unchanged", req_id, gpu, reason);
+                    runtime_attempt.busy();
+                    (make_inference_result_err(&req_id, "busy"), None)
                 }
                 _ => {
                     warn!("chat[{}]: inference produced no output", req_id);
@@ -2056,8 +2108,8 @@ impl StratumHandler {
             };
             let gpu = lease.gpu();
             runtime_attempt.set_gpu(gpu);
-            let pause = crate::miner::begin_inference_pause();
-            info!("OPoI AiTask [{}]: PoW suspended for GPU {} inference", stable_id, gpu);
+            let pause = crate::miner::begin_network_inference_pause();
+            info!("OPoI AiTask [{}]: inference on GPU {} ({})", stable_id, gpu, crate::miner::inference_pause_scope());
             if let Err(e) = tokio::task::spawn_blocking(move || {
                 run_inference_and_upload(
                     gpu, model_id, prompt, max_tokens, ipfs_url, stable_id, cache_key, cache_ref, publisher, pause,
@@ -2125,16 +2177,22 @@ fn run_inference_and_upload(
     let _cleanup = InProgressCleanup { cache_key: cache_key.clone(), cache: Arc::clone(&cache), runtime_generation };
     let inference = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         info!("OPoI [{}]: starting SLM inference (max_tokens={}, GPU {})", stable_id, max_tokens, gpu);
-        keryx_miner::slm::load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens)
+        keryx_miner::slm::try_load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens)
     }));
 
-    // Neither the card lease nor the global PoW pause is needed by the network upload. Release both
+    // Neither the card lease nor a backend-wide PoW pause is needed by the network upload. Release both
     // before IPFS retries so another request/card and mining can proceed immediately.
     drop(lease);
     drop(pause);
 
     let text = match inference {
-        Ok(Some(text)) if !text.is_empty() => text,
+        Ok(Ok(text)) if !text.is_empty() => text,
+        Ok(Err(InferenceError::Deferred(reason))) => {
+            info!("OPoI [{}]: GPU {} deferred ({}) — request remains retryable", stable_id, gpu, reason);
+            runtime_attempt.busy();
+            publisher.publish(DetachedTaskOutcome::Busy);
+            return;
+        }
         Ok(_) => {
             warn!("OPoI [{}]: inference returned empty text — skipping IPFS upload", stable_id);
             runtime_attempt.failed();

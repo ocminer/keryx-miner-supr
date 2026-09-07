@@ -806,7 +806,7 @@ fn adapt_snapshot(snapshot: runtime::Snapshot, clocks: &mut ClockBaselines) -> U
     };
     let mining_state = if snapshot.inference.staging_error {
         MiningState::Degraded
-    } else if snapshot.mining.preparing {
+    } else if snapshot.mining.preparing && snapshot.mining.total_hashrate_hs == 0.0 {
         MiningState::Preparing
     } else if snapshot.mining.inference_paused {
         MiningState::InferencePaused
@@ -839,9 +839,8 @@ fn adapt_snapshot(snapshot: runtime::Snapshot, clocks: &mut ClockBaselines) -> U
         .iter()
         .map(|device| {
             let inference_host = inference_gpu == Some(device.index);
-            let activity = if snapshot.mining.preparing {
-                DeviceActivity::Preparing
-            } else if snapshot.mining.inference_paused && inference_host {
+            let activity = if snapshot.mining.inference_paused_gpus.contains(&device.index)
+                || (snapshot.mining.inference_paused && inference_host) {
                 DeviceActivity::Inference
             } else if snapshot.mining.inference_paused {
                 DeviceActivity::Paused
@@ -849,6 +848,8 @@ fn adapt_snapshot(snapshot: runtime::Snapshot, clocks: &mut ClockBaselines) -> U
                 DeviceActivity::Offline
             } else if device.hashrate_hs > 0.0 {
                 DeviceActivity::Mining
+            } else if snapshot.mining.preparing {
+                DeviceActivity::Preparing
             } else {
                 DeviceActivity::Stalled
             };
@@ -1164,6 +1165,25 @@ mod tests {
         runtime, sanitize_log_message, should_enable_with, ClockTrack, EXIT_RESTORE_REQUESTED,
     };
     use std::ffi::OsString;
+
+    #[test]
+    fn dashboard_marks_only_the_cards_currently_serving() {
+        let mut snapshot = runtime::Snapshot::default();
+        snapshot.connection = runtime::ConnectionState::Connected;
+        snapshot.mining.inference_paused_gpus = vec![2];
+        snapshot.mining.preparing = true; // One card rebuilding must not hide hashing peers.
+        snapshot.mining.devices = (0..3)
+            .map(|index| runtime::DeviceSnapshot {
+                index,
+                hashrate_hs: if index == 2 { 0.0 } else { 5_000_000.0 },
+                ..Default::default()
+            })
+            .collect();
+        let view = super::adapt_snapshot(snapshot, &mut super::ClockBaselines::default());
+        assert_eq!(view.devices[0].activity, crate::tui::DeviceActivity::Mining);
+        assert_eq!(view.devices[1].activity, crate::tui::DeviceActivity::Mining);
+        assert_eq!(view.devices[2].activity, crate::tui::DeviceActivity::Inference);
+    }
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()

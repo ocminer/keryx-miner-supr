@@ -9,7 +9,7 @@
 //! landing in the middle of another card's staging can stall bring-up entirely (reported as
 //! "stops loading the GPUs and spins in a loop"). Holding the DECLARATION means the pool has
 //! nothing to challenge until the rig can actually answer; holding MINING keeps the walk from
-//! competing with staging for the same starved host. Off by default; purely opt-in.
+//! competing with staging for the same starved host. Enabled by `--wait-ready` or `--low-ram`.
 //!
 //! Semantics:
 //!  - Every GPU worker registers itself at thread start; every successful walk install marks
@@ -95,6 +95,16 @@ pub fn mark_ready(device_id: u64) {
     }
 }
 
+/// Before startup completes, an evicted walk is no longer ready. Once mining has started,
+/// model swaps must never close the latch or pause the other cards.
+pub fn mark_not_ready(device_id: u64) {
+    if let Ok(mut g) = sets().lock() {
+        if !OPENED.load(Ordering::Relaxed) {
+            g.1.remove(&device_id);
+        }
+    }
+}
+
 /// True while mining and the OPoI declaration must stay held. Cheap; called per batch attempt
 /// and per declaration pass.
 pub fn holds() -> bool {
@@ -102,10 +112,14 @@ pub fn holds() -> bool {
         return false;
     }
     let elapsed = started().elapsed();
-    let (missing, total): (Vec<u64>, usize) = match sets().lock() {
-        Ok(g) => (g.0.difference(&g.1).copied().collect(), g.0.len()),
+    // Keep readiness changes serialized with opening the latch: a concurrent uninstall must
+    // not invalidate our all-ready snapshot between checking it and publishing OPENED.
+    let ready_sets = match sets().lock() {
+        Ok(g) => g,
         Err(_) => return false,
     };
+    let missing: Vec<u64> = ready_sets.0.difference(&ready_sets.1).copied().collect();
+    let total = ready_sets.0.len();
     // No worker registered YET. Startup itself (config, pool connect, plugin init) can take a
     // long time on the RAM-starved rigs this flag targets, so HOLD — only after a generous
     // window conclude that no GPU backend produced a worker and open, loudly. This must NOT latch
@@ -186,12 +200,18 @@ mod tests {
         mark_ready(0);
         assert!(holds(), "one of two cards ready — must hold (grace window also active)");
         mark_ready(1);
+        mark_not_ready(0); // a second model's warmup evicts this walk during bring-up
+        assert!(!sets().lock().unwrap().1.contains(&0));
+        assert!(holds(), "an evicted startup walk must be installed again");
+        mark_ready(0);
         // Inside the 10 s startup grace the gate still holds even though all are ready.
         assert!(holds(), "startup grace must hold the gate");
         // After the grace it opens (simulate by waiting out the grace in test time: the grace
         // is wall-clock; keep the test fast by only checking the latch path via OPENED).
         OPENED.store(true, Ordering::Relaxed);
         assert!(!holds(), "open latch must stay open");
+        mark_not_ready(0);
+        assert!(!holds(), "later inference must not stop the other GPUs");
         mark_ready(1); // idempotent, no panic, no re-close
         assert!(!holds());
     }

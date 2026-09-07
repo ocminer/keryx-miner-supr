@@ -624,7 +624,9 @@ impl Drop for InferenceDrainGuard {
     }
 }
 
-pub fn pause_and_drain_for_inference(gpu: usize) -> Option<InferenceDrainGuard> {
+pub fn pause_and_drain_for_inference(
+    gpu: usize,
+) -> Result<InferenceDrainGuard, crate::inference_coord::DeferredReason> {
     set_inference_paused_on(gpu, true);
     let guard = InferenceDrainGuard(gpu);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -639,7 +641,7 @@ pub fn pause_and_drain_for_inference(gpu: usize) -> Option<InferenceDrainGuard> 
         }
         if std::time::Instant::now() >= deadline {
             log::error!("PoM Metal[gpu{}]: model install did not drain within 30s — refusing GPU inference", gpu);
-            return None;
+            return Err(crate::inference_coord::DeferredReason::InstallBusy);
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
@@ -648,12 +650,12 @@ pub fn pause_and_drain_for_inference(gpu: usize) -> Option<InferenceDrainGuard> 
         while Arc::strong_count(&miner) > 2 {
             if std::time::Instant::now() >= deadline {
                 log::error!("PoM Metal[gpu{}]: walk did not drain within 30s — refusing GPU inference", gpu);
-                return None;
+                return Err(crate::inference_coord::DeferredReason::WalkBusy);
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
-    Some(guard)
+    Ok(guard)
 }
 
 /// `--only-inference`: serve requests, barely mine. Same contract as the CUDA side.

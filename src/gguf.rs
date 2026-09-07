@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -67,19 +67,19 @@ pub struct GgufMeta {
     pub tensor_data_offset: u64,
 }
 
-fn read_u32(f: &mut File) -> Result<u32> {
+fn read_u32(f: &mut impl Read) -> Result<u32> {
     let mut b = [0u8; 4];
     f.read_exact(&mut b)?;
     Ok(u32::from_le_bytes(b))
 }
 
-fn read_u64(f: &mut File) -> Result<u64> {
+fn read_u64(f: &mut impl Read) -> Result<u64> {
     let mut b = [0u8; 8];
     f.read_exact(&mut b)?;
     Ok(u64::from_le_bytes(b))
 }
 
-fn read_string(f: &mut File) -> Result<String> {
+fn read_string(f: &mut impl Read) -> Result<String> {
     let len = read_u64(f)?;
     if len > 64 * 1024 * 1024 {
         bail!("GGUF: unreasonable string length {}", len);
@@ -91,13 +91,13 @@ fn read_string(f: &mut File) -> Result<String> {
 
 /// Skip (or, for `general.alignment`, capture) one metadata value of GGUF value type `vt`.
 /// Returns the value as u64 for the scalar integer types so the caller can read alignment.
-fn skip_value(f: &mut File, vt: u32) -> Result<Option<u64>> {
+fn skip_value(f: &mut (impl Read + Seek), vt: u32) -> Result<Option<u64>> {
     match vt {
-        0 | 1 => { f.seek(SeekFrom::Current(1))?; Ok(None) }         // u8 / i8
-        2 | 3 => { f.seek(SeekFrom::Current(2))?; Ok(None) }         // u16 / i16
+        0 | 1 => { f.seek_relative(1)?; Ok(None) }                  // u8 / i8
+        2 | 3 => { f.seek_relative(2)?; Ok(None) }                  // u16 / i16
         4 => Ok(Some(read_u32(f)? as u64)),                          // u32 (alignment candidate)
-        5 | 6 => { f.seek(SeekFrom::Current(4))?; Ok(None) }         // i32 / f32
-        7 => { f.seek(SeekFrom::Current(1))?; Ok(None) }             // bool
+        5 | 6 => { f.seek_relative(4)?; Ok(None) }                  // i32 / f32
+        7 => { f.seek_relative(1)?; Ok(None) }                      // bool
         8 => { read_string(f)?; Ok(None) }                           // string
         9 => {                                                       // array
             let elem_vt = read_u32(f)?;
@@ -111,7 +111,7 @@ fn skip_value(f: &mut File, vt: u32) -> Result<Option<u64>> {
                 _ => None,
             };
             if let Some(sz) = fixed {
-                f.seek(SeekFrom::Current(sz * n as i64))?;
+                f.seek_relative(sz * n as i64)?;
             } else {
                 for _ in 0..n {
                     skip_value(f, elem_vt)?;
@@ -120,7 +120,7 @@ fn skip_value(f: &mut File, vt: u32) -> Result<Option<u64>> {
             Ok(None)
         }
         10 => Ok(Some(read_u64(f)?)),                                // u64 (alignment candidate)
-        11 | 12 => { f.seek(SeekFrom::Current(8))?; Ok(None) }       // i64 / f64
+        11 | 12 => { f.seek_relative(8)?; Ok(None) }                // i64 / f64
         other => bail!("GGUF: unknown metadata value type {}", other),
     }
 }
@@ -128,6 +128,17 @@ fn skip_value(f: &mut File, vt: u32) -> Result<Option<u64>> {
 impl GgufMeta {
     /// Parse a GGUF v2/v3 header from the start of `f` (seeks to 0 first).
     pub fn read(f: &mut File) -> Result<Self> {
+        // Tokenizer metadata contains hundreds of thousands of short strings. Reading each
+        // length/token directly from File produced millions of tiny syscalls per readiness poll,
+        // starving Stratum of jobs, share ACKs and inference requests, especially on network disks.
+        let mut reader = BufReader::with_capacity(64 * 1024, f);
+        let result = Self::read_header(&mut reader);
+        // Preserve the caller-visible file position instead of leaving it at our read-ahead end.
+        reader.seek(SeekFrom::Current(0))?;
+        result
+    }
+
+    fn read_header(f: &mut (impl Read + Seek)) -> Result<Self> {
         f.seek(SeekFrom::Start(0))?;
         let magic = read_u32(f).context("GGUF: read magic")?;
         if magic != GGUF_MAGIC {
@@ -294,6 +305,13 @@ mod tests {
 
         let mut f = File::open(&path).unwrap();
         let meta = GgufMeta::read(&mut f).unwrap();
+        assert_eq!(f.stream_position().unwrap(), buf.len() as u64);
+        let unbuffered = GgufMeta::read_header(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(meta.tensor_data_offset, unbuffered.tensor_data_offset);
+        for (name, tensor) in &meta.tensors {
+            assert_eq!(tensor.offset, unbuffered.tensors[name].offset);
+            assert_eq!(tensor.nbytes, unbuffered.tensors[name].nbytes);
+        }
         assert_eq!(meta.tensors.len(), 2);
         assert_eq!(meta.tensors["a"].nbytes, 32); // 8 × f32
         assert_eq!(meta.tensors["a"].offset, 0);
@@ -306,5 +324,44 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn tokenizer_strings_are_buffered_without_changing_layout() {
+        struct CountingReader {
+            data: std::io::Cursor<Vec<u8>>,
+            reads: usize,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                self.data.read(bytes)
+            }
+        }
+        impl Seek for CountingReader {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(pos)
+            }
+        }
+        let mut data = Vec::new();
+        data.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes()); // no tensors needed for the metadata check
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&4u64.to_le_bytes());
+        data.extend_from_slice(b"test");
+        data.extend_from_slice(&9u32.to_le_bytes()); // array of strings
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&100_000u64.to_le_bytes());
+        for _ in 0..100_000 {
+            data.extend_from_slice(&3u64.to_le_bytes());
+            data.extend_from_slice(b"abc");
+        }
+        let expected_offset = (data.len() as u64).div_ceil(32) * 32;
+        let mut reader =
+            BufReader::with_capacity(64 * 1024, CountingReader { data: std::io::Cursor::new(data), reads: 0 });
+        let meta = GgufMeta::read_header(&mut reader).unwrap();
+        assert_eq!(meta.tensor_data_offset, expected_offset);
+        assert!(reader.get_ref().reads < 32, "not two disk reads per tokenizer token");
     }
 }

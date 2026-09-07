@@ -3,16 +3,14 @@ use libloading::{Library, Symbol};
 
 pub mod gguf;
 pub mod inference;
+pub mod inference_coord;
 pub mod integrity;
 pub mod keccak;
 pub mod models;
 #[cfg(any(
     all(feature = "pom-opencl", any(unix, windows)),
     all(
-        any(
-            all(feature = "pom-cuda", not(feature = "pom-opencl")),
-            all(target_os = "macos", feature = "pom-metal")
-        ),
+        any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")),
         any(unix, windows)
     )
 ))]

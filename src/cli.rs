@@ -78,7 +78,7 @@ pub struct Opt {
     #[clap(
         long = "low-ram",
         visible_alias = "save-ram",
-        help = "Load models onto GPUs ONE AT A TIME instead of all cards in parallel, so peak SYSTEM RAM ≈ one model (not N). Each card's index build + GGUF load pulls the weights through host RAM; parallel bring-up on many cards can OOM a low-RAM rig. Slower startup, much lower peak RAM.",
+        help = "Serialize GPU model staging and inference loads to reduce peak system RAM. Implies --wait-ready: mining and OPoI declaration begin after every card is set up. Slower startup, lower RAM and disk contention; serving remains on the GPU.",
         help_heading = "OPoI / Inference"
     )]
     pub low_ram: bool,

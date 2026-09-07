@@ -166,6 +166,33 @@ LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64 \
 
 Add `--cuda-device N` to run a single GPU, a tier flag (`--very-high`, …) to pin all cards to one tier, or `--force-model` to set a model per card (see [Model tiers](#model-tiers) below).
 
+### Inference on multi-GPU rigs
+
+On NVIDIA/CUDA, inference pauses and drains only the GPU serving the request. Other cards keep
+hashing and receiving new pool or solo templates. The serving card resumes on the current job when
+generation finishes. Its walk remains paused during generation/model changes to protect the shared
+model buffers. OpenCL/Metal retain their existing backend-wide pause.
+
+Use `--inference-cards 2` to restrict inference to CUDA ordinal 2; the other cards remain PoW-only.
+This works on identical-GPU rigs too. On mixed rigs, the allowed card(s) must be able to serve every
+advertised model. Ordinals refer to the GPUs visible to this process, so `CUDA_VISIBLE_DEVICES` can
+change the numbering. An explicit restriction also bounds failover; startup logs show the allowed set.
+
+For a rig with limited system RAM, use `--low-ram --no-resident-tree`. Low-RAM mode serializes model
+staging and inference loads and implies `--wait-ready`, holding mining and capability declaration
+until every card is set up. Slow installs and concurrent self-tests defer without withdrawing the
+model, demoting its tier, or moving inference to another card. A real load/generation failure still
+requires recovery before the model can be advertised.
+
+The Kimi-48B GGUF is about 28 GiB. A host with less RAM may stream it successfully but will have
+slower cold starts and reloads because the file cannot stay cached. Avoid `--resident-tree` on such
+hosts; it adds a much larger RAM requirement. The 30-second CUDA walk-drain guard is a GPU safety
+limit, not a model-loading deadline: an installer that already owns the card now returns busy
+immediately and is allowed to finish.
+
+Model-header checks use buffered reads and skip duplicate assigned models, keeping readiness polls
+from flooding the disk with tiny reads and delaying pool messages on multi-card rigs.
+
 ### Interactive Matrix dashboard
 
 When standard input, output, and error are all attached to a real terminal, the miner opens its

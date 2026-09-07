@@ -1979,6 +1979,7 @@ pub fn walk_drain_failed(device_id: u32) -> bool {
 /// restart loop reported from the field on 10 GB RTX 3080s.
 #[must_use = "a false result means the old walk still owns model memory; do not reload/free it"]
 pub fn uninstall_released(device_id: u32) -> bool {
+    crate::wait_ready::mark_not_ready(device_id as u64);
     let removed = match miners().lock() {
         Ok(mut g) => remove_device_entry(&mut g, device_id),
         Err(_) => None,
@@ -2201,7 +2202,7 @@ pub fn inference_paused_for(device_id: u32) -> bool {
 
 /// Devices whose mining model is currently being staged. The owner thread is recorded so the
 /// install-time inference self-test can enter the drain gate re-entrantly; a request on any other
-/// thread must wait until staging has either published the resident miner or unwound. Keeping this
+/// thread defers until staging has either published the resident miner or unwound. Keeping this
 /// state separate from `miners()` closes the empty-map window where inference previously concluded
 /// that a card was idle while `ensure_installed` was already allocating/loading on it.
 fn installing_devices() -> &'static Mutex<HashMap<u32, std::thread::ThreadId>> {
@@ -2219,7 +2220,7 @@ impl DeviceInstallGuard {
         let owner = std::thread::current().id();
         let mut installing = installing_devices().lock().unwrap_or_else(|p| p.into_inner());
         // This check and publication share one mutex with the drain-side observation. Thus either
-        // staging wins and inference waits, or inference raises the pause first and staging defers.
+        // staging wins and inference defers, or inference raises the pause first and staging defers.
         if inference_paused_for(device_id) || installing.contains_key(&device_id) {
             return None;
         }
@@ -2250,24 +2251,21 @@ impl Drop for InferenceDrainGuard {
     }
 }
 
-pub fn pause_and_drain_for_inference(gpu: usize) -> Option<InferenceDrainGuard> {
+pub fn pause_and_drain_for_inference(
+    gpu: usize,
+) -> Result<InferenceDrainGuard, crate::inference_coord::DeferredReason> {
     set_inference_paused_on(gpu, true);
     let guard = InferenceDrainGuard(gpu);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let current = std::thread::current().id();
-    loop {
-        let staged_by_other_thread = installing_devices()
-            .lock()
-            .map(|installing| installing.get(&(gpu as u32)).map(|owner| owner != &current).unwrap_or(false))
-            .unwrap_or(true);
-        if !staged_by_other_thread {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            log::error!("PoM[gpu{}]: model install did not drain within 30s — refusing GPU inference", gpu);
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
+    let staged_by_other_thread = installing_devices()
+        .lock()
+        .map(|installing| installing.get(&(gpu as u32)).map(|owner| owner != &current).unwrap_or(false))
+        .unwrap_or(true);
+    if staged_by_other_thread {
+        // An installer may itself need the inference lease we hold. Never wait on it here:
+        // release our pause/lease and let the install-time probe complete on its owning thread.
+        return Err(crate::inference_coord::DeferredReason::InstallBusy);
     }
     let resident = miners().lock().ok().and_then(|map| map.get(&(gpu as u32)).cloned());
     if let Some(miner) = resident {
@@ -2276,10 +2274,10 @@ pub fn pause_and_drain_for_inference(gpu: usize) -> Option<InferenceDrainGuard> 
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() || !wait_for_owner_count_at_most(&miner, 2, remaining) {
             log::error!("PoM[gpu{}]: walk did not drain within 30s — refusing to overlap GPU inference", gpu);
-            return None; // `guard` drops and clears the pause bit
+            return Err(crate::inference_coord::DeferredReason::WalkBusy); // guard clears the pause
         }
     }
-    Some(guard)
+    Ok(guard)
 }
 
 /// Transient GPU runtime fault classifier (upstream Keryx-Labs/keryx-miner@278098b): the
@@ -4151,9 +4149,13 @@ pub fn set_low_ram(on: bool) {
 pub fn low_ram() -> bool {
     LOW_RAM.load(Ordering::Relaxed)
 }
-fn load_lock() -> &'static Mutex<()> {
-    static L: OnceLock<Mutex<()>> = OnceLock::new();
-    L.get_or_init(|| Mutex::new(()))
+pub(crate) fn try_host_load(
+) -> Result<Option<crate::inference_coord::HostLoadPermit<'static>>, crate::inference_coord::DeferredReason> {
+    static GATE: OnceLock<crate::inference_coord::HostLoadGate> = OnceLock::new();
+    if !low_ram() {
+        return Ok(None);
+    }
+    GATE.get_or_init(Default::default).try_enter().map(Some).ok_or(crate::inference_coord::DeferredReason::HostLoadBusy)
 }
 
 pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
@@ -4181,20 +4183,19 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
         }
         return false;
     }
-    // Coordinate the complete staging transaction with inference. In particular, do not allow a
-    // generation to observe an empty resident map and start while llama/raw walk buffers are being
-    // allocated. A self-test invoked by this same staging thread is intentionally re-entrant in the
-    // drain path above; every other thread waits for this guard to drop.
-    let _install_guard = match DeviceInstallGuard::begin(device_id) {
-        Some(guard) => guard,
-        None => return false,
-    };
+    // Queued low-RAM installers must not claim a GPU or block a worker thread. The same permit
+    // covers background inference loads, and our own install-time probe can enter it reentrantly.
+    let Ok(_load_guard) = try_host_load() else { return false };
     // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
     LOADING.fetch_add(1, Ordering::Relaxed);
-    // --low-ram: one card's full model bring-up at a time (peak host RAM = one model, not N).
-    let _load_guard = if low_ram() { Some(load_lock().lock().unwrap_or_else(|p| p.into_inner())) } else { None };
+    struct LoadingGuard;
+    impl Drop for LoadingGuard {
+        fn drop(&mut self) {
+            LOADING.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let _loading = LoadingGuard;
     let ok = ensure_installed_inner(device_id, daa);
-    LOADING.fetch_sub(1, Ordering::Relaxed);
     ok
 }
 
@@ -4329,6 +4330,13 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             }
         }
     }
+    // Host index construction and waits above touch no GPU. Publish Installing only for the
+    // actual GPU transaction, with the inference pause check and publication under one lock.
+    let Some(_install_guard) = DeviceInstallGuard::begin(device_id) else { return false };
+    if is_installed(device_id) {
+        return true;
+    }
+
     // One CUDA-resident PoM worker per GPU. This avoids all workers contending for a single
     // GPU0-bound miner object while still sharing the host-side index across the process.
     //
@@ -4409,7 +4417,12 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // whichever card mines the tier — this covers mixed rigs (e.g. a 3070 mining Qwen while the big
     // card serves GLM). The result is cached per model, so only the first card per model generates; a
     // model that fails is withdrawn from ai:cap and NOT mined on any card. (`inference_gpu` above.)
-    if !crate::slm::run_inference_self_test(&model_id, inference_gpu) {
+    let probe = crate::slm::run_inference_self_test(&model_id, inference_gpu);
+    if let crate::slm::SelfTestOutcome::Deferred(reason) = probe {
+        log::debug!("PoM[gpu{}]: inference proof deferred ({}) — keeping tier and route unchanged", device_id, reason);
+        return false;
+    }
+    if probe == crate::slm::SelfTestOutcome::Failed && !crate::slm::model_serveable(&model_id) {
         // The tier's model could not be SERVED (inference self-test failed) — usually the serving GPU
         // can't fit this tier alongside the model it already hosts (mixed rig), too little VRAM, a bad
         // file, or a GPU fault. We never mine a tier we cannot serve. DEMOTE to the next smaller
@@ -4677,6 +4690,36 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serving_gpu_pause_is_scoped_and_install_contention_defers() {
+        const SERVING: u32 = 60;
+        const PEER: u32 = 61;
+        let install = DeviceInstallGuard::begin(SERVING).unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                assert!(matches!(
+                    pause_and_drain_for_inference(SERVING as usize),
+                    Err(crate::inference_coord::DeferredReason::InstallBusy)
+                ));
+                assert!(!inference_paused_for(SERVING));
+                assert!(!inference_paused_for(PEER));
+            })
+            .join()
+            .unwrap();
+        });
+        // Its own install-time probe may enter reentrantly without waiting on itself.
+        let pause = pause_and_drain_for_inference(SERVING as usize).unwrap();
+        assert!(inference_paused_for(SERVING));
+        assert!(!inference_paused_for(PEER));
+        assert!(DeviceInstallGuard::begin(SERVING).is_none());
+        let peer = DeviceInstallGuard::begin(PEER).unwrap();
+        drop(peer);
+        drop(pause);
+        drop(install);
+        assert!(!inference_paused_for(SERVING));
+        assert!(DeviceInstallGuard::begin(SERVING).is_some());
+    }
 
     #[test]
     fn nested_inference_pause_does_not_resume_early() {

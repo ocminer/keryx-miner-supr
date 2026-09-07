@@ -121,6 +121,8 @@ pub struct MiningSnapshot {
     pub sample_sequence: u64,
     pub preparing: bool,
     pub inference_paused: bool,
+    /// Exact CUDA cards paused for inference. `inference_paused` denotes the whole rig.
+    pub inference_paused_gpus: Vec<u32>,
     pub total_hashrate_hs: f64,
     pub average_60s_hs: Option<f64>,
     pub hashrate_history_hs: Vec<f64>,
@@ -355,6 +357,7 @@ struct RuntimeStats {
     inference_last_tokens: AtomicU64,
     inference_pause_started_ms: AtomicU64,
     inference_pause_total_ms: AtomicU64,
+    inference_pauses: Mutex<std::collections::BTreeMap<Option<usize>, usize>>,
     inference_serveable_models: AtomicU64,
     inference_staging_error: AtomicBool,
 
@@ -462,6 +465,7 @@ impl RuntimeStats {
             inference_last_tokens: AtomicU64::new(UNSET),
             inference_pause_started_ms: AtomicU64::new(UNSET),
             inference_pause_total_ms: AtomicU64::new(0),
+            inference_pauses: Mutex::new(std::collections::BTreeMap::new()),
             inference_serveable_models: AtomicU64::new(0),
             inference_staging_error: AtomicBool::new(false),
             escrow_enabled: AtomicBool::new(false),
@@ -969,19 +973,50 @@ pub fn clear_connection_inference_queue(generation: u64) -> bool {
 }
 
 pub fn inference_pause_started() {
-    let stats = hub();
-    stats.inference_paused.store(true, Ordering::Relaxed);
-    let _ =
-        stats.inference_pause_started_ms.compare_exchange(UNSET, stats.now_ms(), Ordering::Relaxed, Ordering::Relaxed);
+    update_inference_pause(None, true);
 }
 
 pub fn inference_pause_ended() {
+    update_inference_pause(None, false);
+}
+
+fn update_inference_pause(gpu: Option<usize>, started: bool) {
     let stats = hub();
-    stats.inference_paused.store(false, Ordering::Relaxed);
-    let started = stats.inference_pause_started_ms.swap(UNSET, Ordering::Relaxed);
-    if started != UNSET {
-        stats.inference_pause_total_ms.fetch_add(stats.now_ms().saturating_sub(started), Ordering::Relaxed);
+    let mut pauses = stats.inference_pauses.lock().unwrap_or_else(|p| p.into_inner());
+    if started {
+        *pauses.entry(gpu).or_default() += 1;
+        let _ = stats.inference_pause_started_ms.compare_exchange(
+            UNSET,
+            stats.now_ms(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    } else if let Some(count) = pauses.get_mut(&gpu) {
+        *count -= 1;
+        if *count == 0 {
+            pauses.remove(&gpu);
+        }
     }
+    stats.inference_paused.store(pauses.contains_key(&None), Ordering::Relaxed);
+    if pauses.is_empty() {
+        let since = stats.inference_pause_started_ms.swap(UNSET, Ordering::Relaxed);
+        if since != UNSET {
+            stats.inference_pause_total_ms.fetch_add(stats.now_ms().saturating_sub(since), Ordering::Relaxed);
+        }
+    }
+}
+
+pub struct GpuInferencePause(Option<usize>);
+
+impl Drop for GpuInferencePause {
+    fn drop(&mut self) {
+        update_inference_pause(self.0, false);
+    }
+}
+
+pub fn begin_gpu_inference_pause(gpu: Option<usize>) -> GpuInferencePause {
+    update_inference_pause(gpu, true);
+    GpuInferencePause(gpu)
 }
 
 pub fn set_inference_model_status(
@@ -1266,6 +1301,11 @@ pub fn try_snapshot() -> Option<Snapshot> {
         5 => EscrowStatus::Degraded,
         _ => EscrowStatus::Disabled,
     };
+    let pauses = stats.inference_pauses.lock().unwrap_or_else(|p| p.into_inner());
+    let paused_gpus: Vec<u32> = pauses.keys().filter_map(|gpu| gpu.and_then(|n| u32::try_from(n).ok())).collect();
+    let all_paused = pauses.contains_key(&None)
+        || stats.inference_paused.load(Ordering::Relaxed)
+        || (!devices.is_empty() && devices.iter().all(|d| paused_gpus.contains(&d.index)));
     let pause_total = stats.inference_pause_total_ms.load(Ordering::Relaxed).saturating_add(
         load_optional_u64(&stats.inference_pause_started_ms).map(|started| now_ms.saturating_sub(started)).unwrap_or(0),
     );
@@ -1287,7 +1327,8 @@ pub fn try_snapshot() -> Option<Snapshot> {
         mining: MiningSnapshot {
             sample_sequence: stats.mining_sample_sequence.load(Ordering::Relaxed),
             preparing: stats.mining_preparing.load(Ordering::Relaxed),
-            inference_paused: stats.inference_paused.load(Ordering::Relaxed),
+            inference_paused: all_paused,
+            inference_paused_gpus: paused_gpus,
             total_hashrate_hs: f64::from_bits(stats.total_hashrate_bits.load(Ordering::Relaxed)),
             average_60s_hs,
             hashrate_history_hs: recent_rates,
@@ -1411,6 +1452,27 @@ mod tests {
     // Serialize only those cases so one test's best-effort snapshot lock cannot make another test's
     // deliberately non-blocking event publication look as though production attribution failed.
     static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn device_pause_preserves_peer_status_and_nested_accounting() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let old_devices = super::hub().devices.read().unwrap().clone();
+        *super::hub().devices.write().unwrap() = (0..3)
+            .map(|index| super::DeviceSnapshot { index, hashrate_hs: 5_000_000.0, ..Default::default() })
+            .collect();
+        let outer = super::begin_gpu_inference_pause(Some(2));
+        let inner = super::begin_gpu_inference_pause(Some(2));
+        let second = super::begin_gpu_inference_pause(Some(1));
+        let snapshot = read_snapshot();
+        assert!(!snapshot.mining.inference_paused);
+        assert_eq!(snapshot.mining.inference_paused_gpus, vec![1, 2]);
+        drop(inner);
+        drop(second);
+        assert_eq!(read_snapshot().mining.inference_paused_gpus, vec![2]);
+        drop(outer);
+        assert!(read_snapshot().mining.inference_paused_gpus.is_empty());
+        *super::hub().devices.write().unwrap() = old_devices;
+    }
 
     fn enter_global_test() -> MutexGuard<'static, ()> {
         TEST_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())

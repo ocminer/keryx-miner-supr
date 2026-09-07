@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokenizers::Tokenizer;
 
+pub use crate::inference_coord::{DeferredReason, InferenceError, SelfTestOutcome};
 use crate::models::{ModelFormat, ModelSpec};
 
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
@@ -1390,21 +1391,6 @@ fn bounded_deadline_ms(deadline_ms: u64) -> u64 {
     }
 }
 
-/// Claim one exact card. Used by a self-test which must prove the same `(model, gpu)` route it
-/// records, rather than being silently migrated by the policy router.
-fn acquire_specific_inference_card(gpu: usize, deadline_ms: u64) -> Option<InferenceLease> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bounded_deadline_ms(deadline_ms));
-    loop {
-        if try_claim_card(gpu) {
-            return Some(InferenceLease { gpu });
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-}
-
 /// Measured tokens/sec per card — populated on the first real generation on each card
 /// (`record_card_toks`), so the `Speed` policy ranks on a MEASURED number rather than a synthetic
 /// probe ("measure, don't proxy"). Until a card has a measurement it ranks by the total-VRAM proxy.
@@ -1492,15 +1478,23 @@ fn card_assigned_model_bytes(gpu: usize) -> u64 {
 }
 
 /// CUDA ordinals eligible to serve `model_id`, restricted by `--inference-cards`. Preference:
-///   1. Walk cards whose ASSIGNED tier == `model_id` (zero-dup reuse — the model is already this
+///   1. Proven serving routes, including a healthy host whose walk is temporarily being rebuilt.
+///   2. Walk cards whose ASSIGNED tier == `model_id` (zero-dup reuse — the model is already this
 ///      card's mining tier, so inference needs no extra copy beyond pausing that card's walk).
-///   2. If none match by assignment (e.g. a chat request for a tier no card mines), ALL allowed
+///   3. If none match by assignment (e.g. a chat request for a tier no card mines), ALL allowed
 ///      walk cards (the model is a declared tier; inference evicts that card's walk anyway — this
 ///      is the "fits free VRAM" fallback in practice).
 /// Single-GPU / no-CUDA collapses to `[inference_gpu_ordinal()]` so behavior is unchanged.
 fn eligible_cards(model_id: &[u8; 32]) -> Vec<usize> {
     #[cfg(feature = "pom-cuda")]
     {
+        // A proven inference engine stays eligible while its walk is being rebuilt. Restricting
+        // proofs to walk_devices() made a temporary uninstall send the next request to an unproven
+        // peer, evicting another full model even though the established serving host was healthy.
+        let proven = proven_route_gpus(model_id);
+        if !proven.is_empty() {
+            return proven;
+        }
         let restrict = inference_cards_restrict();
         let allowed = |g: usize| restrict.is_empty() || restrict.contains(&g);
         let cards: Vec<usize> =
@@ -1696,6 +1690,15 @@ pub fn inference_gpu_ordinal() -> usize {
             return restrict_inference_gpu(n);
         }
     }
+    // Apply explicit restrictions BEFORE selection/logging. The allowed card can still be
+    // staging and absent from walk_devices(); that does not authorize a move to a mining peer.
+    #[cfg(feature = "pom-cuda")]
+    {
+        let allowed = inference_cards_restrict();
+        if !allowed.is_empty() {
+            return biggest_cuda_gpu_within(&allowed).unwrap_or(allowed[0]);
+        }
+    }
     // OpenCL/Vulkan owns one process-wide inference engine and records it as one logical route;
     // physical placement is tracked separately by pom_opencl's full-PCI mapping. Never let an
     // unrelated NVIDIA card discovered via nvidia-smi change this logical key on a mixed host.
@@ -1750,6 +1753,13 @@ pub fn inference_gpu_for_model(model_id: &[u8; 32]) -> usize {
             }
         }
 
+        // Keep an established serving host stable while peers install/uninstall. Choosing from
+        // the changing walk map made identical-VRAM rigs repeatedly load the model on new cards.
+        let proven = proven_route_gpus(model_id);
+        if let Some(&gpu) = proven.first() {
+            return gpu;
+        }
+
         // During mixed-rig startup the walk map is still empty, but per-device mining models are
         // already known. Prefer a card actually assigned this exact model instead of sending every
         // tier's warmer to the globally-largest GPU. Apart from wasting VRAM, the old choice could
@@ -1757,11 +1767,7 @@ pub fn inference_gpu_for_model(model_id: &[u8; 32]) -> usize {
         // untested. Explicit per-process isolation keeps its historical own-card behavior.
         #[cfg(feature = "pom-cuda")]
         if !NO_SHARED_INFERENCE.load(std::sync::atomic::Ordering::Relaxed) {
-            let mut candidates: Vec<usize> =
-                crate::pom_gpu::walk_devices().into_iter().map(|gpu| gpu as usize).collect();
-            if candidates.is_empty() {
-                candidates = cli_cuda_devices();
-            }
+            let mut candidates = cli_cuda_devices();
             if candidates.is_empty() {
                 candidates = crate::pom_gpu::query_all_gpus_vram().into_iter().map(|(gpu, _)| gpu as usize).collect();
             }
@@ -1804,16 +1810,7 @@ fn parse_cuda_devices<I: IntoIterator<Item = String>>(args: I) -> Vec<usize> {
 /// ordinal. Logged ONCE per chosen ordinal: this is called from the staging retry loop, and logging
 /// unconditionally produced a line every second for as long as staging kept failing.
 fn biggest_cuda_gpu_within(pool: &[usize]) -> Option<usize> {
-    let mut best: Option<(usize, u64)> = None;
-    for (i, mib) in gpu_mem_mib("memory.total") {
-        if !pool.is_empty() && !pool.contains(&i) {
-            continue;
-        }
-        if best.map_or(true, |(_, m)| mib > m) {
-            best = Some((i, mib));
-        }
-    }
-    let (ord, _) = best?;
+    let ord = largest_allowed_gpu(pool, &gpu_mem_mib("memory.total"))?;
     if ord != 0 {
         static LOGGED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
             std::sync::OnceLock::new();
@@ -1827,6 +1824,14 @@ fn biggest_cuda_gpu_within(pool: &[usize]) -> Option<usize> {
         }
     }
     Some(ord)
+}
+
+fn largest_allowed_gpu(pool: &[usize], memory: &std::collections::HashMap<usize, u64>) -> Option<usize> {
+    memory
+        .iter()
+        .filter(|(gpu, _)| pool.is_empty() || pool.contains(gpu))
+        .max_by(|(a, am), (b, bm)| am.cmp(bm).then_with(|| b.cmp(a)))
+        .map(|(&gpu, _)| gpu)
 }
 
 /// Candle device used only by the CUDA readiness probe and dormant legacy models. Active H6
@@ -2031,6 +2036,46 @@ fn self_test_failures() -> &'static RwLock<std::collections::HashMap<SelfTestKey
 }
 
 const SELF_TEST_FAILURE_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn probe_flights() -> &'static crate::inference_coord::ProbeFlights {
+    static FLIGHTS: OnceLock<crate::inference_coord::ProbeFlights> = OnceLock::new();
+    FLIGHTS.get_or_init(Default::default)
+}
+
+/// A probe never waits while holding a peer's install transaction. Busy callers unwind and retry
+/// after the owner progresses. The flight permit has no timeout: a slow load keeps its one owner.
+fn probe_exact_inference_route(model_id: &[u8; 32], gpu: usize) -> SelfTestOutcome {
+    probe_exact_inference_route_with(model_id, gpu, || {
+        try_load_and_run_inference_on(gpu, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS)
+    })
+}
+
+fn probe_exact_inference_route_with(
+    model_id: &[u8; 32],
+    gpu: usize,
+    generate: impl FnOnce() -> std::result::Result<String, InferenceError>,
+) -> SelfTestOutcome {
+    let Some(_probe) = probe_flights().try_enter(*model_id, gpu) else {
+        return SelfTestOutcome::Deferred(DeferredReason::ProbeBusy);
+    };
+    if !try_claim_card(gpu) {
+        return SelfTestOutcome::Deferred(DeferredReason::CardBusy);
+    }
+    let _lease = InferenceLease { gpu };
+    if model_serveable_on(model_id, gpu) {
+        return SelfTestOutcome::Passed;
+    }
+    match generate() {
+        Ok(text) if current_probe_passed(Some(&text)) && model_serveable_on(model_id, gpu) => SelfTestOutcome::Passed,
+        Err(InferenceError::Deferred(reason)) => SelfTestOutcome::Deferred(reason),
+        _ => {
+            // Publish failure while still owning the card. A later successful probe must not be
+            // overwritten by a previous caller's delayed bookkeeping after it released the lease.
+            record_unserveable_on(model_id, gpu);
+            SelfTestOutcome::Failed
+        }
+    }
+}
 
 /// True once `model_id` PASSED its inference self-test on this rig and has not since been withdrawn.
 /// This is the gate for both declaring the model to the pool and mining its tier.
@@ -2334,17 +2379,17 @@ pub fn invalidate_inference_routes_on_gpu(gpu: usize, reason: &str) {
 /// Run ONE tiny inference on `gpu` to prove `model_id` can actually serve OPoI before we declare or
 /// mine its tier. Caches the outcome. PASS → `mark_model_available` (declarable + mineable); FAIL →
 /// `mark_model_unavailable` (withdrawn from ai:cap; the mining gate then refuses to grind a tier we
-/// cannot serve). Budgeted by nature: a warm short generation is ~1-2 s; a model that needs far
-/// longer would miss the on-chain service window anyway, so slow/empty == not serveable.
-pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
+/// cannot serve). Cold load/coordination time is not a verdict on generation speed: Deferred
+/// keeps the existing assignment intact and retries after the operation owning the card finishes.
+pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> SelfTestOutcome {
     if !inference_card_allowed(gpu) {
         log::warn!("OPoI self-test: GPU {} is excluded by --inference-cards; probe refused", gpu);
-        return false;
+        return SelfTestOutcome::Failed;
     }
     if let Ok(m) = self_test_state().read() {
         if let Some(&passed) = m.get(&(*model_id, gpu)) {
             if passed && !model_is_unavailable(model_id) {
-                return true;
+                return SelfTestOutcome::Passed;
             }
             if !passed {
                 let still_cooling_down = self_test_failures()
@@ -2354,7 +2399,7 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
                     .map(|at| at.elapsed() < SELF_TEST_FAILURE_RETRY)
                     .unwrap_or(false);
                 if still_cooling_down {
-                    return false;
+                    return SelfTestOutcome::Deferred(DeferredReason::RetryBackoff);
                 }
             }
             // A later global withdrawal invalidated the cached success. Re-run a real generation
@@ -2376,44 +2421,28 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
             "OPoI self-test: model id not registered in the supported lineup yet (startup ordering) — \
              deferring the probe, will retry next staging cycle."
         );
-        return false;
+        return SelfTestOutcome::Deferred(DeferredReason::ModelNotRegistered);
     }
-    log::info!(
+    log::debug!(
         "OPoI self-test: probing '{}' on GPU {} — a model must prove it can generate before we \
          declare/mine its tier (the network exists to serve inference).",
         name,
         gpu
     );
     let t0 = std::time::Instant::now();
-    // Self-tests participate in the same per-card lease as live serving. Without this, parallel GPU
-    // bring-up can run two model swaps on one card and clear the non-refcounted pause bit too early.
-    let Some(_lease) = acquire_specific_inference_card(gpu, DEFAULT_INFERENCE_DEADLINE_MS) else {
-        // Busy is not a capability verdict. Do not cache/withdraw a route merely because another
-        // legitimate inference held the card during startup; the next staging cycle will retry.
-        log::warn!("OPoI self-test: GPU {} remained busy for the probe deadline — deferring", gpu);
-        return false;
-    };
-    let out = {
-        // A previous waiter may have completed the same probe while we waited for the card.
-        if let Ok(m) = self_test_state().read() {
-            if !model_is_unavailable(model_id) {
-                if let Some(&passed) = m.get(&(*model_id, gpu)) {
-                    if passed {
-                        return true;
-                    }
-                }
-            }
-        }
-        load_and_run_inference_on(gpu, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS)
-    };
-    drop(_lease);
+    let outcome = probe_exact_inference_route(model_id, gpu);
+    if let SelfTestOutcome::Deferred(reason) = outcome {
+        log::debug!("OPoI self-test: '{}' on GPU {} deferred ({}) — capability unchanged", name, gpu, reason);
+        return outcome;
+    }
     let secs = t0.elapsed().as_secs_f64();
     // Every successful backend publishes its own route proof before returning. Do not publish a
     // second time here: a subprocess can exit and have its monitor invalidate the proof between the
     // backend return and this coordinator, and a late unconditional write would resurrect a dead
     // route permanently. A non-empty response counts only while the backend-owned proof survives.
-    let initial_passed = current_probe_passed(out.as_deref()) && model_serveable_on(model_id, gpu);
+    let initial_passed = outcome == SelfTestOutcome::Passed;
     let mut passed = initial_passed;
+    let mut deferred_alternate = None;
     // ── INFERENCE-HOST FAILOVER ──
     // A failed probe on the DESIGNATED host must not condemn the model (and with it the whole
     // rig: withdrawal → every card demotes/halts → zero declared models → mining suspended).
@@ -2446,10 +2475,12 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
                 "OPoI self-test: '{}' failed on GPU {} — FAILING OVER: retrying the probe on GPU {}                  (a healthy alternate host keeps the rig mining).", name, gpu, alt
             );
             let t1 = std::time::Instant::now();
-            let out2 = acquire_specific_inference_card(alt, DEFAULT_INFERENCE_DEADLINE_MS).and_then(|_lease| {
-                load_and_run_inference_on(alt, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS)
-            });
-            if matches!(&out2, Some(t) if !t.trim().is_empty()) && set_inference_override_if_proven(model_id, alt) {
+            let out2 = probe_exact_inference_route(model_id, alt);
+            if let SelfTestOutcome::Deferred(reason) = out2 {
+                deferred_alternate = Some(reason);
+                continue;
+            }
+            if out2 == SelfTestOutcome::Passed && set_inference_override_if_proven(model_id, alt) {
                 log::warn!(
                     "OPoI self-test: '{}' PASSED on GPU {} in {:.1}s — inference host MOVED {} → {}                      (GPU {} failed its probe; it keeps mining PoM, GPU {} now serves).",
                     name, alt, t1.elapsed().as_secs_f64(), gpu, alt, gpu, alt
@@ -2459,9 +2490,6 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
             }
             log::warn!("OPoI self-test: '{}' also failed on GPU {} ({:.1}s).", name, alt, t1.elapsed().as_secs_f64());
         }
-    }
-    if !initial_passed {
-        record_unserveable_on(model_id, gpu);
     }
     if passed {
         log::info!("OPoI self-test: '{}' PASSED in {:.1}s — serveable; its tier will be declared + mined.", name, secs);
@@ -2476,6 +2504,8 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
             secs,
             gpu
         );
+    } else if let Some(reason) = deferred_alternate {
+        return SelfTestOutcome::Deferred(reason);
     } else {
         mark_model_unavailable(model_id, "inference_self_test_failed");
         log::warn!(
@@ -2487,7 +2517,11 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> bool {
             secs
         );
     }
-    passed
+    if passed || model_serveable(model_id) {
+        SelfTestOutcome::Passed
+    } else {
+        SelfTestOutcome::Failed
+    }
 }
 
 /// Durable startup proof coordinator. Capability/job gates intentionally remain closed until a
@@ -2503,19 +2537,24 @@ pub fn warm_inference_route(model_id: [u8; 32], initial_gpu: usize) {
         // A failed probe may establish a model-specific failover override. Resolve placement every
         // round so the durable warmer follows that proven card instead of repeatedly retrying the
         // failed original and evicting/reloading both GPUs forever.
-        let passed = run_inference_self_test(&model_id, target_gpu);
-        if passed {
+        let outcome = run_inference_self_test(&model_id, target_gpu);
+        if outcome == SelfTestOutcome::Passed {
             delay = std::time::Duration::from_secs(30);
+        } else if let SelfTestOutcome::Deferred(reason) = outcome {
+            log::debug!("OPoI startup proof on GPU {} deferred ({})", target_gpu, reason);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            // Keep this placement: contention is not a reason to select or reload another GPU.
+            continue;
         } else {
             log::warn!(
-                "OPoI startup proof for model {:.8} on GPU {} failed/deferred; retrying in {}s",
+                "OPoI startup proof for model {:.8} on GPU {} failed; retrying in {}s",
                 hex::encode(model_id),
                 target_gpu,
                 delay.as_secs()
             );
         }
         std::thread::sleep(delay);
-        if !passed {
+        if outcome != SelfTestOutcome::Passed {
             delay = (delay * 2).min(std::time::Duration::from_secs(300));
         }
         target_gpu = inference_gpu_for_model(&model_id);
@@ -2593,7 +2632,7 @@ fn model_is_unavailable(model_id: &[u8; 32]) -> bool {
     unavailable_models().read().unwrap().contains(model_id)
 }
 
-pub fn loaded_model_ids() -> Vec<[u8; 32]> {
+pub fn loaded_model_ids() -> Vec<[u8; 32]>{
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let mut ids: Vec<[u8; 32]> = specs
         .iter()
@@ -2604,9 +2643,12 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]> {
     // (its dir's `.ok` present) and not already listed. pom-cuda only — the map is empty elsewhere.
     #[cfg(feature = "pom-cuda")]
     for (mid, gguf) in crate::pom_gpu::assigned_models() {
+        if ids.contains(&mid) || model_is_unavailable(&mid) {
+            continue;
+        }
         let marker_ready = std::path::Path::new(&gguf).parent().map_or(false, |d| d.join(".ok").exists());
         let ready = marker_ready && crate::gguf::is_complete_file(std::path::Path::new(&gguf));
-        if ready && !ids.contains(&mid) && !model_is_unavailable(&mid) {
+        if ready {
             ids.push(mid);
         }
     }
@@ -2677,12 +2719,30 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
 /// in-process llama.cpp engine branch is card-aware (its own resident model per card + per-card
 /// generate); the candle/vk fallbacks remain the single-card dormant path.
 pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
+    try_load_and_run_inference_on(gpu, model_id, prompt, max_tokens).ok()
+}
+
+/// Typed serving entry point. Coordination/staging delays are retryable and do not invalidate
+/// capability. Callers own the exact card lease; the backend owns the mining pause through return.
+pub fn try_load_and_run_inference_on(
+    gpu: usize,
+    model_id: &[u8; 32],
+    prompt: &str,
+    max_tokens: usize,
+) -> std::result::Result<String, InferenceError> {
+    if !inference_card_allowed(gpu) {
+        log::warn!("OPoI: refusing inference on excluded GPU {}", gpu);
+        return Err(InferenceError::Failed);
+    }
     if let Err(reason) = validate_inference_request(prompt, max_tokens, DEFAULT_INFERENCE_DEADLINE_MS) {
         log::warn!("OPoI: rejected inference request for GPU {}: {}", gpu, reason);
-        return None;
+        return Err(InferenceError::Failed);
     }
     let specs = *SUPPORTED_SPECS.read().unwrap();
-    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let spec = specs
+        .iter()
+        .find(|s| &s.model_id == model_id)
+        .ok_or(InferenceError::Deferred(DeferredReason::ModelNotRegistered))?;
 
     // Race guard: never attempt inference (or a card model-swap that uninstalls the walk) for a
     // model whose GGUF is not fully on disk yet. The initial background prefetch may still be
@@ -2693,12 +2753,19 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
             "OPoI: model '{}' not fully staged yet — skipping inference (avoids a load race); will serve once ready.",
             spec.name
         );
-        record_unserveable_on(model_id, gpu);
-        if !any_proven_route(model_id) {
-            mark_model_unavailable(model_id, "model_file_incomplete");
-        }
-        return None;
+        return Err(InferenceError::Deferred(DeferredReason::ModelIncomplete));
     }
+
+    // Share the worker's host-RAM envelope. A worker-owned self-test re-enters its permit;
+    // background warmers and live requests defer while a different thread is staging.
+    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    let _host_load = crate::pom_gpu::try_host_load().map_err(InferenceError::Deferred)?;
+
+    // Include the drain in frontend pause accounting, not just the generation after it succeeds.
+    // Busy admission unwinds this guard immediately without reporting a failed inference.
+    let _pause_stats = crate::runtime_stats::begin_gpu_inference_pause(
+        if cfg!(all(feature = "pom-cuda", not(feature = "pom-opencl"))) { Some(gpu) } else { None },
+    );
 
     // GPU inference and the possession walk must never overlap on the serving card. Publishing a
     // stopped job is not itself a completion barrier: a worker may already be inside a long kernel.
@@ -2709,15 +2776,9 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
         all(feature = "pom-cuda", not(feature = "pom-opencl")),
         all(target_os = "macos", feature = "pom-metal"),
     ))]
-    let _walk_drain = match crate::pom_gpu::pause_and_drain_for_inference(gpu) {
-        Some(guard) => guard,
-        None => return None,
-    };
+    let _walk_drain = crate::pom_gpu::pause_and_drain_for_inference(gpu).map_err(InferenceError::Deferred)?;
     #[cfg(feature = "pom-opencl")]
-    let _walk_drain = match crate::pom_opencl::pause_and_drain_for_inference(gpu) {
-        Some(guard) => guard,
-        None => return None,
-    };
+    let _walk_drain = crate::pom_opencl::pause_and_drain_for_inference(gpu).map_err(InferenceError::Deferred)?;
 
     // Prefer a running llama.cpp llama-server: AMD always (candle has no AMD-GPU backend; Vulkan
     // server), NVIDIA when a CUDA llama-server is bundled/env-pointed (Phase 1 of candle-
@@ -2757,7 +2818,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                         "OPoI: GPU {} walk did not drain; refusing to free/swap llama weights underneath it",
                         gpu
                     );
-                    return None;
+                    return Err(InferenceError::Deferred(DeferredReason::WalkBusy));
                 }
                 if !crate::llama_engine::ensure_loaded_on(&gguf, gpu) {
                     log::warn!(
@@ -2768,8 +2829,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
             }
             if !exact_server_ready && crate::llama_engine::active_for(&gguf, gpu) {
                 let t0 = std::time::Instant::now();
-                // --only-inference: yield the card to the request. Returns None (no-op) on a normal rig,
-                // where mining continues through the generation as it always has.
+                // The serving card's drain guard remains held throughout generation.
                 if let Some(text) = crate::llama_engine::generate_for(gpu, &gguf, prompt, max_tokens) {
                     let secs = t0.elapsed().as_secs_f64();
                     if secs > 0.0 {
@@ -2781,7 +2841,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                         // truncated <think> block is not an answer and must never enable ai:cap.
                         record_serveable_on(model_id, gpu);
                         mark_model_available(model_id, "generation_success");
-                        return Some(clean);
+                        return Ok(clean);
                     }
                     log::warn!(
                     "SlmEngine: in-process llama output on GPU {} was empty after stripping think tags — trying the next engine.",
@@ -2838,7 +2898,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                     if !clean.trim().is_empty() {
                         record_serveable_on(model_id, gpu);
                         mark_model_available(model_id, "llama_vk_generation_success");
-                        return Some(clean);
+                        return Ok(clean);
                     }
                     log::warn!("SlmEngine: in-process llama-vk output was empty after stripping think tags.");
                 }
@@ -2859,11 +2919,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                 {
                     if !crate::pom_gpu::uninstall_released(gpu as u32) {
                         log::error!("OPoI: GPU {} walk remained referenced; refusing llama-server model swap", gpu);
-                        record_unserveable_on(model_id, gpu);
-                        if !any_proven_route(model_id) {
-                            mark_model_unavailable(model_id, "walk_drain_failed");
-                        }
-                        return None;
+                        return Err(InferenceError::Deferred(DeferredReason::WalkBusy));
                     }
                     crate::llama_engine::unload_for_gpu(gpu);
                 }
@@ -2890,7 +2946,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                             );
                             crate::llama_vulkan::stop();
                             crate::pom_opencl::release_provisional_dedication_after_server_stop();
-                            return None;
+                            return Err(InferenceError::Failed);
                         }
                         if !crate::llama_vulkan::commit_route_success(&gguf, gpu, model_id) {
                             // The response itself is still valid for this request, but its child
@@ -2900,7 +2956,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                                 "SlmEngine: llama-server answered, but its exact process was no longer live at route-proof commit"
                             );
                         }
-                        return Some(clean);
+                        return Ok(clean);
                     }
                     log::warn!("SlmEngine: llama-server output was empty after stripping think tags.");
                 }
@@ -2913,7 +2969,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
 
     // catch_unwind prevents any internal panic (cudarc, candle, OOM…) from permanently
     // poisoning ENGINE. Without this, one panic bricks inference for the entire session.
-    let result = std::panic::catch_unwind(|| {
+    let result = std::panic::catch_unwind(|| -> std::result::Result<Option<String>, InferenceError> {
         let mut guard = match ENGINE.lock() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -2935,7 +2991,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
             #[cfg(any(feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
             if !crate::pom_gpu::uninstall_released(gpu as u32) {
                 log::error!("OPoI: GPU {} walk did not drain; legacy inference load deferred", gpu);
-                return None;
+                return Err(InferenceError::Deferred(DeferredReason::WalkBusy));
             }
             *guard = None;
             log::info!("SlmEngine: legacy inference device active (CUDA:{})", gpu);
@@ -2945,13 +3001,13 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                 }
                 Err(e) => {
                     log::error!("SlmEngine: failed to load '{}': {}", spec.name, e);
-                    return None;
+                    return Ok(None);
                 }
             }
         }
 
-        let engine = guard.as_mut()?;
-        match generate(engine, prompt, max_tokens) {
+        let engine = guard.as_mut().ok_or(InferenceError::Failed)?;
+        Ok(match generate(engine, prompt, max_tokens) {
             Ok(text) if !text.is_empty() => Some(text),
             Ok(_) => {
                 log::warn!("SlmEngine '{}': think block cut by max_tokens, skipping response", engine.name);
@@ -2961,30 +3017,31 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
                 log::warn!("SlmEngine '{}' generate error: {}", engine.name, e);
                 None
             }
-        }
+        })
     });
 
     match result {
-        Ok(Some(output)) => {
+        Ok(Ok(Some(output))) => {
             let clean = strip_think_tags(&output);
             if !clean.trim().is_empty() {
                 record_serveable_on(model_id, gpu);
                 mark_model_available(model_id, "legacy_generation_success");
-                Some(clean)
+                Ok(clean)
             } else {
                 record_unserveable_on(model_id, gpu);
                 if !any_proven_route(model_id) {
                     mark_model_unavailable(model_id, "empty_generation");
                 }
-                None
+                Err(InferenceError::Failed)
             }
         }
-        Ok(None) => {
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(None)) => {
             record_unserveable_on(model_id, gpu);
             if !any_proven_route(model_id) {
                 mark_model_unavailable(model_id, "all_gpu_inference_routes_failed");
             }
-            None
+            Err(InferenceError::Failed)
         }
         Err(_) => {
             log::error!("SlmEngine: inference panicked — engine evicted, will retry on next challenge");
@@ -2998,7 +3055,7 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
             if !any_proven_route(model_id) {
                 mark_model_unavailable(model_id, "inference_panic");
             }
-            None
+            Err(InferenceError::Failed)
         }
     }
 }
@@ -3070,6 +3127,24 @@ mod cuda_device_set_tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn explicit_host_can_be_absent_from_the_live_walk_set() {
+        let memory = [(0, 32768), (1, 32768), (2, 32768)].into_iter().collect();
+        assert_eq!(super::largest_allowed_gpu(&[2], &memory), Some(2));
+        assert_eq!(super::largest_allowed_gpu(&[1, 0], &memory), Some(0));
+        assert_eq!(super::largest_allowed_gpu(&[], &memory), Some(0));
+        assert_eq!(super::largest_allowed_gpu(&[3], &memory), None);
+    }
+
+    #[cfg(feature = "pom-cuda")]
+    #[test]
+    fn proven_host_stays_eligible_without_a_mining_walk() {
+        let model = [0x93; 32];
+        super::record_serveable_on(&model, 903);
+        assert_eq!(super::eligible_cards(&model), vec![903]);
+        super::clear_self_test(&model);
     }
 
     #[test]
@@ -3202,6 +3277,63 @@ mod inference_admission_tests {
 
 #[cfg(test)]
 mod inference_probe_tests {
+    #[test]
+    fn concurrent_probe_followers_defer_without_poisoning_capability() {
+        use super::*;
+        let model = [0xd3; 32];
+        let gpu = 901;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let owner = s.spawn(move || {
+                probe_exact_inference_route_with(&model, gpu, || {
+                    started_tx.send(()).unwrap();
+                    finish_rx.recv().unwrap();
+                    record_serveable_on(&model, gpu);
+                    Ok("OK".into())
+                })
+            });
+            started_rx.recv().unwrap();
+            for _ in 0..3 {
+                assert_eq!(
+                    probe_exact_inference_route_with(&model, gpu, || panic!("duplicate probe")),
+                    SelfTestOutcome::Deferred(DeferredReason::ProbeBusy)
+                );
+            }
+            assert!(!self_test_attempted(&model));
+            assert!(!model_is_unavailable(&model));
+            assert!(!inference_gpu_overrides().read().unwrap().contains_key(&model));
+            finish_tx.send(()).unwrap();
+            assert_eq!(owner.join().unwrap(), SelfTestOutcome::Passed);
+        });
+        assert!(model_serveable_on(&model, gpu));
+        self_test_state().write().unwrap().remove(&(model, gpu));
+    }
+
+    #[test]
+    fn transient_install_and_walk_delays_do_not_cache_a_failure() {
+        use super::*;
+        let model = [0x94; 32];
+        let gpu = 902;
+        for reason in [DeferredReason::InstallBusy, DeferredReason::WalkBusy, DeferredReason::HostLoadBusy] {
+            assert_eq!(
+                probe_exact_inference_route_with(&model, gpu, || Err(InferenceError::Deferred(reason))),
+                SelfTestOutcome::Deferred(reason)
+            );
+            assert!(!self_test_attempted(&model));
+            assert!(!model_is_unavailable(&model));
+            assert!(!self_test_failures().read().unwrap().contains_key(&(model, gpu)));
+            assert!(!inference_gpu_overrides().read().unwrap().contains_key(&model));
+        }
+        assert_eq!(
+            probe_exact_inference_route_with(&model, gpu, || Err(InferenceError::Failed)),
+            SelfTestOutcome::Failed
+        );
+        assert_eq!(self_test_state().read().unwrap().get(&(model, gpu)), Some(&false));
+        assert!(self_test_failures().read().unwrap().contains_key(&(model, gpu)));
+        self_test_state().write().unwrap().remove(&(model, gpu));
+        self_test_failures().write().unwrap().remove(&(model, gpu));
+    }
     use super::{current_probe_passed, select_runtime_status_route};
 
     #[test]

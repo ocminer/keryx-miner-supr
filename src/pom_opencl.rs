@@ -876,7 +876,9 @@ impl Drop for InferenceDrainGuard {
     }
 }
 
-pub fn pause_and_drain_for_inference(_gpu: usize) -> Option<InferenceDrainGuard> {
+pub fn pause_and_drain_for_inference(
+    _gpu: usize,
+) -> Result<InferenceDrainGuard, crate::inference_coord::DeferredReason> {
     INFERENCE_PAUSE_COUNT.fetch_add(1, Ordering::AcqRel);
     let guard = InferenceDrainGuard;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -890,7 +892,7 @@ pub fn pause_and_drain_for_inference(_gpu: usize) -> Option<InferenceDrainGuard>
         }
         if std::time::Instant::now() >= deadline {
             log::error!("PoM[opencl]: model install did not drain within 30s — refusing GPU inference");
-            return None;
+            return Err(crate::inference_coord::DeferredReason::InstallBusy);
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
@@ -903,11 +905,11 @@ pub fn pause_and_drain_for_inference(_gpu: usize) -> Option<InferenceDrainGuard>
             Ok(completed) => drop(completed),
             Err(_) => {
                 log::error!("PoM[opencl]: resident miner mutex poisoned — refusing GPU inference");
-                return None; // guard clears the pause count
+                return Err(crate::inference_coord::DeferredReason::WalkBusy); // guard clears pause
             }
         }
     }
-    Some(guard)
+    Ok(guard)
 }
 
 thread_local! {
