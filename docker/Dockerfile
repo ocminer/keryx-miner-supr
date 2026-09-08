@@ -6,11 +6,17 @@
 # (the build context must contain hiveos/dist-modern/ from `hiveos/build-offline.sh … dist-modern modern`).
 FROM nvidia/cuda:12.9.1-base-ubuntu24.04
 
+# openssh-server generates host keys during installation. Remove them in this same layer:
+# public image layers must never contain shared private host keys. Each container creates
+# its own keys on first start (see entrypoint.sh).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget htop tmux nano openssh-server \
         libgomp1 libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
-    && sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+    && sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
+    && rm -f /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_rsa_key.pub \
+        /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_ecdsa_key.pub \
+        /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub
 
 WORKDIR /app
 # NVIDIA-only modern PoM host, matching CUDA plugin and runtime closure. AMD cards need the

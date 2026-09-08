@@ -19,8 +19,11 @@ export LD_LIBRARY_PATH="$PWD:$PWD/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 
 # SSH for ops/debug (matches the octa suprminer-base contract).
 echo "root:${ROOT_PASSWORD:-keryx}" | chpasswd 2>/dev/null || true
-mkdir -p /run/sshd && /usr/sbin/sshd 2>/dev/null || true
-echo "[entrypoint] SSH on :22 (user root)"
+if mkdir -p /run/sshd && ssh-keygen -A >/dev/null 2>&1 && /usr/sbin/sshd 2>/dev/null; then
+    echo "[entrypoint] SSH on :22 (user root; set ROOT_PASSWORD before exposing the port)"
+else
+    echo "[entrypoint] WARNING: SSH unavailable; continuing miner startup."
+fi
 
 WALLET="${KERYX_WALLET:-${WALLET:-}}"
 if [ -z "$WALLET" ]; then
