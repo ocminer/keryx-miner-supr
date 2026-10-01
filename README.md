@@ -28,6 +28,14 @@ stopped and verified stopped), stock clocks unless noted, each row pool-verified
 | CMP 170HX | Kimi-Linear-48B | 1.76 MH/s | 213 W | 8.3 kH/s/W |
 | RTX 3070 | Qwen3.5-9B | **1.35 MH/s** | 249 W | 5.4 kH/s/W |
 
+Efficiency sweet spots (2026-10-01 core-clock sweeps, see [BENCHMARKS.md](BENCHMARKS.md); production miner running, caps untouched):
+
+| GPU | Setting | Hashrate | Power | Efficiency | vs stock |
+|---|---|---|---|---|---|
+| RTX 5090 | stock, full cap (no underclock helps) | 5.27–5.97 MH/s | 572–600 W | 9.2–9.95 kH/s/W | cooling is the lever, not clocks |
+| RTX 3070 | core lock 1300 MHz (`nvidia-smi -lgc 0,1300`) | 1.33 MH/s | 154 W | 8.66 kH/s/W | 93 % hashrate, 64 % power, +44 % |
+| CMP 170HX | core lock 1000 MHz (`nvidia-smi -lgc 1000,1000`) | 1.91 MH/s | 154 W | 12.42 kH/s/W | 80 % hashrate, 62 % power, +29 % |
+
 The walk is over the model, so **cards on different tiers are not doing the same work** — compare
 within a tier. The CMP 170HX row is heat-limited (85 °C, clocked to 1200 MHz); the same card measured
 1.95 MH/s before it heat-soaked. The RTX 3070s carry a +250 MHz core offset.

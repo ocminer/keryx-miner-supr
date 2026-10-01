@@ -63,6 +63,107 @@ an RTX 3070 does 1.35 MH/s on it against 0.84 MH/s on the classic dp4a walk (+61
 
 ---
 
+## RTX 5090 core-clock and memory-clock efficiency sweep — 2026-10-01, rig11r GPU1 (v0.13.3, PoM v4, Qwen3.5-9B tier)
+
+Question from the operator: is there an underclock "sweet spot" where the card mines more efficiently and cooler?
+Method: one card (rig11r GPU1, the thermally limited second RTX 5090, fan 95–100 % at stock), production miner
+left running and submitting to the pool, power cap untouched at 575 W (the fleet guard asserts it). Each step:
+set `nvidia-smi -lgc 0,<MHz>` (core) or `-lmc 0,<MHz>` (memory), 60 s settle, then 10 samples 15 s apart of the
+miner's own per-device hashrate (`--api-bind` JSON) plus `nvidia-smi` power/temperature/clocks. Locks released
+afterwards. Raw CSVs: `rig11r:/home/marcel/gpu1-sweep.csv`, `gpu1-memsweep.csv`.
+
+| setting | MH/s | W | kH/s/W | °C | SM MHz | mem MHz |
+|---|---:|---:|---:|---:|---:|---:|
+| stock, unlocked (self-throttles at 575 W / 85 °C) | **5.27** | 572 | **9.21** | 83 | 1689 | 13801 |
+| core locked 1600 | 4.08 | 464 | 8.78 | 80 | 1590 | 13801 |
+| core locked 1400 | 3.58 | 410 | 8.72 | 79 | 1387 | 13801 |
+| core locked 1250 | 3.20 | 372 | 8.60 | 78 | 1237 | 13801 |
+| core locked 1100 | 2.82 | 336 | 8.41 | 75 | 1087 | 13801 |
+| core locked 950 | 2.54 | 300 | 8.48 | 72 | 937 | 13801 |
+| memory locked 12000 → driver snaps to 7001 | 3.16 | 416 | 7.60 | 81 | 2476 | 7001 |
+| memory locked 10000 → 7001 | 3.17 | 417 | 7.60 | 82 | 2483 | 7001 |
+| memory locked 8000 → 7001 | 3.17 | 417 | 7.59 | 82 | 2483 | 7001 |
+| memory locked 6000 → 810 | 0.35 | 157 | 2.25 | 62 | 2845 | 810 |
+
+Result — **there is no underclock sweet spot for the v4 walk on the 5090**:
+
+- Hashrate falls almost linearly with the core clock and efficiency falls with it at every step
+  (9.21 → 8.48 kH/s/W from 1689 to 937 MHz). The board's fixed power (GDDR7 at 13.8 GHz, fans, VRMs)
+  does not shrink with the core, so slower = less work per watt. Cooler, yes; more efficient, no.
+- Halving the memory clock cuts the hashrate 40 % while the core races to 2.48 GHz and cannot make
+  it up: the walk is memory-bandwidth bound as well. Efficiency drops to 7.6 kH/s/W.
+- The most efficient configuration measured is **stock clocks at the full power cap**. The first 5090
+  on the same rig (GPU0, 69 °C, 2.4 GHz, 600 W) does 5.97 MH/s = **9.95 kH/s/W**, 8 % better than
+  GPU1 — the difference is cooling, not settings: GPU1 is thermally throttled to 1.69 GHz.
+- Actionable: keep 5090s at stock clocks and the 575–600 W cap; spend effort on airflow for GPU1
+  (or accept the 88 °C guard limit set 2026-10-01). Do not deploy core or memory underclocks on 5090s.
+
+## RTX 3070 core-clock and memory-clock efficiency sweep — 2026-10-01, rig08 GPU0 (v0.13.3, PoM v4, Qwen3.5-9B tier)
+
+Same method as the 5090 sweep above (production miner left running, 240 W cap untouched, `-lgc`/`-lmc`,
+60 s settle, 10 samples 15 s apart). Raw CSV: `rig08:/home/marcel/gpu0-sweep.csv`. Note: the first run on
+this box produced garbage because bash `printf` under the German locale parsed "1.441" as 1 — the script
+now forces `LC_ALL=C`.
+
+| setting | MH/s | W | kH/s/W | °C | SM MHz | mem MHz |
+|---|---:|---:|---:|---:|---:|---:|
+| stock, unlocked (+250 MHz offset, 240 W cap) | 1.440 | 239 | 6.02 | 67 | 1704 | 6801 |
+| core locked 1500 | 1.424 | 188 | 7.56 | 62 | 1500 | 6801 |
+| **core locked 1300** | **1.333** | **154** | **8.66** | **59** | 1290 | 6801 |
+| core locked 1100 | 1.162 | 140 | 8.33 | 58 | 1095 | 6801 |
+| core locked 900 | 0.976 | 122 | 7.98 | 56 | 900 | 6801 |
+| memory locked 6000 → 5001 | 1.073 | 238 | 4.51 | 67 | 1870 | 5001 |
+| memory locked 5000 → 810 | 0.146 | 79 | 1.86 | 52 | 1905 | 810 |
+| memory locked 4000 → 810 | 0.146 | 78 | 1.87 | 51 | 1905 | 810 |
+
+Result — **the 3070 has a real sweet spot, and it is the opposite of the 5090**:
+
+- At stock the 3070 burns its whole 240 W cap for 1.44 MH/s (6.0 kH/s/W). Locking the core at
+  **1300 MHz** keeps 93 % of the hashrate for 64 % of the power: **8.66 kH/s/W, +44 % efficiency**,
+  8 °C cooler. 1500 MHz is the "almost free" point (−1 % hashrate, −21 % power) if hashrate matters
+  more than efficiency; below 1300 the efficiency curve turns down again.
+- Memory must stay at stock: any lock makes the driver drop to 5001 or 810 MHz and the walk collapses.
+- **Deployed 2026-10-01 17:40Z on both rig08 3070s:** `gpu_clocks: {uuid: {"lgc": [0, 1300]}}` in
+  `rig08.json` / `rig08-launch.json` (applied by the fleet guard at every launch, released on exit),
+  plus applied live with `nvidia-smi -lgc 0,1300`. Expected per rig: ~2.67 MH/s at ~310 W instead of
+  2.88 MH/s at ~480 W.
+- Why the two cards differ: on the 5090 the fixed board power (GDDR7 at 13.8 GHz) dominates and the
+  walk is bandwidth bound, so a slower core only wastes the memory power; on the 3070 the stock boost
+  sits far up the V/F curve and the +250 MHz offset pushes it further, so the first few hundred MHz
+  off the top cost almost nothing in hashrate and a lot in watts. Measure each architecture; do not
+  copy settings across generations.
+
+## CMP 170HX core-clock efficiency sweep — 2026-10-01, rigtr12 GPU1 (v0.13.3, PoM v4, Qwen3.5-9B tier, 250 W cap)
+
+Same method as the two sweeps above (production miner left running and submitting, cap untouched at
+250 W, `nvidia-smi -lgc <MHz>,<MHz>`, 60 s settle, 12 samples 15 s apart of the miner API hashrate plus
+`nvidia-smi` power/temperature/clocks, locks released afterwards). The CMP 170HX is a GA100 die with
+8 GB HBM2e at a fixed 1458 MHz (memory locks are not offered); at stock it is power-capped at 250 W and
+runs ~1270 MHz. Raw results: `rigtr12:/mnt/development/workspaces/germany-keryx-switch-20260930/cmp-sweep-20261001/results.json`.
+
+| setting | MH/s | W | kH/s/W | °C core / mem | SM MHz | mem MHz |
+|---|---:|---:|---:|---:|---:|---:|
+| stock, unlocked (power-capped at 250 W) | 2.385 | 248 | 9.64 | 79 / 82 | 1269 | 1458 |
+| core locked 1200 | 2.258 | 212 | 10.64 | 73 / 78 | 1200 | 1458 |
+| core locked 1100 | 2.093 | 178 | 11.76 | 66 / 73 | 1110 | 1458 |
+| **core locked 1000** | **1.913** | **154** | **12.42** | **62 / 71** | 1005 | 1458 |
+| core locked 900 | 1.719 | 141 | 12.21 | 60 / 69 | 900 | 1458 |
+| core locked 800 | 1.547 | 131 | 11.82 | 58 / 68 | 810 | 1458 |
+| core locked 700 | 1.351 | 117 | 11.50 | 56 / 66 | 705 | 1458 |
+
+Result — **the CMP 170HX behaves like the 3070, with a broad optimum around 1000 MHz**:
+
+- Efficiency rises monotonically from stock down to 1000 MHz (**9.64 → 12.42 kH/s/W, +29 %**) and
+  only then turns down; 1100 MHz is the balanced point (88 % of the hashrate for 72 % of the power,
+  +22 %), 1000 MHz the efficiency maximum (80 % of the hashrate for 62 % of the power, 17 °C cooler
+  on the core and 11 °C on the HBM).
+- HBM2e power is small and fixed, so unlike the 5090 the core is where the watts go; the walk on this
+  card is not bandwidth-starved until the core drops below ~900 MHz.
+- **Deployed 2026-10-01 18:57Z on rigtr12 GPU1:** `gpu_clocks: {uuid: {"lgc": [0, 1000]}}` in
+  `rigtr12-cmp.json` (applied by the fleet guard at the next launch) and applied live with
+  `nvidia-smi -lgc 1000,1000`. Expected: ~1.9 MH/s at ~155–165 W instead of 2.39 MH/s at 248 W.
+  The second CMP 170HX fleet (us-rig-02, five cards at 160–250 W caps) is the next candidate.
+
 # Pre-relaunch PoM (historical)
 
 Everything below predates the keryxd v1.5.1 relaunch walk and is kept for reference only. The
