@@ -2079,6 +2079,44 @@ fn probe_exact_inference_route_with(
 
 /// True once `model_id` PASSED its inference self-test on this rig and has not since been withdrawn.
 /// This is the gate for both declaring the model to the pool and mining its tier.
+/// Consecutive in-process llama generation failures tolerated (per model and card) before the
+/// router falls through to the legacy engine path. See the comment at the call site.
+const INPROCESS_TRANSIENT_FAILURES: u32 = 3;
+
+fn inprocess_failures() -> &'static std::sync::Mutex<std::collections::HashMap<([u8; 32], usize), u32>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<([u8; 32], usize), u32>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn note_inprocess_failure(model_id: &[u8; 32], gpu: usize) -> u32 {
+    let mut m = match inprocess_failures().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let n = m.entry((*model_id, gpu)).or_insert(0);
+    *n += 1;
+    *n
+}
+
+fn clear_inprocess_failures(model_id: &[u8; 32], gpu: usize) {
+    if let Ok(mut m) = inprocess_failures().lock() {
+        m.remove(&(*model_id, gpu));
+    }
+}
+
+/// Architectures that only the in-process llama.cpp engine can serve (no candle loader).
+fn llama_only_format(spec: &ModelSpec) -> bool {
+    matches!(
+        spec.format,
+        ModelFormat::GgufExaone4
+            | ModelFormat::GgufGlm4
+            | ModelFormat::GgufQwen35
+            | ModelFormat::GgufKimiLinear
+            | ModelFormat::GgufGemma4
+    )
+}
+
 fn any_proven_route(model_id: &[u8; 32]) -> bool {
     self_test_state()
         .read()
@@ -2841,6 +2879,7 @@ pub fn try_load_and_run_inference_on(
                         // truncated <think> block is not an answer and must never enable ai:cap.
                         record_serveable_on(model_id, gpu);
                         mark_model_available(model_id, "generation_success");
+                        clear_inprocess_failures(model_id, gpu);
                         return Ok(clean);
                     }
                     log::warn!(
@@ -2863,7 +2902,35 @@ pub fn try_load_and_run_inference_on(
                 // meant to fix hit once in hours; this broke every multi-GPU rig, so the trade is
                 // clear. A safer cascade fix must distinguish the SELF-TEST probe from real OPoI
                 // serving instead of making both terminal.
-                log::warn!("SlmEngine: in-process llama generate failed on GPU {} — trying the next engine.", gpu);
+                // Llama-only architectures (H4 lineup) have NO other engine: falling through to the
+                // legacy path uninstalls this card's walk, fails to load, and withdraws the model —
+                // and a withdrawn model is never challenged again, so the rig stays suspended forever
+                // (field report: Windows RTX 3090, Qwen3.6-27B, self-test PASSED, first live request
+                // failed once, mining suspended permanently). While the engine is still resident,
+                // treat a failed generation as TRANSIENT: keep the model and its proven route, reply
+                // failed for this request only, and keep mining. Only after repeated consecutive
+                // failures on this card fall through to the previous behavior.
+                if llama_only_format(spec) && crate::llama_engine::active_for(&gguf, gpu) {
+                    let n = note_inprocess_failure(model_id, gpu);
+                    if n < INPROCESS_TRANSIENT_FAILURES {
+                        log::warn!(
+                            "SlmEngine: in-process llama generate failed on GPU {} ({}/{} consecutive) — \
+                             keeping '{}' serveable; this request is answered as failed, mining continues.",
+                            gpu,
+                            n,
+                            INPROCESS_TRANSIENT_FAILURES,
+                            spec.name
+                        );
+                        return Err(InferenceError::Failed);
+                    }
+                    log::warn!(
+                        "SlmEngine: in-process llama generate failed {} times in a row on GPU {} — trying the next engine.",
+                        n,
+                        gpu
+                    );
+                } else {
+                    log::warn!("SlmEngine: in-process llama generate failed on GPU {} — trying the next engine.", gpu);
+                }
             }
         }
     }

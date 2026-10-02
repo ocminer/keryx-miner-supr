@@ -607,10 +607,60 @@ fn generate_locked(e: &Engine, prompt: &str, max_tokens: usize) -> Option<String
     let n =
         unsafe { (e.generate)(e.model, cp.as_ptr(), max_tokens, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int) };
     if n <= 0 {
+        // -1: request rejected by the engine (prompt/limits/tokenize); 0: the model produced no
+        // text (first decode failed, end-of-turn as first token, or a stop marker at offset 0).
+        log::warn!(
+            "llama engine: generate returned {} ({}) — prompt {} bytes, max_tokens {}",
+            n,
+            if n < 0 { "request rejected by the engine" } else { "no text produced" },
+            prompt.len(),
+            max_tokens
+        );
         return None;
     }
     buf.truncate(n as usize);
-    String::from_utf8(buf).ok()
+    Some(utf8_complete_prefix(buf))
+}
+
+/// Generation stops at a token budget, and a multi-byte UTF-8 character can be split across the
+/// last token boundary. Rejecting the whole answer for that (the old `String::from_utf8(..).ok()`)
+/// turned a valid reply into "generate failed". Keep the longest valid prefix instead; any invalid
+/// byte inside the text (never expected) is replaced, not fatal.
+fn utf8_complete_prefix(buf: Vec<u8>) -> String {
+    match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => {
+            // `error_len() == None` means the input simply ended inside a multi-byte sequence:
+            // drop that incomplete tail. Anything else is a genuinely invalid byte: replace it.
+            let incomplete_tail = e.utf8_error().error_len().is_none();
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            if incomplete_tail {
+                bytes.truncate(valid);
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+}
+
+#[cfg(test)]
+mod utf8_tests {
+    use super::utf8_complete_prefix;
+    #[test]
+    fn keeps_complete_text() {
+        assert_eq!(utf8_complete_prefix("héllo — ok".as_bytes().to_vec()), "héllo — ok");
+    }
+    #[test]
+    fn trims_split_multibyte_tail() {
+        let mut b = "answer —".as_bytes().to_vec();
+        b.pop(); // cut the 3-byte em dash in the middle
+        assert_eq!(utf8_complete_prefix(b), "answer ");
+    }
+    #[test]
+    fn replaces_inner_garbage() {
+        let b = vec![b'a', 0xFF, b'b'];
+        assert_eq!(utf8_complete_prefix(b), "a\u{FFFD}b");
+    }
 }
 
 /// Legacy shim: generate on the single/first resident engine. Prefer `generate_on(gpu, …)`.

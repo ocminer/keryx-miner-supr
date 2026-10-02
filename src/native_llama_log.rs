@@ -4,8 +4,8 @@
 //! callback writes directly to stderr, bypassing Rust's switchable logger and corrupting an active
 //! alternate-screen dashboard.  The pinned llama API exposes `llama_log_get`/`llama_log_set`, so
 //! install one callback before the first backend/model call and leave it installed for the sidecar
-//! lifetime.  The callback reads the host's atomic TUI state: while the dashboard is active it is a
-//! no-op; in classic mode it delegates to the exact callback/user-data pair that was installed
+//! lifetime.  The callback reads the host's atomic TUI state: while the dashboard is active only
+//! warnings/errors are forwarded to the miner's logger (no stderr); in classic mode it delegates to the exact callback/user-data pair that was installed
 //! before us.  No file-descriptor redirection, environment mutation, allocation, or lock is used on
 //! the native logging path.
 
@@ -29,7 +29,32 @@ static INSTALL_RESULT: OnceLock<bool> = OnceLock::new();
 unsafe extern "C" fn dispatch(level: c_int, text: *const c_char, user_data: *mut c_void) {
     // This callback crosses a C ABI boundary and therefore deliberately contains only atomic
     // reads, pointer loads, and a call back into the native logger. None of those operations panic.
-    if crate::tui_active() || user_data.is_null() {
+    if crate::tui_active() {
+        // The dashboard owns the terminal, so native output must not reach stderr. Warnings and
+        // errors are still routed into the miner's own logger (shown in the dashboard's event
+        // panel and in log files) — otherwise a failed model load or generation only ever reports
+        // "load failed" without llama.cpp's reason. Info/debug chatter stays suppressed.
+        // ggml levels: 3 = WARN, 4 = ERROR. Rare path; never unwind across the C ABI.
+        if level == 3 || level == 4 {
+            let _ = std::panic::catch_unwind(|| {
+                if text.is_null() {
+                    return;
+                }
+                let msg = std::ffi::CStr::from_ptr(text).to_string_lossy();
+                let msg = msg.trim_end();
+                if msg.is_empty() {
+                    return;
+                }
+                if level == 4 {
+                    log::error!(target: "llama.cpp", "{}", msg);
+                } else {
+                    log::warn!(target: "llama.cpp", "{}", msg);
+                }
+            });
+        }
+        return;
+    }
+    if user_data.is_null() {
         return;
     }
     let bridge = &*(user_data as *const Bridge);
