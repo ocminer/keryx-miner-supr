@@ -63,6 +63,10 @@ struct Engine {
     pom_pci: PciFn,
     gpu: usize,
     gguf: String,
+    /// Context the model was loaded with, and whether the library has the prompt guard — see
+    /// `llama_engine::unguarded_prompt_cap` (same llama.cpp b10015 batch assert).
+    n_ctx: c_int,
+    prompt_guard: bool,
 }
 // The wrapper serializes generation + walk dispatches internally (gen_lock / walk_lock).
 unsafe impl Send for Engine {}
@@ -420,6 +424,8 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
             pom_pci: pci,
             gpu: main_gpu.max(0) as usize, // -1 = auto; the actual device is read via pom_pci
             gguf: gguf.to_string(),
+            n_ctx,
+            prompt_guard: sym::<AbiFn>(lib, "keryx_llama_prompt_guard").map_or(false, |f| f() == 1),
         });
         dedication_attempt.armed = false;
         true
@@ -442,10 +448,28 @@ pub fn active_for(gguf: &str) -> bool {
     }
 }
 
+/// Same guard as the CUDA engine: an unguarded library aborts the process (llama.cpp
+/// `GGML_ASSERT(n_tokens_all <= n_batch)`) on a prompt longer than its batch.
+fn prompt_allowed(e: &Engine, prompt: &str) -> bool {
+    let cap = crate::llama_engine_prompt_cap(e.n_ctx);
+    if !e.prompt_guard && prompt.len() > cap {
+        log::warn!(
+            "llama-vk engine: refusing a {}-byte prompt — this library has no prompt guard (cap {} bytes)",
+            prompt.len(),
+            cap
+        );
+        return false;
+    }
+    true
+}
+
 /// Generate up to `max_tokens` of OPoI text in-process.
 pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
     let g = engine().lock().ok()?;
     let e = g.as_ref()?;
+    if !prompt_allowed(e, prompt) {
+        return None;
+    }
     let cp = CString::new(prompt).ok()?;
     let cap: usize = 65536;
     let mut out = vec![0u8; cap];
@@ -463,6 +487,9 @@ pub fn generate_for(gguf: &str, prompt: &str, max_tokens: usize) -> Option<Strin
     let g = engine().lock().ok()?;
     let e = g.as_ref()?;
     if e.gguf != gguf {
+        return None;
+    }
+    if !prompt_allowed(e, prompt) {
         return None;
     }
     let cp = CString::new(prompt).ok()?;

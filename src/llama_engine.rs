@@ -26,6 +26,7 @@ type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
 type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
 type InfoFn =
     unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
+type PromptGuardFn = unsafe extern "C" fn() -> c_int;
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
 type FreeFn = unsafe extern "C" fn(*mut c_void);
 // CUDA ordinal owning tensor i's bytes, or -1 (host/unified/unknown). Upstream aa29fd2 — optional
@@ -63,6 +64,12 @@ struct Engine {
     /// Optional: absent on older `libkeryx-llama.so` builds (looked up soft, gate no-ops if None).
     tensor_device: Option<TensorDeviceFn>,
     gguf: String,
+    /// Context the model was loaded with (tokens) — bounds the prompt an unguarded library can take.
+    n_ctx: c_int,
+    /// `keryx_llama_prompt_guard() == 1`: the library chunks the prompt by n_batch and refuses (-2)
+    /// one that does not fit the context. Older libraries feed the whole prompt as ONE batch and
+    /// llama.cpp GGML_ASSERTs `n_tokens <= n_batch` — aborting the whole miner on one request.
+    prompt_guard: bool,
 }
 // The wrapper serializes generation internally; tensor info is read-only after load.
 unsafe impl Send for Engine {}
@@ -188,7 +195,7 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
         let cg = CString::new(gguf).ok()?;
         log::info!("llama engine: loading {} on GPU {} (in-process, zero-dup)…", gguf, gpu);
         let configured_ctx = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse::<c_int>().ok());
-        let n_ctx: c_int = configured_ctx.unwrap_or(4096);
+        let mut n_ctx: c_int = configured_ctx.unwrap_or(4096);
         let mut model = load(cg.as_ptr(), gpu as c_int, n_ctx);
         if model.is_null() && configured_ctx.is_none() && n_ctx > 1024 {
             // Context-alloc retry (upstream Keryx-Labs/keryx-miner 9e6dc8d4, adapted): a card too
@@ -196,6 +203,7 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             // Retry once at 1024 before giving up (skipped when the user pinned KERYX_LLAMA_CTX).
             log::warn!("llama engine: {}-token context did not fit on GPU {} — retrying with 1024 tokens.", n_ctx, gpu);
             model = load(cg.as_ptr(), gpu as c_int, 1024);
+            n_ctx = 1024;
         }
         if model.is_null() {
             log::warn!("llama engine: model load failed on GPU {} (VRAM? arch? driver?) — OPoI inference unavailable on this card.", gpu);
@@ -205,7 +213,26 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             "llama engine: ✓ active on GPU {} — llama.cpp hosts the model + serves OPoI inference in-process.",
             gpu
         );
-        Some(Engine { model, count, info, generate: gen, free, tensor_device, gguf: gguf.to_string() })
+        let prompt_guard = sym::<PromptGuardFn>(lib, b"keryx_llama_prompt_guard\0").map_or(false, |f| f() == 1);
+        if !prompt_guard {
+            log::info!(
+                "llama engine: library has no prompt guard — prompts are capped at {} bytes on GPU {} so an \
+                 oversized request cannot abort the miner (update libkeryx-llama.so to lift the cap).",
+                unguarded_prompt_cap(n_ctx),
+                gpu
+            );
+        }
+        Some(Engine {
+            model,
+            count,
+            info,
+            generate: gen,
+            free,
+            tensor_device,
+            gguf: gguf.to_string(),
+            n_ctx,
+            prompt_guard,
+        })
     }
 }
 
@@ -593,12 +620,33 @@ pub fn generate_for(gpu: usize, gguf: &str, prompt: &str, max_tokens: usize) -> 
     generate_locked(e, prompt, max_tokens)
 }
 
+/// Bytes the chat template may add around the user prompt (BOS, role markers, an implicit system
+/// line). Every byte-level BPE / byte-fallback tokenizer emits at most one token per byte of the
+/// formatted text, so `prompt + margin <= n_batch` bytes guarantees `tokens <= n_batch`.
+const PROMPT_TEMPLATE_MARGIN_BYTES: usize = 512;
+
+/// Largest prompt (bytes) an UNGUARDED library can take without tripping llama.cpp's
+/// `GGML_ASSERT(n_tokens_all <= n_batch)` (n_batch = min(n_ctx, 2048) in b10015): that assert
+/// aborts the whole process — every card — on a single oversized request.
+fn unguarded_prompt_cap(n_ctx: c_int) -> usize {
+    crate::llama_engine_prompt_cap(n_ctx)
+}
+
 fn generate_locked(e: &Engine, prompt: &str, max_tokens: usize) -> Option<String> {
     if prompt.is_empty()
         || prompt.len() > crate::slm::MAX_INFERENCE_PROMPT_BYTES
         || max_tokens == 0
         || max_tokens > crate::slm::MAX_INFERENCE_TOKENS
     {
+        return None;
+    }
+    if !e.prompt_guard && prompt.len() > unguarded_prompt_cap(e.n_ctx) {
+        log::warn!(
+            "llama engine: refusing a {}-byte prompt — this libkeryx-llama.so has no prompt guard and a prompt \
+             over {} bytes could exceed llama.cpp's batch and abort the miner",
+            prompt.len(),
+            unguarded_prompt_cap(e.n_ctx)
+        );
         return None;
     }
     let cp = CString::new(prompt).ok()?;
@@ -612,7 +660,12 @@ fn generate_locked(e: &Engine, prompt: &str, max_tokens: usize) -> Option<String
         log::warn!(
             "llama engine: generate returned {} ({}) — prompt {} bytes, max_tokens {}",
             n,
-            if n < 0 { "request rejected by the engine" } else { "no text produced" },
+            match n {
+                -2 => "prompt does not fit the model context — refused",
+                -3 => "prompt decode failed",
+                n if n < 0 => "request rejected by the engine",
+                _ => "no text produced",
+            },
             prompt.len(),
             max_tokens
         );
@@ -640,6 +693,20 @@ fn utf8_complete_prefix(buf: Vec<u8>) -> String {
             }
             String::from_utf8_lossy(&bytes).into_owned()
         }
+    }
+}
+
+#[cfg(test)]
+mod prompt_guard_tests {
+    use super::{unguarded_prompt_cap, PROMPT_TEMPLATE_MARGIN_BYTES};
+    #[test]
+    fn unguarded_cap_stays_inside_llama_batch() {
+        // b10015: n_batch = min(n_ctx, 2048); a prompt of `cap` bytes + template stays below it.
+        assert_eq!(unguarded_prompt_cap(4096), 2048 - PROMPT_TEMPLATE_MARGIN_BYTES);
+        assert_eq!(unguarded_prompt_cap(1024), 1024 - PROMPT_TEMPLATE_MARGIN_BYTES);
+        assert_eq!(unguarded_prompt_cap(65536), 2048 - PROMPT_TEMPLATE_MARGIN_BYTES);
+        assert_eq!(unguarded_prompt_cap(256), 0);
+        assert_eq!(unguarded_prompt_cap(-1), 0);
     }
 }
 

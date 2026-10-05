@@ -97,6 +97,15 @@ pub mod llama_engine_vk {
     }
     pub fn mark_gpu_inference_unfit() {}
 }
+/// Largest prompt (bytes) a libkeryx-llama build WITHOUT `keryx_llama_prompt_guard` can take:
+/// such a build feeds the whole prompt as one batch, and llama.cpp b10015
+/// `GGML_ASSERT(n_tokens_all <= n_batch)` (n_batch = min(n_ctx, 2048)) aborts the whole miner on a
+/// longer one. Byte-level BPE / byte-fallback tokenizers emit at most one token per byte of the
+/// formatted text, so the prompt plus a 512-byte chat-template margin always fits the batch.
+pub fn llama_engine_prompt_cap(n_ctx: std::os::raw::c_int) -> usize {
+    (n_ctx.clamp(0, 2048) as usize).saturating_sub(512)
+}
+
 // In-process llama.cpp engine (dlopen'd libkeryx-llama.{so,dylib}): candle-independence — when
 // present it hosts the model (the walk gathers over its VRAM on CUDA / zero-dup; on Metal the
 // walk today keeps its own packed buffer) AND serves OPoI text. Compiled on every unix target

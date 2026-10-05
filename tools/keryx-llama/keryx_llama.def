@@ -12,4 +12,5 @@ EXPORTS
     keryx_llama_tensor_info
     keryx_llama_tensor_device
     keryx_llama_generate
+    keryx_llama_prompt_guard
     keryx_llama_free

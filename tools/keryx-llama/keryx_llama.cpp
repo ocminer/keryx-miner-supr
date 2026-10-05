@@ -181,7 +181,18 @@ int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char
     // Penalty/DRY samplers retain accepted-token history. Reset it with the KV cache so one remote
     // request cannot bias or truncate the next independent request.
     llama_sampler_reset(h->smpl);
-    llama_batch batch = llama_batch_get_one(toks.data(), (int32_t)toks.size());
+    // Prompt guard (upstream v0.5.6 1670060): llama_decode GGML_ASSERTs n_tokens <= n_batch and
+    // a prompt longer than the context can never be answered — either one used to ABORT the whole
+    // miner (every card) on a single oversized request. Refuse with -2 instead, and feed the
+    // prompt in n_batch-sized chunks so any prompt that fits the context is served.
+    const int n_ctx_tok = (int)llama_n_ctx(h->ctx);
+    const int n_batch_tok = std::max(1, (int)llama_n_batch(h->ctx));
+    if (n <= 0 || n > n_ctx_tok - 16) return -2;
+    for (int i = 0; i + n_batch_tok < n; i += n_batch_tok) {
+        if (llama_decode(h->ctx, llama_batch_get_one(toks.data() + i, n_batch_tok)) != 0) return -3;
+    }
+    const int tail = ((n - 1) % n_batch_tok) + 1;
+    llama_batch batch = llama_batch_get_one(toks.data() + (n - tail), (int32_t)tail);
     int written = 0;
     std::string acc; // mirrors `out` for cross-piece stop-string scanning
     for (int i = 0; i < max_tokens; i++) {
@@ -210,6 +221,11 @@ int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char
     out[written] = 0;
     return written;
 }
+
+// Present (=1) when keryx_llama_generate chunks the prompt by n_batch and refuses (-2) a prompt
+// that does not fit the context instead of aborting. The miner looks it up softly: an older
+// library without it gets a conservative byte cap on the Rust side.
+int keryx_llama_prompt_guard() { return 1; }
 
 void keryx_llama_free(KeryxLlama* h) {
     if (!h) return;
