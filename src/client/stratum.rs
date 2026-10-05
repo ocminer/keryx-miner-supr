@@ -1393,10 +1393,10 @@ impl StratumHandler {
                                 // staging against a pre-H10 testnet still works.)
                                 if POOL_FORCED_POM.load(std::sync::atomic::Ordering::Relaxed) {
                                     // Same reasoning one frontier later: once the mainnet H14 ETA has
-                                    // passed (models::stage_post_h14 — never before it, so the pre-gate
+                                    // passed (clock re-read per job — never before it, so the pre-gate
                                     // path is unchanged) a DAA-less job is floored at the H14 gate, or
                                     // a suffix-less pool would grind H10 seeds forever after the fork.
-                                    let floor = if keryx_miner::models::stage_post_h14() {
+                                    let floor = if keryx_miner::models::h14_eta_passed_now() {
                                         keryx_miner::pom::private_inference_activation_daa()
                                     } else {
                                         keryx_miner::pom::h10_activation_daa()

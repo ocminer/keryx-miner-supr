@@ -344,6 +344,16 @@ fn stage_post_h14_at(now: u64, forced: Option<&str>, gate_overridden: bool) -> b
     !gate_overridden && now >= H14_MAINNET_ETA_UNIX
 }
 
+/// Uncached form of `stage_post_h14` — re-reads the clock on every call, for long-running
+/// heuristics (a DAA-less pool job crossing the gate while the process runs).
+pub fn h14_eta_passed_now() -> bool {
+    stage_post_h14_at(
+        now_unix(),
+        std::env::var("KERYX_H14_STAGE").ok().as_deref(),
+        crate::pom::is_h14_activation_overridden(),
+    )
+}
+
 /// Whether startup staging should already use the post-H14 lineup (see `stage_post_h14_at`).
 pub fn stage_post_h14() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
