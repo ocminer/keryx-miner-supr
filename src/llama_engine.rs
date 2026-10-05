@@ -27,6 +27,9 @@ type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
 type InfoFn =
     unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
 type PromptGuardFn = unsafe extern "C" fn() -> c_int;
+type Load2Fn = unsafe extern "C" fn(*const c_char, c_int, *const c_int, c_int, c_int) -> *mut c_void;
+type CtxInfoFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
+type NCtxFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
 type FreeFn = unsafe extern "C" fn(*mut c_void);
 // CUDA ordinal owning tensor i's bytes, or -1 (host/unified/unknown). Upstream aa29fd2 — optional
@@ -196,7 +199,36 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
         log::info!("llama engine: loading {} on GPU {} (in-process, zero-dup)…", gguf, gpu);
         let configured_ctx = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse::<c_int>().ok());
         let mut n_ctx: c_int = configured_ctx.unwrap_or(4096);
-        let mut model = load(cg.as_ptr(), gpu as c_int, n_ctx);
+        // Context ladder (upstream v0.5.6 d5ccad3, adapted for zero-dup): newer libraries load the
+        // weights once and try the model's context cap down to its floor with an 8-bit KV cache +
+        // flash attention, keeping a context only if `walk_reserve_mib` VRAM stays free for the PoM
+        // walk's own buffers. Mining always wins over context size.
+        let load2 = if configured_ctx.is_none() { sym::<Load2Fn>(lib, b"keryx_llama_load2\0") } else { None };
+        let n_ctx_fn = sym::<NCtxFn>(lib, b"keryx_llama_n_ctx\0");
+        let mut model: *mut c_void = std::ptr::null_mut();
+        if let Some(load2) = load2 {
+            let (floor, cap) = crate::models::spec_for_gguf(gguf)
+                .map_or((4096, 4096), |m| (m.ctx_floor as c_int, m.ctx_cap as c_int));
+            let ladder = context_ladder(cap, floor);
+            let reserve: c_int = std::env::var("KERYX_LLAMA_WALK_RESERVE_MB")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_WALK_RESERVE_MIB);
+            model = load2(cg.as_ptr(), gpu as c_int, ladder.as_ptr(), ladder.len() as c_int, reserve);
+            if !model.is_null() {
+                n_ctx = n_ctx_fn.map(|f| f(model)).filter(|&n| n > 0).unwrap_or(*ladder.last().unwrap());
+                if n_ctx < floor {
+                    log::warn!("llama engine: context {} tokens on GPU {} is below the {}-token floor clients assume", n_ctx, gpu, floor);
+                }
+            } else {
+                // The ladder ends at the floor; one last plain 4096-token try below.
+                log::warn!("llama engine: no context between {} and {} tokens fit on GPU {} — trying 4096.", cap, floor, gpu);
+                n_ctx = 4096;
+            }
+        }
+        if model.is_null() {
+            model = load(cg.as_ptr(), gpu as c_int, n_ctx);
+        }
         if model.is_null() && configured_ctx.is_none() && n_ctx > 1024 {
             // Context-alloc retry (upstream Keryx-Labs/keryx-miner 9e6dc8d4, adapted): a card too
             // tight for the default 4096-token context can still host the model with a smaller one.
@@ -209,9 +241,13 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             log::warn!("llama engine: model load failed on GPU {} (VRAM? arch? driver?) — OPoI inference unavailable on this card.", gpu);
             return None;
         }
+        let context_info = sym::<CtxInfoFn>(lib, b"keryx_llama_context_info\0")
+            .map(|f| CStr::from_ptr(f(model)).to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("n_ctx={}", n_ctx));
         log::info!(
-            "llama engine: ✓ active on GPU {} — llama.cpp hosts the model + serves OPoI inference in-process.",
-            gpu
+            "llama engine: ✓ active on GPU {} — llama.cpp hosts the model + serves OPoI inference in-process ({}).",
+            gpu,
+            context_info
         );
         let prompt_guard = sym::<PromptGuardFn>(lib, b"keryx_llama_prompt_guard\0").map_or(false, |f| f() == 1);
         if !prompt_guard {
@@ -233,6 +269,34 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             n_ctx,
             prompt_guard,
         })
+    }
+}
+
+/// VRAM (MiB) left free after the engine's context for the zero-dup PoM walk (gather tables, batch
+/// scratch, kernel workspace). Override with KERYX_LLAMA_WALK_RESERVE_MB.
+const DEFAULT_WALK_RESERVE_MIB: c_int = 1536;
+
+/// Context sizes to try, largest first: the cap, then halves of it down to the floor.
+fn context_ladder(cap: c_int, floor: c_int) -> Vec<c_int> {
+    let mut out = Vec::new();
+    let mut n = cap.max(floor);
+    while n > floor {
+        out.push(n);
+        n /= 2;
+    }
+    out.push(floor);
+    out
+}
+
+#[cfg(test)]
+mod ctx_ladder_tests {
+    use super::context_ladder;
+    #[test]
+    fn ladder_runs_from_cap_down_to_floor() {
+        assert_eq!(context_ladder(131_072, 32_768), vec![131_072, 65_536, 32_768]);
+        assert_eq!(context_ladder(32_768, 32_768), vec![32_768]);
+        assert_eq!(context_ladder(32_768, 8_192), vec![32_768, 16_384, 8_192]);
+        assert_eq!(context_ladder(4_096, 8_192), vec![8_192]);
     }
 }
 

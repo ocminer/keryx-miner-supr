@@ -34,7 +34,45 @@ struct KeryxLlama {
     llama_sampler* smpl  = nullptr;
     std::vector<std::string> names; // canonical (byte-lexicographic) order — matches pom.rs
     std::mutex gen_lock;
+    std::string ctx_info;           // "n_ctx=… kv=… flash_attn=…" for the miner log
 };
+
+// Context with an 8-bit KV cache and flash attention (upstream v0.5.6 d5ccad3): half the
+// per-token VRAM of f16, so >=32k tokens fit next to the PoM walk. Falls back to the default f16
+// cache for an architecture the fast path cannot serve. *kv receives the cache type used.
+static llama_context* keryx_make_ctx(llama_model* model, int n_ctx, const char** kv, llama_context_params* out) {
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
+    // The logical batch bounds one decode call; the physical one bounds the compute buffers,
+    // which grow with it and not with the context.
+    cp.n_batch = std::min(2048u, cp.n_ctx);
+    cp.n_ubatch = std::min(512u, cp.n_batch);
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.type_k = GGML_TYPE_Q8_0;
+    cp.type_v = GGML_TYPE_Q8_0;
+    *kv = "q8_0";
+    llama_context* ctx = llama_init_from_model(model, cp);
+    if (!ctx) {
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        cp.type_k = GGML_TYPE_F16;
+        cp.type_v = GGML_TYPE_F16;
+        *kv = "f16";
+        ctx = llama_init_from_model(model, cp);
+    }
+    if (ctx && out) *out = cp;
+    return ctx;
+}
+
+// Free VRAM (MiB) on CUDA ordinal `gpu`, or -1 when it cannot be queried.
+static long keryx_free_mib(int gpu) {
+    int prev = -1;
+    cudaGetDevice(&prev);
+    if (cudaSetDevice(gpu) != cudaSuccess) return -1;
+    size_t fr = 0, tot = 0;
+    const bool ok = cudaMemGetInfo(&fr, &tot) == cudaSuccess;
+    if (prev >= 0) cudaSetDevice(prev);
+    return ok ? (long)(fr >> 20) : -1;
+}
 
 extern "C" {
 
@@ -53,7 +91,10 @@ void keryx_llama_log_set_v1(ggml_log_callback callback, void* user_data) {
     llama_log_set(callback, user_data);
 }
 
-KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
+// Shared loader: weights are loaded ONCE; context sizes are tried largest-first from `ladder`.
+// A context is kept only if at least `reserve_mib` VRAM stays free afterwards for the PoM walk's
+// own buffers (zero-dup gather tables, batch scratch); the last candidate is always kept.
+static KeryxLlama* keryx_load_impl(const char* gguf_path, int gpu, const int* ladder, int n_ladder, int reserve_mib) {
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 999;
@@ -63,9 +104,20 @@ KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     llama_model* model = llama_model_load_from_file(gguf_path, mp);
     if (!model) return nullptr;
 
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
-    llama_context* ctx = llama_init_from_model(model, cp);
+    llama_context* ctx = nullptr;
+    llama_context_params cp{};
+    const char* kv = "f16";
+    long free_after = -1;
+    for (int i = 0; i < n_ladder && !ctx; ++i) {
+        ctx = keryx_make_ctx(model, ladder[i], &kv, &cp);
+        if (!ctx) continue;                                   // context did not fit: next size
+        free_after = keryx_free_mib(gpu);
+        const bool last = (i == n_ladder - 1);
+        if (!last && reserve_mib > 0 && free_after >= 0 && free_after < reserve_mib) {
+            llama_free(ctx);                                  // leave room for the walk
+            ctx = nullptr;
+        }
+    }
     if (!ctx) { llama_model_free(model); return nullptr; }
 
     // Same user-facing sampling the candle path uses (repeat penalty -> temperature 0.7 /
@@ -94,10 +146,32 @@ KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
 
     auto* h = new KeryxLlama();
     h->model = model; h->ctx = ctx; h->smpl = smpl;
+    h->ctx_info = "n_ctx=" + std::to_string(llama_n_ctx(ctx)) + " kv=" + kv +
+                  " flash_attn=" + llama_flash_attn_type_name(cp.flash_attn_type) +
+                  " n_batch=" + std::to_string(llama_n_batch(ctx)) + " n_ubatch=" + std::to_string(llama_n_ubatch(ctx)) +
+                  " vram_free_after=" + std::to_string(free_after) + "MiB";
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
     std::sort(h->names.begin(), h->names.end());
     return h;
 }
+
+KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
+    const int one[1] = { n_ctx > 0 ? n_ctx : 4096 };
+    return keryx_load_impl(gguf_path, gpu, one, 1, 0);
+}
+
+// Context ladder + walk reserve (see keryx_load_impl). Optional export: the miner falls back to
+// keryx_llama_load when an older library lacks it.
+KeryxLlama* keryx_llama_load2(const char* gguf_path, int gpu, const int* ladder, int n_ladder, int reserve_mib) {
+    if (!ladder || n_ladder <= 0) return keryx_llama_load(gguf_path, gpu, 4096);
+    return keryx_load_impl(gguf_path, gpu, ladder, n_ladder, reserve_mib);
+}
+
+// Context parameters the engine ended up with, for the miner log.
+const char* keryx_llama_context_info(KeryxLlama* h) { return h ? h->ctx_info.c_str() : ""; }
+
+// Allocated context window in tokens (0 when unavailable).
+int keryx_llama_n_ctx(KeryxLlama* h) { return (h && h->ctx) ? (int)llama_n_ctx(h->ctx) : 0; }
 
 size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
 

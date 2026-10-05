@@ -122,6 +122,7 @@ struct KeryxLlama {
     uint64_t supl_bytes = 0;
     bool walk_ready = false;
     std::mutex walk_lock; // one dispatch at a time on our cmd buffer/fence
+    std::string ctx_info;           // "n_ctx=… kv=… flash_attn=…" for the miner log
 };
 
 // ── small Vulkan helpers ────────────────────────────────────────────────────────────────────
@@ -481,7 +482,38 @@ bool keryx_llama_pom_pci(KeryxLlama* h, uint32_t* domain, uint32_t* bus, uint32_
     return true;
 }
 
-KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
+
+// 8-bit KV + flash attention context (upstream v0.5.6 d5ccad3), f16 fallback. Mirrors keryx_llama.cpp.
+static llama_context* keryx_make_ctx(llama_model* model, int n_ctx, const char** kv, llama_context_params* out) {
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
+    cp.n_batch = std::min(2048u, cp.n_ctx);
+    cp.n_ubatch = std::min(512u, cp.n_batch);
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.type_k = GGML_TYPE_Q8_0;
+    cp.type_v = GGML_TYPE_Q8_0;
+    *kv = "q8_0";
+    llama_context* ctx = llama_init_from_model(model, cp);
+    if (!ctx) {
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        cp.type_k = GGML_TYPE_F16;
+        cp.type_v = GGML_TYPE_F16;
+        *kv = "f16";
+        ctx = llama_init_from_model(model, cp);
+    }
+    if (ctx && out) *out = cp;
+    return ctx;
+}
+
+// Free memory (MiB) of the model's main device via the ggml backend API, -1 if unknown.
+static long keryx_free_mib_model(llama_model* model, int main_gpu) {
+    if (!model || main_gpu < 0 || (size_t)main_gpu >= model->devices.size()) return -1;
+    size_t fr = 0, tot = 0;
+    ggml_backend_dev_memory(model->devices[main_gpu], &fr, &tot);
+    return tot ? (long)(fr >> 20) : -1;
+}
+
+static KeryxLlama* keryx_load_impl(const char* gguf_path, int gpu, const int* ladder, int n_ladder, int reserve_mib) {
     llama_backend_init();
     // gpu < 0 = "auto-pick a discrete GPU" (issue #18): resolve it against ggml's OWN device
     // list so the model never lands on an integrated GPU. When the miner publishes its selected
@@ -517,9 +549,21 @@ KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     llama_model* model = llama_model_load_from_file(gguf_path, mp);
     if (!model) return nullptr;
 
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
-    llama_context* ctx = llama_init_from_model(model, cp);
+    // Weights load once; context sizes are tried largest-first. Keep one only if `reserve_mib`
+    // stays free for walk_init (the zero-dup walk allocates its tables right after this).
+    llama_context* ctx = nullptr;
+    llama_context_params cp{};
+    const char* kv = "f16";
+    long free_after = -1;
+    for (int i = 0; i < n_ladder && !ctx; ++i) {
+        ctx = keryx_make_ctx(model, ladder[i], &kv, &cp);
+        if (!ctx) continue;
+        free_after = keryx_free_mib_model(model, main_gpu);
+        if (i != n_ladder - 1 && reserve_mib > 0 && free_after >= 0 && free_after < reserve_mib) {
+            llama_free(ctx);
+            ctx = nullptr;
+        }
+    }
     if (!ctx) { llama_model_free(model); return nullptr; }
 
     llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -534,6 +578,10 @@ KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     auto* h = new KeryxLlama();
     h->model = model; h->ctx = ctx; h->smpl = smpl;
     h->gguf_path = gguf_path;
+    h->ctx_info = "n_ctx=" + std::to_string(llama_n_ctx(ctx)) + " kv=" + kv +
+                  " flash_attn=" + llama_flash_attn_type_name(cp.flash_attn_type) +
+                  " n_batch=" + std::to_string(llama_n_batch(ctx)) + " n_ubatch=" + std::to_string(llama_n_ubatch(ctx)) +
+                  " vram_free_after=" + std::to_string(free_after) + "MiB";
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
     std::sort(h->names.begin(), h->names.end());
 
@@ -544,6 +592,17 @@ KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     }
     return h;
 }
+
+KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
+    const int one[1] = { n_ctx > 0 ? n_ctx : 4096 };
+    return keryx_load_impl(gguf_path, gpu, one, 1, 0);
+}
+KeryxLlama* keryx_llama_load2(const char* gguf_path, int gpu, const int* ladder, int n_ladder, int reserve_mib) {
+    if (!ladder || n_ladder <= 0) return keryx_llama_load(gguf_path, gpu, 4096);
+    return keryx_load_impl(gguf_path, gpu, ladder, n_ladder, reserve_mib);
+}
+const char* keryx_llama_context_info(KeryxLlama* h) { return h ? h->ctx_info.c_str() : ""; }
+int keryx_llama_n_ctx(KeryxLlama* h) { return (h && h->ctx) ? (int)llama_n_ctx(h->ctx) : 0; }
 
 size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
 

@@ -60,6 +60,11 @@ pub struct ModelSpec {
     /// KV cache + CUDA workspace. Used by the OPoI capability gate so `ai:cap`
     /// never announces a model the miner cannot load. 0 = never gated.
     pub min_vram_mb: u64,
+    /// Smallest context window (tokens) the engine should hold for this model — the budget clients
+    /// assume (upstream v0.5.6 d5ccad3). The ladder never goes below it.
+    pub ctx_floor: u32,
+    /// Largest context window worth allocating when the VRAM allows it.
+    pub ctx_cap: u32,
 }
 
 pub const GLM_4_9B_0414: ModelSpec = ModelSpec {
@@ -74,6 +79,8 @@ pub const GLM_4_9B_0414: ModelSpec = ModelSpec {
     weight_cids: &["QmfBGGZumBR4XGFLLPjYozvhRSt3kXjrgsV3jXciCdAeM7"],
     dir_name: "GLM-4-9B-0414",
     min_vram_mb: 12_000,
+    ctx_floor: 32768,
+    ctx_cap: 32768,
 };
 
 pub const QWEN3_6_27B: ModelSpec = ModelSpec {
@@ -88,6 +95,8 @@ pub const QWEN3_6_27B: ModelSpec = ModelSpec {
     weight_cids: &["QmamoYQGGAkBaqiWuNmwxeC9AQnt9F7sLyX57VoqbJWeUV"],
     dir_name: "Qwen3.6-27B",
     min_vram_mb: 24_000,
+    ctx_floor: 32768,
+    ctx_cap: 65536,
 };
 
 /// H14 tier-3 model (--high), replaces Qwen3.6-27B at the private-inference gate —
@@ -107,6 +116,8 @@ pub const QWEN3_8_27B: ModelSpec = ModelSpec {
     dir_name: "Qwen3.8-27B",
     // ~16.8 GB Q4_K weights + KV/workspace → 24 GB card (3090/4090/5090), same as Qwen3.6-27B.
     min_vram_mb: 24_000,
+    ctx_floor: 32768,
+    ctx_cap: 65536,
 };
 
 pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
@@ -121,6 +132,8 @@ pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
     weight_cids: &["QmSVhtoNrL8bWJXZuEXMMWqty8qHScQMRuacuoa9ujsYqp"],
     dir_name: "Kimi-Linear-48B",
     min_vram_mb: 30_000,
+    ctx_floor: 32768,
+    ctx_cap: 131072,
 };
 
 // ── H6 lineup additions ─────────────────────────────────────────
@@ -143,6 +156,8 @@ pub const QWEN3_5_9B_ABLITERATED: ModelSpec = ModelSpec {
     dir_name: "Qwen3.5-9B-abliterated",
     // ~6.5 GB Q5_K_M weights + ~1.3 GB KV/workspace → 8 GB card.
     min_vram_mb: 8_000,
+    ctx_floor: 8192,
+    ctx_cap: 32768,
 };
 
 /// H6 tier-2 model — gemma-4-12B-it-abliterated Q6_K (huihui-ai abliteration, mradermacher GGUF).
@@ -164,6 +179,8 @@ pub const GEMMA_4_12B_ABLITERATED: ModelSpec = ModelSpec {
     // 20 GB was from an OOM on the pre-v0.10.6 candle path, which loaded a SECOND full copy.)
     dir_name: "Gemma-4-12B-abliterated",
     min_vram_mb: 15_000,
+    ctx_floor: 32768,
+    ctx_cap: 131072,
 };
 
 /// Whether `model_id` is one of the Proof-of-Model tier models (any era). DAA-independent —
@@ -544,6 +561,12 @@ pub const REGISTRY: &[&ModelSpec] = &[
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
     REGISTRY.iter().copied().find(|m| m.name == name)
+}
+
+/// The lineup model a GGUF path belongs to, by its `models/<dir_name>/` component.
+pub fn spec_for_gguf(path: &str) -> Option<&'static ModelSpec> {
+    let normalized = path.replace('\\', "/");
+    REGISTRY.iter().copied().find(|m| normalized.contains(&format!("/{}/", m.dir_name)))
 }
 
 pub fn available_names() -> Vec<&'static str> {
