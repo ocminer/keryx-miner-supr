@@ -64,7 +64,12 @@ static llama_context* keryx_make_ctx(llama_model* model, int n_ctx, const char**
 }
 
 // Free VRAM (MiB) on CUDA ordinal `gpu`, or -1 when it cannot be queried.
+// Metal (unified memory): -1, so the context ladder keeps the largest context that loads.
 static long keryx_free_mib(int gpu) {
+#ifdef __APPLE__
+    (void)gpu;
+    return -1;
+#else
     int prev = -1;
     cudaGetDevice(&prev);
     if (cudaSetDevice(gpu) != cudaSuccess) return -1;
@@ -72,6 +77,7 @@ static long keryx_free_mib(int gpu) {
     const bool ok = cudaMemGetInfo(&fr, &tot) == cudaSuccess;
     if (prev >= 0) cudaSetDevice(prev);
     return ok ? (long)(fr >> 20) : -1;
+#endif
 }
 
 
