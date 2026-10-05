@@ -4033,6 +4033,90 @@ pub fn set_device_model(device_id: u32, model_id: [u8; 32], gguf_path: String) {
     }
 }
 
+/// Outcome of `advance_era_model_if_due` for one worker iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EraSwap {
+    /// The device already holds the model its tier mines at this DAA (the common case — no-op).
+    NotDue,
+    /// The device was switched to the era-correct model; its walk is uninstalled and the next
+    /// `ensure_installed` builds the new one.
+    Swapped,
+    /// A swap is due but cannot run right now (inference owns the card, or the new model is not
+    /// staged yet). The device must NOT grind: its old walk can only produce rejected proofs.
+    Deferred,
+}
+
+/// Pure era decision: the model `current` must be replaced with at `daa`, if any. A device keeps
+/// its hardware tier for life (`Tier::for_model`); only the model that tier mines changes at an
+/// era gate (H14: tier 3 Qwen3.6-27B -> Qwen3.8-27B). Symmetric, so a process that staged the
+/// post-gate model early (clock ahead of the chain) swaps back for pre-gate blocks.
+pub fn era_model_for(current: &[u8; 32], daa: u64) -> Option<&'static crate::models::ModelSpec> {
+    let tier = crate::models::Tier::for_model(current)?;
+    let want = tier.pom_spec_at(daa);
+    (want.model_id != *current).then_some(want)
+}
+
+/// Hot-swap this device's mining model at an era crossing (H14), in place, without a restart —
+/// called by the device's own worker before every install/grind, so the walk is never running
+/// while it is replaced. Inert (one map lookup) until a gate actually changes the device's model;
+/// pre-H14 it is a no-op for every tier, keeping 0.13.4 behaviour byte-identical.
+///
+/// Steps (mirroring the existing OOM-demotion model replacement): pin the era model as this
+/// device's own model (per-device possession index), uninstall the old walk, free the old model
+/// from this card's llama engine, retire the old model from ai:cap/routing, register the new one
+/// in the served lineup and start its durable inference warmer. The next `ensure_installed`
+/// builds (or reuses the pre-built) possession tree, checks it against the node's pinned anchor,
+/// self-tests the new model and walks it zero-dup.
+pub fn advance_era_model_if_due(device_id: u32, daa: u64) -> EraSwap {
+    let Some((current, old_gguf)) = device_model(device_id) else { return EraSwap::NotDue };
+    let Some(want) = era_model_for(&current, daa) else { return EraSwap::NotDue };
+    let new_gguf = crate::slm::gguf_path_for(want).to_string_lossy().into_owned();
+    let staged = std::path::Path::new(&new_gguf).parent().map_or(false, |d| d.join(".ok").exists());
+    if !staged {
+        static LAST_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(LAST_WARN.swap(now, Ordering::Relaxed)) >= 60 {
+            log::error!(
+                "PoM[gpu{}]: DAA {} needs model '{}' for this tier (era gate) but it is not downloaded yet ({}). \
+                 This card is PAUSED — its current model can only produce rejected proofs past the gate. \
+                 The background prefetch keeps retrying.",
+                device_id,
+                daa,
+                want.name,
+                new_gguf
+            );
+        }
+        crate::slm::ensure_era_prefetch(want);
+        return EraSwap::Deferred;
+    }
+    // Same mutual exclusion as an install: either the swap wins and inference on this card
+    // defers, or an in-flight inference keeps the card and the swap retries next iteration.
+    let Some(_install_guard) = DeviceInstallGuard::begin(device_id) else { return EraSwap::Deferred };
+    info!(
+        "PoM[gpu{}]: era gate crossed at DAA {} — tier model {:.16} → '{}' (hot-swap, no restart).",
+        device_id,
+        daa,
+        hex::encode(current),
+        want.name
+    );
+    set_device_model(device_id, want.model_id, new_gguf.clone());
+    if !uninstall_released(device_id) {
+        // A stuck walk still owns the old table: the regular stuck-table path keeps the card idle
+        // until it lets go. The new model is already assigned, so the rebuild picks it up.
+        log::warn!("PoM[gpu{}]: old walk still draining — the new model installs once it releases.", device_id);
+    }
+    // The in-process engine on THIS card still hosts the retired model (zero-dup inference copy).
+    // Free it now so the new model's load has the VRAM; a different card's engine is untouched.
+    if crate::llama_engine::active_for(&old_gguf, device_id as usize) {
+        crate::llama_engine::unload_for_gpu(device_id as usize);
+    }
+    crate::slm::swap_era_model(&current, want);
+    EraSwap::Swapped
+}
+
 /// Devices whose model was pinned by `--force-model`. A forced device is NEVER auto-demoted on an
 /// OOM — `--force-model` means "load exactly this, no VRAM check", so we honor it even if it OOMs.
 fn forced_devices() -> &'static Mutex<std::collections::HashSet<u32>> {
@@ -4305,6 +4389,17 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             info!("PoM: building host weight index (gpu{}) — this can take a while…", device_id);
             match crate::pom::WeightIndex::build_from_gguf(&gguf, model_id) {
                 Ok(mut idx) => {
+                    // The node verifies every proof against its pinned (R_T, N) for the tier. A
+                    // mismatch here means a corrupt/wrong GGUF: refuse to mine an H14-introduced
+                    // model on it (only rejected proofs would follow); report it for older models.
+                    if let Err(e) = crate::models::check_pom_anchor(&model_id, &idx.r_t, idx.n_chunks) {
+                        if crate::models::pom_anchor_enforced(&model_id) {
+                            log::error!("PoM[gpu{}]: {} — NOT mining this model.", device_id, e);
+                            crate::slm::set_staging_error(e);
+                            return false;
+                        }
+                        log::warn!("PoM[gpu{}]: {}", device_id, e);
+                    }
                     // Opt-in solo block-race edge (upstream 7a6e7a0): hold the FULL Merkle tree in
                     // RAM so the post-hit proof build is a pure lookup instead of the optimized
                     // sparse-checkpoint path. This removes its remaining proof-release latency.

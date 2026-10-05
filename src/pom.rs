@@ -398,6 +398,25 @@ pub fn is_h14_seed_era(daa: u64) -> bool {
     daa >= h14_activation_daa()
 }
 
+/// Upstream/node name of the H14 gate (`Params::private_inference_activation`). One gate drives
+/// every H14 rule in this miner — walk seed, tier-3 lineup, private inference, legacy pool tasks —
+/// exactly like the node, so they can never cross at different DAAs.
+#[inline]
+pub fn private_inference_activation_daa() -> u64 {
+    h14_activation_daa()
+}
+
+/// Whether a block at `daa` is past the H14 (private-inference) gate.
+#[inline]
+pub fn is_h14_era(daa: u64) -> bool {
+    daa >= h14_activation_daa()
+}
+
+/// True when `KERYX_POM_H14_ACTIVATION_DAA` moved the gate (testing).
+pub fn is_h14_activation_overridden() -> bool {
+    h14_activation_daa() != POM_H14_ACTIVATION_DAA
+}
+
 /// Real formula shipped and golden-verified (node v1.5.7 + miner-upstream v0.5.3).
 pub const H10_SPEC_VERIFIED: bool = true;
 

@@ -754,6 +754,27 @@ impl MinerManager {
                                 std::thread::sleep(std::time::Duration::from_millis(25));
                                 continue;
                             }
+                            // Era gate (H14): a tier whose model changes at this DAA (tier 3: Qwen3.6-27B ->
+                            // Qwen3.8-27B) is hot-swapped HERE, by the card's own worker, so its walk is
+                            // never running while it is replaced. One map lookup and a no-op until a gate
+                            // flips this card's model; pre-H14 it never fires. While a due swap cannot run
+                            // (new model still staging / inference owns the card) the card must not grind:
+                            // its old walk could only produce proofs the node rejects.
+                            #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+                            if keryx_miner::pom_gpu::advance_era_model_if_due(wdid, daa)
+                                == keryx_miner::pom_gpu::EraSwap::Deferred
+                            {
+                                if let Some(new_cmd) = block_channel.get_changed()? {
+                                    state = match new_cmd {
+                                        Some(WorkerCommand::Job(s)) => Some(s),
+                                        Some(WorkerCommand::Close) => return Ok(()),
+                                        None => None,
+                                    };
+                                    continue;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                continue;
+                            }
                             if !pom_driver::is_installed(wdid) {
                                 // Cooperative pre-reload check: act on a pending shutdown / newer job
                                 // before a multi-second blocking model reload.

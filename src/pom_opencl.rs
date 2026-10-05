@@ -1668,6 +1668,13 @@ fn ensure_index(model_id: [u8; 32], gguf_path: &str, tier: u8) -> Result<(), Str
     }
     log::info!("PoM: building WeightIndex from {gguf_path} (tier {tier})…");
     let mut index = crate::pom::WeightIndex::build_from_gguf(gguf_path, model_id).map_err(|e| e.to_string())?;
+    if let Err(e) = crate::models::check_pom_anchor(&model_id, &index.r_t, index.n_chunks) {
+        if crate::models::pom_anchor_enforced(&model_id) {
+            crate::slm::set_staging_error(e.clone());
+            return Err(e);
+        }
+        log::warn!("PoM: {e}");
+    }
     log::info!(
         "PoM: tier {tier} loaded — {} chunks, computed R_T = {} (must match the node's pinned root)",
         index.n_chunks,
@@ -1837,6 +1844,23 @@ pub fn mine_v4(
     // sponge over the tagged words is exactly the node's pom_block_seed_h14 — no kernel change, the
     // same mechanism as the CUDA path. Pre-H14 these are the words 0.13.4 passed, bit for bit.
     let s = crate::pom::pph_seed_words_for_era(pph, daa);
+    // The tier lineup is per block: past the H14 gate the tier-3 model is Qwen3.8-27B, and a walk
+    // over the previous model can only yield proofs the node rejects. The OpenCL tier is
+    // process-wide and resident, so pause instead of grinding dead work; a restart stages the
+    // era-correct model (already prefetched in the background).
+    if let Some((model_id, _, _)) = TIER.lock().ok().and_then(|g| g.clone()) {
+        if crate::models::pom_tier_index(&model_id, daa).is_none() {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                let want = crate::models::Tier::for_model(&model_id).map(|t| t.pom_spec_at(daa).name).unwrap_or("?");
+                log::error!(
+                    "PoM[opencl]: DAA {daa} is past the H14 gate and this tier now mines '{want}' — the resident \
+                     model is retired, mining PAUSED. Restart the miner to load '{want}' (prefetched in the background)."
+                );
+            }
+            return Err(crate::pom::GrindError::Paused("tier model retired at the H14 gate — restart required"));
+        }
+    }
     let t = words(target_le);
     let Some(miner) = miner_for(id) else {
         return Err(crate::pom::GrindError::Paused("OpenCL walk not installed"));

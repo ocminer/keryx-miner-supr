@@ -2242,14 +2242,8 @@ fn publish_runtime_model_status(model_id: &[u8; 32]) {
     let Some(spec) = crate::models::REGISTRY.iter().copied().find(|spec| spec.model_id == display_model_id) else {
         return;
     };
-    let tier = match crate::models::REGISTRY.iter().position(|candidate| candidate.model_id == display_model_id) {
-        Some(0) => "very-light",
-        Some(1) => "light",
-        Some(2) => "default",
-        Some(3) => "high",
-        Some(4) => "very-high",
-        _ => "custom",
-    };
+    // By hardware tier, not REGISTRY position: H14 appends Qwen3.8-27B as a second `high` model.
+    let tier = crate::models::Tier::for_model(&display_model_id).map_or("custom", |t| t.label());
     #[cfg(feature = "pom-cuda")]
     let backend = "CUDA";
     #[cfg(all(not(feature = "pom-cuda"), feature = "pom-opencl"))]
@@ -2444,6 +2438,10 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> SelfTestOutco
             // so recovery is earned, rather than leaving a once-good route wedged forever.
         }
     }
+    if is_era_retired(model_id) {
+        // Retired at an era gate (H14 tier-3 swap): never load it again.
+        return SelfTestOutcome::Deferred(DeferredReason::ModelNotRegistered);
+    }
     let name = {
         let specs = *SUPPORTED_SPECS.read().unwrap();
         specs.iter().find(|s| &s.model_id == model_id).map(|s| s.name).unwrap_or("?")
@@ -2569,9 +2567,16 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> SelfTestOutco
 /// thrash. The coordinator deliberately remains alive after success: a later GPU-context reset
 /// invalidates the exact route proof and this same thread then earns it again without a restart.
 pub fn warm_inference_route(model_id: [u8; 32], initial_gpu: usize) {
+    // One durable warmer per model: the era swap starts one for the new model, which must not
+    // double up with a startup warmer for the same model.
+    let Some(_registration) = WarmerRegistration::claim(model_id) else { return };
     let mut delay = std::time::Duration::from_secs(30);
     let mut target_gpu = initial_gpu;
     loop {
+        if is_era_retired(&model_id) {
+            log::info!("OPoI: model {:.8} retired at an era gate — its route warmer stops.", hex::encode(model_id));
+            return;
+        }
         // A failed probe may establish a model-specific failover override. Resolve placement every
         // round so the durable warmer follows that proven card instead of repeatedly retrying the
         // failed original and evicting/reloading both GPUs forever.
@@ -2596,6 +2601,200 @@ pub fn warm_inference_route(model_id: [u8; 32], initial_gpu: usize) {
             delay = (delay * 2).min(std::time::Duration::from_secs(300));
         }
         target_gpu = inference_gpu_for_model(&model_id);
+    }
+}
+
+// ── Era model swap (H14: tier 3 Qwen3.6-27B -> Qwen3.8-27B) ─────────────────────────────────────
+
+/// Models retired at an era gate. A retired model is withdrawn from ai:cap, never self-tested or
+/// loaded again, and its warmer stops. Reversible: a swap back (pre-gate block after an early
+/// post-gate staging) un-retires it.
+fn era_retired() -> &'static RwLock<std::collections::HashSet<[u8; 32]>> {
+    static SET: OnceLock<RwLock<std::collections::HashSet<[u8; 32]>>> = OnceLock::new();
+    SET.get_or_init(|| RwLock::new(std::collections::HashSet::new()))
+}
+
+pub fn is_era_retired(model_id: &[u8; 32]) -> bool {
+    era_retired().read().map(|s| s.contains(model_id)).unwrap_or(false)
+}
+
+fn live_warmers() -> &'static Mutex<std::collections::HashSet<[u8; 32]>> {
+    static SET: OnceLock<Mutex<std::collections::HashSet<[u8; 32]>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// RAII claim on "the durable warmer of this model"; dropped when the warmer exits.
+struct WarmerRegistration([u8; 32]);
+
+impl WarmerRegistration {
+    fn claim(model_id: [u8; 32]) -> Option<Self> {
+        let mut g = live_warmers().lock().unwrap_or_else(|p| p.into_inner());
+        g.insert(model_id).then(|| Self(model_id))
+    }
+}
+
+impl Drop for WarmerRegistration {
+    fn drop(&mut self) {
+        live_warmers().lock().unwrap_or_else(|p| p.into_inner()).remove(&self.0);
+    }
+}
+
+/// Pure lineup rewrite of an era swap: `old` replaced by `new` in place (keeping the order the
+/// declaration/dashboards see), or `new` appended when `old` was not in the lineup (a per-card
+/// model). Never duplicates `new`.
+fn lineup_with_era_model(
+    lineup: &[&'static ModelSpec],
+    old: &[u8; 32],
+    new: &'static ModelSpec,
+) -> Vec<&'static ModelSpec> {
+    let mut out: Vec<&'static ModelSpec> = Vec::with_capacity(lineup.len() + 1);
+    for s in lineup {
+        let s = if &s.model_id == old { new } else { *s };
+        if !out.iter().any(|o| o.model_id == s.model_id) {
+            out.push(s);
+        }
+    }
+    if !out.iter().any(|o| o.model_id == new.model_id) {
+        out.push(new);
+    }
+    out
+}
+
+/// Bookkeeping half of the per-device era swap (`pom_gpu::advance_era_model_if_due`): retire the
+/// old model (withdraw from ai:cap, drop its route proofs and failover overrides, stop its
+/// warmer), put the new model into the served lineup and start its durable route warmer so the
+/// pool sees it declared as soon as it proves it can generate. Idempotent — every card of a
+/// multi-card tier calls it at the same crossing.
+pub fn swap_era_model(old: &[u8; 32], new: &'static ModelSpec) {
+    static SWAP: Mutex<()> = Mutex::new(());
+    let _serial = SWAP.lock().unwrap_or_else(|p| p.into_inner());
+    let first = era_retired().write().map(|mut s| s.insert(*old)).unwrap_or(false);
+    if let Ok(mut s) = era_retired().write() {
+        s.remove(&new.model_id);
+    }
+    {
+        let mut supported = SUPPORTED_SPECS.write().unwrap_or_else(|p| p.into_inner());
+        let next = lineup_with_era_model(&supported, old, new);
+        if next.len() != supported.len() || next.iter().zip(supported.iter()).any(|(a, b)| a.model_id != b.model_id) {
+            *supported = Box::leak(next.into_boxed_slice());
+        }
+    }
+    {
+        let mut v2 = LINEUP_V2.write().unwrap_or_else(|p| p.into_inner());
+        if v2.iter().any(|s| &s.model_id == old) {
+            let next = lineup_with_era_model(&v2, old, new);
+            *v2 = Box::leak(next.into_boxed_slice());
+        }
+    }
+    if first {
+        clear_self_test(old);
+        if let Ok(mut overrides) = inference_gpu_overrides().write() {
+            overrides.remove(old);
+        }
+        mark_model_unavailable(old, "retired_at_era_gate");
+        log::info!(
+            "OPoI: era gate — model {:.8} retired; serving lineup now {}.",
+            hex::encode(old),
+            SUPPORTED_SPECS.read().map(|s| s.iter().map(|m| m.name).collect::<Vec<_>>().join(", ")).unwrap_or_default()
+        );
+    }
+    mark_model_available(&new.model_id, "era_gate_model");
+    let model_id = new.model_id;
+    std::thread::spawn(move || {
+        let gpu = inference_gpu_for_model(&model_id);
+        warm_inference_route(model_id, gpu);
+    });
+}
+
+/// Keep (re)trying to stage an era model the miner will need at a gate, in the background. One
+/// retry loop per model per process.
+pub fn ensure_era_prefetch(spec: &'static ModelSpec) {
+    static STARTED: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
+    {
+        let mut started = STARTED.lock().unwrap_or_else(|p| p.into_inner());
+        if started.contains(&spec.model_id) {
+            return;
+        }
+        started.push(spec.model_id);
+    }
+    std::thread::spawn(move || {
+        let one: &'static [&'static ModelSpec] = Box::leak(vec![spec].into_boxed_slice());
+        let mut round = 0u32;
+        loop {
+            match prefetch_models(one) {
+                Ok(()) => {
+                    log::info!("Era model '{}' staged — ready for its gate.", spec.name);
+                    prebuild_possession_tree(spec);
+                    return;
+                }
+                Err(e) => {
+                    round += 1;
+                    log::warn!("Era model '{}' staging failed (attempt {}): {} — retrying in 60s", spec.name, round, e);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    });
+}
+
+/// Build (or verify a reused) possession tree for a staged model ahead of its gate, so the
+/// crossing does not idle the card while 16+ GB are hashed, and check it against the node's pinned
+/// anchor so a corrupt download is reported days before it would matter. The tree cache is shared
+/// (`pom-tree.bin` next to the GGUF); the in-memory index is dropped right away.
+pub fn prebuild_possession_tree(spec: &'static ModelSpec) {
+    if std::env::var("KERYX_H14_PREBUILD_TREE").ok().as_deref() == Some("0") {
+        return;
+    }
+    let gguf = gguf_path_for(spec);
+    let t0 = std::time::Instant::now();
+    log::info!("PoM: pre-building the possession tree of '{}' for its era gate (background, CPU/disk only)…", spec.name);
+    match crate::pom::WeightIndex::build_from_gguf(&gguf.to_string_lossy(), spec.model_id) {
+        Ok(idx) => match crate::models::check_pom_anchor(&spec.model_id, &idx.r_t, idx.n_chunks) {
+            Ok(()) => log::info!(
+                "PoM: '{}' possession tree ready in {:.0}s — R_T matches the node's pinned anchor (N={}).",
+                spec.name,
+                t0.elapsed().as_secs_f64(),
+                idx.n_chunks
+            ),
+            Err(e) => {
+                log::error!("PoM: '{}' — {}", spec.name, e);
+                set_staging_error(format!("{}: {}", spec.name, e));
+            }
+        },
+        Err(e) => log::warn!("PoM: pre-building '{}' possession tree failed ({}) — it is built at the gate instead.", spec.name, e),
+    }
+}
+
+#[cfg(test)]
+mod era_swap_tests {
+    use super::*;
+    use crate::models::{GEMMA_4_12B_ABLITERATED, KIMI_LINEAR_48B, QWEN3_5_9B_ABLITERATED, QWEN3_6_27B, QWEN3_8_27B};
+
+    #[test]
+    fn lineup_rewrite_replaces_in_place_and_never_duplicates() {
+        let lineup: Vec<&'static ModelSpec> = vec![&KIMI_LINEAR_48B, &QWEN3_6_27B, &GEMMA_4_12B_ABLITERATED];
+        let out = lineup_with_era_model(&lineup, &QWEN3_6_27B.model_id, &QWEN3_8_27B);
+        assert_eq!(out.iter().map(|s| s.name).collect::<Vec<_>>(), ["kimi-linear-48b", "qwen3.8-27b", "gemma-4-12b-abliterated"]);
+        // Idempotent.
+        let again = lineup_with_era_model(&out, &QWEN3_6_27B.model_id, &QWEN3_8_27B);
+        assert_eq!(again.len(), 3);
+        // A per-card model that was not in the primary lineup is appended.
+        let single: Vec<&'static ModelSpec> = vec![&QWEN3_5_9B_ABLITERATED];
+        let out = lineup_with_era_model(&single, &QWEN3_6_27B.model_id, &QWEN3_8_27B);
+        assert_eq!(out.iter().map(|s| s.name).collect::<Vec<_>>(), ["qwen3.5-9b-abliterated", "qwen3.8-27b"]);
+        // Swap back (pre-gate block after an early post-gate staging).
+        let back = lineup_with_era_model(&[&QWEN3_8_27B], &QWEN3_8_27B.model_id, &QWEN3_6_27B);
+        assert_eq!(back.iter().map(|s| s.name).collect::<Vec<_>>(), ["qwen3.6-27b"]);
+    }
+
+    #[test]
+    fn warmer_registration_is_exclusive_per_model() {
+        let id = [0xE5u8; 32];
+        let first = WarmerRegistration::claim(id).expect("first claim");
+        assert!(WarmerRegistration::claim(id).is_none(), "second warmer for the same model refused");
+        assert!(WarmerRegistration::claim([0xE6u8; 32]).is_some());
+        drop(first);
+        assert!(WarmerRegistration::claim(id).is_some(), "claim released on exit");
     }
 }
 
@@ -2674,14 +2873,14 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]>{
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let mut ids: Vec<[u8; 32]> = specs
         .iter()
-        .filter(|s| spec_files_ready(s) && !model_is_unavailable(&s.model_id))
+        .filter(|s| spec_files_ready(s) && !model_is_unavailable(&s.model_id) && !is_era_retired(&s.model_id))
         .map(|s| s.model_id)
         .collect();
     // Per-card assignments (mixed rig / --force-model): add any assigned tier whose GGUF is staged
     // (its dir's `.ok` present) and not already listed. pom-cuda only — the map is empty elsewhere.
     #[cfg(feature = "pom-cuda")]
     for (mid, gguf) in crate::pom_gpu::assigned_models() {
-        if ids.contains(&mid) || model_is_unavailable(&mid) {
+        if ids.contains(&mid) || model_is_unavailable(&mid) || is_era_retired(&mid) {
             continue;
         }
         let marker_ready = std::path::Path::new(&gguf).parent().map_or(false, |d| d.join(".ok").exists());

@@ -182,14 +182,14 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
             vram_mb,
             vram_mb / 1024
         );
-        log::error!("   Use --high (Qwen3.6-27B) or a smaller H6 tier.");
+        log::error!("   Use --high (Qwen3.6/3.8-27B) or a smaller tier.");
         // Non-fatal: let candle fail with its own OOM so the miner logs the actual error.
     }
 
     let model_label = if needs_very_high {
         "Kimi-Linear-48B (very-high)"
     } else if needs_high {
-        "Qwen3.6-27B (high)"
+        "Qwen3-27B (high)"
     } else {
         "Qwen3.5-9B / GLM-9B / Gemma-12B"
     };
@@ -363,7 +363,7 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
         vram_mb,
         picked.pom_model_name(),
         picked,
-        models::pom_tier_index(&picked.pom_spec().model_id, keryx_miner::pom::pom_v3_activation_daa()).unwrap_or(0),
+        models::pom_tier_index(&picked.pom_spec().model_id, models::staging_daa()).unwrap_or(0),
         need,
         AUTO_TIER_HEADROOM_MB,
     );
@@ -400,7 +400,7 @@ fn select_tier_nvidia(opt: &cli::Opt) -> keryx_miner::models::Tier {
                 return Tier::Default;
             }
             "high" => {
-                info!("--tier high: tier 3 — mines Qwen3.6-27B under PoM.");
+                info!("--tier high: tier 3 — mines {} under PoM (Qwen3.6-27B before H14, Qwen3.8-27B from it).", Tier::High.pom_spec().name);
                 return Tier::High;
             }
             "very-high" | "veryhigh" | "very_high" => {
@@ -422,7 +422,7 @@ fn select_tier_nvidia(opt: &cli::Opt) -> keryx_miner::models::Tier {
         info!("--very-high mode: tier 4 — mines Kimi-Linear-48B under PoM.");
         Tier::VeryHigh
     } else if opt.high {
-        info!("--high mode: tier 3 — mines Qwen3.6-27B under PoM.");
+        info!("--high mode: tier 3 — mines {} under PoM (Qwen3.6-27B before H14, Qwen3.8-27B from it).", Tier::High.pom_spec().name);
         Tier::High
     } else if opt.light {
         info!("--light mode: tier 1 — mines GLM-4-9B under PoM.");
@@ -467,7 +467,7 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
         vram_mb,
         picked.pom_model_name(),
         picked,
-        models::pom_tier_index(&picked.pom_spec().model_id, keryx_miner::pom::pom_v3_activation_daa()).unwrap_or(0),
+        models::pom_tier_index(&picked.pom_spec().model_id, models::staging_daa()).unwrap_or(0),
         need,
         AUTO_TIER_HEADROOM_MB,
     );
@@ -494,7 +494,7 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
                  ({} will download in the background; restart to use it.)",
                 tier.pom_model_name(),
                 tier,
-                models::pom_tier_index(&tier.pom_spec().model_id, keryx_miner::pom::pom_v3_activation_daa())
+                models::pom_tier_index(&tier.pom_spec().model_id, models::staging_daa())
                     .unwrap_or(0),
                 picked.pom_model_name(),
             );
@@ -1348,9 +1348,26 @@ async fn run() -> Result<(), Error> {
     // --force-model contract: the forced model loads REGARDLESS of VRAM fit (power-user knob), so
     // the capability gate is skipped for it — otherwise filter_specs_by_vram silently drops the
     // forced spec and PoM never configures (the "--force-model ignored" bug class, issue #7).
-    // Stage the CURRENT-era lineup: resolve at the H6 gate, whose anchors (tier-0 Qwen3.5-9B) pin
-    // POM_TIERS_H6 — matching `Tier::pom_spec()`. The pre-H6 lineups were retired with their models.
-    let lineup_daa = keryx_miner::pom::pom_v3_activation_daa();
+    // Stage the CURRENT-era lineup: resolve at `staging_daa()` — the H6 gate (POM_TIERS_H6, the
+    // 0.13.4 lineup) until the H14 gate is known to be behind us, then the H14 gate (POM_TIERS_H14:
+    // tier 3 = Qwen3.8-27B) — matching `Tier::pom_spec()`. The per-block truth is the job DAA: a
+    // CUDA card hot-swaps its tier model at the crossing (pom_gpu::advance_era_model_if_due).
+    let lineup_daa = keryx_miner::models::staging_daa();
+    if keryx_miner::models::stage_post_h14() {
+        info!("H14: staging the post-gate lineup (tier 3 = Qwen3.8-27B).");
+    } else {
+        info!(
+            "H14: staging the pre-gate lineup; tier-3 cards switch to Qwen3.8-27B in place at DAA {} \
+             (prefetched in the background, no restart needed on NVIDIA).",
+            keryx_miner::pom::private_inference_activation_daa()
+        );
+    }
+    if keryx_miner::pom::is_h14_activation_overridden() {
+        warn!(
+            "PoM: H14 GATE OVERRIDDEN to DAA {} via KERYX_POM_H14_ACTIVATION_DAA — staging/testing ONLY!",
+            keryx_miner::pom::private_inference_activation_daa()
+        );
+    }
     let specs_all = keryx_miner::models::specs_for(lineup_daa, tier);
     let specs_v2 = if tier_forced {
         info!("--force-model: VRAM capability gate skipped for the forced model — it will load regardless of fit (may OOM an undersized card).");
@@ -1398,6 +1415,32 @@ async fn run() -> Result<(), Error> {
     // Prefetch BOTH lineups in the BACKGROUND (suprnova: backgrounded so a worker/plugin error
     // surfaces immediately instead of after a multi-GB download — the HiveOS "black screen" fix).
     // The OPoI hard gate keeps PoW suspended until the files are ready and un-suspends itself.
+    // H14: every model an assigned tier must mine across the gate, beyond the staged lineup
+    // (Qwen3.8-27B for tier-3 cards while the pre-gate lineup is staged). Staged AFTER the lineup so
+    // the mining-tier model never competes with it for a small disk; its possession tree is
+    // pre-built and checked against the node's pinned anchor so the crossing does not idle the card.
+    let era_extra: Vec<&'static keryx_miner::models::ModelSpec> = {
+        #[allow(unused_mut)]
+        let mut tiers = vec![tier];
+        #[cfg(not(feature = "pom-opencl"))]
+        tiers.extend(device_tiers.iter().map(|(_, t, _)| *t));
+        let mut v: Vec<&'static keryx_miner::models::ModelSpec> = Vec::new();
+        for t in tiers {
+            for s in keryx_miner::models::pom_models_all_eras(t) {
+                if !specs_v2.iter().any(|x| x.model_id == s.model_id) && !v.iter().any(|x| x.model_id == s.model_id) {
+                    v.push(s);
+                }
+            }
+        }
+        v
+    };
+    if !era_extra.is_empty() {
+        info!(
+            "H14: will also stage {} for the tier-3 switch at DAA {} (background, after the current lineup).",
+            era_extra.iter().map(|s| s.name).collect::<Vec<_>>().join(", "),
+            keryx_miner::pom::private_inference_activation_daa()
+        );
+    }
     info!("Prefetching model files in the background — PoW stays OPoI-gated until they're ready…");
     tokio::spawn(async move {
         // The MINING-TIER model FIRST and on its own — its possession index is what mining needs.
@@ -1444,6 +1487,9 @@ async fn run() -> Result<(), Error> {
             Ok(Ok(())) => info!("Model files ready (uncensored lineup) — OPoI inference available."),
             Ok(Err(e)) => warn!("Model prefetch failed — AiRequest tasks will be skipped: {}", e),
             Err(e) => warn!("Model prefetch task panicked — AiRequest tasks will be skipped: {}", e),
+        }
+        for spec in era_extra {
+            keryx_miner::slm::ensure_era_prefetch(spec);
         }
     });
 
