@@ -28,6 +28,18 @@ pub fn upload(text: &str, api_url: &str) -> anyhow::Result<[u8; 34]> {
     cid_v0_to_multihash(cid_str)
 }
 
+/// sha2-256 multihash (`0x12 0x20 || sha256(data)`) of raw bytes. From the H14 gate a private
+/// answer travels inline in the AiResponse and its CID field carries this digest of the sealed
+/// body — nothing is uploaded, so no IPFS node is needed.
+pub fn sha256_multihash(data: &[u8]) -> [u8; 34] {
+    use sha2::{Digest, Sha256};
+    let mut out = [0u8; 34];
+    out[0] = 0x12;
+    out[1] = 0x20;
+    out[2..].copy_from_slice(&Sha256::digest(data));
+    out
+}
+
 /// Decode a base58btc CIDv0 string (e.g. "Qm...") into a 34-byte raw multihash.
 fn cid_v0_to_multihash(cid: &str) -> anyhow::Result<[u8; 34]> {
     let bytes = base58btc_decode(cid)

@@ -433,6 +433,16 @@ impl EscrowWatcher {
         hex::encode(self.pubkey_bytes)
     }
 
+    /// The x-only public key of the escrow key (the H14 private-inference recipient identity).
+    pub fn pubkey_bytes(&self) -> [u8; 32] {
+        self.pubkey_bytes
+    }
+
+    /// The escrow secret, for opening private-inference envelopes sealed to this key.
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.secret_key.secret_bytes()
+    }
+
     /// V2 responder identity for an AiResponse: schnorr signature with the escrow key over the
     /// domain-hashed v1 payload bytes — MUST match the node's `verified_responder`
     /// (blake2b-256("KeryxServiceResponderV1" || signed_bytes)).
