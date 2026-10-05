@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
+mod ai;
 mod statum_codec;
 
 use crate::client::stratum::statum_codec::{ErrorCode, MiningNotify, MiningSubmit, NewLineJsonCodecError, StratumLine};
@@ -426,6 +427,19 @@ static POOL_FORCED_POM: AtomicBool = AtomicBool::new(false);
 /// pick up the extraNonce (a small counter), leave PoM disabled, and get every share rejected without
 /// proof. Returns None when no field parses as digits (older suffix-less pools); the caller then falls
 /// back to the LAST_DAA_SCORE/POOL_FORCED_POM flooring.
+/// Logged at most once a minute: a pool still sending legacy plaintext tasks past the H14 gate.
+fn warn_legacy_task_past_gate(daa: u64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if now.saturating_sub(LAST.swap(now, Ordering::Relaxed)) >= 60 {
+        warn!(
+            "OPoI: pool still dispatches legacy inference tasks at DAA {} (past the H14 gate) — private inference \
+             needs a v3 pool (mining.ai_request); task ignored, the job is mined normally.",
+            daa
+        );
+    }
+}
+
 fn job_id_daa(job_id: &str) -> Option<u64> {
     let parts: Vec<&str> = job_id.split('_').collect();
     let daa_field = match parts.len() {
@@ -518,6 +532,9 @@ pub struct StratumHandler {
     /// error-20 reply can be attributed to telemetry (not mistaken for a rejected share) and a
     /// success ack doesn't log a spurious "ignoring result".
     telemetry_req_ids: HashSet<u32>,
+    /// Ids of our `mining.ai_response` lines, so the pool's ack is never mistaken for a share
+    /// result (or counted as a rejected share). Bounded like `telemetry_req_ids`.
+    ai_response_ids: HashSet<u32>,
     /// Process start, for the telemetry `uptime_s` field.
     start_time: std::time::Instant,
     /// The last model-id set announced to the pool via `mining.declare_capabilities`. Declare is
@@ -870,6 +887,7 @@ impl StratumHandler {
             inference_cache,
             telemetry_on: keryx_miner::telemetry::enabled(),
             telemetry_req_ids: HashSet::new(),
+            ai_response_ids: HashSet::new(),
             start_time: std::time::Instant::now(),
             declared_model_ids: None,
             last_declare_at: None,
@@ -946,7 +964,9 @@ impl StratumHandler {
                 };
                 let unsigned_response: Option<(String, u32)> = match (&result_opt, &req_id) {
                     (Some(res), Some(rid))
-                        if daa_now >= keryx_miner::pom::pom_v3_activation_daa() && !response_already_accepted =>
+                        if daa_now >= keryx_miner::pom::pom_v3_activation_daa()
+                            && !keryx_miner::pom::is_h14_era(daa_now)
+                            && !response_already_accepted =>
                     {
                         Some((rid.clone(), res.response_length))
                     }
@@ -1143,6 +1163,10 @@ impl StratumHandler {
                                 if self.telemetry_req_ids.remove(&rid) {
                                     return Ok(());
                                 }
+                                if self.ai_response_ids.remove(&rid) {
+                                    info!("AI response accepted by the pool");
+                                    return Ok(());
+                                }
                                 let pending = self.shares_stats.shares_pending.lock().await.remove(&rid);
                                 if let Some((_jobid, device_id)) = pending {
                                     let delivered_inference = if let Some(req_id) =
@@ -1238,7 +1262,18 @@ impl StratumHandler {
                                 serde_json::Value::String(s) => s,
                                 other => other.to_string(),
                             };
-                            let inference_started = self.handle_ai_task(task_json, miner).await;
+                            // H14 (upstream cd2bbbc): the task path answers in plaintext over IPFS and
+                            // the pool signs a body-less AiResponse — from the private-inference gate a
+                            // request is a sealed envelope only the pool's escrow key opens, and the
+                            // answer must travel sealed inline. A v3 pool dispatches `mining.ai_request`
+                            // instead; a legacy task past the gate is ignored and the job mined normally.
+                            let inference_started = if keryx_miner::pom::is_h14_era(daa_score) {
+                                warn_legacy_task_past_gate(daa_score);
+                                *self.current_task_slot.lock().await = None;
+                                false
+                            } else {
+                                self.handle_ai_task(task_json, miner).await
+                            };
                             if inference_started {
                                 // PoW already paused inside handle_ai_task — do NOT feed a new
                                 // block template or the GPU immediately resumes hashing.
@@ -1357,7 +1392,16 @@ impl StratumHandler {
                                 // (`h10_activation_daa()` honours KERYX_POM_H10_ACTIVATION_DAA, so
                                 // staging against a pre-H10 testnet still works.)
                                 if POOL_FORCED_POM.load(std::sync::atomic::Ordering::Relaxed) {
-                                    base.max(keryx_miner::pom::h10_activation_daa())
+                                    // Same reasoning one frontier later: once the mainnet H14 ETA has
+                                    // passed (models::stage_post_h14 — never before it, so the pre-gate
+                                    // path is unchanged) a DAA-less job is floored at the H14 gate, or
+                                    // a suffix-less pool would grind H10 seeds forever after the fork.
+                                    let floor = if keryx_miner::models::stage_post_h14() {
+                                        keryx_miner::pom::private_inference_activation_daa()
+                                    } else {
+                                        keryx_miner::pom::h10_activation_daa()
+                                    };
+                                    base.max(floor)
                                 } else {
                                     base
                                 }
@@ -1399,6 +1443,10 @@ impl StratumHandler {
                                 }))
                                 .await
                         }
+                        StratumCommand::MiningAiRequest(fields) => {
+                            self.handle_ai_request(fields).await;
+                            Ok(())
+                        }
                         StratumCommand::MiningChallenge((model_id_hex, nonce_hex)) => {
                             self.handle_challenge(model_id_hex, nonce_hex, miner).await;
                             Ok(())
@@ -1430,6 +1478,10 @@ impl StratumHandler {
                 // Telemetry method rejected (v0.7.0): if this id was a mining.hello/mining.telemetry
                 // request, an error 20 means the pool doesn't support telemetry → disable it for the
                 // session and keep mining. NEVER counted as a rejected share; never fatal.
+                if self.ai_response_ids.remove(&id) {
+                    warn!("AI response rejected by the pool: {}", error);
+                    return Ok(());
+                }
                 if self.telemetry_req_ids.remove(&id) {
                     if matches!(code, ErrorCode::Unknown) && self.telemetry_on {
                         self.telemetry_on = false;
@@ -1655,6 +1707,112 @@ impl StratumHandler {
             let _now = ticker.tick().await;
             info!("{}", shares_info)
         }
+    }
+
+    /// `mining.ai_request` (upstream 2cf7ab5, the H14 pool path): the pool opened the private
+    /// request with ITS escrow key and sends the plaintext prompt; we run it on a leased card
+    /// (only that card's walk pauses, like the challenge path) and return the answer inline as
+    /// `mining.ai_response`. The pool seals and signs it. Failures send nothing: an empty answer
+    /// is never a valid response and the pool re-dispatches.
+    async fn handle_ai_request(&mut self, fields: (String, String, String, String, String, u32, String)) {
+        let request = match ai::AiRequest::parse(fields) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!("Invalid AI request from pool: {}", error);
+                return;
+            }
+        };
+        if !keryx_miner::slm::model_serveable(&request.model_id) {
+            warn!("AI request {:.16}: model {:.8} is not served by this rig", request.task_id, request.model_hex);
+            keryx_miner::runtime_stats::record_inference_failed_request(
+                keryx_miner::runtime_stats::InferenceKind::PoolTask,
+            );
+            return;
+        }
+        if let Err(reason) = keryx_miner::slm::validate_inference_request(
+            &request.prompt,
+            request.max_tokens,
+            keryx_miner::slm::DEFAULT_INFERENCE_DEADLINE_MS,
+        ) {
+            warn!("AI request {:.16}: {}", request.task_id, reason);
+            keryx_miner::runtime_stats::record_inference_failed_request(
+                keryx_miner::runtime_stats::InferenceKind::PoolTask,
+            );
+            return;
+        }
+        // The id is allocated here so the pool's ack is matched to this response, never to a share.
+        let id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
+        if self.ai_response_ids.len() > 64 {
+            self.ai_response_ids.clear();
+        }
+        self.ai_response_ids.insert(id);
+        let send_channel = self.send_channel.clone();
+        let worker = self.miner_address.clone();
+        let mut runtime_attempt = keryx_miner::runtime_stats::begin_inference(
+            keryx_miner::runtime_stats::InferenceKind::PoolTask,
+            Some(&request.model_id),
+        );
+        tokio::spawn(async move {
+            let Some(lease) = keryx_miner::slm::acquire_inference_card_async(
+                &request.model_id,
+                keryx_miner::slm::DEFAULT_INFERENCE_DEADLINE_MS,
+            )
+            .await
+            else {
+                warn!("AI request {:.16}: all eligible cards busy — not answered", request.task_id);
+                runtime_attempt.busy();
+                return;
+            };
+            let gpu = lease.gpu();
+            runtime_attempt.set_gpu(gpu);
+            let pause = crate::miner::begin_network_inference_pause();
+            info!(
+                "AI request {:.16}: inference on GPU {} ({}) — model={:.8} max_tokens={}",
+                request.task_id,
+                gpu,
+                crate::miner::inference_pause_scope(),
+                request.model_hex,
+                request.max_tokens
+            );
+            let (model_id, prompt, max_tokens) = (request.model_id, request.prompt.clone(), request.max_tokens);
+            let result = tokio::task::spawn_blocking(move || {
+                let result = keryx_miner::slm::try_load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens);
+                drop(lease);
+                drop(pause);
+                result
+            })
+            .await
+            .unwrap_or(Err(InferenceError::Failed));
+            let text = match result {
+                Ok(text) if !text.is_empty() => text,
+                Ok(_) | Err(InferenceError::Failed) => {
+                    warn!("AI request {:.16}: inference produced no answer", request.task_id);
+                    runtime_attempt.failed();
+                    return;
+                }
+                Err(InferenceError::Deferred(reason)) => {
+                    info!("AI request {:.16}: GPU {} deferred ({})", request.task_id, gpu, reason);
+                    runtime_attempt.busy();
+                    return;
+                }
+            };
+            match request.response(id, worker, &text) {
+                Ok(line) => {
+                    if send_channel.send(line).await.is_ok() {
+                        keryx_miner::runtime_stats::record_inference_prepared();
+                        runtime_attempt.served(text.split_whitespace().count());
+                        info!("AI request {:.16}: answered ({} chars)", request.task_id, text.len());
+                    } else {
+                        runtime_attempt.failed();
+                        warn!("AI request {:.16}: connection closed before the answer was sent", request.task_id);
+                    }
+                }
+                Err(error) => {
+                    runtime_attempt.failed();
+                    warn!("AI request {:.16}: {}", request.task_id, error);
+                }
+            }
+        });
     }
 
     /// Parse the task JSON from a `MiningNotifyWithTask`, store it in `current_task_slot`,

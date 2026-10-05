@@ -166,6 +166,13 @@ pub(crate) enum StratumCommand {
     // [ metrics-object ]. DISPLAY/OPS ONLY (spoofable).
     #[serde(rename = "mining.telemetry")]
     MiningTelemetry((Value,)),
+    // Pool-dispatched AI inference (upstream 2cf7ab5; the H14 private-inference pool path): pool →
+    // miner [task_id, txid, request_hash, model_id_hex, prompt_b64, max_tokens, reward].
+    #[serde(rename = "mining.ai_request")]
+    MiningAiRequest((String, String, String, String, String, u32, String)),
+    // miner → pool [worker, task_id, request_hash, model_id_hex, answer_b64].
+    #[serde(rename = "mining.ai_response")]
+    MiningAiResponse((String, String, String, String, String)),
     // Phase 2 OPoI: bridge → miner — "model_id_hex:nonce_hex" capability challenge
     #[serde(rename = "mining.challenge")]
     MiningChallenge((String, String)),
