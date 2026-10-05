@@ -242,6 +242,17 @@ impl State {
         // H14 (DAA >= 121,985,000): the seed becomes pom_block_seed_h14 (H10 fold over a
         // pph XORed with SEED_H14_TAG). The host rebuild MUST use the same era the GPU walk
         // used, or the tile paths mismatch the verifier -> BadTilePath on every share.
+        if pom::is_h14_era(self.daa_score) {
+            static H14_ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !H14_ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                info!(
+                    "H14 GATE CROSSED at DAA {} (gate {}): mining with the H14 walk seed; tier 3 = Qwen3.8-27B; \
+                     private inference active, legacy pool inference tasks ignored.",
+                    self.daa_score,
+                    pom::h14_activation_daa()
+                );
+            }
+        }
         let seed = pom::pom_block_seed_rewalk_era(&pph, timestamp, nonce, self.daa_score);
         let (v4, final_state) = pom_v4::build_proof_v4(tier, seed, index)
             .map_err(|e| info!("PoM v4 proof build failed: {e}"))
