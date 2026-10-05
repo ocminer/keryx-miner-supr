@@ -1833,7 +1833,10 @@ pub fn mine_v4(
     // Byte-identical dispatch to pom::pom_block_seed_v4_era. The POW fold (p) is unchanged (H3 words).
     let h10_era = daa >= crate::pom::h10_activation_daa();
     let p = crate::pom::pph_words_for_era(pph, true);
-    let s = if h10_era { crate::pom::pph_words(pph) } else { crate::pom::pph_words_v4(pph) };
+    // Seed words for the era: v4-salted (pre-H10), RAW (H10) or H14-TAGGED raw pph. The kernel's H10
+    // sponge over the tagged words is exactly the node's pom_block_seed_h14 — no kernel change, the
+    // same mechanism as the CUDA path. Pre-H14 these are the words 0.13.4 passed, bit for bit.
+    let s = crate::pom::pph_seed_words_for_era(pph, daa);
     let t = words(target_le);
     let Some(miner) = miner_for(id) else {
         return Err(crate::pom::GrindError::Paused("OpenCL walk not installed"));
@@ -1981,7 +1984,10 @@ mod v4_byte_exact {
     // (h10=false → reversible v4 fold; h10=true → one-way cSHAKE256 PowHash). Pow fold uses the
     // H3-salted words ("v4 pow uses the h3 fold").
     fn cpu_pow(index: &crate::pom::WeightIndex, pph: &[u8; 32], time: u64, nonce: u64, h10: bool) -> [u8; 32] {
-        let seed = crate::pom::pom_block_seed_v4_era(pph, time, nonce, h10);
+        cpu_pow_seed(index, pph, crate::pom::pom_block_seed_v4_era(pph, time, nonce, h10))
+    }
+
+    fn cpu_pow_seed(index: &crate::pom::WeightIndex, pph: &[u8; 32], seed: u64) -> [u8; 32] {
         let (_proof, fin) = crate::pom_v4::build_proof_v4(0, seed, index).unwrap();
         crate::pom::pom_pow_value(fin, pph, true)
     }
@@ -1997,13 +2003,18 @@ mod v4_byte_exact {
                 return;
             }
         };
+        // KERYX_TEST_OPENCL_ANY_VENDOR=1 opts a dedicated non-AMD OpenCL device (e.g. an idle NVIDIA
+        // test card) into this byte-exactness test.
+        let any_vendor = std::env::var("KERYX_TEST_OPENCL_ANY_VENDOR").ok().as_deref() == Some("1");
         let Some(dev) = dev_ids.into_iter().map(opencl3::device::Device::new).find(|dev| {
-            dev.vendor()
-                .map(|vendor| {
-                    let vendor = vendor.to_ascii_lowercase();
-                    vendor.contains("advanced micro devices") || vendor.trim() == "amd"
-                })
-                .unwrap_or(false)
+            any_vendor
+                || dev
+                    .vendor()
+                    .map(|vendor| {
+                        let vendor = vendor.to_ascii_lowercase();
+                        vendor.contains("advanced micro devices") || vendor.trim() == "amd"
+                    })
+                    .unwrap_or(false)
         }) else {
             eprintln!("no AMD OpenCL GPU — skipping v4 byte-exact test");
             return;
@@ -2036,11 +2047,19 @@ mod v4_byte_exact {
         // (H10 one-way cSHAKE256 seed — the v0.12.0 hardfork). KERYX_TEST_H10=0/1/both selects an
         // era for isolated device runs. A keccak/absorb bug shows up as an argmin mismatch.
         let eras = selected_h10_eras(std::env::var("KERYX_TEST_H10").ok().as_deref(), true).expect("KERYX_TEST_H10");
-        for &h10 in &eras {
+        // Every H10 run also validates the H14 era: the unchanged H10 kernel fed H14-TAGGED pph words
+        // must equal the host's pom_block_seed_h14 walk (the production H14 path).
+        let passes: Vec<(bool, bool)> =
+            eras.iter().flat_map(|&h10| if h10 { vec![(true, false), (true, true)] } else { vec![(false, false)] }).collect();
+        for &(h10, h14) in &passes {
             // CPU argmin pow over 0..NN with the era-correct seed; target = that min.
             let mut best = ([0xFFu8; 32], u64::MAX);
             for nonce in 0..NN {
-                let pv = cpu_pow(&index, &pph, time, nonce, h10);
+                let pv = if h14 {
+                    cpu_pow_seed(&index, &pph, crate::pom::pom_block_seed_h14(&pph, time, nonce))
+                } else {
+                    cpu_pow(&index, &pph, time, nonce, h10)
+                };
                 let le_le = |a: &[u8; 32], b: &[u8; 32]| {
                     for k in (0..4).rev() {
                         let (wa, wb) = (
@@ -2058,11 +2077,18 @@ mod v4_byte_exact {
                 }
             }
             let (target, w_cpu) = best;
-            eprintln!("[h10={h10}] cpu argmin nonce = {w_cpu}");
+            eprintln!("[h10={h10} h14={h14}] cpu argmin nonce = {w_cpu}");
 
             let p = crate::pom::pph_words_for_era(&pph, true);
-            // Seed words match the era: raw pph for H10 (keccak absorbs them), v4-salted otherwise.
-            let s = if h10 { crate::pom::pph_words(&pph) } else { crate::pom::pph_words_v4(&pph) };
+            // Seed words match the era: raw pph for H10 (keccak absorbs them), H14-tagged raw pph
+            // for H14, v4-salted otherwise — the exact production selection (pph_seed_words_for_era).
+            let s = if h14 {
+                crate::pom::pph_words(&crate::pom::seed_h14_pph(&pph))
+            } else if h10 {
+                crate::pom::pph_words(&pph)
+            } else {
+                crate::pom::pph_words_v4(&pph)
+            };
             let t = words(&target);
             let hf: u32 = if h10 { 1 } else { 0 };
             for &(m, name) in modes {
@@ -2079,9 +2105,9 @@ mod v4_byte_exact {
                 assert_eq!(
                     miner.mine_v4(p, s, time, t, 0, NN, hf).expect("OpenCL v4 grind"),
                     Some(w_cpu),
-                    "{name} v4 winner mismatch (h10={h10})"
+                    "{name} v4 winner mismatch (h10={h10} h14={h14})"
                 );
-                eprintln!("[h10={h10}] {name}: OK");
+                eprintln!("[h10={h10} h14={h14}] {name}: OK");
             }
         }
     }
