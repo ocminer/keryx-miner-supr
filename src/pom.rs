@@ -376,6 +376,28 @@ pub fn h10_activation_daa() -> u64 {
     })
 }
 
+/// H14 (private inference) gate. MUST equal the node's `private_inference_activation`
+/// (consensus/core/src/config/params.rs::H14_ACTIVATION_DAA = 121_985_000, ~2026-10-09
+/// 14:00 UTC). At/after it the PoM walk seed becomes `pom_block_seed_h14`; a miner that
+/// keeps emitting H10 seeds past the gate fails BadTilePath on EVERY share (dead work).
+pub const POM_H14_ACTIVATION_DAA: u64 = 121_985_000;
+
+pub fn h14_activation_daa() -> u64 {
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("KERYX_POM_H14_ACTIVATION_DAA")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(POM_H14_ACTIVATION_DAA)
+    })
+}
+
+/// Whether a block at `daa` is in the H14 (private-inference) seed era.
+#[inline]
+pub fn is_h14_seed_era(daa: u64) -> bool {
+    daa >= h14_activation_daa()
+}
+
 /// Real formula shipped and golden-verified (node v1.5.7 + miner-upstream v0.5.3).
 pub const H10_SPEC_VERIFIED: bool = true;
 
@@ -417,6 +439,51 @@ pub fn pom_block_seed_v4_era(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64
         pom_block_seed_h10(pre_pow_hash, timestamp, nonce)
     } else {
         pom_block_seed_v4(pre_pow_hash, timestamp, nonce)
+    }
+}
+
+/// Domain tag XORed into `pre_pow_hash` for the H14 walk seed.
+/// BYTE-IDENTICAL to the node's `pom::SEED_H14_TAG` and miner-upstream v0.5.6.
+pub const SEED_H14_TAG: [u8; 32] = *b"KERYX-H14-PRIVATE-INFERENCE-SEED";
+
+/// `pre_pow_hash` as fed to the H14 walk seed.
+pub fn seed_h14_pph(pre_pow_hash: &[u8; 32]) -> [u8; 32] {
+    let mut out = *pre_pow_hash;
+    for (b, t) in out.iter_mut().zip(SEED_H14_TAG.iter()) {
+        *b ^= t;
+    }
+    out
+}
+
+/// H14 block seed: the H10 seed over the H14-tagged `pre_pow_hash`.
+/// BYTE-IDENTICAL to the node's `pom_block_seed_h14`.
+pub fn pom_block_seed_h14(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_h10(&seed_h14_pph(pre_pow_hash), timestamp, nonce)
+}
+
+/// Re-walk-era (v4 proof format) block seed for a block at `daa`. Mirrors the node's
+/// `pom_block_seed_rewalk_era`: H14 -> H10 -> v4. Taking the DAA (not a pair of bools)
+/// is deliberate — it makes it impossible to select the wrong era at a call site.
+pub fn pom_block_seed_rewalk_era(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, daa: u64) -> u64 {
+    if is_h14_seed_era(daa) {
+        pom_block_seed_h14(pre_pow_hash, timestamp, nonce)
+    } else if is_h10_seed_era(daa) {
+        pom_block_seed_h10(pre_pow_hash, timestamp, nonce)
+    } else {
+        pom_block_seed_v4(pre_pow_hash, timestamp, nonce)
+    }
+}
+
+/// SEED words for the GPU seed kernel at `daa`. In the H10/H14 era the kernel absorbs RAW
+/// pph words into its cSHAKE256 sponge; H14 differs ONLY by the tag XOR, so handing the
+/// kernel tagged words is exactly `pom_block_seed_h14`. Pre-H10 keeps the v4-salted fold.
+pub fn pph_seed_words_for_era(pre_pow_hash: &[u8; 32], daa: u64) -> [u64; 4] {
+    if is_h14_seed_era(daa) {
+        pph_words(&seed_h14_pph(pre_pow_hash))
+    } else if is_h10_seed_era(daa) {
+        pph_words(pre_pow_hash)
+    } else {
+        pph_words_v4(pre_pow_hash)
     }
 }
 
@@ -1940,6 +2007,27 @@ mod tests {
         assert_eq!(h10, st[0]);
         // era dispatch + properties
         assert_eq!(super::pom_block_seed_v4_era(&pph, ts, nonce, true), h10);
+
+        // ── H14 pinned vectors — these are the SAME constants asserted in the node's
+        // consensus/core/src/pom.rs::seed_h14_vectors and miner-upstream v0.5.6. If any of
+        // these drift, the miner mines dead work past the H14 gate.
+        assert_eq!(super::pom_block_seed_h14(&[0u8; 32], 0, 0), 0xacda16263d02e8a8);
+        assert_eq!(super::pom_block_seed_h14(&pph, ts, nonce), 0xcb49e5584c867af5);
+        assert_eq!(super::pom_block_seed_h14(&[0xa5u8; 32], ts, u64::MAX), 0xf198e8412c2f6255);
+        // H14 must differ from H10 on the same input, and equal H10 over the tagged pph.
+        assert_ne!(super::pom_block_seed_h14(&pph, ts, nonce), h10);
+        assert_eq!(
+            super::pom_block_seed_h14(&pph, ts, nonce),
+            super::pom_block_seed_h10(&super::seed_h14_pph(&pph), ts, nonce)
+        );
+        // The era dispatcher must pick H14 at/after the gate and H10 just below it.
+        let g = super::h14_activation_daa();
+        assert_eq!(super::pom_block_seed_rewalk_era(&pph, ts, nonce, g), super::pom_block_seed_h14(&pph, ts, nonce));
+        assert_eq!(super::pom_block_seed_rewalk_era(&pph, ts, nonce, g - 1), h10);
+        // And the GPU seed words must be the tagged words past the gate (what makes the
+        // unchanged CUDA seed kernel emit H14 seeds).
+        assert_eq!(super::pph_seed_words_for_era(&pph, g), super::pph_words(&super::seed_h14_pph(&pph)));
+        assert_eq!(super::pph_seed_words_for_era(&pph, g - 1), super::pph_words(&pph));
         assert_ne!(h10, super::pom_block_seed_v4(&pph, ts, nonce), "H10 must differ from reversible v4");
         assert_ne!(h10, super::pom_block_seed_h10(&pph, ts, nonce ^ 1));
         assert_ne!(h10, super::pom_block_seed_h10(&pph, ts + 1, nonce));

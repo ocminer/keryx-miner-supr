@@ -239,7 +239,10 @@ impl State {
         // `pomFinalState` on submitBlock; the solo `FullBlock` path fills it in `assemble_pom_block`).
         // H10 (DAA >= gate): the host proof MUST be rebuilt with the SAME one-way seed the GPU
         // walk used, or the tile paths mismatch the verifier's H10 walk (BadTilePath rejection).
-        let seed = pom::pom_block_seed_v4_era(&pph, timestamp, nonce, pom::is_h10_seed_era(self.daa_score));
+        // H14 (DAA >= 121,985,000): the seed becomes pom_block_seed_h14 (H10 fold over a
+        // pph XORed with SEED_H14_TAG). The host rebuild MUST use the same era the GPU walk
+        // used, or the tile paths mismatch the verifier -> BadTilePath on every share.
+        let seed = pom::pom_block_seed_rewalk_era(&pph, timestamp, nonce, self.daa_score);
         let (v4, final_state) = pom_v4::build_proof_v4(tier, seed, index)
             .map_err(|e| info!("PoM v4 proof build failed: {e}"))
             .ok()?;

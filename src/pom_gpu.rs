@@ -893,6 +893,7 @@ impl PomGpuMiner {
         start: u64,
         batch: u64,
         h10_era: bool,
+        h14_era: bool,
     ) -> candle_core::Result<Option<u64>> {
         if batch == 0 {
             return Ok(None);
@@ -916,7 +917,14 @@ impl PomGpuMiner {
         // pre-H10 = v4-salted pph (reversible fold); H10 = RAW pph words (the kernel's keccak absorbs
         // them into the cSHAKE256 PowHash sponge). The `h10` flag below tells the kernel which fold.
         let p = crate::pom::pph_words_for_era(pre_pow_hash, true);
-        let s = if h10_era { crate::pom::pph_words(pre_pow_hash) } else { crate::pom::pph_words_v4(pre_pow_hash) };
+        // H14: tagged pph words make the UNCHANGED seed kernel emit pom_block_seed_h14.
+        let s = if h14_era {
+            crate::pom::pph_words(&crate::pom::seed_h14_pph(pre_pow_hash))
+        } else if h10_era {
+            crate::pom::pph_words(pre_pow_hash)
+        } else {
+            crate::pom::pph_words_v4(pre_pow_hash)
+        };
         let t = words4(target_le);
         let k = crate::pom_v4::POM_V4_K as u32;
         bind_device_ctx(&self.stream)?; // multi-GPU: bind this device's context before the raw launch
@@ -3133,11 +3141,11 @@ fn v4_bench_cfg(
 ) -> candle_core::Result<f64> {
     let never = [0u8; 32];
     set_v4_tune(device_id, t);
-    miner.mine_v4(pph, ts, &never, 1, t.batch, h10_era)?; // warm-up: JIT, buffer alloc, clocks
+    miner.mine_v4(pph, ts, &never, 1, t.batch, h10_era, false)?; // warm-up: JIT, buffer alloc, clocks
     let started = std::time::Instant::now();
     let mut n: u64 = 0;
     while started.elapsed() < std::time::Duration::from_millis(ms) {
-        miner.mine_v4(pph, ts, &never, 1 + n, t.batch, h10_era)?;
+        miner.mine_v4(pph, ts, &never, 1 + n, t.batch, h10_era, false)?;
         n += t.batch;
     }
     let secs = started.elapsed().as_secs_f64();
@@ -3748,9 +3756,9 @@ fn v4_config_agrees_with_reference(
     let probe = 4096u64;
     let result = (|| {
         set_v4_tune(device_id, V4Tune { ncf: false, tc: false, sidecar: false, sidecar_lut: false, batch: probe });
-        let reference = miner.mine_v4(&pph, ts, &target, 1, probe, h10_era)?;
+        let reference = miner.mine_v4(&pph, ts, &target, 1, probe, h10_era, false)?;
         set_v4_tune(device_id, V4Tune { batch: probe, ..cand });
-        let candidate = miner.mine_v4(&pph, ts, &target, 1, probe, h10_era)?;
+        let candidate = miner.mine_v4(&pph, ts, &target, 1, probe, h10_era, false)?;
         Ok(reference == candidate)
     })();
     match saved {
@@ -3837,6 +3845,9 @@ pub fn mine_v4(
     }
     // H10 (DAA >= POM_H10_SEED_ACTIVATION_DAA): one-way seed derivation.
     let h10_era = crate::pom::is_h10_seed_era(daa);
+    // H14 (DAA >= 121,985,000): seed = pom_block_seed_h14. Derived from the SAME daa so the
+    // GPU grind and the host proof rebuild in pow.rs can never disagree on the era.
+    let h14_era = crate::pom::is_h14_seed_era(daa);
     // 🔴 HARD SAFETY GUARD: the H10 seed formula is an UNVERIFIED PLACEHOLDER until the node's
     // spec lands and pom::pom_seed_fold_v4_h10 is confirmed byte-for-byte. Mining the H10 era with
     // a wrong seed = 100% rejected blocks + service-bond strikes. So while the spec is unverified,
@@ -3914,7 +3925,7 @@ pub fn mine_v4(
     if !custom_image_is_exact(device_id, &miner, h10_era) {
         return Err(crate::pom::GrindError::Backend("custom walk image failed ABI/exactness validation".into()));
     }
-    let outcome = miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch, h10_era);
+    let outcome = miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch, h10_era, h14_era);
     match outcome {
         Ok(winner) => Ok(crate::pom::GrindCompleted { winner, hashes_done: batch }),
         Err(e) => {
@@ -5191,12 +5202,12 @@ mod v4_kernel_tests {
             let pow = crate::pom::pom_pow_value(fs, &PPH, true);
             // GPU with h10_era=true must reproduce the SAME final_state → win at pow, lose below it.
             assert_eq!(
-                miner.mine_v4(&PPH, TS, &pow, nonce, 1, true).unwrap(),
+                miner.mine_v4(&PPH, TS, &pow, nonce, 1, true, false).unwrap(),
                 Some(nonce),
                 "H10: GPU seed fold != host at nonce {nonce} (win check)"
             );
             assert_eq!(
-                miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1, true).unwrap(),
+                miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1, true, false).unwrap(),
                 None,
                 "H10: GPU found nonce below host pow at {nonce} (lose check)"
             );
@@ -5244,10 +5255,64 @@ mod v4_kernel_tests {
         ];
         for (name, tune) in variants {
             set_v4_tune(device_id, tune);
-            let got = miner.mine_v4(&PPH, TS, &target, BASE, BATCH, true).unwrap();
+            let got = miner.mine_v4(&PPH, TS, &target, BASE, BATCH, true, false).unwrap();
             assert_eq!(got, Some(expected), "{name}: batched H10 seeds diverged from host");
         }
         println!("batched H10 host↔GPU seeds OK; expected nonce {expected}");
+    }
+
+
+    /// Batch-level H10 gate. The old chase optimization accidentally broadcast one thread's seed to
+    /// 31 different nonces; batch=1 lockstep could not expose it. Pick a later nonce whose host pow is
+    /// a new record low (therefore it is the batch's unambiguous lowest winner at that target), then
+    /// require classic, chase+TC, and chaseless dispatch choices to return that same nonce.
+    #[test]
+    #[ignore]
+    fn v4_h14_batched_seeds_match_host() {
+        // H14 (DAA >= 121,985,000): seed = pom_block_seed_h10 over a pph XORed with
+        // SEED_H14_TAG. The host hands the UNCHANGED pom_seed_h10_batch kernel those tagged
+        // words, so the kernel must produce exactly pom_block_seed_h14. Proven here on real
+        // hardware: if it did not, the GPU would walk different tiles and never find the
+        // host-predicted record nonce.
+        const BASE: u64 = 10_000;
+        const BATCH: u64 = 128;
+        let data = blob(2048);
+        let index = crate::pom::index_from_ram(data.clone());
+        let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
+
+        let mut best_pow = [0xffu8; 32];
+        let mut chosen = None;
+        for i in 0..BATCH {
+            let nonce = BASE + i;
+            // the ONLY difference from the H10 test: the H14 seed
+            let seed = crate::pom::pom_block_seed_h14(&PPH, TS, nonce);
+            assert_ne!(seed, crate::pom::pom_block_seed_h10(&PPH, TS, nonce), "H14 seed must differ from H10");
+            let (_proof, fin) = crate::pom_v4::build_proof_v4(0, seed, &index).unwrap();
+            // pow fold is UNCHANGED by H14: raw/H3-salted pph words
+            let pow = crate::pom::pom_pow_value(fin, &PPH, true);
+            if pow_leq(&pow, &best_pow) {
+                best_pow = pow;
+                if i > 0 && i % 32 != 0 {
+                    chosen = Some((nonce, pow));
+                    break;
+                }
+            }
+        }
+        let (expected, target) = chosen.expect("failed to find a non-lane0 record pow in test batch");
+
+        let device_id = 0;
+        let variants = [
+            ("classic", V4Tune { ncf: false, tc: false, sidecar: false, sidecar_lut: false, batch: BATCH }),
+            ("chase+tc", V4Tune { ncf: false, tc: true, sidecar: false, sidecar_lut: false, batch: BATCH }),
+            ("chaseless", V4Tune { ncf: true, tc: true, sidecar: false, sidecar_lut: false, batch: BATCH }),
+        ];
+        for (name, tune) in variants {
+            set_v4_tune(device_id, tune);
+            // h10_era=true, h14_era=true -> host must pass TAGGED seed words to the kernel
+            let got = miner.mine_v4(&PPH, TS, &target, BASE, BATCH, true, true).unwrap();
+            assert_eq!(got, Some(expected), "{name}: batched H14 seeds diverged from host");
+        }
+        println!("batched H14 host<->GPU seeds OK; expected nonce {expected}");
     }
 
     /// Reports (visibly, with --nocapture) which walk kernel this GPU resolves to, and proves the
@@ -5274,12 +5339,12 @@ mod v4_kernel_tests {
         assert_eq!(re, fs);
         let pow = crate::pom::pom_pow_value(fs, &PPH, true);
         assert_eq!(
-            miner.mine_v4(&PPH, TS, &pow, nonce, 1, false).unwrap(),
+            miner.mine_v4(&PPH, TS, &pow, nonce, 1, false, false).unwrap(),
             Some(nonce),
             "[{kind}] GPU did not find the nonce at the host pow target — divergence"
         );
         assert_eq!(
-            miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1, false).unwrap(),
+            miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1, false, false).unwrap(),
             None,
             "[{kind}] GPU found the nonce below the host pow — divergence"
         );
@@ -5373,7 +5438,7 @@ mod v4_kernel_tests {
                     println!("skip {label} (h10={h10}): card resolved to {kind}");
                     continue;
                 }
-                let got = miner.mine_v4(&PPH, TS, &target, base, BATCH, h10).unwrap();
+                let got = miner.mine_v4(&PPH, TS, &target, base, BATCH, h10, false).unwrap();
                 assert_eq!(
                     got,
                     Some(want),
@@ -5595,7 +5660,7 @@ mod v4_kernel_tests {
                         },
                     );
                     assert_eq!(
-                        miner.mine_v4(&PPH, TS, &target, start, batch, h10).unwrap(),
+                        miner.mine_v4(&PPH, TS, &target, start, batch, h10, false).unwrap(),
                         expected,
                         "{} winner mismatch h10={h10} batch={batch}",
                         backend.label()
@@ -5637,7 +5702,7 @@ mod v4_kernel_tests {
         let pow = crate::pom::pom_pow_value(fs, &PPH, true);
         let sweep = |prefetch: &str| -> Vec<Option<u64>> {
             std::env::set_var("KERYX_POM_V4_CHASE_PREFETCH", prefetch);
-            (0..6).map(|i| miner.mine_v4(&PPH, TS, &pow, i * B, B, false).unwrap()).collect()
+            (0..6).map(|i| miner.mine_v4(&PPH, TS, &pow, i * B, B, false, false).unwrap()).collect()
         };
         let on = sweep("1");
         let off = sweep("0");
@@ -5802,11 +5867,11 @@ mod v4_kernel_tests {
         let target = [0u8; 32]; // impossible (pow > 0 always)
         let batch: u64 = std::env::var("KERYX_POM_V4_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 16);
         // warmup
-        let _ = miner.mine_v4(&PPH, TS, &target, 0, batch, false).unwrap();
+        let _ = miner.mine_v4(&PPH, TS, &target, 0, batch, false, false).unwrap();
         let t0 = std::time::Instant::now();
         let mut nonces = 0u64;
         while t0.elapsed().as_secs() < secs {
-            let _ = miner.mine_v4(&PPH, TS, &target, nonces, batch, false).unwrap();
+            let _ = miner.mine_v4(&PPH, TS, &target, nonces, batch, false, false).unwrap();
             nonces += batch;
         }
         let el = t0.elapsed().as_secs_f64();
@@ -5837,13 +5902,13 @@ mod v4_kernel_tests {
                 let pow = crate::pom::pom_pow_value(fs, &PPH, true);
                 // GPU wins at target == host pow_value ...
                 assert_eq!(
-                    miner.mine_v4(&PPH, TS, &pow, nonce, 1, false).unwrap(),
+                    miner.mine_v4(&PPH, TS, &pow, nonce, 1, false, false).unwrap(),
                     Some(nonce),
                     "[{tag}] GPU did NOT find nonce {nonce} at host pow target — GPU pow > host pow (divergence)"
                 );
                 // ... and LOSES one below it -> GPU pow == host pow exactly (byte-exact final_state).
                 assert_eq!(
-                    miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1, false).unwrap(),
+                    miner.mine_v4(&PPH, TS, &dec_le(pow), nonce, 1, false, false).unwrap(),
                     None,
                     "[{tag}] GPU found nonce {nonce} below host pow — GPU pow < host pow (divergence)"
                 );
