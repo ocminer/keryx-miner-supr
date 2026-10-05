@@ -307,6 +307,11 @@ pub struct KeryxdHandler {
     /// wasted (upstream v0.5.6 7ca66e6). Bounded like the replay filter.
     ai_answered_by_me: HashSet<[u8; 32]>,
 
+    /// A template was dropped because no model was proven serveable yet. Templates are otherwise
+    /// only re-requested on a node notification, so a quiet chain (solo/testnet) would never hand
+    /// out the next one; the tick loop re-requests once a model is ready.
+    template_deferred_for_models: bool,
+
     /// In-flight or completed inference for a node-issued challenge. Completion is edge-triggered
     /// so the 200 ms timer emits one, not 5-per-second, GetBlockTemplate refresh.
     challenge_inference: Option<ChallengeInference>,
@@ -382,7 +387,12 @@ impl Client for KeryxdHandler {
                     // GetBlockTemplate RPC is emitted by any 200 ms tick.
                     let regular_finished = self.inference_rx.is_some() && self.poll_inference().await;
                     let challenge_finished = !regular_finished && self.challenge_inference_ready();
-                    if regular_finished || challenge_finished {
+                    let models_now_ready =
+                        self.template_deferred_for_models && keryx_miner::slm::has_proven_serveable_model();
+                    if models_now_ready {
+                        self.template_deferred_for_models = false;
+                    }
+                    if regular_finished || challenge_finished || models_now_ready {
                         self.client_get_block_template().await?;
                     }
                     if self.escrow_pubkey.is_some() && self.last_strike_poll.elapsed().as_secs() >= 60 {
@@ -504,6 +514,7 @@ impl KeryxdHandler {
             ai_request_txids: HashMap::new(),
             inference_rx: None,
             ai_answered_by_me: HashSet::new(),
+            template_deferred_for_models: false,
             challenge_inference: None,
             last_known_daa: 0,
             ipfs_url,
@@ -1393,6 +1404,7 @@ impl KeryxdHandler {
                 // OPoI is mandatory: refuse to mine if no models are ready.
                 // Keryx core invariant — no inference, no PoW.
                 if !keryx_miner::slm::has_proven_serveable_model() {
+                    self.template_deferred_for_models = true;
                     if self.last_known_daa % 200 == 0 {
                         log::warn!("OPoI: no models ready — mining suspended until model files are available");
                     }
