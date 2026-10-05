@@ -50,7 +50,7 @@ back to gRPC. Apply the Flight Sheet to your rig(s).
 
 **Model tier** (heavier = more reward; each needs more VRAM + a bigger first-run download):
 - `--very-light` — Qwen3.5-9B (≥ 7 GB) · `--light` — GLM-4-9B (≥ 11 GB) ·
-  *(default)* Gemma-4-12B (≥ 15 GB) · `--high` — Qwen3.6-27B (≥ 22 GB) ·
+  *(default)* Gemma-4-12B (≥ 15 GB) · `--high` — Qwen3.6-27B, Qwen3.8-27B from H14 (≥ 22 GB) ·
   `--very-high` — Kimi-Linear-48B (≥ 28 GB).
 - **`--tier auto`** — **per-card AUTO** (this is also the default with blank extra args): each GPU
   loads the heaviest model its own VRAM can hold, so a mixed rig gets a different model per card = max reward.

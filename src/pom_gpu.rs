@@ -6039,3 +6039,29 @@ mod intensity_tests {
         assert!(v4_starting_batch(1) >= POM_V4_BATCH_MIN);
     }
 }
+
+#[cfg(test)]
+mod era_swap_decision_tests {
+    use super::era_model_for;
+    use crate::models::{GEMMA_4_12B_ABLITERATED, GLM_4_9B_0414, KIMI_LINEAR_48B, QWEN3_5_9B_ABLITERATED, QWEN3_6_27B, QWEN3_8_27B};
+
+    /// The per-card hot-swap decision: only tier 3 changes, exactly at the gate, in both
+    /// directions (an early post-gate staging swaps back for pre-gate blocks); everything else and
+    /// unknown models never swap.
+    #[test]
+    fn era_model_for_swaps_only_tier_3_at_the_gate() {
+        let gate = crate::pom::private_inference_activation_daa();
+        let name = |m: &[u8; 32], daa| era_model_for(m, daa).map(|s| s.name);
+        assert_eq!(name(&QWEN3_6_27B.model_id, gate - 1), None);
+        assert_eq!(name(&QWEN3_6_27B.model_id, gate), Some("qwen3.8-27b"));
+        assert_eq!(name(&QWEN3_6_27B.model_id, u64::MAX), Some("qwen3.8-27b"));
+        assert_eq!(name(&QWEN3_8_27B.model_id, gate), None);
+        assert_eq!(name(&QWEN3_8_27B.model_id, gate - 1), Some("qwen3.6-27b"));
+        for spec in [&QWEN3_5_9B_ABLITERATED, &GLM_4_9B_0414, &GEMMA_4_12B_ABLITERATED, &KIMI_LINEAR_48B] {
+            for daa in [0, gate - 1, gate, u64::MAX] {
+                assert_eq!(name(&spec.model_id, daa), None, "{} must never swap", spec.name);
+            }
+        }
+        assert_eq!(name(&[0u8; 32], gate), None);
+    }
+}

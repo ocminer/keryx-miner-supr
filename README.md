@@ -353,8 +353,12 @@ Current **H6/H10-era** lineup:
 | `--very-light` | Qwen3.5-9B-abliterated        | ≥ 7 GB            |
 | `--light`      | GLM-4-9B-0414                 | ≥ 11 GB           |
 | *(default)*    | Gemma-4-12B-abliterated       | ≥ 15 GB           |
-| `--high`       | Qwen3.6-27B                   | ≥ 22 GB           |
+| `--high`       | Qwen3.6-27B → Qwen3.8-27B at H14 | ≥ 22 GB        |
 | `--very-high`  | Kimi-Linear-48B               | ≥ 28 GB           |
+
+At the H14 gate (DAA 121 985 000, ~2026-10-09 14:00 UTC) tier 3 (`--high`) changes model to
+Qwen3.8-27B: the miner downloads it in the background beforehand (~17 GB extra disk) and NVIDIA cards
+switch over in place at the gate; an AMD tier-3 card pauses there until the miner is restarted.
 
 The tier flags are stable, but retired H4/H5 models are no longer mineable. The current models carry
 a GGUF-embedded tokenizer, so only `model.gguf` is downloaded. Normal OPoI inference is GPU-only;
