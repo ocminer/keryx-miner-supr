@@ -511,11 +511,12 @@ static llama_context* keryx_make_ctx(llama_model* model, int n_ctx, const char**
     return ctx;
 }
 
-// Free memory (MiB) of the model's main device via the ggml backend API, -1 if unknown.
-static long keryx_free_mib_model(llama_model* model, int main_gpu) {
-    if (!model || main_gpu < 0 || (size_t)main_gpu >= model->devices.size()) return -1;
+// Free memory (MiB) of the model's device via the ggml backend API, -1 if unknown.
+// LLAMA_SPLIT_MODE_NONE leaves exactly one entry in model->devices: the main GPU.
+static long keryx_free_mib_model(llama_model* model) {
+    if (!model || model->devices.empty() || !model->devices[0].dev) return -1;
     size_t fr = 0, tot = 0;
-    ggml_backend_dev_memory(model->devices[main_gpu], &fr, &tot);
+    ggml_backend_dev_memory(model->devices[0].dev, &fr, &tot);
     return tot ? (long)(fr >> 20) : -1;
 }
 
@@ -564,7 +565,7 @@ static KeryxLlama* keryx_load_impl(const char* gguf_path, int gpu, const int* la
     for (int i = 0; i < n_ladder && !ctx; ++i) {
         ctx = keryx_make_ctx(model, ladder[i], &kv, &cp);
         if (!ctx) continue;
-        free_after = keryx_free_mib_model(model, main_gpu);
+        free_after = keryx_free_mib_model(model);
         if (i != n_ladder - 1 && reserve_mib > 0 && free_after >= 0 && free_after < reserve_mib) {
             llama_free(ctx);
             ctx = nullptr;
