@@ -354,6 +354,13 @@ pub fn h14_eta_passed_now() -> bool {
     )
 }
 
+/// Clock-only check (no `KERYX_H14_STAGE` knob): the mainnet ETA has passed and the gate is not
+/// overridden. Used for the DAA-less pool-job floor, which must never move early just because an
+/// operator chose to stage the post-gate model ahead of time.
+pub fn h14_eta_passed_by_clock() -> bool {
+    stage_post_h14_at(now_unix(), None, crate::pom::is_h14_activation_overridden())
+}
+
 /// Whether startup staging should already use the post-H14 lineup (see `stage_post_h14_at`).
 pub fn stage_post_h14() -> bool {
     static CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

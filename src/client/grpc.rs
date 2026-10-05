@@ -750,11 +750,9 @@ impl KeryxdHandler {
                     // Binary AiRequestPayload (dedicated AI subnetwork).
                     hex::decode(&tx.payload).ok().and_then(|raw| {
                         let req = keryx_inference::AiRequestPayload::deserialize(&raw)?;
-                        let (prompt, private) = if req.is_private() {
-                            if !private_era {
-                                log::debug!("OPoI: ignoring a private-envelope AiRequest before the H14 gate");
-                                return None;
-                            }
+                        // Before the gate an envelope is not a private request at all: keep the
+                        // 0.13.4 handling (plain bytes), so pre-gate behaviour is unchanged.
+                        let (prompt, private) = if private_era && req.is_private() {
                             Self::open_private_request(&req, escrow_secret.as_ref())?
                         } else {
                             if private_era {

@@ -1152,6 +1152,18 @@ impl StratumHandler {
 
     async fn handle_message(&mut self, msg: StratumLine, miner: &mut MinerManager) -> Result<(), Error> {
         let msg = self.absorb_v3_notify(msg);
+        // The pool's reply to our `mining.ai_response`, whatever its shape (true / false / null /
+        // error), is never a share result and never a reason to drop the connection (upstream
+        // checks it first too).
+        if let (Some(rid), StratumLinePayload::StratumResult { result }) = (msg.id, &msg.payload) {
+            if self.ai_response_ids.remove(&rid) {
+                match (&msg.error, result) {
+                    (None, StratumResult::Plain(Some(true))) => info!("AI response accepted by the pool"),
+                    (err, _) => warn!("AI response not accepted by the pool: {:?}", err),
+                }
+                return Ok(());
+            }
+        }
         match msg.clone() {
             StratumLine { id, payload, error: None, .. } => {
                 match payload {
@@ -1163,10 +1175,7 @@ impl StratumHandler {
                                 if self.telemetry_req_ids.remove(&rid) {
                                     return Ok(());
                                 }
-                                if self.ai_response_ids.remove(&rid) {
-                                    info!("AI response accepted by the pool");
-                                    return Ok(());
-                                }
+
                                 let pending = self.shares_stats.shares_pending.lock().await.remove(&rid);
                                 if let Some((_jobid, device_id)) = pending {
                                     let delivered_inference = if let Some(req_id) =
@@ -1396,7 +1405,7 @@ impl StratumHandler {
                                     // passed (clock re-read per job — never before it, so the pre-gate
                                     // path is unchanged) a DAA-less job is floored at the H14 gate, or
                                     // a suffix-less pool would grind H10 seeds forever after the fork.
-                                    let floor = if keryx_miner::models::h14_eta_passed_now() {
+                                    let floor = if keryx_miner::models::h14_eta_passed_by_clock() {
                                         keryx_miner::pom::private_inference_activation_daa()
                                     } else {
                                         keryx_miner::pom::h10_activation_daa()
@@ -1478,10 +1487,7 @@ impl StratumHandler {
                 // Telemetry method rejected (v0.7.0): if this id was a mining.hello/mining.telemetry
                 // request, an error 20 means the pool doesn't support telemetry → disable it for the
                 // session and keep mining. NEVER counted as a rejected share; never fatal.
-                if self.ai_response_ids.remove(&id) {
-                    warn!("AI response rejected by the pool: {}", error);
-                    return Ok(());
-                }
+
                 if self.telemetry_req_ids.remove(&id) {
                     if matches!(code, ErrorCode::Unknown) && self.telemetry_on {
                         self.telemetry_on = false;

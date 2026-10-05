@@ -4102,12 +4102,19 @@ pub fn advance_era_model_if_due(device_id: u32, daa: u64) -> EraSwap {
         hex::encode(current),
         want.name
     );
-    set_device_model(device_id, want.model_id, new_gguf.clone());
-    if !uninstall_released(device_id) {
-        // A stuck walk still owns the old table: the regular stuck-table path keeps the card idle
-        // until it lets go. The new model is already assigned, so the rebuild picks it up.
-        log::warn!("PoM[gpu{}]: old walk still draining — the new model installs once it releases.", device_id);
+    // Drain the old walk FIRST. While any walk still holds the old table (or a previous drain left
+    // it quarantined) nothing may be freed or replaced: on a zero-dup card that walk reads the
+    // llama engine's weights, and freeing them under it is a sticky ILLEGAL_ADDRESS that aborts
+    // every card. Stay Deferred (idle) until the table is released; `table_stuck` self-heals.
+    if table_stuck(device_id) {
+        return EraSwap::Deferred;
     }
+    if !uninstall_released(device_id) {
+        set_table_stuck(device_id, true);
+        log::warn!("PoM[gpu{}]: old walk still draining — the era swap waits until it releases.", device_id);
+        return EraSwap::Deferred;
+    }
+    set_device_model(device_id, want.model_id, new_gguf.clone());
     // The in-process engine on THIS card still hosts the retired model (zero-dup inference copy).
     // Free it now so the new model's load has the VRAM; a different card's engine is untouched.
     if crate::llama_engine::active_for(&old_gguf, device_id as usize) {

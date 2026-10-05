@@ -1855,7 +1855,9 @@ pub fn mine_v4(
                 let want = crate::models::Tier::for_model(&model_id).map(|t| t.pom_spec_at(daa).name).unwrap_or("?");
                 log::error!(
                     "PoM[opencl]: DAA {daa} is past the H14 gate and this tier now mines '{want}' — the resident \
-                     model is retired, mining PAUSED. Restart the miner to load '{want}' (prefetched in the background)."
+                     model is retired, mining PAUSED. Restart the miner to load '{want}' (prefetched in the background); \
+                     if the restart still stages the old model (gate reached before its 2026-10-09 14:00 UTC estimate), \
+                     start it with KERYX_H14_STAGE=post."
                 );
             }
             return Err(crate::pom::GrindError::Paused("tier model retired at the H14 gate — restart required"));

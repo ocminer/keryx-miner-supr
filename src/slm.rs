@@ -2045,6 +2045,9 @@ fn probe_flights() -> &'static crate::inference_coord::ProbeFlights {
 /// A probe never waits while holding a peer's install transaction. Busy callers unwind and retry
 /// after the owner progresses. The flight permit has no timeout: a slow load keeps its one owner.
 fn probe_exact_inference_route(model_id: &[u8; 32], gpu: usize) -> SelfTestOutcome {
+    if is_era_retired(model_id) {
+        return SelfTestOutcome::Deferred(DeferredReason::ModelNotRegistered);
+    }
     probe_exact_inference_route_with(model_id, gpu, || {
         try_load_and_run_inference_on(gpu, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS)
     })
@@ -2967,6 +2970,10 @@ pub fn try_load_and_run_inference_on(
     prompt: &str,
     max_tokens: usize,
 ) -> std::result::Result<String, InferenceError> {
+    if is_era_retired(model_id) {
+        log::debug!("OPoI: model {:.8} is retired at an era gate — not loading it", hex::encode(model_id));
+        return Err(InferenceError::Failed);
+    }
     if !inference_card_allowed(gpu) {
         log::warn!("OPoI: refusing inference on excluded GPU {}", gpu);
         return Err(InferenceError::Failed);
