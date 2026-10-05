@@ -449,6 +449,12 @@ static bool run_dispatch(KeryxLlama* h, VkPipeline pipe, VkPipelineLayout pl, Vk
 
 // ── exported ABI ───────────────────────────────────────────────────────────────────────────────
 
+
+// Shared system prompt set by the miner (keryx_llama_set_system_prompt); empty = none.
+static std::mutex g_sys_mu;
+static std::string g_sys_prompt;
+static std::string keryx_system_prompt() { std::lock_guard<std::mutex> g(g_sys_mu); return g_sys_prompt; }
+
 extern "C" {
 
 // Core ABI (load/generate/free) matches the CUDA flavor; the _vk_abi covers the walk exports.
@@ -601,6 +607,10 @@ KeryxLlama* keryx_llama_load2(const char* gguf_path, int gpu, const int* ladder,
     if (!ladder || n_ladder <= 0) return keryx_llama_load(gguf_path, gpu, 4096);
     return keryx_load_impl(gguf_path, gpu, ladder, n_ladder, reserve_mib);
 }
+void keryx_llama_set_system_prompt(const char* text) {
+    std::lock_guard<std::mutex> g(g_sys_mu);
+    g_sys_prompt = text ? text : "";
+}
 const char* keryx_llama_context_info(KeryxLlama* h) { return h ? h->ctx_info.c_str() : ""; }
 int keryx_llama_n_ctx(KeryxLlama* h) { return (h && h->ctx) ? (int)llama_n_ctx(h->ctx) : 0; }
 
@@ -660,14 +670,51 @@ int64_t keryx_llama_pom_mine(KeryxLlama* h, const uint64_t p[4], const uint64_t 
 // length, or -1 on error. Serialized — one generation at a time (OPoI challenges are rare).
 int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
     if (!h || !prompt || !out || cap < 2 || max_tokens <= 0 || max_tokens > 2048) return -1;
+    // Up to 64 KiB (upstream v0.5.6 1c34683: post-H14 AiRequest payload limit); the context check
+    // below refuses (-2) whatever does not fit the allocated window.
     size_t prompt_len = 0;
-    while (prompt_len <= 4096 && prompt[prompt_len] != '\0') ++prompt_len;
-    if (prompt_len == 0 || prompt_len > 4096) return -1;
+    while (prompt_len <= 65536 && prompt[prompt_len] != '\0') ++prompt_len;
+    if (prompt_len == 0 || prompt_len > 65536) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
 
-    std::vector<llama_token> toks(prompt_len + 16);
-    int n = llama_tokenize(vocab, prompt, (int32_t)prompt_len, toks.data(), (int32_t)toks.size(), true, true);
+    // Chat template + shared system prompt (same as keryx_llama.cpp): a raw prompt never reaches a
+    // turn boundary, so the model rambles; GLM-4 / system-less templates get the system text folded
+    // into the user turn (upstream 32d641a/dbfb745).
+    std::string formatted;
+    if (const char* tmpl = llama_model_chat_template(h->model, nullptr)) {
+        const std::string sys = keryx_system_prompt();
+        const bool glm = std::strstr(tmpl, "[gMASK]") != nullptr;
+        std::string folded;
+        auto apply = [&](const llama_chat_message* msgs, size_t n_msgs) -> bool {
+            int need = llama_chat_apply_template(tmpl, msgs, n_msgs, /*add_ass=*/true, nullptr, 0);
+            if (need <= 0) return false;
+            formatted.resize((size_t)need);
+            int wrote = llama_chat_apply_template(tmpl, msgs, n_msgs, true, &formatted[0], need);
+            if (wrote <= 0) { formatted.clear(); return false; }
+            formatted.resize((size_t)wrote);
+            return true;
+        };
+        bool ok = false;
+        if (!sys.empty() && !glm) {
+            llama_chat_message two[2] = { { "system", sys.c_str() }, { "user", prompt } };
+            ok = apply(two, 2);
+        }
+        if (!ok && !sys.empty()) {
+            folded = sys + "\n\n" + prompt;
+            llama_chat_message one{ "user", folded.c_str() };
+            ok = apply(&one, 1);
+        }
+        if (!ok) {
+            llama_chat_message one{ "user", prompt };
+            apply(&one, 1);
+        }
+    }
+    const char* infer = formatted.empty() ? prompt : formatted.c_str();
+    const int infer_len = (int)strlen(infer);
+
+    std::vector<llama_token> toks(infer_len + 16);
+    int n = llama_tokenize(vocab, infer, infer_len, toks.data(), (int32_t)toks.size(), true, true);
     if (n < 0) return -1;
     toks.resize(n);
 

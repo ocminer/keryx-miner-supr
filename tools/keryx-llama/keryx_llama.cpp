@@ -74,6 +74,12 @@ static long keryx_free_mib(int gpu) {
     return ok ? (long)(fr >> 20) : -1;
 }
 
+
+// Shared system prompt set by the miner (keryx_llama_set_system_prompt); empty = none.
+static std::mutex g_sys_mu;
+static std::string g_sys_prompt;
+static std::string keryx_system_prompt() { std::lock_guard<std::mutex> g(g_sys_mu); return g_sys_prompt; }
+
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
@@ -167,6 +173,12 @@ KeryxLlama* keryx_llama_load2(const char* gguf_path, int gpu, const int* ladder,
     return keryx_load_impl(gguf_path, gpu, ladder, n_ladder, reserve_mib);
 }
 
+// Optional export: the system prompt applied to every request (UTF-8, copied).
+void keryx_llama_set_system_prompt(const char* text) {
+    std::lock_guard<std::mutex> g(g_sys_mu);
+    g_sys_prompt = text ? text : "";
+}
+
 // Context parameters the engine ended up with, for the miner log.
 const char* keryx_llama_context_info(KeryxLlama* h) { return h ? h->ctx_info.c_str() : ""; }
 
@@ -233,14 +245,37 @@ int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char
     // ramble until max_tokens (the EOG check below never fires because the model doesn't think it
     // finished a turn). With the template the model emits its end-of-turn token (e.g. <|im_end|>),
     // which IS an EOG token → clean stop. Falls back to the raw prompt if the GGUF has no template.
+    // System prompt (upstream v0.5.6 32d641a/dbfb745): the miner sets one shared, vendor-agnostic
+    // system prompt via keryx_llama_set_system_prompt. It goes in as a real system turn through the
+    // GGUF's own template; GLM-4 ignores the system role, so (as upstream) it is folded into the
+    // user turn there — and for any template that cannot take a system role.
     std::string formatted;
     if (const char* tmpl = llama_model_chat_template(h->model, nullptr)) {
-        llama_chat_message msg{ "user", prompt };
-        int need = llama_chat_apply_template(tmpl, &msg, 1, /*add_ass=*/true, nullptr, 0);
-        if (need > 0) {
+        const std::string sys = keryx_system_prompt();
+        const bool glm = std::strstr(tmpl, "[gMASK]") != nullptr;
+        std::string folded;
+        auto apply = [&](const llama_chat_message* msgs, size_t n_msgs) -> bool {
+            int need = llama_chat_apply_template(tmpl, msgs, n_msgs, /*add_ass=*/true, nullptr, 0);
+            if (need <= 0) return false;
             formatted.resize((size_t)need);
-            int wrote = llama_chat_apply_template(tmpl, &msg, 1, true, &formatted[0], need);
-            if (wrote > 0) formatted.resize((size_t)wrote); else formatted.clear();
+            int wrote = llama_chat_apply_template(tmpl, msgs, n_msgs, true, &formatted[0], need);
+            if (wrote <= 0) { formatted.clear(); return false; }
+            formatted.resize((size_t)wrote);
+            return true;
+        };
+        bool ok = false;
+        if (!sys.empty() && !glm) {
+            llama_chat_message two[2] = { { "system", sys.c_str() }, { "user", prompt } };
+            ok = apply(two, 2);
+        }
+        if (!ok && !sys.empty()) {
+            folded = sys + "\n\n" + prompt;
+            llama_chat_message one{ "user", folded.c_str() };
+            ok = apply(&one, 1);
+        }
+        if (!ok) {
+            llama_chat_message one{ "user", prompt };
+            apply(&one, 1);
         }
     }
     const char* infer = formatted.empty() ? prompt : formatted.c_str();

@@ -10,13 +10,17 @@
 //! and [`pom_byte_gate`] cross-checks the engine's gather against the host possession index at
 //! every startup — any mismatch refuses zero-dup and the OpenCL blob path takes over.
 
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::{Mutex, OnceLock};
 
 use libloading::Library;
 
 type AbiFn = unsafe extern "C" fn() -> c_int;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
+type Load2Fn = unsafe extern "C" fn(*const c_char, c_int, *const c_int, c_int, c_int) -> *mut c_void;
+type NCtxFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+type SysPromptFn = unsafe extern "C" fn(*const c_char);
+type CtxInfoFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type FreeFn = unsafe extern "C" fn(*mut c_void);
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
 type ReadyFn = unsafe extern "C" fn(*mut c_void) -> bool;
@@ -401,8 +405,40 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
             if main_gpu < 0 { "auto-discrete".to_string() } else { main_gpu.to_string() },
             so.display()
         );
-        let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
-        let model = load(cg.as_ptr(), main_gpu, n_ctx);
+        let configured_ctx: Option<c_int> = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok());
+        let mut n_ctx: c_int = configured_ctx.unwrap_or(4096);
+        // Context ladder + walk reserve (upstream d5ccad3, same as the CUDA engine): the library
+        // keeps a context only if the reserve stays free for the zero-dup walk it builds next.
+        let mut model: *mut c_void = std::ptr::null_mut();
+        if configured_ctx.is_none() {
+            if let Some(load2) = sym::<Load2Fn>(lib, "keryx_llama_load2") {
+                let (floor, cap) = crate::models::spec_for_gguf(gguf)
+                    .map_or((4096, 4096), |m| (m.ctx_floor as c_int, m.ctx_cap as c_int));
+                let ladder = crate::models::context_ladder(cap, floor);
+                let reserve: c_int = std::env::var("KERYX_LLAMA_WALK_RESERVE_MB")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(crate::models::DEFAULT_WALK_RESERVE_MIB);
+                model = load2(cg.as_ptr(), main_gpu, ladder.as_ptr(), ladder.len() as c_int, reserve);
+                if !model.is_null() {
+                    n_ctx = sym::<NCtxFn>(lib, "keryx_llama_n_ctx").map(|f| f(model)).filter(|&n| n > 0).unwrap_or(floor);
+                }
+            }
+        }
+        if model.is_null() {
+            model = load(cg.as_ptr(), main_gpu, n_ctx);
+        }
+        if !model.is_null() {
+            if let (Some(set_sys), Ok(sys)) = (
+                sym::<SysPromptFn>(lib, "keryx_llama_set_system_prompt"),
+                CString::new(crate::models::SYSTEM_PROMPT_NEXT),
+            ) {
+                set_sys(sys.as_ptr());
+            }
+            if let Some(info) = sym::<CtxInfoFn>(lib, "keryx_llama_context_info") {
+                log::info!("llama-vk engine: context {}", CStr::from_ptr(info(model)).to_string_lossy());
+            }
+        }
         if model.is_null() {
             log::warn!("llama-vk engine: model load failed (VRAM? Vulkan ICD?) — fallbacks stay active.");
             return false;

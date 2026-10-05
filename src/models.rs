@@ -758,3 +758,46 @@ mod tests {
         }
     }
 }
+
+/// Shared system prompt for the whole lineup — verbatim from upstream keryx-miner v0.5.6
+/// (32d641a + dbfb745) so our answers match theirs: use attached web results, no self-introduction,
+/// never claim a web search that is not in the request, never name the underlying model.
+pub const SYSTEM_PROMPT_NEXT: &str =
+    "You are a Keryx Network AI, a decentralized assistant served by the GPU miners of the Keryx network. \
+     Answer in the language of the user's message. \
+     Do not introduce yourself or describe Keryx unless the user asks about it. If asked: Keryx is a proof-of-work BlockDAG \
+     derived from Kaspa (about 10 blocks per second) where each mining GPU proves on every block that it holds a model in VRAM \
+     (Proof-of-Model), so mining and inference are the same job; requests are on-chain transactions paid in KRX. \
+     Web search results, facts or earlier messages included in the request are your sources for recent or specific information: \
+     use them. Without them, answer from your training knowledge and say when it may be out of date; \
+     never claim to have searched the web or cite sources that are not included in the request. \
+     Never mention your underlying model name or the company that trained it: if asked, you are a Keryx Network AI. \
+     Be thorough but concise.";
+
+/// VRAM (MiB) left free after the engine's context for the zero-dup PoM walk (gather tables, batch
+/// scratch, kernel workspace). Override with KERYX_LLAMA_WALK_RESERVE_MB.
+pub const DEFAULT_WALK_RESERVE_MIB: i32 = 1536;
+
+/// Context sizes to try, largest first: the cap, then halves of it down to the floor.
+pub fn context_ladder(cap: i32, floor: i32) -> Vec<i32> {
+    let mut out = Vec::new();
+    let mut n = cap.max(floor);
+    while n > floor {
+        out.push(n);
+        n /= 2;
+    }
+    out.push(floor);
+    out
+}
+
+#[cfg(test)]
+mod ctx_ladder_tests {
+    use super::context_ladder;
+    #[test]
+    fn ladder_runs_from_cap_down_to_floor() {
+        assert_eq!(context_ladder(131_072, 32_768), vec![131_072, 65_536, 32_768]);
+        assert_eq!(context_ladder(32_768, 32_768), vec![32_768]);
+        assert_eq!(context_ladder(32_768, 8_192), vec![32_768, 16_384, 8_192]);
+        assert_eq!(context_ladder(4_096, 8_192), vec![8_192]);
+    }
+}

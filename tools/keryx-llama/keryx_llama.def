@@ -11,6 +11,7 @@ EXPORTS
     keryx_llama_load2
     keryx_llama_context_info
     keryx_llama_n_ctx
+    keryx_llama_set_system_prompt
     keryx_llama_tensor_count
     keryx_llama_tensor_info
     keryx_llama_tensor_device
