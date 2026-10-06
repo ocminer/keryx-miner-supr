@@ -489,12 +489,31 @@ bool keryx_llama_pom_pci(KeryxLlama* h, uint32_t* domain, uint32_t* bus, uint32_
 }
 
 
+// GLM-4-0414 rotates 64 of its 128 head dimensions; a GGUF missing the key rotates all of them
+// (upstream v0.5.7 3f2b2ac).
+static bool keryx_needs_glm4_rope_fix(const char* gguf_path) {
+    gguf_init_params params = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+    gguf_context* g = gguf_init_from_file(gguf_path, params);
+    if (!g) return false;
+    bool fix = false;
+    const int64_t arch = gguf_find_key(g, "general.architecture");
+    if (arch >= 0 && gguf_get_kv_type(g, arch) == GGUF_TYPE_STRING
+        && std::strcmp(gguf_get_val_str(g, arch), "glm4") == 0) {
+        fix = gguf_find_key(g, "glm4.rope.dimension_count") < 0;
+    }
+    gguf_free(g);
+    return fix;
+}
+
 // 8-bit KV + flash attention context (upstream v0.5.6 d5ccad3), f16 fallback. Mirrors keryx_llama.cpp.
 static llama_context* keryx_make_ctx(llama_model* model, int n_ctx, const char** kv, llama_context_params* out) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
     cp.n_batch = std::min(2048u, cp.n_ctx);
     cp.n_ubatch = std::min(512u, cp.n_batch);
+    // The cache is cleared before every request, so sliding-window layers only need their window
+    // (upstream v0.5.7 30d72ed: tier 2 fits a 16 GB card).
+    cp.swa_full = false;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.type_k = GGML_TYPE_Q8_0;
     cp.type_v = GGML_TYPE_Q8_0;
@@ -553,6 +572,13 @@ static KeryxLlama* keryx_load_impl(const char* gguf_path, int gpu, const int* la
     mp.split_mode   = LLAMA_SPLIT_MODE_NONE; // ONE GPU — never layer-split across mining cards
     mp.main_gpu     = main_gpu;
     mp.use_mmap     = true;
+    llama_model_kv_override overrides[2] = {};               // zeroed tail terminates the list
+    if (keryx_needs_glm4_rope_fix(gguf_path)) {
+        overrides[0].tag = LLAMA_KV_OVERRIDE_TYPE_INT;
+        std::strncpy(overrides[0].key, "glm4.rope.dimension_count", sizeof(overrides[0].key) - 1);
+        overrides[0].val_i64 = 64;
+        mp.kv_overrides = overrides;
+    }
     llama_model* model = llama_model_load_from_file(gguf_path, mp);
     if (!model) return nullptr;
 
