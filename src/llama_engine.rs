@@ -37,6 +37,8 @@ type FreeFn = unsafe extern "C" fn(*mut c_void);
 // CUDA ordinal owning tensor i's bytes, or -1 (host/unified/unknown). Upstream aa29fd2 — optional
 // symbol (absent on older .so builds → the ownership gate below degrades to a no-op).
 type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
+/// Optional (v0.14.1 engines): reason of the last failed load, "" when none.
+type LastErrorFn = unsafe extern "C" fn() -> *const c_char;
 
 /// Install a process-lifetime bridge over llama.cpp/ggml's native stderr logger. Older shipped
 /// sidecars already export these stable llama API symbols, so the host fix also protects them
@@ -240,7 +242,15 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             n_ctx = 1024;
         }
         if model.is_null() {
-            log::warn!("llama engine: model load failed on GPU {} (VRAM? arch? driver?) — OPoI inference unavailable on this card.", gpu);
+            // v0.14.1 engines explain the refusal (e.g. the compute-capability gate: a Volta card on
+            // the modern line, which would otherwise have aborted the miner on the first kernel).
+            let why = sym::<LastErrorFn>(lib, b"keryx_llama_last_error\0")
+                .map(|f| CStr::from_ptr(f()).to_string_lossy().into_owned())
+                .filter(|m| !m.is_empty());
+            match why {
+                Some(m) => log::error!("llama engine: model load refused on GPU {}: {}", gpu, m),
+                None => log::warn!("llama engine: model load failed on GPU {} (VRAM? arch? driver?) — OPoI inference unavailable on this card.", gpu),
+            }
             return None;
         }
         if let (Some(set_sys), Ok(sys)) =

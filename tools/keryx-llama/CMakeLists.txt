@@ -48,6 +48,18 @@ target_include_directories(keryx-llama PRIVATE
 # llama pulls in ggml + its cuda/cpu/base backends transitively.
 target_link_libraries(keryx-llama PRIVATE llama ggml)
 
+# Architecture gate (v0.14.1): the engine refuses GPUs below the lowest compiled arch with an
+# actionable message instead of ggml_abort-ing the miner on the first kernel launch. Derived from
+# the first CMAKE_CUDA_ARCHITECTURES entry ("75-real" -> 75).
+if(CMAKE_CUDA_ARCHITECTURES)
+  list(GET CMAKE_CUDA_ARCHITECTURES 0 _keryx_min_arch)
+  string(REGEX REPLACE "[^0-9].*$" "" _keryx_min_arch "${_keryx_min_arch}")
+  if(_keryx_min_arch MATCHES "^[0-9]+$")
+    target_compile_definitions(keryx-llama PRIVATE KERYX_LLAMA_MIN_CC=${_keryx_min_arch})
+    message(STATUS "keryx-llama: KERYX_LLAMA_MIN_CC=${_keryx_min_arch}")
+  endif()
+endif()
+
 # MSVC: nothing is exported from a DLL by default — feed the module-definition file so the
 # keryx_llama_* C ABI is exported (Linux/macOS export via default visibility, so no-op there).
 if(MSVC)

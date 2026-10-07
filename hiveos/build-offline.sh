@@ -222,7 +222,11 @@ docker run --rm --network none \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER="$KCUDA/bin/nvcc" \
         "${simd_flags[@]}"
       /opt/keryx-cmake/bin/cmake --build "$build_dir" --target llama -j "$LLAMA_JOBS"
+      # Architecture gate (v0.14.1): the engine refuses GPUs below the lowest compiled arch with an
+      # actionable message instead of ggml_abort-ing the miner on the first kernel launch.
+      min_cc="${LLAMA_ARCHS%%;*}"
       g++ -O2 -std=c++17 -shared -fPIC -fopenmp /src/tools/keryx-llama/keryx_llama.cpp \
+        -DKERYX_LLAMA_MIN_CC="${min_cc//[^0-9]/}" \
         -I /llama/include -I /llama/ggml/include -I /llama/src -I /llama/common \
         -I "$KCUDA/include" \
         -Wl,--start-group "$build_dir/src/libllama.a" \

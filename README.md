@@ -147,8 +147,10 @@ explicit emergency fallback and is not a release route.
 
 Or skip building entirely — the release page ships two prebuilt lines:
 
-- **modern** — sm_75+, native sm_120 for RTX 50xx; driver 575+.
-- **legacy** — sm_61+ : **GTX 10-series (1080 Ti)**, Tesla V100/Volta, CMP 100-210, Turing and
+- **modern** — sm_75+ (RTX 20-series/Turing and newer, native sm_120 for RTX 50xx); driver 575+.
+  It carries **no Volta kernels** (its CUDA 13 toolchain cannot target sm_70): a **Tesla V100 /
+  Titan V / Quadro GV100 must use the legacy line**, whatever driver is installed.
+- **legacy** — sm_61+ : **GTX 10-series (1080 Ti)**, **Tesla V100/Volta**, CMP 100-210, Turing and
   newer; driver 550+. Pascal is covered by this line, so there is no separate `pascal` download.
 
 Windows AMD users should download `keryx-miner-supr-windows-amd.zip`. It includes the OpenCL

@@ -24,10 +24,26 @@
 #include <cuda_runtime.h>
 #endif
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
+
+// Lowest CUDA compute capability (major*10+minor) whose SASS/PTX this build carries. Set by the
+// build scripts from the first CMAKE_CUDA_ARCHITECTURES entry (modern 75, legacy 61). 0 = no gate.
+#ifndef KERYX_LLAMA_MIN_CC
+#define KERYX_LLAMA_MIN_CC 0
+#endif
+
+// Last load failure, for the host's log (optional ABI export `keryx_llama_last_error`).
+static std::mutex g_err_mu;
+static std::string g_last_error;
+static void keryx_set_last_error(const std::string& e) {
+    std::lock_guard<std::mutex> g(g_err_mu);
+    g_last_error = e;
+    fprintf(stderr, "[keryx-llama] %s\n", e.c_str());
+}
 
 struct KeryxLlama {
     llama_model*   model = nullptr;
@@ -111,6 +127,15 @@ extern "C" {
 // ABI version — the miner refuses to use a mismatched .so.
 int keryx_llama_abi() { return 2; }
 
+// Optional (v0.14.1): human-readable reason of the last failed load ("" if none). Additive — the
+// host resolves it with dlsym and tolerates its absence in older engines.
+const char* keryx_llama_last_error() {
+    static thread_local std::string copy;
+    std::lock_guard<std::mutex> g(g_err_mu);
+    copy = g_last_error;
+    return copy.c_str();
+}
+
 // Optional presentation ABI: expose llama.cpp's logger through wrapper-owned names. ELF/Mach-O
 // hosts can also resolve llama_log_get/set directly from historical sidecars; the named bridge is
 // required on Windows, whose module-definition file intentionally exports only this wrapper API.
@@ -127,6 +152,30 @@ void keryx_llama_log_set_v1(ggml_log_callback callback, void* user_data) {
 // A context is kept only if at least `reserve_mib` VRAM stays free afterwards for the PoM walk's
 // own buffers (zero-dup gather tables, batch scratch); the last candidate is always kept.
 static KeryxLlama* keryx_load_impl(const char* gguf_path, int gpu, const int* ladder, int n_ladder, int reserve_mib) {
+#if !defined(__APPLE__) && KERYX_LLAMA_MIN_CC > 0
+    // Architecture gate. ggml has no load-time check: on a GPU older than every compiled arch the
+    // model loads fine and the FIRST kernel launch dies with "no kernel image is available" inside
+    // ggml_abort — taking the whole miner down (field report: Tesla V100 sm_70 on the modern line,
+    // whose engines are built for sm_75+). Refuse here with an actionable message instead.
+    {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, gpu) == cudaSuccess &&
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, gpu) == cudaSuccess) {
+            const int cc = major * 10 + minor;
+            if (cc < KERYX_LLAMA_MIN_CC) {
+                char buf[320];
+                snprintf(buf, sizeof(buf),
+                         "GPU %d has compute capability %d.%d but this build's inference engine carries "
+                         "kernels for %d.%d and newer only. Use the build line for your GPU: LEGACY = sm_61+ "
+                         "(GTX 10-series, Tesla V100/Volta, CMP 100-210, Turing+; driver 550+), MODERN = sm_75+ "
+                         "(driver 575+). Not loading the model on this GPU.",
+                         gpu, major, minor, KERYX_LLAMA_MIN_CC / 10, KERYX_LLAMA_MIN_CC % 10);
+                keryx_set_last_error(buf);
+                return nullptr;
+            }
+        }
+    }
+#endif
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 999;
@@ -296,8 +345,25 @@ int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char
             formatted.resize((size_t)wrote);
             return true;
         };
+        // Gemma 4 is NOT the classic <start_of_turn> Gemma: its Jinja template renders turns as
+        // `<|turn>role\n…<turn|>\n`, which llama_chat_apply_template cannot detect (b10015 only knows
+        // <start_of_turn>), so `apply` fails and — until v0.14.1 — the RAW prompt reached the model:
+        // no system turn, no turn boundary. Short prompts (the pool's 1-word "ping" probe) then
+        // produced junk; on Volta the junk ended in `<channel|>`, the miner's think-tag stripper
+        // left an empty answer, three empty answers withdrew the model and suspended mining (field
+        // report: Tesla V100 "can't load inference, candle fails"). Render it by hand, verbatim as
+        // upstream keryx-miner's format_prompt_by_name does, with the empty thought channel of the
+        // `enable_thinking=false` branch so the visible answer starts immediately. No literal <bos>:
+        // this GGUF sets add_bos_token, so llama_tokenize(add_special=true) prepends it.
+        const bool gemma4 = std::strstr(tmpl, "<|turn>") != nullptr;
         bool ok = false;
-        if (!sys.empty() && !glm) {
+        if (gemma4) {
+            formatted.clear();
+            if (!sys.empty()) formatted += "<|turn>system\n" + sys + "<turn|>\n";
+            formatted += std::string("<|turn>user\n") + prompt + "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
+            ok = true;
+        }
+        if (!ok && !sys.empty() && !glm) {
             llama_chat_message two[2] = { { "system", sys.c_str() }, { "user", prompt } };
             ok = apply(two, 2);
         }

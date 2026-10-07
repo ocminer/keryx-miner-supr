@@ -58,7 +58,9 @@ docker run --rm --network host \
       -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DGGML_CUDA_NCCL=OFF -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_COMPILER=$KCUDA/bin/nvcc $SIMD_FLAGS
     /tmp/cmk/bin/cmake --build $B --target llama -j "$JOBS"
+    MINCC="${ARCHS%%;*}"
     g++ -O2 -std=c++17 -shared -fPIC -fopenmp /repo/tools/keryx-llama/keryx_llama.cpp \
+      -DKERYX_LLAMA_MIN_CC="${MINCC//[^0-9]/}" \
       -I /llama/include -I /llama/ggml/include -I /llama/src -I /llama/common \
       -I $KCUDA/include \
       -Wl,--start-group $B/src/libllama.a $B/ggml/src/ggml-cuda/libggml-cuda.a \

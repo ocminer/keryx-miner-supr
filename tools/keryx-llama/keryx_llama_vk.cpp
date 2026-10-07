@@ -722,8 +722,25 @@ int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char
             formatted.resize((size_t)wrote);
             return true;
         };
+        // Gemma 4 is NOT the classic <start_of_turn> Gemma: its Jinja template renders turns as
+        // `<|turn>role\n…<turn|>\n`, which llama_chat_apply_template cannot detect (b10015 only knows
+        // <start_of_turn>), so `apply` fails and — until v0.14.1 — the RAW prompt reached the model:
+        // no system turn, no turn boundary. Short prompts (the pool's 1-word "ping" probe) then
+        // produced junk; on Volta the junk ended in `<channel|>`, the miner's think-tag stripper
+        // left an empty answer, three empty answers withdrew the model and suspended mining (field
+        // report: Tesla V100 "can't load inference, candle fails"). Render it by hand, verbatim as
+        // upstream keryx-miner's format_prompt_by_name does, with the empty thought channel of the
+        // `enable_thinking=false` branch so the visible answer starts immediately. No literal <bos>:
+        // this GGUF sets add_bos_token, so llama_tokenize(add_special=true) prepends it.
+        const bool gemma4 = std::strstr(tmpl, "<|turn>") != nullptr;
         bool ok = false;
-        if (!sys.empty() && !glm) {
+        if (gemma4) {
+            formatted.clear();
+            if (!sys.empty()) formatted += "<|turn>system\n" + sys + "<turn|>\n";
+            formatted += std::string("<|turn>user\n") + prompt + "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
+            ok = true;
+        }
+        if (!ok && !sys.empty() && !glm) {
             llama_chat_message two[2] = { { "system", sys.c_str() }, { "user", prompt } };
             ok = apply(two, 2);
         }
