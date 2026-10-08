@@ -572,6 +572,8 @@ impl MinerManager {
                     keryx_miner::wait_ready::register_device(d as u64);
                 }
                 let mut nonces = vec![no_winner; 1];
+                #[cfg(feature = "pom-opencl")]
+                let mut shown_dedicated = false;
 
                 let mut state = None;
                 // AMD PoM: cap on proof-builds running concurrently on detached threads (the async
@@ -873,6 +875,16 @@ impl MinerManager {
                                 continue;
                             }
                             Err(keryx_miner::pom::GrindError::Paused(_reason)) => {
+                                // AMD: a card reserved for inference (model + walk do not fit in its
+                                // VRAM) pauses by design; show it as an inference card, not STALLED.
+                                #[cfg(feature = "pom-opencl")]
+                                if let (Some(dev), Some(ordinal)) = (opencl_device_id, worker_ordinal) {
+                                    let dedicated = keryx_miner::pom_opencl::is_dedicated_inference_device(dev);
+                                    if dedicated != shown_dedicated {
+                                        keryx_miner::runtime_stats::set_inference_dedicated_gpu(ordinal, dedicated);
+                                        shown_dedicated = dedicated;
+                                    }
+                                }
                                 std::thread::sleep(std::time::Duration::from_millis(100));
                                 continue;
                             }
@@ -881,6 +893,13 @@ impl MinerManager {
                                 continue;
                             }
                         };
+                        #[cfg(feature = "pom-opencl")]
+                        if shown_dedicated {
+                            if let Some(ordinal) = worker_ordinal {
+                                keryx_miner::runtime_stats::set_inference_dedicated_gpu(ordinal, false);
+                            }
+                            shown_dedicated = false;
+                        }
                         if let Some((_, cursor)) = pom_cursor.as_mut() {
                             cursor.commit(completed.hashes_done);
                         }

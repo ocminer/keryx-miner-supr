@@ -840,6 +840,7 @@ fn adapt_snapshot(snapshot: runtime::Snapshot, clocks: &mut ClockBaselines) -> U
         .map(|device| {
             let inference_host = inference_gpu == Some(device.index);
             let activity = if snapshot.mining.inference_paused_gpus.contains(&device.index)
+                || snapshot.mining.inference_dedicated_gpus.contains(&device.index)
                 || (snapshot.mining.inference_paused && inference_host) {
                 DeviceActivity::Inference
             } else if snapshot.mining.inference_paused {
@@ -1183,6 +1184,27 @@ mod tests {
         assert_eq!(view.devices[0].activity, crate::tui::DeviceActivity::Mining);
         assert_eq!(view.devices[1].activity, crate::tui::DeviceActivity::Mining);
         assert_eq!(view.devices[2].activity, crate::tui::DeviceActivity::Inference);
+    }
+
+    #[test]
+    fn dedicated_inference_card_is_not_shown_as_stalled() {
+        // AMD 16 GB rig on the default tier: GPU0 is reserved for inference (model + walk do not
+        // fit together) and mines nothing by design; GPU3 is a genuine 0 H/s fault.
+        let mut snapshot = runtime::Snapshot::default();
+        snapshot.connection = runtime::ConnectionState::Connected;
+        snapshot.mining.inference_dedicated_gpus = vec![0];
+        snapshot.mining.devices = (0..4)
+            .map(|index| runtime::DeviceSnapshot {
+                index,
+                hashrate_hs: if index == 0 || index == 3 { 0.0 } else { 830_000.0 },
+                ..Default::default()
+            })
+            .collect();
+        let view = super::adapt_snapshot(snapshot, &mut super::ClockBaselines::default());
+        assert_eq!(view.devices[0].activity, crate::tui::DeviceActivity::Inference);
+        assert_eq!(view.devices[1].activity, crate::tui::DeviceActivity::Mining);
+        assert_eq!(view.devices[2].activity, crate::tui::DeviceActivity::Mining);
+        assert_eq!(view.devices[3].activity, crate::tui::DeviceActivity::Stalled);
     }
 
     fn args(values: &[&str]) -> Vec<OsString> {

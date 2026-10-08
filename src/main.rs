@@ -1559,7 +1559,9 @@ async fn run() -> Result<(), Error> {
                 let vram_mb = keryx_miner::pom_opencl::max_gpu_global_mem_mb().unwrap_or(0);
                 if vram_mb > 0 && vram_mb < need_mb {
                     info!(
-                        "PoM(AMD): model ({gguf_mb} MiB) + possession blob need ~{need_mb} MiB on one                          card; largest card has {vram_mb} MiB — the inference card will be DEDICATED to                          OPoI (it will not mine); all other cards mine at full rate."
+                        "PoM(AMD): model ({gguf_mb} MiB) + possession blob need ~{need_mb} MiB on one card; largest card has \
+                         {vram_mb} MiB — the inference card will be DEDICATED to OPoI (it will not mine, shown as \
+                         INF); all other cards mine at full rate."
                     );
                     keryx_miner::pom_opencl::require_dedicated_inference_card();
                 }

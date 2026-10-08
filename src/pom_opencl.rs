@@ -1012,6 +1012,11 @@ fn clear_dedication_owned_by(owner: DedicationOwner) {
     }
 }
 
+/// True when `device_id` (a cl_device_id) is the card reserved for GPU inference.
+pub fn is_dedicated_inference_device(device_id: usize) -> bool {
+    dedicated_device() == Some(device_id)
+}
+
 fn dedicated_device() -> Option<usize> {
     DEDICATED_DEV.lock().unwrap_or_else(|p| p.into_inner()).device
 }

@@ -123,6 +123,9 @@ pub struct MiningSnapshot {
     pub inference_paused: bool,
     /// Exact CUDA cards paused for inference. `inference_paused` denotes the whole rig.
     pub inference_paused_gpus: Vec<u32>,
+    /// Cards reserved for inference because model and PoM walk cannot share their VRAM (AMD
+    /// 16 GB cards on the default tier). They do not mine by design; not counted as AI pause.
+    pub inference_dedicated_gpus: Vec<u32>,
     pub total_hashrate_hs: f64,
     pub average_60s_hs: Option<f64>,
     pub hashrate_history_hs: Vec<f64>,
@@ -358,6 +361,7 @@ struct RuntimeStats {
     inference_pause_started_ms: AtomicU64,
     inference_pause_total_ms: AtomicU64,
     inference_pauses: Mutex<std::collections::BTreeMap<Option<usize>, usize>>,
+    inference_dedicated: Mutex<std::collections::BTreeSet<u32>>,
     inference_serveable_models: AtomicU64,
     inference_staging_error: AtomicBool,
 
@@ -466,6 +470,7 @@ impl RuntimeStats {
             inference_pause_started_ms: AtomicU64::new(UNSET),
             inference_pause_total_ms: AtomicU64::new(0),
             inference_pauses: Mutex::new(std::collections::BTreeMap::new()),
+            inference_dedicated: Mutex::new(std::collections::BTreeSet::new()),
             inference_serveable_models: AtomicU64::new(0),
             inference_staging_error: AtomicBool::new(false),
             escrow_enabled: AtomicBool::new(false),
@@ -972,6 +977,17 @@ pub fn clear_connection_inference_queue(generation: u64) -> bool {
     set_connection_inference_queue(generation, 0, 0)
 }
 
+/// Mark (or clear) a card as reserved for inference: it intentionally mines nothing while the
+/// model is resident because model and walk do not fit together in its VRAM.
+pub fn set_inference_dedicated_gpu(index: u32, dedicated: bool) {
+    let mut set = hub().inference_dedicated.lock().unwrap_or_else(|p| p.into_inner());
+    if dedicated {
+        set.insert(index);
+    } else {
+        set.remove(&index);
+    }
+}
+
 pub fn inference_pause_started() {
     update_inference_pause(None, true);
 }
@@ -1329,6 +1345,11 @@ pub fn try_snapshot() -> Option<Snapshot> {
             preparing: stats.mining_preparing.load(Ordering::Relaxed),
             inference_paused: all_paused,
             inference_paused_gpus: paused_gpus,
+            inference_dedicated_gpus: stats
+                .inference_dedicated
+                .lock()
+                .map(|set| set.iter().copied().collect())
+                .unwrap_or_default(),
             total_hashrate_hs: f64::from_bits(stats.total_hashrate_bits.load(Ordering::Relaxed)),
             average_60s_hs,
             hashrate_history_hs: recent_rates,
@@ -1472,6 +1493,18 @@ mod tests {
         drop(outer);
         assert!(read_snapshot().mining.inference_paused_gpus.is_empty());
         *super::hub().devices.write().unwrap() = old_devices;
+    }
+
+    #[test]
+    fn dedicated_inference_card_is_listed_without_counting_as_ai_pause() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        super::set_inference_dedicated_gpu(7, true);
+        let snapshot = read_snapshot();
+        assert_eq!(snapshot.mining.inference_dedicated_gpus, vec![7]);
+        assert!(!snapshot.mining.inference_paused);
+        assert!(!snapshot.mining.inference_paused_gpus.contains(&7));
+        super::set_inference_dedicated_gpu(7, false);
+        assert!(read_snapshot().mining.inference_dedicated_gpus.is_empty());
     }
 
     fn enter_global_test() -> MutexGuard<'static, ()> {
