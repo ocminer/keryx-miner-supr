@@ -4258,6 +4258,19 @@ pub fn is_device_forced(device_id: u32) -> bool {
 }
 
 /// The model this device mines: its per-device override if set, else the process-wide default.
+/// True when a card other than `device_id` has a resident walk for `model_id` or is building one.
+/// Only active mining workers count (installed miners and in-flight installs), not every GPU in
+/// the box, so cards excluded from mining never keep a model announced.
+fn model_active_on_other_device(device_id: u32, model_id: &[u8; 32]) -> bool {
+    let mut devices: Vec<u32> = miners().lock().map(|m| m.keys().copied().collect()).unwrap_or_default();
+    if let Ok(installing) = installing_devices().lock() {
+        devices.extend(installing.keys().copied());
+    }
+    devices
+        .into_iter()
+        .any(|d| d != device_id && device_model(d).map_or(false, |(m, _)| &m == model_id))
+}
+
 pub fn device_model(device_id: u32) -> Option<([u8; 32], String)> {
     if let Ok(m) = device_models().lock() {
         if let Some(v) = m.get(&device_id) {
@@ -4859,8 +4872,20 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                     }
                     return false;
                 }
-                crate::slm::mark_model_unavailable(&model_id, "walk_build_oom");
-                crate::slm::clear_self_test(&model_id);
+                // One card's OOM is a per-card problem while another active card still mines this
+                // model: demote only this card. Withdrawing it rig-wide used to stop the healthy
+                // cards too (is_model_ready turns false) and flapped every self-test cycle.
+                if model_active_on_other_device(device_id, &model_id) {
+                    log::warn!(
+                        "PoM[gpu{}]: walk OOM on {} MB VRAM; model {:.8} stays in ai:cap — other cards still mine it.",
+                        device_id,
+                        vram_mb,
+                        hex::encode(model_id)
+                    );
+                } else {
+                    crate::slm::mark_model_unavailable(&model_id, "walk_build_oom");
+                    crate::slm::clear_self_test(&model_id);
+                }
                 match crate::slm::next_smaller_ready_spec(&model_id, vram_mb) {
                     Some(smaller) => {
                         log::warn!(
@@ -6340,5 +6365,33 @@ mod era_swap_decision_tests {
             }
         }
         assert_eq!(name(&[0u8; 32], gate), None);
+    }
+}
+
+#[cfg(test)]
+mod oom_withdrawal_tests {
+    use super::*;
+
+    /// One card's walk OOM must not withdraw a model another active card still mines.
+    #[test]
+    fn walk_oom_withdrawal_is_scoped_to_inactive_models() {
+        let model = [0x5au8; 32];
+        let other_model = [0xa5u8; 32];
+        let (oom_card, healthy_card) = (9_001u32, 9_002u32);
+        set_device_model(oom_card, model, String::new());
+        set_device_model(healthy_card, model, String::new());
+        // Only the failing card is active: withdrawing is still correct.
+        installing_devices().lock().unwrap().insert(oom_card, std::thread::current().id());
+        assert!(!model_active_on_other_device(oom_card, &model));
+        // A second card building the same model keeps it announced.
+        installing_devices().lock().unwrap().insert(healthy_card, std::thread::current().id());
+        assert!(model_active_on_other_device(oom_card, &model));
+        // ...but not a different model.
+        assert!(!model_active_on_other_device(oom_card, &other_model));
+        // After the failing card is demoted, the healthy card's own OOM would withdraw it.
+        set_device_model(oom_card, other_model, String::new());
+        assert!(!model_active_on_other_device(healthy_card, &model));
+        installing_devices().lock().unwrap().retain(|d, _| *d != oom_card && *d != healthy_card);
+        device_models().lock().unwrap().retain(|d, _| *d != oom_card && *d != healthy_card);
     }
 }
