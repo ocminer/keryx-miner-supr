@@ -308,6 +308,9 @@ pub struct PomGpuMiner {
     /// gather/prefix layout. The mutex permits releasing the ~model_bytes/128 allocation when the
     /// autotuner keeps one of the established backends.
     v4_snippet_folds: Mutex<Option<Arc<CudaSlice<u64>>>>,
+    /// Per-tile device address (or the straddle flag) for the address consumer; same lifetime and
+    /// ownership rules as `v4_snippet_folds`.
+    v4_tile_addrs: Mutex<Option<Arc<CudaSlice<u64>>>>,
     _tensors: Vec<QTensor>,     // raw-loaded tensors kept alive so the gather pointers stay valid
     _shared: Vec<Arc<QTensor>>, // shared-with-inference tensors kept alive (zero-dup, Option C)
     _uploads: Vec<CudaSlice<u8>>, // our own device copies of llama-engine host-resident tensors
@@ -319,6 +322,8 @@ enum V4Backend {
     TensorCore,
     SidecarTensorCore,
     SidecarLutTensorCore,
+    /// Sidecar chase + tensor-core consumer fetching through a per-tile device-address table.
+    SidecarAddrTensorCore,
     Chaseless,
 }
 
@@ -329,16 +334,43 @@ impl V4Backend {
             Self::TensorCore => "tensor-core",
             Self::SidecarTensorCore => "sidecar-chase+tensor-core",
             Self::SidecarLutTensorCore => "sidecar-chase+LUT-tensor-core",
+            Self::SidecarAddrTensorCore => "sidecar-chase+addr-tensor-core",
             Self::Chaseless => "chaseless",
         }
     }
 
     fn needs_offsets(self) -> bool {
-        matches!(self, Self::TensorCore | Self::SidecarTensorCore | Self::SidecarLutTensorCore)
+        matches!(
+            self,
+            Self::TensorCore | Self::SidecarTensorCore | Self::SidecarLutTensorCore | Self::SidecarAddrTensorCore
+        )
     }
 
     fn uses_sidecar(self) -> bool {
-        matches!(self, Self::SidecarTensorCore | Self::SidecarLutTensorCore)
+        matches!(self, Self::SidecarTensorCore | Self::SidecarLutTensorCore | Self::SidecarAddrTensorCore)
+    }
+
+    /// Kernels that resolve segments through the model-owned bucket LUT.
+    fn uses_lut(self) -> bool {
+        matches!(self, Self::SidecarLutTensorCore | Self::SidecarAddrTensorCore)
+    }
+
+    /// Consumer kernel for the chase+tensor-core family.
+    fn tc_walk_kernel(self) -> &'static str {
+        match self {
+            Self::SidecarLutTensorCore => "pom_mine_v4_tc_sidecar_lut_seeded",
+            Self::SidecarAddrTensorCore => "pom_mine_v4_tc_sidecar_addr_seeded",
+            _ => "pom_mine_v4_tc_seeded",
+        }
+    }
+
+    /// cp.async pipeline depth the consumer kernel was compiled with (shared-memory sizing).
+    fn tc_pipe(self) -> u64 {
+        if self == Self::SidecarAddrTensorCore {
+            v4_tca_pipe()
+        } else {
+            v4_tc_pipe()
+        }
     }
 }
 
@@ -514,6 +546,7 @@ impl PomGpuMiner {
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
             v4_snippet_folds: Mutex::new(None),
+            v4_tile_addrs: Mutex::new(None),
             _tensors: tensors,
             _shared: Vec::new(),
             _uploads: Vec::new(),
@@ -584,6 +617,7 @@ impl PomGpuMiner {
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
             v4_snippet_folds: Mutex::new(None),
+            v4_tile_addrs: Mutex::new(None),
             _tensors: Vec::new(),
             _shared: Vec::new(),
             _uploads: uploads,
@@ -667,6 +701,7 @@ impl PomGpuMiner {
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
             v4_snippet_folds: Mutex::new(None),
+            v4_tile_addrs: Mutex::new(None),
             _tensors: raw,
             _shared: kept_shared,
             _uploads: Vec::new(),
@@ -813,6 +848,7 @@ impl PomGpuMiner {
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
             v4_snippet_folds: Mutex::new(None),
+            v4_tile_addrs: Mutex::new(None),
             _tensors: Vec::new(),
             _shared: Vec::new(),
             _uploads: uploads,
@@ -1034,22 +1070,17 @@ impl PomGpuMiner {
             // stale offsets can never reach the walk.
             let need = (batch as usize) * (k as usize);
             let tc_warps: u64 = v4_tc_warps();
-            let tc_pipe: u64 = v4_tc_pipe();
+            let tc_pipe: u64 = backend.tc_pipe();
             let tc_smem: u32 = (tc_warps * 256 * (tc_pipe + 1) * 4) as u32;
             let sidecar_folds = if backend.uses_sidecar() { Some(self.v4_snippet_folds()?) } else { None };
-            let sidecar_lut = if backend == V4Backend::SidecarLutTensorCore { Some(self.v4_ncf_lut()?) } else { None };
+            let sidecar_lut = if backend.uses_lut() { Some(self.v4_ncf_lut()?) } else { None };
+            let tile_addrs =
+                if backend == V4Backend::SidecarAddrTensorCore { Some(self.v4_tile_addrs()?) } else { None };
             let chase = load_walk_func(
                 &self.cuda,
                 if backend.uses_sidecar() { "pom_mine_v4_chase_sidecar_seeded" } else { "pom_mine_v4_chase_seeded" },
             )?;
-            let walk = load_walk_func(
-                &self.cuda,
-                if backend == V4Backend::SidecarLutTensorCore {
-                    "pom_mine_v4_tc_sidecar_lut_seeded"
-                } else {
-                    "pom_mine_v4_tc_seeded"
-                },
-            )?;
+            let walk = load_walk_func(&self.cuda, backend.tc_walk_kernel())?;
             // MEASURED NEGATIVE — default OFF. Cross-batch prefetch is sound (see
             // v4_chase_prefetch_matches_serial) but SLOWER on a 5090: 5.92 vs 5.99 Mh/s. The walk
             // already runs at ~91% of DRAM peak, so the chase's bytes cannot be hidden — running it
@@ -1189,6 +1220,9 @@ impl PomGpuMiner {
                     .arg(&view);
                 if let Some((lut, lut_sh)) = sidecar_lut.as_ref() {
                     b.arg(&**lut).arg(lut_sh);
+                }
+                if let Some(addrs) = tile_addrs.as_ref() {
+                    b.arg(&**addrs);
                 }
                 b.arg(&*h10_seeds).arg(&h10).arg(&*winner);
                 unsafe {
@@ -1538,14 +1572,71 @@ dp4a kernel.",
         if let Ok(mut slot) = self.v4_snippet_folds.lock() {
             slot.take();
         }
+        self.v4_release_tile_addrs();
+    }
+
+    fn v4_release_tile_addrs(&self) {
+        if let Ok(mut slot) = self.v4_tile_addrs.lock() {
+            slot.take();
+        }
+    }
+
+    /// Per-tile device address of chunk 0 (or bit 0 set when the tile straddles a segment), built
+    /// once on this stream from the same prefix/LUT the other consumers resolve through.
+    fn v4_tile_addrs(&self) -> candle_core::Result<Arc<CudaSlice<u64>>> {
+        let mut slot = self
+            .v4_tile_addrs
+            .lock()
+            .map_err(|_| candle_core::Error::Msg("PoM v4 tile address mutex poisoned".into()))?;
+        if let Some(addrs) = slot.as_ref() {
+            return Ok(addrs.clone());
+        }
+        let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        if n_tiles == 0 || n_tiles > u32::MAX as u64 {
+            return Err(candle_core::Error::Msg("PoM v4 tile addresses require 1..=u32::MAX complete tiles".into()));
+        }
+        let build = load_walk_func(&self.cuda, "pom_build_v4_tile_addrs_lut")?;
+        let (lut, lut_sh) = self.v4_ncf_lut()?;
+        let addrs = Arc::new(unsafe { self.stream.alloc::<u64>(n_tiles as usize) }.map_err(candle_core::Error::wrap)?);
+        const THREADS: u64 = 256;
+        let mut b = build.builder();
+        b.arg(&self.bases_dev)
+            .arg(&self.prefix_dev)
+            .arg(&self.t_count)
+            .arg(&n_tiles)
+            .arg(&*lut)
+            .arg(&lut_sh)
+            .arg(&*addrs);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (((n_tiles + THREADS - 1) / THREADS) as u32, 1, 1),
+                block_dim: (THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .map_err(candle_core::Error::wrap)?;
+        }
+        log::info!(
+            "PoM[gpu{}]: sidecar tile addresses built: {} tiles, {:.1} MiB fixed VRAM.",
+            self.stream.context().ordinal(),
+            n_tiles,
+            n_tiles as f64 * 8.0 / (1024.0 * 1024.0)
+        );
+        *slot = Some(addrs.clone());
+        Ok(addrs)
     }
 
     fn v4_unallocated_sidecar_bytes(&self, backend: V4Backend) -> u64 {
+        let per_table = (self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS).saturating_mul(8);
+        let mut bytes = 0;
         if backend.uses_sidecar() && self.v4_snippet_folds.lock().map(|slot| slot.is_none()).unwrap_or(true) {
-            (self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS).saturating_mul(8)
-        } else {
-            0
+            bytes += per_table;
         }
+        if backend == V4Backend::SidecarAddrTensorCore
+            && self.v4_tile_addrs.lock().map(|slot| slot.is_none()).unwrap_or(true)
+        {
+            bytes += per_table;
+        }
+        bytes
     }
 
     fn v4_sidecar_available(&self) -> bool {
@@ -1617,15 +1708,9 @@ dp4a kernel.",
     ) -> candle_core::Result<bool> {
         let folds = self.v4_snippet_folds()?;
         let chase = load_walk_func(&self.cuda, "pom_mine_v4_chase_sidecar_seeded")?;
-        let walk = load_walk_func(
-            &self.cuda,
-            if backend == V4Backend::SidecarLutTensorCore {
-                "pom_mine_v4_tc_sidecar_lut_seeded"
-            } else {
-                "pom_mine_v4_tc_seeded"
-            },
-        )?;
-        let sidecar_lut = if backend == V4Backend::SidecarLutTensorCore { Some(self.v4_ncf_lut()?) } else { None };
+        let walk = load_walk_func(&self.cuda, backend.tc_walk_kernel())?;
+        let sidecar_lut = if backend.uses_lut() { Some(self.v4_ncf_lut()?) } else { None };
+        let tile_addrs = if backend == V4Backend::SidecarAddrTensorCore { Some(self.v4_tile_addrs()?) } else { None };
         let offsets = v4_offsets_buf(&self.stream, k as usize)?;
         let view = offsets
             .try_slice(0..k as usize)
@@ -1654,7 +1739,7 @@ dp4a kernel.",
                 .map_err(candle_core::Error::wrap)?;
         }
         let tc_warps = v4_tc_warps();
-        let tc_pipe = v4_tc_pipe();
+        let tc_pipe = backend.tc_pipe();
         let target = [u64::MAX; 4];
         let mut b = walk.builder();
         b.arg(&self.bases_dev)
@@ -1679,6 +1764,9 @@ dp4a kernel.",
             .arg(&view);
         if let Some((lut, lut_sh)) = sidecar_lut.as_ref() {
             b.arg(&**lut).arg(lut_sh);
+        }
+        if let Some(addrs) = tile_addrs.as_ref() {
+            b.arg(&**addrs);
         }
         b.arg(&*h10_seeds).arg(&h10).arg(&winner);
         unsafe {
@@ -2444,6 +2532,14 @@ fn v4_tc_pipe() -> u64 {
     v4_tc_compiled("KERYX_POM_V4_TC_PIPE", COMPILED)
 }
 
+fn v4_tca_pipe() -> u64 {
+    const COMPILED: u64 = match u64::from_str_radix(env!("POM_V4_TCA_PIPE"), 10) {
+        Ok(v) => v,
+        Err(_) => 2,
+    };
+    v4_tc_compiled("KERYX_POM_V4_TCA_PIPE", COMPILED)
+}
+
 fn v4_ncf_warps() -> u64 {
     const COMPILED: u64 = match u64::from_str_radix(env!("POM_V4_NCF_WARPS"), 10) {
         Ok(v) => v,
@@ -2829,6 +2925,8 @@ pub struct V4Tune {
     pub sidecar: bool,
     /// Use the sidecar TC consumer whose full-tile fetch also resolves segments through the LUT.
     pub sidecar_lut: bool,
+    /// Use the sidecar TC consumer that fetches through the per-tile device-address table.
+    pub sidecar_addr: bool,
     pub batch: u64,
 }
 
@@ -2836,6 +2934,8 @@ impl V4Tune {
     fn sidecar_backend(self) -> Option<V4Backend> {
         if !self.sidecar || self.ncf || !self.tc {
             None
+        } else if self.sidecar_addr {
+            Some(V4Backend::SidecarAddrTensorCore)
         } else if self.sidecar_lut {
             Some(V4Backend::SidecarLutTensorCore)
         } else {
@@ -3023,10 +3123,13 @@ fn v4_tune_load(key: &str) -> Option<V4Tune> {
         tc: e.get("tc")?.as_bool()?,
         sidecar: e.get("sidecar").and_then(|v| v.as_bool()).unwrap_or(false),
         sidecar_lut: e.get("sidecar_lut").and_then(|v| v.as_bool()).unwrap_or(false),
+        sidecar_addr: e.get("sidecar_addr").and_then(|v| v.as_bool()).unwrap_or(false),
         batch: e.get("batch")?.as_u64()?,
     };
-    let valid_backend =
-        !(tune.ncf && tune.sidecar) && (!tune.sidecar_lut || tune.sidecar) && (!tune.sidecar || tune.tc);
+    let valid_backend = !(tune.ncf && tune.sidecar)
+        && (!tune.sidecar_lut || tune.sidecar)
+        && (!tune.sidecar_addr || tune.sidecar)
+        && (!tune.sidecar || tune.tc);
     (valid_backend && tune.batch > 0 && tune.batch <= u32::MAX as u64).then_some(tune)
 }
 
@@ -3106,7 +3209,7 @@ fn v4_tune_save(key: &str, t: V4Tune, mhs: f64) {
             key.to_string(),
             serde_json::json!({
                 "ncf": t.ncf, "tc": t.tc,
-                "sidecar": t.sidecar, "sidecar_lut": t.sidecar_lut,
+                "sidecar": t.sidecar, "sidecar_lut": t.sidecar_lut, "sidecar_addr": t.sidecar_addr,
                 "batch": t.batch,
                 "mhs": (mhs * 1000.0).round() / 1000.0,
             }),
@@ -3314,7 +3417,7 @@ fn v4_autotune_requires_job_refresh(result: &V4AutotuneRun) -> bool {
 }
 
 fn v4_classic_tune(base: u64) -> V4Tune {
-    V4Tune { ncf: false, tc: false, sidecar: false, sidecar_lut: false, batch: clamp_launch_batch(base) }
+    V4Tune { ncf: false, tc: false, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: clamp_launch_batch(base) }
 }
 
 /// Last-resort launch state after a candidate errors or fails the winner oracle. Never spread the
@@ -3495,7 +3598,7 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
     // The pph/timestamp only seed the walk; any fixed pair times the same work.
     let pph = [0u8; 32];
     let ts = 0u64;
-    let defaults = V4Tune { ncf: miner.v4_ncf_default(), tc: true, sidecar: false, sidecar_lut: false, batch: base };
+    let defaults = V4Tune { ncf: miner.v4_ncf_default(), tc: true, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: base };
 
     // Candidates are measured INTERLEAVED and reduced by median. A single timed window per candidate
     // is not able to resolve the ~4% differences that matter here: the first pass measured 2.93 for
@@ -3574,6 +3677,14 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
             V4Tune { ncf: false, tc: true, sidecar: true, sidecar_lut: true, ..defaults },
         ));
     }
+    if !blackwell_reduced
+        && miner.v4_sidecar_usable(V4Backend::SidecarAddrTensorCore, n_tiles, k, &p_words, &s_words, ts)
+    {
+        kinds.push((
+            "sidecar-chase+addr-tensor-core",
+            V4Tune { ncf: false, tc: true, sidecar: true, sidecar_lut: true, sidecar_addr: true, ..defaults },
+        ));
+    }
     if miner.v4_ncf_usable(n_tiles, k, &p_words, &s_words, ts) {
         kinds.push(("chaseless", V4Tune { ncf: true, tc: true, ..defaults }));
     }
@@ -3629,6 +3740,8 @@ fn v4_autotune(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> V4Autotune
 
     if best.sidecar_backend().is_none() {
         miner.v4_release_snippet_folds();
+    } else if best.sidecar_backend() != Some(V4Backend::SidecarAddrTensorCore) {
+        miner.v4_release_tile_addrs();
     }
 
     // Publish the chosen KIND before sizing the batch. The VRAM cap charges chase+TC for its
@@ -3755,7 +3868,7 @@ fn v4_config_agrees_with_reference(
     let ts = 7u64;
     let probe = 4096u64;
     let result = (|| {
-        set_v4_tune(device_id, V4Tune { ncf: false, tc: false, sidecar: false, sidecar_lut: false, batch: probe });
+        set_v4_tune(device_id, V4Tune { ncf: false, tc: false, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: probe });
         let reference = miner.mine_v4(&pph, ts, &target, 1, probe, h10_era, false)?;
         set_v4_tune(device_id, V4Tune { batch: probe, ..cand });
         let candidate = miner.mine_v4(&pph, ts, &target, 1, probe, h10_era, false)?;
@@ -3810,6 +3923,7 @@ fn custom_image_is_exact(device_id: u32, miner: &PomGpuMiner, h10_era: bool) -> 
         tc: true,
         sidecar: false,
         sidecar_lut: false,
+        sidecar_addr: false,
         batch: v4_batch_for_device(device_id),
     });
     let ok = match v4_config_agrees_with_reference(device_id, miner, cand, h10_era) {
@@ -4932,7 +5046,7 @@ mod tests {
         assert!(V4ProfileClaim::try_acquire(key).is_none(), "a peer must reuse rather than duplicate the sweep");
         let unrelated = V4ProfileClaim::try_acquire(distinct_key).expect("distinct profiles are independent");
         drop(unrelated);
-        let shared = V4Tune { ncf: true, tc: true, sidecar: false, sidecar_lut: false, batch: 11_520 };
+        let shared = V4Tune { ncf: true, tc: true, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: 11_520 };
         first.publish(shared);
         drop(first);
         assert_eq!(v4_profile_ready(key), Some(shared), "peers receive the result without relying on disk cache");
@@ -5079,8 +5193,8 @@ mod tests {
 
     #[test]
     fn experimental_sidecar_needs_a_material_walk_gain() {
-        let established = V4Tune { ncf: true, tc: true, sidecar: false, sidecar_lut: false, batch: 32_768 };
-        let sidecar = V4Tune { ncf: false, tc: true, sidecar: true, sidecar_lut: true, batch: 32_768 };
+        let established = V4Tune { ncf: true, tc: true, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: 32_768 };
+        let sidecar = V4Tune { ncf: false, tc: true, sidecar: true, sidecar_lut: true, sidecar_addr: false, batch: 32_768 };
         assert_eq!(
             select_v4_walk_kind(&[established, sidecar], &[Some(10.0), Some(10.19)]),
             Some((established, 10.0)),
@@ -5231,6 +5345,7 @@ impl PomGpuMiner {
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
             v4_snippet_folds: Mutex::new(None),
+            v4_tile_addrs: Mutex::new(None),
             _tensors: Vec::new(),
             _shared: Vec::new(),
             _uploads: uploads,
@@ -5351,9 +5466,9 @@ mod v4_kernel_tests {
 
         let device_id = 0;
         let variants = [
-            ("classic", V4Tune { ncf: false, tc: false, sidecar: false, sidecar_lut: false, batch: BATCH }),
-            ("chase+tc", V4Tune { ncf: false, tc: true, sidecar: false, sidecar_lut: false, batch: BATCH }),
-            ("chaseless", V4Tune { ncf: true, tc: true, sidecar: false, sidecar_lut: false, batch: BATCH }),
+            ("classic", V4Tune { ncf: false, tc: false, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: BATCH }),
+            ("chase+tc", V4Tune { ncf: false, tc: true, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: BATCH }),
+            ("chaseless", V4Tune { ncf: true, tc: true, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: BATCH }),
         ];
         for (name, tune) in variants {
             set_v4_tune(device_id, tune);
@@ -5404,9 +5519,9 @@ mod v4_kernel_tests {
 
         let device_id = 0;
         let variants = [
-            ("classic", V4Tune { ncf: false, tc: false, sidecar: false, sidecar_lut: false, batch: BATCH }),
-            ("chase+tc", V4Tune { ncf: false, tc: true, sidecar: false, sidecar_lut: false, batch: BATCH }),
-            ("chaseless", V4Tune { ncf: true, tc: true, sidecar: false, sidecar_lut: false, batch: BATCH }),
+            ("classic", V4Tune { ncf: false, tc: false, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: BATCH }),
+            ("chase+tc", V4Tune { ncf: false, tc: true, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: BATCH }),
+            ("chaseless", V4Tune { ncf: true, tc: true, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: BATCH }),
         ];
         for (name, tune) in variants {
             set_v4_tune(device_id, tune);
@@ -5531,7 +5646,7 @@ mod v4_kernel_tests {
                 // kernel it exercised (observed on a CC 8.0 card). Pin the tune to match.
                 set_v4_tune(
                     dev,
-                    V4Tune { ncf: ncf == "1", tc: tc == "1", sidecar: false, sidecar_lut: false, batch: BATCH },
+                    V4Tune { ncf: ncf == "1", tc: tc == "1", sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: BATCH },
                 );
                 let kind = miner.v4_walk_kind();
                 if kind != label {
@@ -5562,7 +5677,7 @@ mod v4_kernel_tests {
         }
         set_v4_tune(
             dev,
-            V4Tune { ncf: miner.v4_ncf_default(), tc: true, sidecar: false, sidecar_lut: false, batch: BATCH },
+            V4Tune { ncf: miner.v4_ncf_default(), tc: true, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: BATCH },
         );
         assert!(checked > 0, "no walk kind was exercised");
     }
@@ -5750,17 +5865,25 @@ mod v4_kernel_tests {
                     expected = Some(start);
                 }
 
-                for backend in [V4Backend::TensorCore, V4Backend::SidecarTensorCore, V4Backend::SidecarLutTensorCore] {
+                for backend in [
+                    V4Backend::TensorCore,
+                    V4Backend::SidecarTensorCore,
+                    V4Backend::SidecarLutTensorCore,
+                    V4Backend::SidecarAddrTensorCore,
+                ] {
                     set_v4_tune(
                         dev,
                         V4Tune {
                             ncf: false,
                             tc: true,
                             sidecar: backend.uses_sidecar(),
-                            sidecar_lut: backend == V4Backend::SidecarLutTensorCore,
+                            sidecar_lut: backend.uses_lut(),
+                            sidecar_addr: backend == V4Backend::SidecarAddrTensorCore,
                             batch,
                         },
                     );
+                    // A failed probe would silently fall back to another consumer and still pass.
+                    assert_eq!(installed_v4_backend_for(&miner), Some(backend), "{} not dispatched", backend.label());
                     assert_eq!(
                         miner.mine_v4(&PPH, TS, &target, start, batch, h10, false).unwrap(),
                         expected,
@@ -5769,6 +5892,27 @@ mod v4_kernel_tests {
                     );
                 }
             }
+        }
+
+        // The address table itself: every tile that straddles a cut carries the fallback flag, every
+        // other tile holds exactly bases[seg] + (chunk0 - prefix[seg]) * 32.
+        {
+            let addrs = miner.stream.clone_dtoh(&*miner.v4_tile_addrs().unwrap()).unwrap();
+            let bases = miner.stream.clone_dtoh(&miner.bases_dev).unwrap();
+            let prefix = miner.stream.clone_dtoh(&miner.prefix_dev).unwrap();
+            let mut flagged = 0usize;
+            for (t, &a) in addrs.iter().enumerate() {
+                let c0 = (t * crate::pom_v4::POM_V4_TILE_CHUNKS as usize) as u64;
+                let seg = prefix.partition_point(|&p| p <= c0) - 1;
+                let whole = c0 + crate::pom_v4::POM_V4_TILE_CHUNKS - 1 < prefix[seg + 1];
+                if whole {
+                    assert_eq!(a, bases[seg] + (c0 - prefix[seg]) * CHUNK_BYTES as u64, "tile {t} address");
+                } else {
+                    assert_eq!(a, 1, "straddling tile {t} must be flagged");
+                    flagged += 1;
+                }
+            }
+            assert_eq!(flagged, 3, "cuts at chunks 17/1021/32769 straddle exactly three tiles");
         }
 
         miner.v4_release_snippet_folds();
@@ -5796,7 +5940,7 @@ mod v4_kernel_tests {
         const B: u64 = 64;
         // Force the chase+TC path. On GDDR cards the default is chaseless, which never touches the
         // prefetch machinery and previously let this test pass without exercising its subject.
-        set_v4_tune(0, V4Tune { ncf: false, tc: true, sidecar: false, sidecar_lut: false, batch: B });
+        set_v4_tune(0, V4Tune { ncf: false, tc: true, sidecar: false, sidecar_lut: false, sidecar_addr: false, batch: B });
         // A nonce in the FOURTH batch, so at least two prefetch hits precede it.
         let nonce = 3 * B + 17;
         let seed = crate::pom::pom_block_seed_v4(&PPH, TS, nonce);
@@ -5978,6 +6122,132 @@ mod v4_kernel_tests {
         }
         let el = t0.elapsed().as_secs_f64();
         println!("v4_bench: {} nonces in {:.2}s = {:.3} Mh/s (batch {})", nonces, el, nonces as f64 / el / 1e6, batch);
+    }
+
+    /// Production-faithful bench: the REAL mining GGUF uploaded with `load_raw` (the multi-segment
+    /// layout the miner walks, not one synthetic blob), H10 seeds, and an explicit backend/batch.
+    /// KERYX_BENCH_GGUF=<model.gguf> KERYX_BENCH_SECS=20 KERYX_POM_V4_BATCH=56832
+    /// KERYX_BENCH_BACKEND=sidecar_lut|sidecar|tc|ncf|classic KERYX_BENCH_H14=0|1
+    #[test]
+    #[ignore]
+    fn v4_bench_real() {
+        let gguf = std::env::var("KERYX_BENCH_GGUF").expect("KERYX_BENCH_GGUF");
+        let secs: f64 = std::env::var("KERYX_BENCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20.0);
+        let batch: u64 = std::env::var("KERYX_POM_V4_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(56_832);
+        let h14 = std::env::var("KERYX_BENCH_H14").ok().as_deref() == Some("1");
+        let backend = std::env::var("KERYX_BENCH_BACKEND").unwrap_or_else(|_| "sidecar_lut".into());
+        let (ncf, tc, sidecar, sidecar_lut, sidecar_addr) = match backend.as_str() {
+            "ncf" => (true, true, false, false, false),
+            "tc" => (false, true, false, false, false),
+            "sidecar" => (false, true, true, false, false),
+            "sidecar_lut" => (false, true, true, true, false),
+            "sidecar_addr" => (false, true, true, true, true),
+            "classic" => (false, false, false, false, false),
+            other => panic!("unknown KERYX_BENCH_BACKEND {other}"),
+        };
+        let t_load = std::time::Instant::now();
+        let miner = PomGpuMiner::load_raw(&gguf, 0).unwrap();
+        let n_tiles = miner.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        set_v4_tune(0, V4Tune { ncf, tc, sidecar, sidecar_lut, sidecar_addr, batch });
+        let target = [0u8; 32];
+        let _ = miner.mine_v4(&PPH, TS, &target, 0, batch, true, h14).unwrap();
+        let _ = miner.mine_v4(&PPH, TS, &target, batch, batch, true, h14).unwrap();
+        println!(
+            "v4_bench_real: loaded {} tiles, T={} segments in {:.1}s; running backend {:?}",
+            n_tiles,
+            miner.t_count,
+            t_load.elapsed().as_secs_f64(),
+            installed_v4_backend_for(&miner)
+        );
+        // A/B mode: KERYX_BENCH_IMAGES=a.cubin,b.cubin alternates the walk image every
+        // KERYX_BENCH_SECS for KERYX_BENCH_ROUNDS rounds in this one process (same model upload,
+        // same card temperature trend), so clock drift cannot masquerade as a kernel difference.
+        if let Ok(images) = std::env::var("KERYX_BENCH_IMAGES") {
+            let images: Vec<String> = images.split(',').map(|s| s.trim().to_string()).collect();
+            let rounds: usize = std::env::var("KERYX_BENCH_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+            let mut totals = vec![(0u64, 0f64); images.len()];
+            let mut start = 2 * batch;
+            for round in 0..rounds {
+                // Rotate the order every round so heat drift within a round is spread evenly.
+                for k in 0..images.len() {
+                    let ix = (k + round) % images.len();
+                    let img = &images[ix];
+                    // "be=<backend>" switches the consumer on the embedded image instead.
+                    if let Some(be) = img.strip_prefix("be=") {
+                        std::env::remove_var("KERYX_WALK_FATBIN");
+                        let (ncf, tc, sidecar, sidecar_lut, sidecar_addr) = match be {
+                            "sidecar_lut" => (false, true, true, true, false),
+                            "sidecar_addr" => (false, true, true, true, true),
+                            "tc" => (false, true, false, false, false),
+                            "ncf" => (true, true, false, false, false),
+                            other => panic!("unknown backend {other}"),
+                        };
+                        set_v4_tune(0, V4Tune { ncf, tc, sidecar, sidecar_lut, sidecar_addr, batch });
+                    }
+                    // "path[:warps:pipe]" — a custom image may declare its own TC launch geometry.
+                    let mut parts = img.split(':');
+                    let first = parts.next().unwrap();
+                    if !first.starts_with("be=") {
+                        std::env::set_var("KERYX_WALK_FATBIN", first);
+                    }
+                    match (parts.next(), parts.next()) {
+                        (Some(w), Some(p)) => {
+                            std::env::set_var("KERYX_POM_V4_TC_WARPS", w);
+                            std::env::set_var("KERYX_POM_V4_TC_PIPE", p);
+                        }
+                        _ => {
+                            std::env::remove_var("KERYX_POM_V4_TC_WARPS");
+                            std::env::remove_var("KERYX_POM_V4_TC_PIPE");
+                        }
+                    }
+                    WALK_MODULES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().clear();
+                    let _ = miner.mine_v4(&PPH, TS, &target, start, batch, true, h14).unwrap();
+                    start += batch;
+                    let t0 = std::time::Instant::now();
+                    let mut n = 0u64;
+                    while t0.elapsed().as_secs_f64() < secs {
+                        let _ = miner.mine_v4(&PPH, TS, &target, start, batch, true, h14).unwrap();
+                        start += batch;
+                        n += batch;
+                    }
+                    let el = t0.elapsed().as_secs_f64();
+                    totals[ix].0 += n;
+                    totals[ix].1 += el;
+                    println!("ab round {round} {img}: {:.4} Mh/s", n as f64 / el / 1e6);
+                }
+            }
+            let base = totals[0].0 as f64 / totals[0].1;
+            for (ix, img) in images.iter().enumerate() {
+                let r = totals[ix].0 as f64 / totals[ix].1;
+                println!("ab total {img}: {:.4} Mh/s ({:+.2}% vs first)", r / 1e6, (r / base - 1.0) * 100.0);
+            }
+            return;
+        }
+        let mut nonces = 0u64;
+        let mut samples = Vec::new();
+        let t0 = std::time::Instant::now();
+        let mut tw = std::time::Instant::now();
+        let mut wn = 0u64;
+        while t0.elapsed().as_secs_f64() < secs {
+            let _ = miner.mine_v4(&PPH, TS, &target, 2 * batch + nonces, batch, true, h14).unwrap();
+            nonces += batch;
+            wn += batch;
+            if tw.elapsed().as_secs_f64() >= 2.0 {
+                samples.push(wn as f64 / tw.elapsed().as_secs_f64() / 1e6);
+                tw = std::time::Instant::now();
+                wn = 0;
+            }
+        }
+        let el = t0.elapsed().as_secs_f64();
+        println!(
+            "v4_bench_real: backend={} batch={} h14={} {:.3} Mh/s over {:.1}s; 2s windows {:?}",
+            backend,
+            batch,
+            h14,
+            nonces as f64 / el / 1e6,
+            el,
+            samples.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>()
+        );
     }
 
     #[test]

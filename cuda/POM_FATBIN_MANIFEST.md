@@ -4,12 +4,12 @@ This manifest identifies the modern walk image committed for the v0.13.0 optimiz
 it with `cuda/regenerate-pom-fatbin.sh`; the script refuses incomplete architecture coverage and can
 compare all established GA100 entry points against a baseline before an artifact is installed.
 
-- Compiler: NVIDIA CUDA 13.3, `nvcc V13.3.73`
+- Compiler: NVIDIA CUDA 13.2, `nvcc V13.2.86` (adds pom_build_v4_tile_addrs_lut + pom_mine_v4_tc_sidecar_addr_seeded; established sm_80 SASS gate passed)
 - Source: `src/pom_mine.cu`
-- Source SHA-256: `1e43f51f6237c956a876f625ed57ad00f53e5144dd274f42f8cd5b1d73f5ccb1`
+- Source SHA-256: `c719502eb71af94d84632645e08997223599911bb4d92b38f3c9c6d819fdf4ae`
 - Artifact: `cuda/pom_mine.fatbin`
-- Artifact SHA-256: `4159b8db2aec24be63ef54db160da8bcec020a99cec281155996d3b928cfe639`
-- Artifact size: 3,808,272 bytes
+- Artifact SHA-256: `cf92a92367251f078314b21d35fd906acd8cdc3b62a146c1d9d93c29839fef1b`
+- Artifact size: 4,388,256 bytes
 - Native SASS: sm_75, sm_80, sm_86, sm_87, sm_88, sm_89, sm_90, sm_100, sm_103, sm_110,
   sm_120, sm_121
 - Forward-compatible PTX: compute_75 and compute_80

@@ -881,6 +881,142 @@ extern "C" __global__ void pom_mine_v4_tc_sidecar_lut_seeded(
 #endif
 
 // ============================================================================
+// PoM v4 sidecar-address tensor-core consumer (pom_mine_v4_tc_sidecar_addr_seeded).
+//
+// ncu on a CMP 170HX (GA100, sm_80, 64 GB HBM2e, Kimi-48B blob = 29M tiles over 610 segments):
+// the LUT consumer is NOT memory bound (DRAM 35%) but integer-ALU bound (ALU pipe 84%, issue 73%).
+// ~50 of the ~400 warp instructions per step resolve the tile's segment: offsets[] -> lut[] ->
+// prefix[] walk -> prefix[]/bases[] -> pointer math, a 4-deep dependent load chain per lane.
+// Spending ~n_tiles*8 B of otherwise idle VRAM on a per-tile device address removes all of it:
+// offsets[] -> tile_addrs[off] -> cp.async. A tile that straddles a segment boundary (a handful
+// per model) cannot be addressed by one base pointer; its entry is flagged with bit 0 (real
+// addresses are >= 32-byte aligned) and that warp takes the established per-lane LUT path, so the
+// fetched bytes are identical by construction. Fewer live registers and less shared memory per
+// warp also make a 2-deep cp.async pipeline the better trade on sm_80 (+2.5-3% measured alone).
+// ============================================================================
+
+#ifndef V4_TCA_PIPE
+#define V4_TCA_PIPE 2    // cp.async tile buffers per warp for the address consumer
+#endif
+#define V4_TILE_ADDR_STRADDLE 1ULL
+
+// One entry per complete tile: the device address of its chunk 0 when all 32 chunks lie in one
+// segment, else V4_TILE_ADDR_STRADDLE. Built once per model/prefix layout, like the snippet folds.
+extern "C" __global__ void pom_build_v4_tile_addrs_lut(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long n_tiles, const unsigned short* lut, unsigned int lut_sh,
+    unsigned long long* tile_addrs) {
+    const unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (i >= n_tiles) return;
+    const unsigned long long idx = i * (unsigned long long)V4_TILE_CHUNKS;
+    unsigned int lo = __ldg(&lut[idx >> lut_sh]);
+    while (lo + 1 < T && __ldg(&prefix[lo + 1]) <= idx) lo++;
+    const unsigned long long last = idx + (V4_TILE_CHUNKS - 1);
+    const bool whole = (lo + 1 >= T) || (last < __ldg(&prefix[lo + 1]));
+    const unsigned long long addr = bases[lo] + (idx - prefix[lo]) * 32ULL;
+    tile_addrs[i] = (whole && (addr & 31ULL) == 0ULL) ? addr : V4_TILE_ADDR_STRADDLE;
+}
+
+#if __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void v4_tile_cp_async_addr(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    const unsigned short* lut, unsigned int lut_sh, const unsigned long long* tile_addrs,
+    unsigned int tile_index, unsigned int* s_tile, unsigned int lane) {
+    const unsigned long long a = tile_addrs[tile_index];
+    ulonglong2* dst = (ulonglong2*)(s_tile + lane * 8);
+    if (a & V4_TILE_ADDR_STRADDLE) {   // warp-uniform: every lane read the same entry
+        v4_sidecar_tile_cp_async_lut(bases, prefix, T, lut, lut_sh, tile_index, s_tile, lane);
+    } else {
+        const ulonglong2* q = (const ulonglong2*)a + lane * 2u;
+        v4_cp_async16(dst, q);
+        v4_cp_async16(dst + 1, q + 1);
+    }
+}
+
+extern "C" __global__ void pom_mine_v4_tc_sidecar_addr_seeded(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned int K,
+    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
+    unsigned long long time_,
+    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
+    unsigned long long nonce_base, unsigned long long n_nonces,
+    const unsigned int* offsets, const unsigned short* lut, unsigned int lut_sh,
+    const unsigned long long* tile_addrs,
+    const unsigned long long* h10_seeds, unsigned int h10, unsigned long long* winner) {
+    extern __shared__ unsigned int s_shared[];
+    const unsigned int w = threadIdx.x >> 5;
+    const unsigned long long i = (unsigned long long)blockIdx.x * V4_TC_WARPS + w;
+    if (i >= n_nonces) return;
+    const unsigned int x = threadIdx.x & 31u;
+    unsigned int* s_buf = s_shared + w * (256u * (V4_TCA_PIPE + 1));
+    unsigned int* s_state = s_buf + 256u * V4_TCA_PIPE;
+    const unsigned long long nonce = nonce_base + i;
+    unsigned long long seed = (x == 0u)
+        ? pom_seed_fold_era(h10, h10_seeds, i, nonce, time_, s0, s1, s2, s3) : 0ULL;
+    seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
+
+    #pragma unroll
+    for (unsigned int p = 0; p < V4_TCA_PIPE - 1; p++) {
+        if (p < K) {
+            const unsigned int off = offsets[(unsigned long long)p * n_nonces + i];
+            v4_tile_cp_async_addr(bases, prefix, T, lut, lut_sh, tile_addrs, off, s_buf + p * 256u, x);
+        }
+        asm volatile("cp.async.commit_group;");
+    }
+    { unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)x));
+      #pragma unroll
+      for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); s_state[x * 8u + k4] = (unsigned int)h; } }
+    __syncwarp();
+
+    for (unsigned int step = 1; step <= K; step++) {
+        unsigned int* cur = s_buf + ((step - 1u) % V4_TCA_PIPE) * 256u;
+        asm volatile("cp.async.wait_group %0;" :: "n"(V4_TCA_PIPE - 2));
+        __syncwarp();
+        if (step + V4_TCA_PIPE - 2 < K) {
+            const unsigned int off = offsets[
+                (unsigned long long)(step + V4_TCA_PIPE - 2) * n_nonces + i];
+            v4_tile_cp_async_addr(bases, prefix, T, lut, lut_sh, tile_addrs, off,
+                                  s_buf + ((step + V4_TCA_PIPE - 2u) % V4_TCA_PIPE) * 256u, x);
+        }
+        asm volatile("cp.async.commit_group;");
+        v4_imma_step(s_state, cur, step, x);
+    }
+    asm volatile("cp.async.wait_group 0;");
+    __syncwarp();
+
+    unsigned int row4[V4_D4];
+    #pragma unroll
+    for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = s_state[x * 8u + k4];
+    unsigned int* s_tile = s_buf;
+    b3_hash_row32(row4, s_tile + x * 8);
+    __syncwarp();
+    unsigned int* src = s_tile; unsigned int* dst = s_tile + V4_D * 8;
+    for (unsigned int n = V4_D; n > 1; n >>= 1) {
+        if (x < n / 2) b3_hash_pair(src + x * 16, dst + x * 8);
+        __syncwarp();
+        unsigned int* tmp = src; src = dst; dst = tmp;
+    }
+    if (x == 0) {
+        const unsigned long long fin = (unsigned long long)src[0] | ((unsigned long long)src[1] << 32);
+        unsigned long long pv[4];
+        pom_pow_fold(fin, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, i);
+    }
+}
+#else
+extern "C" __global__ void pom_mine_v4_tc_sidecar_addr_seeded(
+    const unsigned long long*, const unsigned long long*, unsigned int, unsigned int,
+    unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long,
+    const unsigned int*, const unsigned short*, unsigned int, const unsigned long long*,
+    const unsigned long long*, unsigned int, unsigned long long*) {}
+#endif
+
+// ============================================================================
 // PoM v4 chaseless tensor-core solver (pom_mine_v4_ncf).
 //
 // The chase kernel re-reads every tile's snippet (32 B) that the walk fetches

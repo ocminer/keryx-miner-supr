@@ -116,8 +116,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tc_warps = cuda_define("V4_TC_WARPS");
         let tc_pipe = cuda_define("V4_TC_PIPE");
         let ncf_warps = cuda_define("V4_NCF_WARPS");
-        for (var, def) in
-            [("POM_V4_TC_WARPS", &tc_warps), ("POM_V4_TC_PIPE", &tc_pipe), ("POM_V4_NCF_WARPS", &ncf_warps)]
+        let tca_pipe = cuda_define("V4_TCA_PIPE");
+        for (var, def) in [
+            ("POM_V4_TC_WARPS", &tc_warps),
+            ("POM_V4_TC_PIPE", &tc_pipe),
+            ("POM_V4_NCF_WARPS", &ncf_warps),
+            ("POM_V4_TCA_PIPE", &tca_pipe),
+        ]
         {
             println!("cargo:rustc-env={}={}", var, def);
         }
