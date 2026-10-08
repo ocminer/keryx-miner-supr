@@ -38,7 +38,8 @@ IMAGE="$1"; OUTDIR="$2"; SUF="$3"; CUDADIR="${4:-}"
   exit 2
 }
 OUT="$REPO/hiveos/$OUTDIR"
-SCRATCH=/tmp/koffcargo-$SUF
+# Resolve a symlinked scratch dir: docker refuses a symlink as a bind-mount source.
+SCRATCH=$(readlink -f /tmp/koffcargo-$SUF)
 TGT="target-offline-$SUF"
 LLAMA_TAG=b10015
 LLAMA_SRC="${KERYX_LLAMA_SRC:-/tmp/llama-src-$LLAMA_TAG}"
