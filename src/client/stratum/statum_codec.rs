@@ -7,9 +7,12 @@ use std::fmt::{Display, Formatter};
 use std::{fmt, io};
 use tokio_util::codec::{Decoder, Encoder, LinesCodec};
 
-/// Stratum messages are small JSON records. Keeping a finite frame cap prevents a peer from making
-/// `LinesCodec` buffer an unbounded prompt/line before a newline arrives.
-pub(crate) const MAX_STRATUM_LINE_BYTES: usize = 64 * 1024;
+/// Keeping a finite frame cap prevents a peer from making `LinesCodec` buffer an unbounded line
+/// before a newline arrives. It must still hold the largest legitimate message: a post-H14
+/// `mining.ai_request` carries the prompt base64-encoded, and a private prompt may inflate up to
+/// `slm::MAX_INFERENCE_PROMPT_BYTES` (1 MiB) -> ~1.34 MiB of base64 plus JSON. The old 64 KiB cap
+/// was below a full 64 KiB private request and made the miner drop its pool connection on one.
+pub(crate) const MAX_STRATUM_LINE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Serialize_repr, Deserialize_repr, Debug, Clone)]
 #[repr(u8)]
@@ -265,12 +268,26 @@ impl Decoder for NewLineJsonCodec {
     type Error = NewLineJsonCodecError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        match self.lines_codec.decode(src) {
-            Ok(Some(s)) => {
-                serde_json::from_str::<StratumLine>(s.as_str()).map_err(|e| (e.to_string(), s).into()).map(Some)
+        loop {
+            match self.lines_codec.decode(src) {
+                Ok(Some(s)) => {
+                    return serde_json::from_str::<StratumLine>(s.as_str())
+                        .map_err(|e| (e.to_string(), s).into())
+                        .map(Some)
+                }
+                // One oversized line is dropped, not the connection: LinesCodec discards the rest
+                // of that line and resumes at the next newline. Ending the stream here used to cost
+                // a full reconnect (and every in-flight share) for a single too-large message.
+                Err(tokio_util::codec::LinesCodecError::MaxLineLengthExceeded) => {
+                    log::warn!(
+                        "stratum: dropped a pool message longer than {} bytes (connection kept)",
+                        MAX_STRATUM_LINE_BYTES
+                    );
+                    continue;
+                }
+                Err(_) => return Err(NewLineJsonCodecError::LineSplitError),
+                Ok(None) => return Ok(None),
             }
-            Err(_) => Err(NewLineJsonCodecError::LineSplitError),
-            _ => Ok(None),
         }
     }
 
@@ -308,10 +325,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_oversized_unterminated_lines() {
+    fn drops_an_oversized_line_and_keeps_decoding() {
+        // Never buffers past the cap, never ends the connection: the oversized line is discarded
+        // up to its newline and the next message decodes normally.
         let mut codec = NewLineJsonCodec::new();
         let mut bytes = BytesMut::from(vec![b'x'; MAX_STRATUM_LINE_BYTES + 1].as_slice());
-        assert!(codec.decode(&mut bytes).is_err());
+        assert!(matches!(codec.decode(&mut bytes), Ok(None)));
+        assert!(bytes.is_empty());
+        bytes.extend_from_slice(b"xxxx\n{\"id\":1,\"result\":true,\"error\":null}\n");
+        assert!(matches!(codec.decode(&mut bytes), Ok(Some(_))));
+    }
+
+    #[test]
+    fn accepts_a_full_size_private_ai_request() {
+        // 1 MiB prompt (the inflate bound) base64-encoded inside a mining.ai_request line.
+        use base64::Engine as _;
+        let prompt = "a".repeat(1 << 20);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(prompt);
+        let h = "ab".repeat(32);
+        let line = format!(
+            "{{\"id\":null,\"method\":\"mining.ai_request\",\"params\":[\"{h}\",\"{h}\",\"{h}\",\"{h}\",\"{b64}\",64,\"200000000\"]}}\n"
+        );
+        assert!(line.len() < MAX_STRATUM_LINE_BYTES);
+        let mut codec = NewLineJsonCodec::new();
+        let mut bytes = BytesMut::from(line.as_bytes());
+        assert!(matches!(codec.decode(&mut bytes), Ok(Some(_))));
     }
 
     /// H6 unsigned AiResponse submit: the wire must be exactly
