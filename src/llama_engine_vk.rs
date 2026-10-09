@@ -519,26 +519,35 @@ pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-pub fn generate_for(gguf: &str, prompt: &str, max_tokens: usize) -> Option<String> {
-    let g = engine().lock().ok()?;
-    let e = g.as_ref()?;
+pub fn generate_for(gguf: &str, prompt: &str, max_tokens: usize) -> Result<String, crate::slm::GenerateError> {
+    use crate::slm::GenerateError;
+    let g = engine().lock().map_err(|_| GenerateError::Failed)?;
+    let e = g.as_ref().ok_or(GenerateError::Failed)?;
     if e.gguf != gguf {
-        return None;
+        return Err(GenerateError::Failed);
     }
-    if !prompt_allowed(e, prompt) {
-        return None;
+    if prompt.len() > crate::slm::MAX_INFERENCE_PROMPT_BYTES || !prompt_allowed(e, prompt) {
+        return Err(GenerateError::PromptTooLong);
     }
-    let cp = CString::new(prompt).ok()?;
+    let cp = CString::new(prompt).map_err(|_| GenerateError::Failed)?;
     let cap: usize = 65536;
     let mut out = vec![0u8; cap];
     let n = unsafe {
         (e.generate)(e.model, cp.as_ptr(), max_tokens as c_int, out.as_mut_ptr() as *mut c_char, cap as c_int)
     };
+    if n == -2 {
+        log::warn!(
+            "llama-vk engine: a {}-byte prompt does not fit the model context ({} tokens) — refused",
+            prompt.len(),
+            e.n_ctx
+        );
+        return Err(GenerateError::PromptTooLong);
+    }
     if n < 0 {
-        return None;
+        return Err(GenerateError::Failed);
     }
     out.truncate(n as usize);
-    String::from_utf8(out).ok()
+    String::from_utf8(out).map_err(|_| GenerateError::Failed)
 }
 
 /// The engine hosts a gather-ready walk (BDA available, table built).

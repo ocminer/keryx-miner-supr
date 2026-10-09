@@ -645,6 +645,8 @@ pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
     None
 }
 
+use crate::slm::GenerateError;
+
 /// Generate OPoI text on `gpu`'s engine. Serialized per-card (one generation per card at a time);
 /// different cards run concurrently. None on any failure (caller falls back).
 pub fn generate_on(gpu: usize, prompt: &str, max_tokens: usize) -> Option<String> {
@@ -654,22 +656,22 @@ pub fn generate_on(gpu: usize, prompt: &str, max_tokens: usize) -> Option<String
         Err(p) => p.into_inner(),
     };
     let e = g.as_ref()?;
-    generate_locked(e, prompt, max_tokens)
+    generate_locked(e, prompt, max_tokens).ok()
 }
 
 /// Generate only when the exact requested GGUF is still resident on this GPU. The identity check
 /// and FFI call share one slot-lock epoch, closing the active_for/available/generate TOCTOU where a
 /// concurrent self-test could swap models between those calls.
-pub fn generate_for(gpu: usize, gguf: &str, prompt: &str, max_tokens: usize) -> Option<String> {
+pub fn generate_for(gpu: usize, gguf: &str, prompt: &str, max_tokens: usize) -> Result<String, GenerateError> {
     let slot = slot_for(gpu);
     let g = match slot.inner.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    let e = g.as_ref()?;
+    let e = g.as_ref().ok_or(GenerateError::Failed)?;
     if e.gguf != gguf {
         log::warn!("llama engine: refusing generation on GPU {}: requested model is not resident", gpu);
-        return None;
+        return Err(GenerateError::Failed);
     }
     generate_locked(e, prompt, max_tokens)
 }
@@ -686,13 +688,12 @@ fn unguarded_prompt_cap(n_ctx: c_int) -> usize {
     crate::llama_engine_prompt_cap(n_ctx)
 }
 
-fn generate_locked(e: &Engine, prompt: &str, max_tokens: usize) -> Option<String> {
-    if prompt.is_empty()
-        || prompt.len() > crate::slm::MAX_INFERENCE_PROMPT_BYTES
-        || max_tokens == 0
-        || max_tokens > crate::slm::MAX_INFERENCE_TOKENS
-    {
-        return None;
+fn generate_locked(e: &Engine, prompt: &str, max_tokens: usize) -> Result<String, GenerateError> {
+    if prompt.len() > crate::slm::MAX_INFERENCE_PROMPT_BYTES {
+        return Err(GenerateError::PromptTooLong);
+    }
+    if prompt.is_empty() || max_tokens == 0 || max_tokens > crate::slm::MAX_INFERENCE_TOKENS {
+        return Err(GenerateError::Failed);
     }
     if !e.prompt_guard && prompt.len() > unguarded_prompt_cap(e.n_ctx) {
         log::warn!(
@@ -701,10 +702,10 @@ fn generate_locked(e: &Engine, prompt: &str, max_tokens: usize) -> Option<String
             prompt.len(),
             unguarded_prompt_cap(e.n_ctx)
         );
-        return None;
+        return Err(GenerateError::PromptTooLong);
     }
-    let cp = CString::new(prompt).ok()?;
-    let max_tokens = c_int::try_from(max_tokens).ok()?;
+    let cp = CString::new(prompt).map_err(|_| GenerateError::Failed)?;
+    let max_tokens = c_int::try_from(max_tokens).map_err(|_| GenerateError::Failed)?;
     let mut buf = vec![0u8; 64 * 1024];
     let n =
         unsafe { (e.generate)(e.model, cp.as_ptr(), max_tokens, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int) };
@@ -712,7 +713,7 @@ fn generate_locked(e: &Engine, prompt: &str, max_tokens: usize) -> Option<String
         // -1: request rejected by the engine (prompt/limits/tokenize); 0: the model produced no
         // text (first decode failed, end-of-turn as first token, or a stop marker at offset 0).
         log::warn!(
-            "llama engine: generate returned {} ({}) — prompt {} bytes, max_tokens {}",
+            "llama engine: generate returned {} ({}) — prompt {} bytes, max_tokens {}, context {} tokens",
             n,
             match n {
                 -2 => "prompt does not fit the model context — refused",
@@ -721,12 +722,13 @@ fn generate_locked(e: &Engine, prompt: &str, max_tokens: usize) -> Option<String
                 _ => "no text produced",
             },
             prompt.len(),
-            max_tokens
+            max_tokens,
+            e.n_ctx
         );
-        return None;
+        return Err(if n == -2 { GenerateError::PromptTooLong } else { GenerateError::Failed });
     }
     buf.truncate(n as usize);
-    Some(utf8_complete_prefix(buf))
+    Ok(utf8_complete_prefix(buf))
 }
 
 /// Generation stops at a token budget, and a multi-byte UTF-8 character can be split across the

@@ -315,9 +315,14 @@ int keryx_llama_tensor_device(KeryxLlama* h, size_t i) {
 // length, or -1 on error. Serialized — one generation at a time (OPoI challenges are rare).
 int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
     if (!h || !prompt || !out || cap < 2 || max_tokens <= 0 || max_tokens > 2048) return -1;
+    // Byte bound = the miner's MAX_INFERENCE_PROMPT_BYTES (1 MiB; was 4096 before H14 private
+    // requests, which refused every valid larger prompt). Whether a prompt fits is decided below
+    // against this card's context (-2), not by a fixed byte count.
+    constexpr size_t kMaxPromptBytes = size_t(1) << 20;
     size_t prompt_len = 0;
-    while (prompt_len <= 4096 && prompt[prompt_len] != '\0') ++prompt_len;
-    if (prompt_len == 0 || prompt_len > 4096) return -1;
+    while (prompt_len <= kMaxPromptBytes && prompt[prompt_len] != '\0') ++prompt_len;
+    if (prompt_len == 0) return -1;
+    if (prompt_len > kMaxPromptBytes) return -2;
     std::lock_guard<std::mutex> g(h->gen_lock);
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
 

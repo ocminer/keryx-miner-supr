@@ -50,7 +50,28 @@ macro_rules! classic_eprintln {
 }
 /// Remote inference admission limits. These are enforced again at the engine boundary (not only
 /// by the Stratum/gRPC parsers), because inference is also called by startup and self-test paths.
-pub const MAX_INFERENCE_PROMPT_BYTES: usize = 4 * 1024;
+///
+/// Prompt bytes: before H14 an AiRequest payload was capped at 4 KiB and so was this limit. From the
+/// private-inference activation on, a sealed request may carry up to 64 KiB, and a compressed prompt
+/// inflates up to `MAX_DECOMPRESSED_PROMPT_LEN` (1 MiB, grpc.rs). A fixed 4 KiB limit refused every
+/// valid larger private prompt (pool field report 2026-10-09: real misses). Whether a prompt can be
+/// served is a property of the CARD (its model context), so the byte limit is now only the 1 MiB
+/// sanity bound and each engine refuses what does not fit its context (`GenerateError::PromptTooLong`).
+pub const MAX_INFERENCE_PROMPT_BYTES: usize = 1 << 20;
+/// Prompts above this never reach the deprecated candle engines (their rotary tables stop at 4096
+/// tokens); it is the pre-H14 limit, so their behavior is unchanged.
+pub const LEGACY_ENGINE_PROMPT_BYTES: usize = 4 * 1024;
+
+/// Why an in-process engine produced no text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerateError {
+    /// The prompt does not fit this card's context (or this library's byte cap). A property of the
+    /// REQUEST, not of the card: the engine is healthy, so it must not count as a card failure,
+    /// withdraw the model or fall through to another engine (which would evict the resident model).
+    PromptTooLong,
+    /// Anything else (model not resident, decode error, empty output).
+    Failed,
+}
 pub const MAX_INFERENCE_TOKENS: usize = 2_048;
 pub const DEFAULT_INFERENCE_DEADLINE_MS: u64 = 30_000;
 pub const MAX_INFERENCE_DEADLINE_MS: u64 = 120_000;
@@ -67,7 +88,7 @@ pub fn validate_inference_request(
         return Err("prompt is empty");
     }
     if prompt.len() > MAX_INFERENCE_PROMPT_BYTES {
-        return Err("prompt exceeds 4096 bytes");
+        return Err("prompt exceeds 1 MiB");
     }
     if max_tokens == 0 {
         return Err("max_tokens must be at least 1");
@@ -3074,7 +3095,20 @@ pub fn try_load_and_run_inference_on(
             if !exact_server_ready && crate::llama_engine::active_for(&gguf, gpu) {
                 let t0 = std::time::Instant::now();
                 // The serving card's drain guard remains held throughout generation.
-                if let Some(text) = crate::llama_engine::generate_for(gpu, &gguf, prompt, max_tokens) {
+                let generated = crate::llama_engine::generate_for(gpu, &gguf, prompt, max_tokens);
+                if generated == Err(GenerateError::PromptTooLong) {
+                    // The request is larger than this card's context: refuse THIS request only. The
+                    // engine is healthy — no failure count, no fallthrough (another engine would
+                    // evict the resident model and the walk for a prompt it cannot serve either).
+                    log::warn!(
+                        "SlmEngine: {}-byte prompt does not fit '{}' on GPU {} — request refused, model stays serveable.",
+                        prompt.len(),
+                        spec.name,
+                        gpu
+                    );
+                    return Err(InferenceError::Failed);
+                }
+                if let Ok(text) = generated {
                     let secs = t0.elapsed().as_secs_f64();
                     if secs > 0.0 {
                         record_card_toks(gpu, text.split_whitespace().count() as f64 / secs);
@@ -3166,7 +3200,16 @@ pub fn try_load_and_run_inference_on(
                 crate::llama_engine_vk::unload();
             }
             if engine_scoped {
-                if let Some(text) = crate::llama_engine_vk::generate_for(&gguf, prompt, max_tokens) {
+                let generated = crate::llama_engine_vk::generate_for(&gguf, prompt, max_tokens);
+                if generated == Err(GenerateError::PromptTooLong) {
+                    log::warn!(
+                        "SlmEngine: {}-byte prompt does not fit '{}' on the Vulkan engine — request refused, model stays serveable.",
+                        prompt.len(),
+                        spec.name
+                    );
+                    return Err(InferenceError::Failed);
+                }
+                if let Ok(text) = generated {
                     let clean = strip_think_tags(&text);
                     if !clean.trim().is_empty() {
                         record_serveable_on(model_id, gpu);
@@ -3238,6 +3281,17 @@ pub fn try_load_and_run_inference_on(
             );
             }
         }
+    }
+
+    // The deprecated candle engines below keep the pre-H14 prompt limit (rotary tables end at 4096
+    // tokens). Refusing here keeps their old behavior for long private prompts.
+    if prompt.len() > LEGACY_ENGINE_PROMPT_BYTES {
+        log::warn!(
+            "SlmEngine: {}-byte prompt is above the {}-byte limit of the fallback engines — request refused.",
+            prompt.len(),
+            LEGACY_ENGINE_PROMPT_BYTES
+        );
+        return Err(InferenceError::Failed);
     }
 
     // catch_unwind prevents any internal panic (cudarc, candle, OOM…) from permanently
@@ -3530,6 +3584,19 @@ mod inference_admission_tests {
             ),
             Ok(MAX_INFERENCE_DEADLINE_MS)
         );
+    }
+
+    #[test]
+    fn admits_every_post_h14_private_prompt_size() {
+        // Pool field report 2026-10-09: valid private prompts above 4 KiB were refused as "prompt
+        // exceeds 4096 bytes". Every size the node accepts (64 KiB payload) and the largest inflated
+        // prompt (grpc MAX_DECOMPRESSED_PROMPT_LEN) must pass admission; the card decides the rest.
+        for n in [4_097usize, 16 * 1024, keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN, 1 << 20] {
+            assert!(validate_inference_request(&"x".repeat(n), 512, 0).is_ok(), "{n} bytes refused");
+        }
+        assert_eq!(MAX_INFERENCE_PROMPT_BYTES, 1 << 20);
+        assert!(MAX_INFERENCE_PROMPT_BYTES >= keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN);
+        assert_eq!(LEGACY_ENGINE_PROMPT_BYTES, 4096);
     }
 
     #[test]

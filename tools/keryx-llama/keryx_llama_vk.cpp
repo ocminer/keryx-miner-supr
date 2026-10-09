@@ -699,9 +699,12 @@ int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char
     if (!h || !prompt || !out || cap < 2 || max_tokens <= 0 || max_tokens > 2048) return -1;
     // Up to 64 KiB (upstream v0.5.6 1c34683: post-H14 AiRequest payload limit); the context check
     // below refuses (-2) whatever does not fit the allocated window.
+    // Same 1 MiB byte bound as the CUDA shim; the context check below (-2) decides what fits.
+    constexpr size_t kMaxPromptBytes = size_t(1) << 20;
     size_t prompt_len = 0;
-    while (prompt_len <= 65536 && prompt[prompt_len] != '\0') ++prompt_len;
-    if (prompt_len == 0 || prompt_len > 65536) return -1;
+    while (prompt_len <= kMaxPromptBytes && prompt[prompt_len] != '\0') ++prompt_len;
+    if (prompt_len == 0) return -1;
+    if (prompt_len > kMaxPromptBytes) return -2;
     std::lock_guard<std::mutex> g(h->gen_lock);
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
 

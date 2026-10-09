@@ -66,8 +66,8 @@ pub mod llama_engine_vk {
     pub fn generate(_prompt: &str, _max_tokens: usize) -> Option<String> {
         None
     }
-    pub fn generate_for(_gguf: &str, _prompt: &str, _max_tokens: usize) -> Option<String> {
-        None
+    pub fn generate_for(_gguf: &str, _prompt: &str, _max_tokens: usize) -> Result<String, crate::slm::GenerateError> {
+        Err(crate::slm::GenerateError::Failed)
     }
     pub fn pom_ready() -> bool {
         false
@@ -159,8 +159,8 @@ pub mod llama_engine {
     pub fn generate_on(_gpu: usize, _prompt: &str, _max_tokens: usize) -> Option<String> {
         None
     }
-    pub fn generate_for(_gpu: usize, _gguf: &str, _prompt: &str, _max_tokens: usize) -> Option<String> {
-        None
+    pub fn generate_for(_gpu: usize, _gguf: &str, _prompt: &str, _max_tokens: usize) -> Result<String, crate::slm::GenerateError> {
+        Err(crate::slm::GenerateError::Failed)
     }
 }
 // PoM GPU driver aliased to `pom_gpu` per platform so main.rs/miner.rs/slm.rs stay backend-agnostic:
