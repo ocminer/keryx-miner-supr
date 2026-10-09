@@ -838,7 +838,16 @@ fn adapt_snapshot(snapshot: runtime::Snapshot, clocks: &mut ClockBaselines) -> U
         .devices
         .iter()
         .map(|device| {
-            let inference_host = inference_gpu == Some(device.index);
+            // A card reserved for inference (AMD: model + walk do not fit together) IS the inference
+            // host. `inference_gpu` comes from the inference router's card numbering, which on AMD
+            // need not match the OpenCL worker index shown here; trusting it alongside the reserved
+            // card labelled a second, still-mining card INF on every request (field report: 3x RX
+            // 6700 XT 12 GB showing two INF cards).
+            let inference_host = if snapshot.mining.inference_dedicated_gpus.is_empty() {
+                inference_gpu == Some(device.index)
+            } else {
+                snapshot.mining.inference_dedicated_gpus.contains(&device.index)
+            };
             let activity = if snapshot.mining.inference_paused_gpus.contains(&device.index)
                 || snapshot.mining.inference_dedicated_gpus.contains(&device.index)
                 || (snapshot.mining.inference_paused && inference_host) {
@@ -1180,6 +1189,42 @@ mod tests {
                 ..Default::default()
             })
             .collect();
+        let view = super::adapt_snapshot(snapshot, &mut super::ClockBaselines::default());
+        assert_eq!(view.devices[0].activity, crate::tui::DeviceActivity::Mining);
+        assert_eq!(view.devices[1].activity, crate::tui::DeviceActivity::Mining);
+        assert_eq!(view.devices[2].activity, crate::tui::DeviceActivity::Inference);
+    }
+
+    #[test]
+    fn only_the_reserved_card_is_shown_as_inference_while_serving() {
+        // AMD 3x 12 GB rig, GPU2 reserved for inference; a request is being served, the router
+        // reports its own card number 0 (not the OpenCL worker index). Only GPU2 is INF; the other
+        // cards are paused for the request (AMD pauses every walk while serving), never INF.
+        let mut snapshot = runtime::Snapshot::default();
+        snapshot.connection = runtime::ConnectionState::Connected;
+        snapshot.mining.inference_dedicated_gpus = vec![2];
+        snapshot.mining.inference_paused = true;
+        snapshot.inference.active = 1;
+        snapshot.inference.gpu_index = Some(0);
+        snapshot.mining.devices = (0..3)
+            .map(|index| runtime::DeviceSnapshot {
+                index,
+                hashrate_hs: if index == 2 { 0.0 } else { 700_000.0 },
+                ..Default::default()
+            })
+            .collect();
+        let view = super::adapt_snapshot(snapshot.clone(), &mut super::ClockBaselines::default());
+        let inf: Vec<u32> = view
+            .devices
+            .iter()
+            .filter(|d| d.activity == crate::tui::DeviceActivity::Inference)
+            .map(|d| d.index)
+            .collect();
+        assert_eq!(inf, vec![2]);
+        assert_eq!(view.devices[0].activity, crate::tui::DeviceActivity::Paused);
+        // After the request: the reserved card stays INF, the others mine.
+        snapshot.mining.inference_paused = false;
+        snapshot.inference.active = 0;
         let view = super::adapt_snapshot(snapshot, &mut super::ClockBaselines::default());
         assert_eq!(view.devices[0].activity, crate::tui::DeviceActivity::Mining);
         assert_eq!(view.devices[1].activity, crate::tui::DeviceActivity::Mining);
