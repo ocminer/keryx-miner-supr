@@ -162,10 +162,14 @@ llama.cpp (Vulkan) and the PoM walk in OpenCL, so a card that does both used to 
 twice. When model + walk do not fit together (for example Qwen3.5-9B on a 12 GB RX 6700 XT), the
 miner reserves one card for inference and that card now **mines over the engine's resident copy**
 through a Vulkan v4 walk kernel — after a startup byte gate that proves the gather path returns the
-exact model bytes. It is shown MINING with the `[INF]` badge. Cards where both fit keep the OpenCL
-walk (fastest). `KERYX_ZERO_DUP=force` makes every engine-hosted card use the Vulkan walk,
-`KERYX_ZERO_DUP=off` restores the inference-only reservation. RDNA1 (RX 5600/5700) never uses it
-(driver hang on buffer-address reads).
+exact model bytes. It is shown MINING with the `[INF]` badge. The Vulkan walk runs at OpenCL speed:
+a chase pass resolves each nonce's 256 tile addresses and the walk uses the matrix cores on RDNA3+
+(`VK_KHR_cooperative_matrix`, int8) or packed int8 dot products elsewhere — measured RX 7600 XT
+0.58 MH/s (OpenCL 0.59), RX 7900 XTX 1.44 (OpenCL 1.51), MI50 0.96 (OpenCL 0.52). Cards where
+both fit keep the OpenCL walk by default. `KERYX_ZERO_DUP=force` makes every engine-hosted card use
+the Vulkan walk, `KERYX_ZERO_DUP=off` restores the inference-only reservation. RDNA1 (RX 5600/5700)
+never uses it (driver hang on buffer-address reads). `KERYX_VK_WALK_MODE=cm|tp|sp` pins the kernel
+(matrix cores / two-phase dp4a / single-phase); the two-phase scratch takes 67 MB of VRAM.
 
 **GTX 1080 Ti / Pascal notes.** Validated on a real 1080 Ti (sm_61, driver 550): the PoM walk is
 byte-exact (host↔GPU lockstep + H10 seed tests pass), pool shares are accepted, and solo mining
