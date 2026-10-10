@@ -54,6 +54,20 @@ static const uint32_t WALK_DOT_SPV[] =
 static const uint32_t WALK_SCALAR_SPV[] =
 #include "pom_walk_vk.spv.inc"
 ;
+// Two-phase variants of the same source: the offset chase (phase 1) and the pipelined walk.
+static const uint32_t CHASE_SPV[] =
+#include "pom_chase_vk.spv.inc"
+;
+static const uint32_t WALK_TP_DOT_SPV[] =
+#include "pom_walk_tp_dot_vk.spv.inc"
+;
+static const uint32_t WALK_TP_SCALAR_SPV[] =
+#include "pom_walk_tp_vk.spv.inc"
+;
+// Matrix-core (VK_KHR_cooperative_matrix int8) two-phase walk; 2 sub-nonces per 64-lane group.
+static const uint32_t WALK_TP_CM_SPV[] =
+#include "pom_walk_tp_cm_vk.spv.inc"
+;
 static const uint32_t FETCH_SPV[] =
 #include "pom_fetch_vk.spv.inc"
 ;
@@ -67,6 +81,7 @@ extern "C" void keryx_vk_queue_submit(size_t dev_num, const void * submit_info, 
 extern "C" int keryx_vk_pick_discrete_device();
 extern "C" int keryx_vk_ggml_index_to_discrete_ordinal(int ggml_index);
 extern "C" bool keryx_vk_integer_dot_product(size_t dev_num);
+extern "C" bool keryx_vk_coopmat_int8(size_t dev_num);
 
 static constexpr uint64_t CHUNK_BYTES = 32;
 static constexpr uint32_t NO_WINNER = 0xFFFFFFFFu;
@@ -74,6 +89,19 @@ static constexpr uint32_t NO_WINNER = 0xFFFFFFFFu;
 // 256-thread workgroup.
 static constexpr uint64_t V4_TILE_CHUNKS = 32;
 static constexpr uint32_t V4_NPG = 8;
+static constexpr uint32_t V4_K = 256;
+// Nonces per two-phase sub-batch (each of the two chase buffers is sized for it): K x 8 B resolved
+// tiles + 8 B seed per nonce = 33.6 MB at 16384 (2 buffers = 67 MB). The chase has one invocation per nonce, so the batch
+// must be large enough to fill the GPU with latency-hiding waves. Windows keeps the TDR-safe
+// 8192. KERYX_VK_WALK_BATCH overrides. One keryx_llama_pom_mine call pipelines up to TP_MAX_SUB
+// sub-batches: chase(i+1) runs concurrently with walk(i) (no barrier between them), so the
+// latency-bound chase hides behind the ALU-bound walk.
+#ifdef _WIN32
+static constexpr uint32_t TP_BATCH_DEFAULT = 8192;
+#else
+static constexpr uint32_t TP_BATCH_DEFAULT = 16384;
+#endif
+static constexpr uint32_t TP_MAX_SUB = 4;
 
 // Must match `layout(push_constant) uniform Push` in pom_walk_vk.comp field for field.
 struct PushWalk {
@@ -87,6 +115,12 @@ struct PushWalk {
     uint32_t batch;
     uint32_t n_tensors;
     uint32_t h10;       // 0 = reversible v4 seed fold; 1 = one-way H10/H14 PowHash seed
+    uint64_t n_tiles_inv; // floor(2^64 / n_tiles): the shader's exact 64-bit modulo by multiply-high
+    uint32_t sub_index; // winner slot of this sub-batch (pipelined dispatch)
+    uint32_t chase_groups;      // walk dispatches: leading workgroups chasing the next sub-batch
+    uint64_t chase_start_nonce;
+    uint32_t chase_batch;
+    uint32_t pad0;
 };
 struct PushFetch {
     uint64_t first_chunk;
@@ -117,9 +151,15 @@ struct KeryxLlama {
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     VkDescriptorSet walk_ds = VK_NULL_HANDLE, fetch_ds = VK_NULL_HANDLE;
-    VkPipelineLayout walk_pl = VK_NULL_HANDLE, fetch_pl = VK_NULL_HANDLE;
-    VkPipeline walk_pipe = VK_NULL_HANDLE, fetch_pipe = VK_NULL_HANDLE;
-    VkShaderModule walk_sm = VK_NULL_HANDLE, fetch_sm = VK_NULL_HANDLE;
+    VkPipelineLayout walk_pl = VK_NULL_HANDLE, fetch_pl = VK_NULL_HANDLE, chase_pl = VK_NULL_HANDLE;
+    VkPipeline walk_pipe = VK_NULL_HANDLE, fetch_pipe = VK_NULL_HANDLE, chase_pipe = VK_NULL_HANDLE;
+    VkShaderModule walk_sm = VK_NULL_HANDLE, fetch_sm = VK_NULL_HANDLE, chase_sm = VK_NULL_HANDLE;
+    // Two-phase scratch (offsets + seeds), double-buffered, and its per-buffer capacity in
+    // nonces; 0 = single-phase walk. One descriptor set per chase buffer.
+    VkBuffer chase_buf[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory chase_mem[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDescriptorSet walk_ds2 = VK_NULL_HANDLE;
+    uint32_t tp_batch = 0;
 
     VkBuffer winner_buf = VK_NULL_HANDLE, out32_buf = VK_NULL_HANDLE;
     VkDeviceMemory winner_mem = VK_NULL_HANDLE, out32_mem = VK_NULL_HANDLE;
@@ -133,6 +173,8 @@ struct KeryxLlama {
     uint64_t supl_bytes = 0;
     bool walk_ready = false;
     bool walk_dot = false;  // packed int8 dot-product kernel selected (else scalar)
+    bool walk_cm = false;   // matrix-core (cooperative matrix) kernel selected
+    uint32_t walk_npg = 8;  // sub-nonces per walk workgroup (dispatch geometry)
     std::mutex walk_lock; // one dispatch at a time on our cmd buffer/fence
     std::string ctx_info;           // "n_ctx=… kv=… flash_attn=…" for the miner log
 };
@@ -216,8 +258,19 @@ static bool staged_upload(KeryxLlama* h, VkBuffer dst, const uint8_t* data, VkDe
     return ok;
 }
 
+// Wave size for the walk pipelines: KERYX_VK_WALK_WAVE=32|64 requests it through
+// VK_EXT_subgroup_size_control (ggml enables the extension); unset = driver default.
+static uint32_t walk_wave_size() {
+    if (const char* e = getenv("KERYX_VK_WALK_WAVE")) {
+        long v = atol(e);
+        if (v == 32 || v == 64) return (uint32_t)v;
+    }
+    return 0;
+}
+
 static VkPipeline make_pipeline(KeryxLlama* h, const uint32_t* spv, size_t spv_bytes,
-                                uint32_t push_bytes, VkShaderModule* sm, VkPipelineLayout* pl) {
+                                uint32_t push_bytes, VkShaderModule* sm, VkPipelineLayout* pl,
+                                uint32_t wave = 0) {
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = spv_bytes;
     smi.pCode = spv;
@@ -230,11 +283,18 @@ static VkPipeline make_pipeline(KeryxLlama* h, const uint32_t* spv, size_t spv_b
     pli.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(h->dev, &pli, nullptr, pl) != VK_SUCCESS) return VK_NULL_HANDLE;
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
+    rss.requiredSubgroupSize = wave;
+    cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, wave ? &rss : nullptr, 0,
                  VK_SHADER_STAGE_COMPUTE_BIT, *sm, "main", nullptr};
     cpi.layout = *pl;
     VkPipeline pipe = VK_NULL_HANDLE;
-    vkCreateComputePipelines(h->dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe);
+    if (vkCreateComputePipelines(h->dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe) != VK_SUCCESS && wave) {
+        KERYX_LOG_WARN("keryx-llama-vk: wave%u pipeline refused — using the driver default\n", wave);
+        cpi.stage.pNext = nullptr;
+        pipe = VK_NULL_HANDLE;
+        vkCreateComputePipelines(h->dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe);
+    }
     return pipe;
 }
 
@@ -377,7 +437,7 @@ static bool walk_init(KeryxLlama* h) {
     if (!make_buffer(h, addrs.size() * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, &h->addrs_buf, &h->addrs_mem, nullptr)) return false;
     if (!staged_upload(h, h->addrs_buf, (const uint8_t*)addrs.data(), addrs.size() * 8)) return false;
-    if (!make_buffer(h, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    if (!make_buffer(h, 4 * TP_MAX_SUB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      false, &h->winner_buf, &h->winner_mem, &h->winner_map)) return false;
     if (!make_buffer(h, (VkDeviceSize)FETCH_WINDOW_CHUNKS * CHUNK_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -385,40 +445,78 @@ static bool walk_init(KeryxLlama* h) {
                      false, &h->out32_buf, &h->out32_mem, &h->out32_map)) return false;
 
     // Descriptors: {binding0 result, binding1 prefix, binding2 addrs} — one set per pipeline.
-    VkDescriptorSetLayoutBinding b[3]{};
-    for (uint32_t i = 0; i < 3; i++) {
+    // Two-phase scratch: offsets (K u32 per nonce, step-major) + seeds (u64 per nonce). A failed
+    // allocation (VRAM tight) falls back to the single-phase walk. KERYX_VK_WALK_MODE=sp forces it.
+    {
+        uint32_t want = TP_BATCH_DEFAULT;
+        if (const char* e = getenv("KERYX_VK_WALK_BATCH")) { long v = atol(e); if (v >= 64) want = (uint32_t)v; }
+        want = (want + V4_NPG - 1) / V4_NPG * V4_NPG;
+        const char* mode = getenv("KERYX_VK_WALK_MODE");
+        if (mode && strcmp(mode, "sp") == 0) {
+            KERYX_LOG_WARN("keryx-llama-vk: KERYX_VK_WALK_MODE=sp — single-phase walk\n");
+        } else {
+            VkDeviceSize bytes = (VkDeviceSize)want * ((VkDeviceSize)V4_K * 8 + 8);  // resolved tiles (u64) + seed
+            bool ok = true;
+            for (int i = 0; i < 2 && ok; i++) {
+                ok = make_buffer(h, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                 false, &h->chase_buf[i], &h->chase_mem[i], nullptr);
+            }
+            if (ok) {
+                h->tp_batch = want;
+            } else {
+                KERYX_LOG_WARN("keryx-llama-vk: two-phase scratch (2 x %llu MiB) unavailable — single-phase walk\n",
+                               (unsigned long long)(bytes >> 20));
+                for (int i = 0; i < 2; i++) {
+                    if (h->chase_buf[i]) vkDestroyBuffer(h->dev, h->chase_buf[i], nullptr);
+                    if (h->chase_mem[i]) vkFreeMemory(h->dev, h->chase_mem[i], nullptr);
+                    h->chase_buf[i] = VK_NULL_HANDLE; h->chase_mem[i] = VK_NULL_HANDLE;
+                }
+            }
+        }
+    }
+
+    VkDescriptorSetLayoutBinding b[5]{};
+    for (uint32_t i = 0; i < 5; i++) {
         b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     }
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = 3;
+    dli.bindingCount = 5;
     dli.pBindings = b;
     if (vkCreateDescriptorSetLayout(h->dev, &dli, nullptr, &h->dsl) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6};
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 15};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpi.maxSets = 2;
+    dpi.maxSets = 3;
     dpi.poolSizeCount = 1;
     dpi.pPoolSizes = &ps;
     if (vkCreateDescriptorPool(h->dev, &dpi, nullptr, &h->dpool) != VK_SUCCESS) return false;
-    VkDescriptorSetLayout layouts[2] = {h->dsl, h->dsl};
+    VkDescriptorSetLayout layouts[3] = {h->dsl, h->dsl, h->dsl};
     VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsa.descriptorPool = h->dpool;
-    dsa.descriptorSetCount = 2;
+    dsa.descriptorSetCount = 3;
     dsa.pSetLayouts = layouts;
-    VkDescriptorSet sets[2];
+    VkDescriptorSet sets[3];
     if (vkAllocateDescriptorSets(h->dev, &dsa, sets) != VK_SUCCESS) return false;
     h->walk_ds = sets[0];
     h->fetch_ds = sets[1];
-    auto write_ds = [&](VkDescriptorSet ds, VkBuffer b0) {
-        VkDescriptorBufferInfo bi[3] = {{b0, 0, VK_WHOLE_SIZE}, {h->prefix_buf, 0, VK_WHOLE_SIZE}, {h->addrs_buf, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet w[3]{};
-        for (uint32_t i = 0; i < 3; i++) {
+    h->walk_ds2 = sets[2];
+    auto write_ds = [&](VkDescriptorSet ds, VkBuffer b0, VkBuffer chase, VkBuffer chase_next) {
+        // Bindings 3/4 (two-phase scratch: this and the next sub-batch) are bound even on the
+        // single-phase/fetch sets: the layout is shared and a dummy (the result buffer) keeps
+        // every binding valid.
+        VkBuffer b3 = chase ? chase : b0;
+        VkBuffer b4 = chase_next ? chase_next : b0;
+        VkDescriptorBufferInfo bi[5] = {{b0, 0, VK_WHOLE_SIZE}, {h->prefix_buf, 0, VK_WHOLE_SIZE},
+                                        {h->addrs_buf, 0, VK_WHOLE_SIZE}, {b3, 0, VK_WHOLE_SIZE}, {b4, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet w[5]{};
+        for (uint32_t i = 0; i < 5; i++) {
             w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, i, 0, 1,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[i], nullptr};
         }
-        vkUpdateDescriptorSets(h->dev, 3, w, 0, nullptr);
+        vkUpdateDescriptorSets(h->dev, 5, w, 0, nullptr);
     };
-    write_ds(h->walk_ds, h->winner_buf);
-    write_ds(h->fetch_ds, h->out32_buf);
+    write_ds(h->walk_ds, h->winner_buf, h->chase_buf[0], h->chase_buf[1]);
+    write_ds(h->walk_ds2, h->winner_buf, h->chase_buf[1], h->chase_buf[0]);
+    write_ds(h->fetch_ds, h->out32_buf, h->chase_buf[0], h->chase_buf[1]);
 
     // The dot-product variant needs VK_KHR_shader_integer_dot_product ENABLED on ggml's device (a
     // SPIR-V capability the driver must have been asked for), not merely advertised.
@@ -428,19 +526,78 @@ static bool walk_init(KeryxLlama* h) {
         if (e[0] == '0') want_dot = false;
     }
     h->walk_dot = want_dot;
-    if (want_dot) {
-        h->walk_pipe = make_pipeline(h, WALK_DOT_SPV, sizeof(WALK_DOT_SPV), sizeof(PushWalk), &h->walk_sm, &h->walk_pl);
+    // Development hook: KERYX_VK_WALK_SPV=<file.spv> loads the walk from a SPIR-V file instead
+    // of the baked blob (shader iteration without relinking; the Rust byte gate still applies).
+    std::vector<uint32_t> ext_spv;
+    if (const char* f = getenv("KERYX_VK_WALK_SPV")) {
+        if (FILE* fp = fopen(f, "rb")) {
+            fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET);
+            if (n > 0 && n % 4 == 0) {
+                ext_spv.resize((size_t)n / 4);
+                if (fread(ext_spv.data(), 1, (size_t)n, fp) != (size_t)n) ext_spv.clear();
+            }
+            fclose(fp);
+        }
+        if (ext_spv.empty()) KERYX_LOG_WARN("keryx-llama-vk: KERYX_VK_WALK_SPV=%s could not be read — using the built-in walk\n", f);
+        else KERYX_LOG_WARN("keryx-llama-vk: walk shader loaded from %s (%zu words) — DEVELOPMENT ONLY\n", f, ext_spv.size());
+    }
+    const bool tp = h->tp_batch != 0;
+    const uint32_t wave = walk_wave_size();
+    // Matrix cores: automatic when the device has int8 cooperative matrices (RDNA3+), unless
+    // KERYX_VK_WALK_MODE=tp|sp (dp4a kernels) or =cm (force the attempt).
+    const char* mode_env = getenv("KERYX_VK_WALK_MODE");
+    const bool cm_forced = mode_env && strcmp(mode_env, "cm") == 0;
+    const bool cm_disabled = mode_env && !cm_forced;
+    bool want_cm = tp && !cm_disabled && (cm_forced || keryx_vk_coopmat_int8(h->gpu));
+    if (const char* n = getenv("KERYX_VK_WALK_NPG")) { long v = atol(n); if (v == 2 || v == 8) h->walk_npg = (uint32_t)v; }
+    if (!ext_spv.empty()) {
+        h->walk_pipe = make_pipeline(h, ext_spv.data(), ext_spv.size() * 4, sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave);
+    } else if (want_cm) {
+        // wave64 measured faster than wave32 for the matrix-core walk (RX 7600 XT / 7900 XTX).
+        h->walk_pipe = make_pipeline(h, WALK_TP_CM_SPV, sizeof(WALK_TP_CM_SPV), sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave ? wave : 64);
+        if (h->walk_pipe) {
+            h->walk_cm = true;
+            h->walk_npg = 2;
+        } else {
+            KERYX_LOG_WARN("keryx-llama-vk: matrix-core walk pipeline refused — using the dp4a kernel\n");
+            h->walk_pipe = make_pipeline(h, want_dot ? WALK_TP_DOT_SPV : WALK_TP_SCALAR_SPV,
+                                         want_dot ? sizeof(WALK_TP_DOT_SPV) : sizeof(WALK_TP_SCALAR_SPV),
+                                         sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave);
+        }
+    } else if (tp && want_dot) {
+        h->walk_pipe = make_pipeline(h, WALK_TP_DOT_SPV, sizeof(WALK_TP_DOT_SPV), sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave);
+    } else if (tp) {
+        h->walk_pipe = make_pipeline(h, WALK_TP_SCALAR_SPV, sizeof(WALK_TP_SCALAR_SPV), sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave);
+    } else if (want_dot) {
+        h->walk_pipe = make_pipeline(h, WALK_DOT_SPV, sizeof(WALK_DOT_SPV), sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave);
     } else {
-        h->walk_pipe = make_pipeline(h, WALK_SCALAR_SPV, sizeof(WALK_SCALAR_SPV), sizeof(PushWalk), &h->walk_sm, &h->walk_pl);
+        h->walk_pipe = make_pipeline(h, WALK_SCALAR_SPV, sizeof(WALK_SCALAR_SPV), sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave);
+    }
+    if (tp) {
+        std::vector<uint32_t> ext_chase;
+        if (const char* f = getenv("KERYX_VK_CHASE_SPV")) {
+            if (FILE* fp = fopen(f, "rb")) {
+                fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET);
+                if (n > 0 && n % 4 == 0) { ext_chase.resize((size_t)n / 4); if (fread(ext_chase.data(), 1, (size_t)n, fp) != (size_t)n) ext_chase.clear(); }
+                fclose(fp);
+            }
+            if (!ext_chase.empty()) KERYX_LOG_WARN("keryx-llama-vk: chase shader loaded from %s — DEVELOPMENT ONLY\n", f);
+        }
+        h->chase_pipe = ext_chase.empty()
+            ? make_pipeline(h, CHASE_SPV, sizeof(CHASE_SPV), sizeof(PushWalk), &h->chase_sm, &h->chase_pl, wave)
+            : make_pipeline(h, ext_chase.data(), ext_chase.size() * 4, sizeof(PushWalk), &h->chase_sm, &h->chase_pl, wave);
+        if (!h->chase_pipe) return false;
     }
     h->fetch_pipe = make_pipeline(h, FETCH_SPV, sizeof(FETCH_SPV), sizeof(PushFetch), &h->fetch_sm, &h->fetch_pl);
     if (!h->walk_pipe || !h->fetch_pipe) return false;
 
     h->walk_ready = true;
     KERYX_LOG_INFO(
-            "keryx-llama-vk: zero-dup v4 walk ready on vk device %zu (%s int8 dot) — %u tensors (%zu VRAM-resident, "
+            "keryx-llama-vk: zero-dup v4 walk ready on vk device %zu (%s, %s) — %u tensors (%zu VRAM-resident, "
             "%zu supplemented), N=%llu chunks (%llu tiles), %llu supplement bytes\n",
-            h->gpu, h->walk_dot ? "packed" : "scalar", h->n_tensors, n_resident, (size_t)h->n_tensors - n_resident,
+            h->gpu, h->walk_cm ? "matrix cores" : (h->walk_dot ? "packed int8 dot" : "scalar int8 dot"),
+            tp ? "two-phase" : "single-phase",
+            h->n_tensors, n_resident, (size_t)h->n_tensors - n_resident,
             (unsigned long long)h->n_chunks, (unsigned long long)(h->n_chunks / V4_TILE_CHUNKS),
             (unsigned long long)supl_total);
     return true;
@@ -465,6 +622,70 @@ static bool run_dispatch(KeryxLlama* h, VkPipeline pipe, VkPipelineLayout pl, Vk
     vkCmdBindDescriptorSets(h->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, nullptr);
     vkCmdPushConstants(h->cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
     vkCmdDispatch(h->cmd, groups, 1, 1);
+    VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+    vkCmdPipelineBarrier(h->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 1, &hb, 0, nullptr, 0, nullptr);
+    vkEndCommandBuffer(h->cmd);
+    return submit_and_wait(h);
+}
+
+// Two-phase grind of `total` nonces as n_sub <= TP_MAX_SUB sub-batches of <= tp_batch, one
+// submission: chase(0); barrier; for i: walk(i) and chase(i+1) back to back WITHOUT a barrier
+// between them (independent buffers), then a barrier. The latency-bound chase of the next
+// sub-batch therefore overlaps the ALU-bound walk. Winner slots are read in order afterwards
+// (lowest-nonce semantics; at most one extra sub-batch of work past the first winner).
+static bool run_two_phase(KeryxLlama* h, PushWalk pw, uint32_t total) {
+    const uint32_t n_sub = (total + h->tp_batch - 1) / h->tp_batch;
+    if (n_sub == 0 || n_sub > TP_MAX_SUB) return false;
+    vkResetCommandBuffer(h->cmd, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(h->cmd, &bi);
+    vkCmdFillBuffer(h->cmd, h->winner_buf, 0, VK_WHOLE_SIZE, NO_WINNER);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+    vkCmdPipelineBarrier(h->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+    VkMemoryBarrier sb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                       VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+    auto sub_push = [&](uint32_t i) {
+        PushWalk p = pw;
+        p.start_nonce = pw.start_nonce + (uint64_t)i * h->tp_batch;
+        p.batch = std::min<uint32_t>(h->tp_batch, total - i * h->tp_batch);
+        p.sub_index = i;
+        return p;
+    };
+    auto chase = [&](uint32_t i) {
+        PushWalk p = sub_push(i);
+        VkDescriptorSet ds = (i & 1) ? h->walk_ds2 : h->walk_ds;
+        vkCmdBindPipeline(h->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, h->chase_pipe);
+        vkCmdBindDescriptorSets(h->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, h->chase_pl, 0, 1, &ds, 0, nullptr);
+        vkCmdPushConstants(h->cmd, h->chase_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
+        vkCmdDispatch(h->cmd, (p.batch + 63) / 64, 1, 1);
+    };
+    // walk(i) carries the chase of sub-batch i+1 as its leading workgroups (fused, concurrent).
+    const uint32_t walk_wg = h->walk_npg == 2 ? 64 : 256;
+    auto walk = [&](uint32_t i, bool fuse_next) {
+        PushWalk p = sub_push(i);
+        if (fuse_next) {
+            PushWalk n = sub_push(i + 1);
+            p.chase_start_nonce = n.start_nonce;
+            p.chase_batch = n.batch;
+            p.chase_groups = (n.batch + walk_wg - 1) / walk_wg;
+        }
+        VkDescriptorSet ds = (i & 1) ? h->walk_ds2 : h->walk_ds;
+        vkCmdBindPipeline(h->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, h->walk_pipe);
+        vkCmdBindDescriptorSets(h->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, h->walk_pl, 0, 1, &ds, 0, nullptr);
+        vkCmdPushConstants(h->cmd, h->walk_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
+        vkCmdDispatch(h->cmd, p.chase_groups + (p.batch + h->walk_npg - 1) / h->walk_npg, 1, 1);
+    };
+    chase(0);
+    for (uint32_t i = 0; i < n_sub; i++) {
+        vkCmdPipelineBarrier(h->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &sb, 0, nullptr, 0, nullptr);
+        walk(i, i + 1 < n_sub);
+    }
     VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
     vkCmdPipelineBarrier(h->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                          0, 1, &hb, 0, nullptr, 0, nullptr);
@@ -694,6 +915,11 @@ bool keryx_llama_pom_fetch(KeryxLlama* h, uint64_t off, uint8_t out[32]) {
 
 // True when the walk uses the packed int8 dot-product kernel (false = scalar fallback).
 bool keryx_llama_pom_walk_dot(KeryxLlama* h) { return h && h->walk_ready && h->walk_dot; }
+// True when the walk runs on the matrix cores (cooperative matrices).
+bool keryx_llama_pom_walk_cm(KeryxLlama* h) { return h && h->walk_ready && h->walk_cm; }
+// Largest `batch` one keryx_llama_pom_mine call accepts (TP_MAX_SUB pipelined sub-batches of the
+// two-phase scratch capacity); 0 = no bound (single-phase walk).
+uint32_t keryx_llama_pom_batch_max(KeryxLlama* h) { return h ? h->tp_batch * TP_MAX_SUB : 0; }
 
 // Grind ONE dispatch of `batch` PoM v4 nonces from `start_nonce` (the caller sub-batches for TDR
 // safety and lowest-nonce early exit, exactly like the OpenCL driver's mine_v4). `p` = POW-fold
@@ -718,6 +944,19 @@ int64_t keryx_llama_pom_mine(KeryxLlama* h, const uint64_t p[4], const uint64_t 
     pw.batch = batch;
     pw.n_tensors = h->n_tensors;
     pw.h10 = h10 ? 1u : 0u;
+    // floor(2^64 / n) without 128-bit arithmetic (MSVC): (2^64-1)/n, +1 exactly when n | 2^64.
+    pw.n_tiles_inv = (~0ULL / n_tiles) + (((~0ULL % n_tiles) + 1 == n_tiles) ? 1 : 0);
+    if (h->tp_batch != 0) {
+        if (batch > h->tp_batch * TP_MAX_SUB) return -2; // caller sub-batches to keryx_llama_pom_batch_max
+        if (!run_two_phase(h, pw, batch)) return -2;
+        const uint32_t n_sub = (batch + h->tp_batch - 1) / h->tp_batch;
+        for (uint32_t i = 0; i < n_sub; i++) {
+            uint32_t w;
+            memcpy(&w, (const uint8_t*)h->winner_map + 4 * i, 4);
+            if (w != NO_WINNER) return (int64_t)i * h->tp_batch + w;
+        }
+        return -1;
+    }
     uint32_t groups = (batch + V4_NPG - 1) / V4_NPG;
     if (!run_dispatch(h, h->walk_pipe, h->walk_pl, h->walk_ds, &pw, sizeof(pw), groups, h->winner_buf)) return -2;
     uint32_t w;
@@ -859,6 +1098,11 @@ void keryx_llama_free(KeryxLlama* h) {
         dbuf(h->prefix_buf, h->prefix_mem);
         dbuf(h->addrs_buf, h->addrs_mem);
         dbuf(h->supl_buf, h->supl_mem);
+        dbuf(h->chase_buf[0], h->chase_mem[0]);
+        dbuf(h->chase_buf[1], h->chase_mem[1]);
+        if (h->chase_pipe) vkDestroyPipeline(h->dev, h->chase_pipe, nullptr);
+        if (h->chase_pl) vkDestroyPipelineLayout(h->dev, h->chase_pl, nullptr);
+        if (h->chase_sm) vkDestroyShaderModule(h->dev, h->chase_sm, nullptr);
         if (h->walk_pipe) vkDestroyPipeline(h->dev, h->walk_pipe, nullptr);
         if (h->fetch_pipe) vkDestroyPipeline(h->dev, h->fetch_pipe, nullptr);
         if (h->walk_pl) vkDestroyPipelineLayout(h->dev, h->walk_pl, nullptr);

@@ -335,3 +335,18 @@ extern "C" bool keryx_vk_integer_dot_product(size_t dev_num) {
         return false;
     }
 }
+
+// True when ggml found 16x16x16 int8 x int8 -> int32 cooperative-matrix support on this device
+// (VK_KHR_cooperative_matrix enabled): the walk's matrix-core kernel can be used.
+extern "C" bool keryx_vk_coopmat_int8(size_t dev_num) {
+    try {
+        if (dev_num >= vk_instance.device_indices.size()) {
+            return false;
+        }
+        vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
+        return dev->coopmat_support && dev->coopmat_int_support && dev->coopmat_int_m == 16 &&
+               dev->coopmat_int_n == 16 && dev->coopmat_int_k == 16;
+    } catch (...) {
+        return false;
+    }
+}

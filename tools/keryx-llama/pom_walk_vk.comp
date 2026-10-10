@@ -25,8 +25,22 @@
 #ifdef USE_DOT
 #extension GL_EXT_integer_dot_product : require
 #endif
+#extension GL_EXT_control_flow_attributes : require
+#ifdef POM_TP_CM
+// RDNA3+/CDNA matrix cores: the 32x32x32 int8 state transition as 8 cooperative-matrix
+// 16x16x16 products per sub-nonce (VK_KHR_cooperative_matrix, int8 x int8 -> int32, exact).
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#endif
 
+#if defined(POM_CHASE) || defined(POM_TP_CM)
+layout(local_size_x = 64) in;
+#else
 layout(local_size_x = 256) in;
+#endif
 
 // A resident weight tensor's bytes as LE u64 words, reached by device address. Canonical chunk
 // c inside tensor j = words [ (c - prefix[j])*4 .. +4 ] at addr[j] (raw GGUF quant bytes,
@@ -40,7 +54,8 @@ layout(std430, buffer_reference, buffer_reference_align = 16) readonly buffer Te
     uvec4 q[];
 };
 
-layout(std430, binding = 0) buffer Winner { uint offset; } OUT;
+// Lowest winning batch-relative index per sub-batch of a pipelined dispatch (pc.sub_index).
+layout(std430, binding = 0) buffer Winner { uint offset[]; } OUT;
 
 // Per-tensor gather table, canonical (name-sorted) order, zero-chunk tensors skipped:
 // prefix[j] = first canonical chunk of tensor j (prefix[n_tensors] = n_chunks sentinel),
@@ -51,6 +66,22 @@ layout(std430, binding = 1) readonly buffer Table {
 layout(std430, binding = 2) readonly buffer Addrs {
     uint64_t addr[];    // n_tensors
 } ADDRS;
+// Two-phase scratch (binding 3): the chase pass writes the K tile offsets of every nonce
+// (step-major: off[step * batch + idx], u32 — n_tiles < 2^32 for any real model) and its walk
+// seed (seed[idx], after the offsets); the walk pass reads them.
+// Chase scratch: per nonce K resolved tiles, then the walk seed. A resolved tile packs the
+// device address of its chunk 0 (bits 0..47, 32-byte aligned), the number of chunks from chunk
+// 0 to the end of its tensor saturated at 32 (bits 48..53) and the tensor index saturated at
+// 1023 (bits 54..63) — the walk needs no table lookup at all except on the rare tile that
+// straddles two tensors (lanes past the boundary search the table).
+layout(std430, binding = 3) buffer Chase {
+    uint64_t tile[];   // [k * batch] resolved tiles (step-major), then batch seeds
+} CHASE;
+// The NEXT sub-batch's scratch: walk dispatches carry the chase of the following sub-batch as
+// extra workgroups (scheduled first), so the latency-bound chase overlaps the ALU-bound walk.
+layout(std430, binding = 4) buffer ChaseNext {
+    uint64_t tile[];
+} CHASE_NEXT;
 
 layout(push_constant) uniform Push {
     uint64_t p0, p1, p2, p3;   // POW-fold pph words (H3-salted)
@@ -63,6 +94,12 @@ layout(push_constant) uniform Push {
     uint     batch;            // nonces in this dispatch
     uint     n_tensors;
     uint     h10;              // 0 = reversible v4 seed fold; 1 = one-way H10/H14 PowHash seed
+    uint64_t n_tiles_inv;      // floor(2^64 / n_tiles), host-computed (see mod_tiles)
+    uint     sub_index;        // winner slot of this sub-batch
+    uint     chase_groups;     // walk dispatches: leading workgroups that chase the next sub-batch
+    uint64_t chase_start_nonce;
+    uint     chase_batch;
+    uint     pad0;
 } pc;
 
 const uint V4_D = 32u;
@@ -70,17 +107,64 @@ const uint V4_D4 = 8u;                 // uints per row/column (32 bytes)
 const uint V4_TILE_CHUNKS = 32u;
 const uint V4_TILE_U32 = 256u;         // 1 KB tile as u32 words
 const uint V4_SP_STRIP_U32 = 384u;     // tile/leaves [0..255] + largest Merkle level [256..383]
+const uint V4_TP_STRIP_U32 = 512u;     // two-phase: tile double-buffer (2 x 256); Merkle reuses it
 const uint V4_NPG = 8u;                // sub-nonces per 256-thread workgroup
 
 const uint64_t V4_S0_ROW_SALT       = 0x03421325594C3C51UL;
 const uint64_t V4_OFFSET_FIRST_SALT = 0x6D1CCF96AC4D76F9UL;
 const uint64_t V4_OFFSET_STEP_SALT  = 0x89050E78D34609EFUL;
 
+#if defined(POM_TP_CM)
+// Two sub-nonces per 64-lane workgroup. Per sub-nonce: the tile (32 columns of 32 B, as u32
+// words, column stride 12 words) and the state (32 rows of 32 B as int8, row stride 48 B) laid
+// out so the fragment loads stay 16-byte aligned with at most 2-way LDS bank conflicts, plus a
+// 16x16 position matrix (shared by the group) that reveals the implementation's accumulator
+// element layout. The Merkle scratch aliases the tile. ~3 KB per sub-nonce. Every exchange
+// stays inside one subgroup (wave32: one sub-nonce per subgroup; wave64: both).
+const uint CM_NPG = 2u;
+const uint CM_TILE_STRIDE = 12u;        // words per padded 32-byte tile column
+const uint CM_TILE_WORDS = 32u * CM_TILE_STRIDE;
+const uint CM_STATE_STRIDE = 48u;       // bytes per padded 32-byte state row
+shared uint   cm_tile[CM_NPG * CM_TILE_WORDS];
+shared int8_t cm_state[CM_NPG][32 * CM_STATE_STRIDE];
+shared uint   cm_layout[256];
+#define scratch cm_tile
+#elif defined(POM_TP)
+// Tile double buffer per sub-nonce as 16-byte vectors (2 x 64 uvec4 = 2 KB): the column reads
+// of the int8 matmul then compile to 128-bit LDS loads the scheduler can batch (as the OpenCL
+// kernel's uint4 reads), instead of 2-word loads each followed by a wait. The Merkle finish
+// runs on the same memory (uvec4 variant). 16 KB per group.
+const uint V4_TP_STRIP_V4 = 128u;
+shared uvec4 tile4[V4_NPG * V4_TP_STRIP_V4];
+shared uint scratch[8];   // the uint-strip helpers are unused here but must compile
+#else
 shared uint scratch[V4_NPG * V4_SP_STRIP_U32];   // 12 KB
+#endif
 // Prefix table mirrored into shared memory (binary-searched once per chunk per step); tables
 // larger than this stay in global memory (every current tier has < 1024 tensors).
 const uint PREFIX_LDS_MAX = 1024u;
 shared uint64_t prefix_lds[PREFIX_LDS_MAX];
+
+// x mod n_tiles, exact, without a 64-bit division: the compiler lowers `%` on uint64_t to a
+// ~400-instruction restoring loop that cost more than the whole int8 matmul per step. With
+// m = floor(2^64 / n) the estimate q = mulhi64(x, m) is floor(x / n) or one less (x < 2^64,
+// 2^64 mod n < n), so one conditional subtraction yields the exact remainder.
+uint64_t mulhi64(uint64_t a, uint64_t b) {
+    uint al = uint(a), ah = uint(a >> 32), bl = uint(b), bh = uint(b >> 32);
+    uint ll_hi, ll_lo, lh_hi, lh_lo, hl_hi, hl_lo, hh_hi, hh_lo;
+    umulExtended(al, bl, ll_hi, ll_lo);
+    umulExtended(al, bh, lh_hi, lh_lo);
+    umulExtended(ah, bl, hl_hi, hl_lo);
+    umulExtended(ah, bh, hh_hi, hh_lo);
+    uint64_t mid = uint64_t(ll_hi) + uint64_t(lh_lo) + uint64_t(hl_lo);
+    uint64_t hi = (uint64_t(hh_hi) << 32) + uint64_t(hh_lo) + uint64_t(lh_hi) + uint64_t(hl_hi) + (mid >> 32);
+    return hi;
+}
+uint64_t mod_tiles(uint64_t x) {
+    uint64_t q = mulhi64(x, pc.n_tiles_inv);
+    uint64_t r = x - q * pc.n_tiles;
+    return r >= pc.n_tiles ? r - pc.n_tiles : r;
+}
 
 // SplitMix64 finalizer — identical to pom.rs mix64 (u64 * wraps).
 uint64_t mix64(uint64_t x) {
@@ -243,11 +327,11 @@ void b3_hash_pair(uint in_base, uint out_base) {
     for (uint i = 0u; i < 8u; ++i) scratch[out_base + i] = cv[i];
 }
 
-// Locate canonical chunk `c` through the prefix table and return its 32 bytes as 8 LE u32 words
-// into scratch[dst_base..dst_base+8] (same u32 order as the OpenCL blob's `dst[w] = src[w]`).
-void load_chunk(uint64_t c, uint dst_base, bool lds_table) {
+// Device address of canonical chunk `c`: binary search of the prefix table (shared-memory mirror
+// when it fits, else global) for the owning tensor. GLSL array subscripts are 32-bit, so the
+// wide arithmetic lives in the buffer_reference POINTER, never the index.
+uint locate_chunk(uint64_t c, bool lds_table, out uint64_t base) {
     uint lo = 0u, hi = pc.n_tensors; // invariant: prefix[lo] <= c < prefix[hi]
-    uint64_t base;
     if (lds_table) {
         while (hi - lo > 1u) {
             uint mid = (lo + hi) / 2u;
@@ -261,78 +345,98 @@ void load_chunk(uint64_t c, uint dst_base, bool lds_table) {
         }
         base = PREFIX.prefix[lo];
     }
-    // Advance the buffer_reference POINTER by the 64-bit byte offset and index with small
-    // constants — GLSL array subscripts are 32-bit, so the wide arithmetic must live in the
-    // pointer, never the index.
-    Tensor16 chunk = Tensor16(ADDRS.addr[lo] + (c - base) * 32UL);
-    uvec4 a = chunk.q[0];
-    uvec4 b = chunk.q[1];
-    scratch[dst_base + 0u] = a.x; scratch[dst_base + 1u] = a.y; scratch[dst_base + 2u] = a.z; scratch[dst_base + 3u] = a.w;
-    scratch[dst_base + 4u] = b.x; scratch[dst_base + 5u] = b.y; scratch[dst_base + 6u] = b.z; scratch[dst_base + 7u] = b.w;
+    return lo;
+}
+uint64_t chunk_addr(uint64_t c, bool lds_table) {
+    uint64_t base;
+    uint lo = locate_chunk(c, lds_table, base);
+    return ADDRS.addr[lo] + (c - base) * 32UL;
 }
 
-void main() {
-    const uint lid  = gl_LocalInvocationID.x;
-    const uint sub  = lid >> 5;              // sub-nonce 0..7 within the group
-    const uint lane = lid & 31u;             // state row 0..31 within the sub-nonce
-    const uint gsub = gl_WorkGroupID.x * V4_NPG + sub;
-    // Sub-nonces past the batch still execute the walk with a dummy nonce (uniform barriers —
-    // every lane must reach every workgroup barrier); they just never submit.
-    const bool live  = gsub < pc.batch;
-    const uint64_t nonce = pc.start_nonce + (live ? uint64_t(gsub) : 0UL);
-    const uint64_t seed  = seed_fold_era(nonce);
-    const uint strip = sub * V4_SP_STRIP_U32; // this sub-nonce's tile/leaves + Merkle level
+// Resolve tile `off` for the chase scratch. Bit 0 clear: the whole 1 KB tile lies in one tensor
+// and the word is the device address of its chunk 0 (chunks are 32-byte aligned, so the low bits
+// are free; the high bits are NOT — RADV places device addresses in the upper half of the GPU
+// address space). Bit 0 set: the tile straddles two tensors (rare) and bits 1..32 hold `off`;
+// the walk lanes then locate their chunk through the table exactly as the single-phase kernel
+// does. `addr0` receives chunk 0's address either way.
+uint64_t resolve_tile(uint64_t off, bool lds_table, out uint64_t addr0) {
+    const uint64_t c0 = off * uint64_t(V4_TILE_CHUNKS);
+    uint64_t base;
+    const uint lo = locate_chunk(c0, lds_table, base);
+    const uint64_t next = lds_table ? prefix_lds[lo + 1u] : PREFIX.prefix[lo + 1u];
+    addr0 = ADDRS.addr[lo] + (c0 - base) * 32UL;
+    if (next - c0 >= uint64_t(V4_TILE_CHUNKS)) {
+        return addr0;
+    }
+    return ((off & 0xFFFFFFFFUL) << 1) | 1UL;
+}
 
-    // Mirror the prefix table into shared memory (uniform decision per dispatch).
+// Device address of chunk `lane` of a resolved tile.
+uint64_t lane_chunk_addr(uint64_t resolved, uint lane, bool lds_table) {
+    if ((resolved & 1UL) == 0UL) {
+        return resolved + uint64_t(lane) * 32UL;
+    }
+    const uint64_t off = resolved >> 1;
+    return chunk_addr(off * uint64_t(V4_TILE_CHUNKS) + uint64_t(lane), lds_table);
+}
+
+// The 32 bytes of canonical chunk `c` as 8 LE u32 words (same u32 order as the OpenCL blob's
+// `dst[w] = src[w]`), into registers.
+void load_chunk_regs(uint64_t c, bool lds_table, out uint w[8]) {
+    Tensor16 chunk = Tensor16(chunk_addr(c, lds_table));
+    uvec4 a = chunk.q[0];
+    uvec4 b = chunk.q[1];
+    w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
+    w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
+}
+
+// ... into scratch[dst_base..dst_base+8].
+void load_chunk(uint64_t c, uint dst_base, bool lds_table) {
+    uint w[8];
+    load_chunk_regs(c, lds_table, w);
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) scratch[dst_base + i] = w[i];
+}
+
+// Mirror the prefix table into shared memory (uniform decision per dispatch; every lane must
+// take part — called before any barrier-dependent work).
+bool mirror_prefix_table(uint lid, uint group_size) {
     const bool lds_table = pc.n_tensors + 1u <= PREFIX_LDS_MAX;
     if (lds_table) {
-        for (uint i = lid; i <= pc.n_tensors; i += 256u) prefix_lds[i] = PREFIX.prefix[i];
+        for (uint i = lid; i <= pc.n_tensors; i += group_size) prefix_lds[i] = PREFIX.prefix[i];
         memoryBarrierShared();
         barrier();
     }
+    return lds_table;
+}
 
-    // S_0 row `lane`: mix64 keystream (identical to pom_v4::v4_initial_state).
-    uint row4[V4_D4];
-    {
-        uint64_t h = mix64(seed ^ (V4_S0_ROW_SALT + uint64_t(lane)));
-        for (uint k4 = 0u; k4 < V4_D4; ++k4) { h = mix64(h); row4[k4] = uint(h); }
-    }
-    uint64_t off = mix64(seed ^ V4_OFFSET_FIRST_SALT) % pc.n_tiles;
-
-    for (uint step = 1u; step <= pc.k; ++step) {
-        // Load this sub-nonce's 1 KB tile: lane loads canonical chunk (tile*32 + lane). Chunks are
-        // located individually, so a tile that straddles two tensors is gathered exactly.
-        load_chunk(off * uint64_t(V4_TILE_CHUNKS) + uint64_t(lane), strip + lane * V4_D4, lds_table);
-        memoryBarrierShared();
-        barrier();
-
-        // The final transition has no successor tile. Skip its serial snippet fold and modulo.
-        if (step < pc.k) {
-            uint64_t sf = 0UL;
-            for (uint w = 0u; w < 8u; ++w) sf = mix64(sf ^ uint64_t(scratch[strip + w]));
-            off = mix64(seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf) % pc.n_tiles;
+// State transition for lane `lane` (row `lane` of S): next[lane][j] = rho8(dot_i8(row, col_j),
+// tweak(step, lane, j)), packed 4 bytes/uint, with the tile at scratch[tile_base..+256].
+void transition(inout uint row4[V4_D4], uint tile_base, uint step, uint lane) {
+    const uint step_tweak = step * 0x9E3779B9u + lane * 0xC2B2AE35u;
+    uint new4[V4_D4];
+    [[unroll]] for (uint j4 = 0u; j4 < V4_D4; ++j4) {
+        uint packed = 0u;
+        [[unroll]] for (uint jj = 0u; jj < 4u; ++jj) {
+            const uint j = j4 * 4u + jj;
+            const uint col = tile_base + j * V4_D4;   // tile column j = 32 bytes
+            int acc = 0;
+            [[unroll]] for (uint k = 0u; k < V4_D4; ++k) acc = dp4(row4[k], scratch[col + k], acc);
+            packed |= rho8(acc, step_tweak + j * 0x85EBCA6Bu) << (8u * jj);
         }
-
-        // next[lane][j] = rho8(dot_i8(row, col_j), tweak(step, lane, j)), packed 4 bytes/uint.
-        const uint step_tweak = step * 0x9E3779B9u + lane * 0xC2B2AE35u;
-        uint new4[V4_D4];
-        for (uint j4 = 0u; j4 < V4_D4; ++j4) {
-            uint packed = 0u;
-            for (uint jj = 0u; jj < 4u; ++jj) {
-                const uint j = j4 * 4u + jj;
-                const uint col = strip + j * V4_D4;   // tile column j = 32 bytes
-                int acc = 0;
-                for (uint k = 0u; k < V4_D4; ++k) acc = dp4(row4[k], scratch[col + k], acc);
-                packed |= rho8(acc, step_tweak + j * 0x85EBCA6Bu) << (8u * jj);
-            }
-            new4[j4] = packed;
-        }
-        for (uint k4 = 0u; k4 < V4_D4; ++k4) row4[k4] = new4[k4];
-        memoryBarrierShared();
-        barrier();   // all lanes done with the tile before step+1 overwrites it
+        new4[j4] = packed;
     }
+    [[unroll]] for (uint k4 = 0u; k4 < V4_D4; ++k4) row4[k4] = new4[k4];
+}
 
-    // root_K: 32 blake3 row leaves + complete depth-5 tree (scratch reuses the tile strip).
+// S_0 row `lane`: mix64 keystream (identical to pom_v4::v4_initial_state).
+void initial_row(uint64_t seed, uint lane, out uint row4[V4_D4]) {
+    uint64_t h = mix64(seed ^ (V4_S0_ROW_SALT + uint64_t(lane)));
+    [[unroll]] for (uint k4 = 0u; k4 < V4_D4; ++k4) { h = mix64(h); row4[k4] = uint(h); }
+}
+
+// root_K (32 blake3 row leaves + depth-5 Merkle tree over scratch[strip..]) -> fold64 -> pow fold
+// -> target check -> atomicMin. Every lane of the sub-nonce takes part (barriers).
+void finish(uint row4[V4_D4], uint strip, uint lane, uint gsub, bool live) {
     b3_hash_row32(row4, strip + lane * 8u);
     memoryBarrierShared();
     barrier();
@@ -344,7 +448,6 @@ void main() {
         barrier();
         uint tmp = src; src = dst; dst = tmp;
     }
-
     if (lane == 0u && live) {
         const uint64_t fin = uint64_t(scratch[src]) | (uint64_t(scratch[src + 1u]) << 32);
         // pom_pow_value: 4 keyed mix64 folds -> 256-bit LE words o0..o3 (H3-salted pph words).
@@ -359,7 +462,384 @@ void main() {
         else if (o1 != pc.t1) { le = o1 < pc.t1; }
         else { le = o0 <= pc.t0; }
         if (le) {
-            atomicMin(OUT.offset, gsub);
+            atomicMin(OUT.offset[pc.sub_index], gsub);
         }
     }
 }
+
+
+// ============================================================================
+// PHASE 1 — chase: one invocation per nonce follows the snippet chain and records all K tile
+// offsets (+ the seed). Reads only chunk 0 (32 B) of each tile — a latency-bound pointer chase
+// the GPU hides with parallelism. Byte-exact with the single-phase snippet fold: same 8 u32
+// words (LE, zero-extended), same order. Port of pom_mine.cl pom_mine_v4_chase.
+// `to_next` (uniform) selects the NEXT sub-batch's scratch (fused into a walk dispatch).
+// ============================================================================
+void chase_nonce(uint idx, uint batch, uint64_t start_nonce, bool lds_table, bool to_next) {
+    const uint64_t nonce = start_nonce + uint64_t(idx);
+    const uint64_t seed = seed_fold_era(nonce);
+    if (to_next) { CHASE_NEXT.tile[pc.k * batch + idx] = seed; } else { CHASE.tile[pc.k * batch + idx] = seed; }
+    uint64_t off = mod_tiles(mix64(seed ^ V4_OFFSET_FIRST_SALT));
+    for (uint step = 1u; step <= pc.k; ++step) {
+        uint64_t addr0;
+        const uint64_t resolved = resolve_tile(off, lds_table, addr0);
+        if (to_next) {
+            CHASE_NEXT.tile[(step - 1u) * batch + idx] = resolved;
+        } else {
+            CHASE.tile[(step - 1u) * batch + idx] = resolved;
+        }
+        if (step == pc.k) break; // K tiles are consumed; tile K+1 is dead
+        // chunk 0 = the snippet.
+        Tensor16 chunk = Tensor16(addr0);
+        uvec4 a = chunk.q[0];
+        uvec4 b = chunk.q[1];
+        uint64_t sf = 0UL;
+        sf = mix64(sf ^ uint64_t(a.x)); sf = mix64(sf ^ uint64_t(a.y)); sf = mix64(sf ^ uint64_t(a.z)); sf = mix64(sf ^ uint64_t(a.w));
+        sf = mix64(sf ^ uint64_t(b.x)); sf = mix64(sf ^ uint64_t(b.y)); sf = mix64(sf ^ uint64_t(b.z)); sf = mix64(sf ^ uint64_t(b.w));
+        off = mod_tiles(mix64(seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf));
+    }
+}
+
+// A lane's chunk of a resolved tile, into registers.
+void load_tile_chunk_regs(uint64_t resolved, uint lane, bool lds_table, out uint w[8]) {
+    Tensor16 chunk = Tensor16(lane_chunk_addr(resolved, lane, lds_table));
+    uvec4 a = chunk.q[0];
+    uvec4 b = chunk.q[1];
+    w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
+    w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
+}
+
+#if defined(POM_TP)
+// State transition over a tile held as 64 uvec4 at tile4[base..base+64]: column j = 2 vectors.
+void transition4(inout uint row4[V4_D4], uint base, uint step, uint lane) {
+    const uint step_tweak = step * 0x9E3779B9u + lane * 0xC2B2AE35u;
+    uint new4[V4_D4];
+    [[unroll]] for (uint j4 = 0u; j4 < V4_D4; ++j4) {
+        uint packed = 0u;
+        [[unroll]] for (uint jj = 0u; jj < 4u; ++jj) {
+            const uint j = j4 * 4u + jj;
+            const uvec4 c0 = tile4[base + j * 2u];
+            const uvec4 c1 = tile4[base + j * 2u + 1u];
+            int acc = 0;
+            acc = dp4(row4[0], c0.x, acc); acc = dp4(row4[1], c0.y, acc);
+            acc = dp4(row4[2], c0.z, acc); acc = dp4(row4[3], c0.w, acc);
+            acc = dp4(row4[4], c1.x, acc); acc = dp4(row4[5], c1.y, acc);
+            acc = dp4(row4[6], c1.z, acc); acc = dp4(row4[7], c1.w, acc);
+            packed |= rho8(acc, step_tweak + j * 0x85EBCA6Bu) << (8u * jj);
+        }
+        new4[j4] = packed;
+    }
+    [[unroll]] for (uint k4 = 0u; k4 < V4_D4; ++k4) row4[k4] = new4[k4];
+}
+
+// finish() over the uvec4 strip: leaves (8 words = 2 vectors each) at [strip..strip+64), the
+// Merkle levels ping-pong with [strip+64..strip+128). Same hashes as finish().
+void finish4(uint row4[V4_D4], uint strip, uint lane, uint gsub, bool live) {
+    {
+        uint m[16];
+        for (uint i = 0u; i < 8u; ++i) m[i] = row4[i];
+        for (uint i = 8u; i < 16u; ++i) m[i] = 0u;
+        uint cv[8];
+        b3_compress_iv(m, 32u, B3_CHUNK_START | B3_CHUNK_END | B3_ROOT, cv);
+        tile4[strip + lane * 2u]      = uvec4(cv[0], cv[1], cv[2], cv[3]);
+        tile4[strip + lane * 2u + 1u] = uvec4(cv[4], cv[5], cv[6], cv[7]);
+    }
+    memoryBarrierShared();
+    barrier();
+    uint src = strip;
+    uint dst = strip + 64u;
+    for (uint n = V4_D; n > 1u; n >>= 1) {
+        if (lane < n / 2u) {
+            uint m[16];
+            const uvec4 a = tile4[src + lane * 4u], b = tile4[src + lane * 4u + 1u];
+            const uvec4 c = tile4[src + lane * 4u + 2u], d = tile4[src + lane * 4u + 3u];
+            m[0] = a.x; m[1] = a.y; m[2] = a.z; m[3] = a.w; m[4] = b.x; m[5] = b.y; m[6] = b.z; m[7] = b.w;
+            m[8] = c.x; m[9] = c.y; m[10] = c.z; m[11] = c.w; m[12] = d.x; m[13] = d.y; m[14] = d.z; m[15] = d.w;
+            uint cv[8];
+            b3_compress_iv(m, 64u, B3_CHUNK_START | B3_CHUNK_END | B3_ROOT, cv);
+            tile4[dst + lane * 2u]      = uvec4(cv[0], cv[1], cv[2], cv[3]);
+            tile4[dst + lane * 2u + 1u] = uvec4(cv[4], cv[5], cv[6], cv[7]);
+        }
+        memoryBarrierShared();
+        barrier();
+        uint tmp = src; src = dst; dst = tmp;
+    }
+    if (lane == 0u && live) {
+        const uvec4 root = tile4[src];
+        const uint64_t fin = uint64_t(root.x) | (uint64_t(root.y) << 32);
+        uint64_t o0 = mix64(fin ^ pc.p0 ^ 0x9E3779B97F4A7C15UL);
+        uint64_t o1 = mix64(o0 ^ pc.p1 ^ 0xC2B2AE3D27D4EB4FUL);
+        uint64_t o2 = mix64(o1 ^ pc.p2 ^ 0x165667B19E3779F9UL);
+        uint64_t o3 = mix64(o2 ^ pc.p3 ^ 0xD6E8FEB86659FD93UL);
+        bool le;
+        if (o3 != pc.t3) { le = o3 < pc.t3; }
+        else if (o2 != pc.t2) { le = o2 < pc.t2; }
+        else if (o1 != pc.t1) { le = o1 < pc.t1; }
+        else { le = o0 <= pc.t0; }
+        if (le) {
+            atomicMin(OUT.offset[pc.sub_index], gsub);
+        }
+    }
+}
+#endif
+
+#if defined(POM_CHASE)
+void main() {
+    const bool lds_table = mirror_prefix_table(gl_LocalInvocationID.x, 64u);
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.batch) {
+        return;
+    }
+    chase_nonce(idx, pc.batch, pc.start_nonce, lds_table, false);
+}
+
+#elif defined(POM_TP_CM)
+// ============================================================================
+// PHASE 2 (matrix cores) — pipelined walk with the state transition on cooperative matrices:
+// next = S x T^T as 2x2 output blocks of 16x16, each the sum of two 16x16x16 int8 products
+// (A = state rows, row-major; B(k, j) = tile byte j*32 + k, i.e. the tile column-major). The
+// products are exact int32. rho8 is applied straight to the accumulator elements each lane
+// holds: VK_KHR_cooperative_matrix keeps the element layout opaque, so the shader reads it
+// once per invocation from a position matrix (element (r, c) = r*16 + c) loaded the same way —
+// byte-identical to the scalar kernel, without a store/reload round trip per step.
+// Synchronisation: subgroupMemoryBarrierShared() only (a wave runs in lockstep; the full
+// subgroupBarrier would also wait for the prefetched tile's DRAM load every step).
+// ============================================================================
+#define CM_ACC_T coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define CM_A_T   coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define CM_B_T   coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+const uint CM_MAX_ELEMS = 16u;          // accumulator elements per lane (8 at wave32, 4 at wave64)
+
+void main() {
+    const uint lid  = gl_LocalInvocationID.x;
+    // Leading workgroups chase the NEXT sub-batch (uniform per workgroup; no barriers on this path).
+    if (gl_WorkGroupID.x < pc.chase_groups) {
+        const uint cidx = gl_WorkGroupID.x * 64u + lid;
+        if (cidx < pc.chase_batch) chase_nonce(cidx, pc.chase_batch, pc.chase_start_nonce, false, true);
+        return;
+    }
+    const uint sub  = lid >> 5;              // sub-nonce 0..1 within the group
+    const uint lane = lid & 31u;             // 0..31 within the sub-nonce
+    const uint gsub = (gl_WorkGroupID.x - pc.chase_groups) * CM_NPG + sub;
+    const bool live = gsub < pc.batch;
+    const uint idx  = live ? gsub : 0u;
+    const bool lds_table = false;            // keep LDS for occupancy; the search is cheap
+    const uint64_t seed = CHASE.tile[pc.k * pc.batch + idx];
+    // Sub-nonces this subgroup computes matrices for (wave32: its own; wave64: both).
+    const uint subs_per_sg = gl_SubgroupSize / 32u;
+    const uint sg_first = gl_SubgroupID * subs_per_sg;
+
+    // Accumulator element layout: position (row*16 + col) of each element this lane holds.
+    for (uint i = lid; i < 256u; i += 64u) cm_layout[i] = i;
+    memoryBarrierShared();
+    barrier();
+    // Per element: its tweak contribution (row*B + col*C within the block) and state byte offset.
+    uint tweak_pos[CM_MAX_ELEMS];
+    uint state_pos[CM_MAX_ELEMS];
+    {
+        CM_ACC_T L;
+        coopMatLoad(L, cm_layout, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint i = 0u; i < CM_MAX_ELEMS; ++i) {
+            const uint p = i < uint(L.length()) ? uint(L[i]) : 0u;
+            const uint r = p >> 4, c = p & 15u;
+            tweak_pos[i] = r * 0xC2B2AE35u + c * 0x85EBCA6Bu;
+            state_pos[i] = r * CM_STATE_STRIDE + c;
+        }
+    }
+    const uint n_elems = min(uint(CM_ACC_T(0).length()), CM_MAX_ELEMS);
+
+    {
+        uint row4[V4_D4];
+        initial_row(seed, lane, row4);
+        [[unroll]] for (uint w = 0u; w < 8u; ++w) {
+            [[unroll]] for (uint b = 0u; b < 4u; ++b)
+                cm_state[sub][lane * CM_STATE_STRIDE + w * 4u + b] = int8_t((row4[w] >> (8u * b)) & 0xffu);
+        }
+        uint w[8];
+        load_tile_chunk_regs(CHASE.tile[idx], lane, lds_table, w);
+        [[unroll]] for (uint i = 0u; i < 8u; ++i) cm_tile[sub * CM_TILE_WORDS + lane * CM_TILE_STRIDE + i] = w[i];
+    }
+    subgroupMemoryBarrierShared();
+
+    // Two tiles in flight: the tile of step+1 sits in `pref` while step+2's load is issued.
+    uint pref[8];
+    if (pc.k > 1u) {
+        load_tile_chunk_regs(CHASE.tile[1u * pc.batch + idx], lane, lds_table, pref);
+    }
+    for (uint step = 1u; step <= pc.k; ++step) {
+        const bool has_next = step < pc.k;
+        const bool has_next2 = step + 1u < pc.k;
+        uint pref2[8];
+        if (has_next2) {
+            load_tile_chunk_regs(CHASE.tile[(step + 1u) * pc.batch + idx], lane, lds_table, pref2);
+        }
+        const uint step_tweak = step * 0x9E3779B9u;
+
+        for (uint si = 0u; si < subs_per_sg; ++si) {
+            const uint s = sg_first + si;
+            // All fragments first (the state is overwritten below while this subgroup still
+            // runs in lockstep, so every load must precede the first store).
+            CM_A_T A[2][2];
+            CM_B_T B[2][2];
+            [[unroll]] for (uint rb = 0u; rb < 2u; ++rb)
+                [[unroll]] for (uint kb = 0u; kb < 2u; ++kb)
+                    coopMatLoad(A[rb][kb], cm_state[s], rb * 16u * CM_STATE_STRIDE + kb * 16u, CM_STATE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint kb = 0u; kb < 2u; ++kb)
+                [[unroll]] for (uint cb = 0u; cb < 2u; ++cb)
+                    coopMatLoad(B[kb][cb], cm_tile, s * CM_TILE_WORDS + cb * 16u * CM_TILE_STRIDE + kb * 4u, CM_TILE_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            [[unroll]] for (uint rb = 0u; rb < 2u; ++rb) {
+                [[unroll]] for (uint cb = 0u; cb < 2u; ++cb) {
+                    CM_ACC_T acc = CM_ACC_T(0);
+                    acc = coopMatMulAdd(A[rb][0], B[0][cb], acc);
+                    acc = coopMatMulAdd(A[rb][1], B[1][cb], acc);
+                    // rho8 on the elements this lane holds; new state bytes written in place.
+                    // Constant element indices (dynamic coopmat element access lowers to select
+                    // chains); the iterations past n_elems are a uniform skip.
+                    [[unroll]] for (uint i = 0u; i < CM_MAX_ELEMS; ++i) {
+                        if (i < n_elems) {
+                            const uint v = rho8(acc[i], step_tweak + rb * (16u * 0xC2B2AE35u) + cb * (16u * 0x85EBCA6Bu) + tweak_pos[i]);
+                            cm_state[s][rb * (16u * CM_STATE_STRIDE) + cb * 16u + state_pos[i]] = int8_t(v);
+                        }
+                    }
+                }
+            }
+        }
+        if (has_next) {
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) cm_tile[sub * CM_TILE_WORDS + lane * CM_TILE_STRIDE + i] = pref[i];
+        }
+        if (has_next2) {
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) pref[i] = pref2[i];
+        }
+        subgroupMemoryBarrierShared();
+    }
+
+    // Final state row of this lane as 8 LE words for the Merkle leaves.
+    uint row4[V4_D4];
+    [[unroll]] for (uint w = 0u; w < 8u; ++w) {
+        uint v = 0u;
+        [[unroll]] for (uint b = 0u; b < 4u; ++b)
+            v |= uint(uint8_t(cm_state[sub][lane * CM_STATE_STRIDE + w * 4u + b])) << (8u * b);
+        row4[w] = v;
+    }
+    subgroupMemoryBarrierShared();
+    finish(row4, sub * V4_SP_STRIP_U32, lane, gsub, live);
+}
+
+#elif defined(POM_TP)
+// ============================================================================
+// PHASE 2 — pipelined walk: identical math to the single-phase walk, but the offsets and the
+// seed come from the chase (no snippet fold / modulo in the hot loop) and each step DOUBLE-
+// BUFFERS the tile: the next tile is fetched into registers before the matmul of the current
+// one, so its DRAM latency overlaps the compute, then staged into the other LDS buffer. Same
+// 8-sub-nonce x 32-lane layout. Port of pom_mine.cl pom_mine_v4_tp.
+// ============================================================================
+void main() {
+    const uint lid  = gl_LocalInvocationID.x;
+    // Leading workgroups chase the NEXT sub-batch (uniform per workgroup; no barriers on this path).
+    if (gl_WorkGroupID.x < pc.chase_groups) {
+        const uint cidx = gl_WorkGroupID.x * 256u + lid;
+        if (cidx < pc.chase_batch) chase_nonce(cidx, pc.chase_batch, pc.chase_start_nonce, false, true);
+        return;
+    }
+    const uint sub  = lid >> 5;
+    const uint lane = lid & 31u;
+    const uint gsub = (gl_WorkGroupID.x - pc.chase_groups) * V4_NPG + sub;
+    const bool live = gsub < pc.batch;
+    const uint idx  = live ? gsub : 0u;      // dummy sub-nonces read nonce 0's tiles (in-bounds)
+    const bool lds_table = false;            // tiles arrive resolved; the table is only for straddles
+    const uint64_t seed = CHASE.tile[pc.k * pc.batch + idx];
+    const uint strip = sub * V4_TP_STRIP_V4;
+    const uint buf0 = strip;                 // tile double-buffer A (64 uvec4)
+    const uint buf1 = strip + 64u;           // tile double-buffer B
+
+    uint row4[V4_D4];
+    initial_row(seed, lane, row4);
+
+    // Prologue: tile off[0] into buf0 (lane = column = chunk, 2 vectors).
+    {
+        uint w[8];
+        load_tile_chunk_regs(CHASE.tile[idx], lane, lds_table, w);
+        tile4[buf0 + lane * 2u]      = uvec4(w[0], w[1], w[2], w[3]);
+        tile4[buf0 + lane * 2u + 1u] = uvec4(w[4], w[5], w[6], w[7]);
+    }
+    memoryBarrierShared();
+    barrier();
+
+    // Two tiles in flight: the tile of step+1 sits in `pref` while step+2's load is issued, so
+    // one DRAM latency is covered by two steps of compute.
+    uint pref[8];
+    if (pc.k > 1u) {
+        load_tile_chunk_regs(CHASE.tile[1u * pc.batch + idx], lane, lds_table, pref);
+    }
+    for (uint step = 1u; step <= pc.k; ++step) {
+        const uint cur = ((step - 1u) & 1u) != 0u ? buf1 : buf0;   // step1->buf0, step2->buf1, ...
+        const uint nxt = ((step - 1u) & 1u) != 0u ? buf0 : buf1;
+        const bool has_next = step < pc.k;
+        const bool has_next2 = step + 1u < pc.k;
+        uint pref2[8];
+        if (has_next2) {
+            load_tile_chunk_regs(CHASE.tile[(step + 1u) * pc.batch + idx], lane, lds_table, pref2);
+        }
+
+        transition4(row4, cur, step, lane);
+
+        // Stage the prefetched tile into the other buffer, then one barrier: it guarantees (a)
+        // `nxt` fully written before step+1 reads it and (b) all lanes done reading `cur` before
+        // step+2 overwrites it (double-buffer).
+        if (has_next) {
+            tile4[nxt + lane * 2u]      = uvec4(pref[0], pref[1], pref[2], pref[3]);
+            tile4[nxt + lane * 2u + 1u] = uvec4(pref[4], pref[5], pref[6], pref[7]);
+        }
+        if (has_next2) {
+            [[unroll]] for (uint w = 0u; w < 8u; ++w) pref[w] = pref2[w];
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+
+    finish4(row4, strip, lane, gsub, live);
+}
+
+#else
+// ============================================================================
+// Single-phase walk (fallback when the two-phase scratch buffer is unavailable).
+// ============================================================================
+void main() {
+    const uint lid  = gl_LocalInvocationID.x;
+    const uint sub  = lid >> 5;              // sub-nonce 0..7 within the group
+    const uint lane = lid & 31u;             // state row 0..31 within the sub-nonce
+    const uint gsub = gl_WorkGroupID.x * V4_NPG + sub;
+    // Sub-nonces past the batch still execute the walk with a dummy nonce (uniform barriers —
+    // every lane must reach every workgroup barrier); they just never submit.
+    const bool live  = gsub < pc.batch;
+    const uint64_t nonce = pc.start_nonce + (live ? uint64_t(gsub) : 0UL);
+    const uint64_t seed  = seed_fold_era(nonce);
+    const uint strip = sub * V4_SP_STRIP_U32; // this sub-nonce's tile/leaves + Merkle level
+    const bool lds_table = mirror_prefix_table(lid, 256u);
+
+    uint row4[V4_D4];
+    initial_row(seed, lane, row4);
+    uint64_t off = mod_tiles(mix64(seed ^ V4_OFFSET_FIRST_SALT));
+
+    for (uint step = 1u; step <= pc.k; ++step) {
+        // Load this sub-nonce's 1 KB tile: lane loads canonical chunk (tile*32 + lane). Chunks are
+        // located individually, so a tile that straddles two tensors is gathered exactly.
+        load_chunk(off * uint64_t(V4_TILE_CHUNKS) + uint64_t(lane), strip + lane * V4_D4, lds_table);
+        memoryBarrierShared();
+        barrier();
+
+        // The final transition has no successor tile. Skip its serial snippet fold and modulo.
+        if (step < pc.k) {
+            uint64_t sf = 0UL;
+            [[unroll]] for (uint w = 0u; w < 8u; ++w) sf = mix64(sf ^ uint64_t(scratch[strip + w]));
+            off = mod_tiles(mix64(seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf));
+        }
+
+        transition(row4, strip, step, lane);
+        memoryBarrierShared();
+        barrier();   // all lanes done with the tile before step+1 overwrites it
+    }
+
+    finish(row4, strip, lane, gsub, live);
+}
+#endif

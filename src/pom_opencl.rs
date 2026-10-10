@@ -1538,9 +1538,9 @@ fn try_claim_shared(device_id: usize) -> bool {
     *SHARED_DEV.lock().unwrap() = Some(device_id);
     log::info!(
         "PoM: card {device_id:#x} ({}) mines the v4 walk over the inference engine's resident model \
-         (zero-dup, {} int8 dot) — one VRAM copy serves inference AND mining.",
+         (zero-dup, {}) — one VRAM copy serves inference AND mining.",
         device_gfx_name(device_id),
-        if crate::llama_engine_vk::pom_walk_dot() { "packed" } else { "scalar" }
+        crate::llama_engine_vk::pom_walk_kernel()
     );
     true
 }

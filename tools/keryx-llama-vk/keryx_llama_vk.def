@@ -16,6 +16,8 @@ EXPORTS
     keryx_llama_pom_fetch_range
     keryx_llama_pom_mine
     keryx_llama_pom_walk_dot
+    keryx_llama_pom_batch_max
+    keryx_llama_pom_walk_cm
     keryx_llama_pom_pci
     keryx_llama_generate
     keryx_llama_free
@@ -30,3 +32,4 @@ EXPORTS
     keryx_vk_ggml_index_to_discrete_ordinal
     keryx_vk_queue_submit
     keryx_vk_integer_dot_product
+    keryx_vk_coopmat_int8

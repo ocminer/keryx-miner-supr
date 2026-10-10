@@ -61,6 +61,8 @@ struct Engine {
     pom_mine: MineFn,
     pom_pci: PciFn,
     walk_dot: Option<ReadyFn>,
+    walk_cm: Option<ReadyFn>,
+    batch_max: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
     gpu: usize,
     gguf: String,
     /// Context the model was loaded with, and whether the library has the prompt guard — see
@@ -455,6 +457,8 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
             pom_mine: mine,
             pom_pci: pci,
             walk_dot: sym::<ReadyFn>(lib, "keryx_llama_pom_walk_dot"),
+            walk_cm: sym::<ReadyFn>(lib, "keryx_llama_pom_walk_cm"),
+            batch_max: sym::<unsafe extern "C" fn(*mut c_void) -> u32>(lib, "keryx_llama_pom_batch_max"),
             gpu: main_gpu.max(0) as usize, // -1 = auto; the actual device is read via pom_pci
             gguf: gguf.to_string(),
             n_ctx,
@@ -722,12 +726,17 @@ pub fn unload() -> bool {
     }
 }
 
-/// True when the engine's walk runs the packed int8 dot-product kernel (false = scalar fallback,
-/// or no engine).
-pub fn pom_walk_dot() -> bool {
-    let Ok(g) = engine().lock() else { return false };
-    let Some(e) = g.as_ref() else { return false };
-    e.walk_dot.map_or(false, |f| unsafe { f(e.model) })
+/// Which kernel the engine's walk runs: "matrix cores", "packed int8 dot" or "scalar int8 dot".
+pub fn pom_walk_kernel() -> &'static str {
+    let Ok(g) = engine().lock() else { return "unknown" };
+    let Some(e) = g.as_ref() else { return "unknown" };
+    if e.walk_cm.map_or(false, |f| unsafe { f(e.model) }) {
+        "matrix cores"
+    } else if e.walk_dot.map_or(false, |f| unsafe { f(e.model) }) {
+        "packed int8 dot"
+    } else {
+        "scalar int8 dot"
+    }
 }
 
 struct InflightGuard;
@@ -755,15 +764,28 @@ pub fn pom_mine_v4(
     h10: bool,
     stop: &dyn Fn() -> bool,
 ) -> Result<(Option<u64>, u64), String> {
-    let (model, mine) = {
+    let (model, mine, cap) = {
         let g = engine().lock().map_err(|_| "engine mutex poisoned".to_string())?;
         let e = g.as_ref().ok_or_else(|| "no engine loaded".to_string())?;
         // Counted under the lock: `unload` takes the same lock, then waits for zero.
         WALK_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        (e.model, e.pom_mine)
+        let cap = e.batch_max.map_or(0, |f| unsafe { f(e.model) }) as u64;
+        (e.model, e.pom_mine, cap)
     };
     let _inflight = InflightGuard;
-    let sub_max = crate::pom_opencl::v4_sub_dispatch_nonces();
+    // Nonces per engine call: the library pipelines up to four two-phase sub-batches per call
+    // (chase of the next overlapping the walk of the current), so a call covers 4 x 32768 on
+    // Linux (4 x 8192 on Windows, TDR-safe); its reported capacity bounds it. The inference pause
+    // is polled between calls. KERYX_VK_SUB_DISPATCH overrides.
+    let default_sub: u64 = if cfg!(target_os = "windows") { 32768 } else { 131072 };
+    let mut sub_max = std::env::var("KERYX_VK_SUB_DISPATCH")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n >= 8)
+        .unwrap_or(default_sub);
+    if cap != 0 {
+        sub_max = sub_max.min(cap);
+    }
     let mut done: u64 = 0;
     while done < batch {
         if done > 0 && stop() {
@@ -841,7 +863,7 @@ mod zero_dup_v4_tests {
         let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         assert!(super::ensure_loaded(&path, gpu), "engine load failed");
         assert!(super::pom_ready(), "engine walk not ready");
-        eprintln!("engine: packed int8 dot = {}", super::pom_walk_dot());
+        eprintln!("engine: walk kernel = {}", super::pom_walk_kernel());
 
         let gen = |label: &str| {
             let t0 = std::time::Instant::now();
