@@ -34,6 +34,11 @@ layout(local_size_x = 256) in;
 layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Tensor {
     uint64_t words[];
 };
+// The same bytes as two 16-byte loads (one chunk = 2 x uvec4): fewer memory instructions on the
+// latency-bound gather. The u32 order is the LE byte order, exactly the OpenCL blob's `dst[w]`.
+layout(std430, buffer_reference, buffer_reference_align = 16) readonly buffer Tensor16 {
+    uvec4 q[];
+};
 
 layout(std430, binding = 0) buffer Winner { uint offset; } OUT;
 
@@ -72,6 +77,10 @@ const uint64_t V4_OFFSET_FIRST_SALT = 0x6D1CCF96AC4D76F9UL;
 const uint64_t V4_OFFSET_STEP_SALT  = 0x89050E78D34609EFUL;
 
 shared uint scratch[V4_NPG * V4_SP_STRIP_U32];   // 12 KB
+// Prefix table mirrored into shared memory (binary-searched once per chunk per step); tables
+// larger than this stay in global memory (every current tier has < 1024 tensors).
+const uint PREFIX_LDS_MAX = 1024u;
+shared uint64_t prefix_lds[PREFIX_LDS_MAX];
 
 // SplitMix64 finalizer — identical to pom.rs mix64 (u64 * wraps).
 uint64_t mix64(uint64_t x) {
@@ -236,24 +245,30 @@ void b3_hash_pair(uint in_base, uint out_base) {
 
 // Locate canonical chunk `c` through the prefix table and return its 32 bytes as 8 LE u32 words
 // into scratch[dst_base..dst_base+8] (same u32 order as the OpenCL blob's `dst[w] = src[w]`).
-void load_chunk(uint64_t c, uint dst_base) {
+void load_chunk(uint64_t c, uint dst_base, bool lds_table) {
     uint lo = 0u, hi = pc.n_tensors; // invariant: prefix[lo] <= c < prefix[hi]
-    while (hi - lo > 1u) {
-        uint mid = (lo + hi) / 2u;
-        if (PREFIX.prefix[mid] <= c) { lo = mid; } else { hi = mid; }
+    uint64_t base;
+    if (lds_table) {
+        while (hi - lo > 1u) {
+            uint mid = (lo + hi) / 2u;
+            if (prefix_lds[mid] <= c) { lo = mid; } else { hi = mid; }
+        }
+        base = prefix_lds[lo];
+    } else {
+        while (hi - lo > 1u) {
+            uint mid = (lo + hi) / 2u;
+            if (PREFIX.prefix[mid] <= c) { lo = mid; } else { hi = mid; }
+        }
+        base = PREFIX.prefix[lo];
     }
     // Advance the buffer_reference POINTER by the 64-bit byte offset and index with small
     // constants — GLSL array subscripts are 32-bit, so the wide arithmetic must live in the
     // pointer, never the index.
-    Tensor chunk = Tensor(ADDRS.addr[lo] + (c - PREFIX.prefix[lo]) * 32UL);
-    uint64_t w0 = chunk.words[0];
-    uint64_t w1 = chunk.words[1];
-    uint64_t w2 = chunk.words[2];
-    uint64_t w3 = chunk.words[3];
-    scratch[dst_base + 0u] = uint(w0);         scratch[dst_base + 1u] = uint(w0 >> 32);
-    scratch[dst_base + 2u] = uint(w1);         scratch[dst_base + 3u] = uint(w1 >> 32);
-    scratch[dst_base + 4u] = uint(w2);         scratch[dst_base + 5u] = uint(w2 >> 32);
-    scratch[dst_base + 6u] = uint(w3);         scratch[dst_base + 7u] = uint(w3 >> 32);
+    Tensor16 chunk = Tensor16(ADDRS.addr[lo] + (c - base) * 32UL);
+    uvec4 a = chunk.q[0];
+    uvec4 b = chunk.q[1];
+    scratch[dst_base + 0u] = a.x; scratch[dst_base + 1u] = a.y; scratch[dst_base + 2u] = a.z; scratch[dst_base + 3u] = a.w;
+    scratch[dst_base + 4u] = b.x; scratch[dst_base + 5u] = b.y; scratch[dst_base + 6u] = b.z; scratch[dst_base + 7u] = b.w;
 }
 
 void main() {
@@ -268,6 +283,14 @@ void main() {
     const uint64_t seed  = seed_fold_era(nonce);
     const uint strip = sub * V4_SP_STRIP_U32; // this sub-nonce's tile/leaves + Merkle level
 
+    // Mirror the prefix table into shared memory (uniform decision per dispatch).
+    const bool lds_table = pc.n_tensors + 1u <= PREFIX_LDS_MAX;
+    if (lds_table) {
+        for (uint i = lid; i <= pc.n_tensors; i += 256u) prefix_lds[i] = PREFIX.prefix[i];
+        memoryBarrierShared();
+        barrier();
+    }
+
     // S_0 row `lane`: mix64 keystream (identical to pom_v4::v4_initial_state).
     uint row4[V4_D4];
     {
@@ -279,7 +302,7 @@ void main() {
     for (uint step = 1u; step <= pc.k; ++step) {
         // Load this sub-nonce's 1 KB tile: lane loads canonical chunk (tile*32 + lane). Chunks are
         // located individually, so a tile that straddles two tensors is gathered exactly.
-        load_chunk(off * uint64_t(V4_TILE_CHUNKS) + uint64_t(lane), strip + lane * V4_D4);
+        load_chunk(off * uint64_t(V4_TILE_CHUNKS) + uint64_t(lane), strip + lane * V4_D4, lds_table);
         memoryBarrierShared();
         barrier();
 
