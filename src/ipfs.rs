@@ -203,11 +203,32 @@ fn find_or_download_kubo() -> anyhow::Result<std::path::PathBuf> {
     let (os, arch) = detect_platform()?;
     let archive_ext = if cfg!(target_os = "windows") { "zip" } else { "tar.gz" };
     let archive_name = format!("kubo_v{}_{}-{}.{}", version, os, arch, archive_ext);
-    let url = format!("https://dist.ipfs.tech/kubo/v{}/{}", version, archive_name);
+    // GitHub releases first: dist.ipfs.tech stopped answering from many networks (connect timeout,
+    // field reports 2026-10-09 on AMD and NVIDIA rigs), and the old single-source download then hung
+    // for minutes and gave up — no kubo, no `ipfs init`, no ~/.ipfs. Same archive on both hosts.
+    let sources = [
+        format!("https://github.com/ipfs/kubo/releases/download/v{}/{}", version, archive_name),
+        format!("https://dist.ipfs.tech/kubo/v{}/{}", version, archive_name),
+    ];
     let archive_path = exe_dir.join(&archive_name);
 
     log::info!("Downloading kubo {}...", version);
-    download_file(&url, &archive_path)?;
+    let mut errors = Vec::new();
+    for url in &sources {
+        match download_file(url, &archive_path) {
+            Ok(()) => {
+                errors.clear();
+                break;
+            }
+            Err(e) => {
+                log::warn!("kubo download failed: {} — trying the next source", e);
+                errors.push(e.to_string());
+            }
+        }
+    }
+    if !errors.is_empty() {
+        anyhow::bail!("kubo download failed from every source ({})", errors.join("; "));
+    }
 
     extract_ipfs_binary(&archive_path, &exe_dir)?;
     std::fs::remove_file(&archive_path).ok();
@@ -264,18 +285,29 @@ fn detect_platform() -> anyhow::Result<(&'static str, &'static str)> {
 
 fn download_file(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
     use std::io::{Read, Write};
-    let response = ureq::get(url)
-        .timeout(Duration::from_secs(300))
-        .call()
-        .map_err(|e| anyhow::anyhow!("Download {}: {}", url, e))?;
+    // An unreachable host must fail fast (connect timeout) so the next source is tried; a slow but
+    // working link must not be cut off by a total deadline, so reads are bounded per read instead.
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(60))
+        .build();
+    let response = agent.get(url).call().map_err(|e| anyhow::anyhow!("Download {}: {}", url, e))?;
     let mut reader = response.into_reader();
-    let mut file = std::fs::File::create(dest)?;
+    // Write to a side file and rename on success: a cut-off download never leaves a truncated
+    // archive under the final name.
+    let part = dest.with_extension("part");
+    let mut file = std::fs::File::create(&part)?;
     let mut buf = vec![0u8; 65_536];
     loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 { break; }
+        let n = reader.read(&mut buf).map_err(|e| anyhow::anyhow!("Download {}: {}", url, e))?;
+        if n == 0 {
+            break;
+        }
         file.write_all(&buf[..n])?;
     }
+    file.sync_all().ok();
+    drop(file);
+    std::fs::rename(&part, dest)?;
     Ok(())
 }
 
