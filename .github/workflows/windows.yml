@@ -235,11 +235,11 @@ jobs:
           if (-not [KeryxVkSmoke]::SetDllDirectory((Get-Location).Path)) {
             throw "SetDllDirectory failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
           }
-          if ([KeryxVkSmoke]::AvxAbi() -ne 2 -or [KeryxVkSmoke]::AvxVkAbi() -ne 5 -or
-              [KeryxVkSmoke]::NoAvxAbi() -ne 2 -or [KeryxVkSmoke]::NoAvxVkAbi() -ne 5) {
+          if ([KeryxVkSmoke]::AvxAbi() -ne 2 -or [KeryxVkSmoke]::AvxVkAbi() -ne 6 -or
+              [KeryxVkSmoke]::NoAvxAbi() -ne 2 -or [KeryxVkSmoke]::NoAvxVkAbi() -ne 6) {
             throw "Vulkan sidecar ABI smoke test failed"
           }
-          Write-Host "Both Vulkan sidecars load and report core ABI 2 / Vulkan ABI 5"
+          Write-Host "Both Vulkan sidecars load and report core ABI 2 / Vulkan ABI 6"
 
       - name: Stage artifact
         shell: pwsh
