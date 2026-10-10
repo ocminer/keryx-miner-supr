@@ -574,6 +574,8 @@ impl MinerManager {
                 let mut nonces = vec![no_winner; 1];
                 #[cfg(feature = "pom-opencl")]
                 let mut shown_dedicated = false;
+                #[cfg(feature = "pom-opencl")]
+                let mut shown_host = false;
 
                 let mut state = None;
                 // AMD PoM: cap on proof-builds running concurrently on detached threads (the async
@@ -899,6 +901,16 @@ impl MinerManager {
                                 keryx_miner::runtime_stats::set_inference_dedicated_gpu(ordinal, false);
                             }
                             shown_dedicated = false;
+                        }
+                        // AMD zero-dup: this card hashes over the inference engine's resident model —
+                        // it is the inference host, shown mining with the INF badge.
+                        #[cfg(feature = "pom-opencl")]
+                        if let (Some(dev), Some(ordinal)) = (opencl_device_id, worker_ordinal) {
+                            let host = keryx_miner::pom_opencl::is_shared_inference_device(dev);
+                            if host != shown_host {
+                                keryx_miner::runtime_stats::set_inference_host_gpu(ordinal, host);
+                                shown_host = host;
+                            }
                         }
                         if let Some((_, cursor)) = pom_cursor.as_mut() {
                             cursor.commit(completed.hashes_done);

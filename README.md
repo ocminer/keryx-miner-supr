@@ -157,6 +157,16 @@ Windows AMD users should download `keryx-miner-supr-windows-amd.zip`. It include
 mining worker and both variants of the in-process Vulkan inference engine; keep every extracted
 file together and install a current AMD graphics driver. CPU inference is not used by default.
 
+**AMD: one model copy for inference and mining (zero-dup, v0.14.6).** On AMD, inference runs in
+llama.cpp (Vulkan) and the PoM walk in OpenCL, so a card that does both used to need the model
+twice. When model + walk do not fit together (for example Qwen3.5-9B on a 12 GB RX 6700 XT), the
+miner reserves one card for inference and that card now **mines over the engine's resident copy**
+through a Vulkan v4 walk kernel — after a startup byte gate that proves the gather path returns the
+exact model bytes. It is shown MINING with the `[INF]` badge. Cards where both fit keep the OpenCL
+walk (fastest). `KERYX_ZERO_DUP=force` makes every engine-hosted card use the Vulkan walk,
+`KERYX_ZERO_DUP=off` restores the inference-only reservation. RDNA1 (RX 5600/5700) never uses it
+(driver hang on buffer-address reads).
+
 **GTX 1080 Ti / Pascal notes.** Validated on a real 1080 Ti (sm_61, driver 550): the PoM walk is
 byte-exact (host↔GPU lockstep + H10 seed tests pass), pool shares are accepted, and solo mining
 against keryxd v1.5.7 produced blocks the node accepted. Measured ~0.457 MH/s at ~249 W on the
@@ -465,6 +475,7 @@ At startup the miner logs which mode is active: `PoM resident tree: ON` or `PoM 
 | Variable | Default | Effect |
 |---|---|---|
 | `KERYX_INFERENCE_GPU` | auto | Pin OPoI inference to a specific CUDA ordinal (see note in *Automatic per-card selection*). |
+| `KERYX_ZERO_DUP` | auto | AMD only. `force`: every card hosting the inference model mines through the Vulkan zero-dup walk instead of its own OpenCL blob; `off`: a reserved inference card stays inference-only; unset: zero-dup exactly on the reserved card (model + walk do not fit together). |
 | `KERYX_RESIDENT_TREE=1` | off | Back-compat equivalent of `--resident-tree` (the CLI flag is preferred; `--no-resident-tree` overrides it). |
 
 ## Roadmap

@@ -1986,15 +1986,18 @@ mod tests {
         let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         assert!(crate::llama_engine_vk::ensure_loaded(&path, gpu), "engine load failed");
         assert!(crate::llama_engine_vk::pom_ready(), "walk not ready");
-        let p = pph_words_for_era(&blake(b"bench-llama-vk"), false);
+        let pph = blake(b"bench-llama-vk");
+        let p = pph_words_for_era(&pph, true);
+        let s = pph_words(&seed_h14_pph(&pph)); // H14 era (production)
         let t = [0u64; 4]; // impossible target -> full grind, no early exit
-        let batch: u64 = 1 << 21;
+        let batch: u64 = 1 << 16;
+        let never = || false;
         // warmup
-        let _ = crate::llama_engine_vk::pom_mine(p, p, 1_700_000_000, t, 0, batch, false);
+        let _ = crate::llama_engine_vk::pom_mine_v4(p, s, 1_700_000_000, t, 0, batch, true, &never);
         let start = std::time::Instant::now();
         let rounds: u64 = 8;
         for i in 0..rounds {
-            let _ = crate::llama_engine_vk::pom_mine(p, p, 1_700_000_000, t, i * batch, batch, false);
+            let _ = crate::llama_engine_vk::pom_mine_v4(p, s, 1_700_000_000, t, i * batch, batch, true, &never);
         }
         let secs = start.elapsed().as_secs_f64();
         eprintln!(

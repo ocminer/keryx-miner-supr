@@ -44,16 +44,11 @@ unsafe fn install_native_log_bridge(lib: &'static Library) -> bool {
 }
 
 const ABI: c_int = 2;
-const VK_ABI: c_int = 5; // bumped 4->5 at H5.1: keryx_llama_pom_mine gained the seed-words arg
+const VK_ABI: c_int = 6; // 5->6: keryx_llama_pom_mine is the PoM v4 walk (tiles, h10 era flag)
 
-/// Max nonces per engine dispatch (ascending sub-batches, early exit on the first winner =
-/// identical lowest-nonce semantics). Linux has no desktop TDR watchdog, so 2^20 quarters the
-/// submit+fence overhead and remains ~120 ms on an MI60-class card. Windows retains the OpenCL
-/// driver's conservative 2^18 bound so a slow card cannot trip WDDM timeout detection.
-#[cfg(not(target_os = "windows"))]
-const SUB_DISPATCH_NONCES: u64 = 1 << 20;
-#[cfg(target_os = "windows")]
-const SUB_DISPATCH_NONCES: u64 = 1 << 18;
+/// Walk dispatches in flight outside the engine mutex (see `pom_mine_v4`): `unload` must not free
+/// the model while one is running.
+static WALK_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 struct Engine {
     model: *mut c_void,
@@ -65,6 +60,7 @@ struct Engine {
     pom_fetch: FetchFn,
     pom_mine: MineFn,
     pom_pci: PciFn,
+    walk_dot: Option<ReadyFn>,
     gpu: usize,
     gguf: String,
     /// Context the model was loaded with, and whether the library has the prompt guard — see
@@ -458,6 +454,7 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
             pom_fetch: fetch,
             pom_mine: mine,
             pom_pci: pci,
+            walk_dot: sym::<ReadyFn>(lib, "keryx_llama_pom_walk_dot"),
             gpu: main_gpu.max(0) as usize, // -1 = auto; the actual device is read via pom_pci
             gguf: gguf.to_string(),
             n_ctx,
@@ -516,20 +513,55 @@ pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
         return None;
     }
     out.truncate(n as usize);
-    String::from_utf8(out).ok()
+    Some(utf8_complete_prefix(out))
+}
+
+/// Generation stops at a token budget, and a multi-byte UTF-8 character can be split across the
+/// last token boundary (byte-level BPE pieces). Rejecting the whole answer for that (the old
+/// `String::from_utf8(..)`) turned a valid reply into "generate failed" — on AMD every pool probe
+/// whose answer was cut mid-character withdrew the model. Keep the longest valid prefix instead;
+/// any invalid byte inside the text (never expected) is replaced, not fatal. Mirrors the CUDA
+/// engine's helper.
+fn utf8_complete_prefix(buf: Vec<u8>) -> String {
+    match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => {
+            let incomplete_tail = e.utf8_error().error_len().is_none();
+            let valid = e.utf8_error().valid_up_to();
+            log::info!(
+                "llama-vk engine: answer ended {} at byte {valid} — keeping the valid prefix",
+                if incomplete_tail { "inside a multi-byte character" } else { "with an invalid byte" }
+            );
+            let mut bytes = e.into_bytes();
+            if incomplete_tail {
+                bytes.truncate(valid);
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
 }
 
 pub fn generate_for(gguf: &str, prompt: &str, max_tokens: usize) -> Result<String, crate::slm::GenerateError> {
     use crate::slm::GenerateError;
-    let g = engine().lock().map_err(|_| GenerateError::Failed)?;
-    let e = g.as_ref().ok_or(GenerateError::Failed)?;
+    let g = engine().lock().map_err(|_| {
+        log::error!("llama-vk engine: engine mutex poisoned — generation refused");
+        GenerateError::Failed
+    })?;
+    let Some(e) = g.as_ref() else {
+        log::warn!("llama-vk engine: no engine loaded — generation refused");
+        return Err(GenerateError::Failed);
+    };
     if e.gguf != gguf {
+        log::warn!("llama-vk engine: resident model {} != requested {gguf} — generation refused", e.gguf);
         return Err(GenerateError::Failed);
     }
     if prompt.len() > crate::slm::MAX_INFERENCE_PROMPT_BYTES || !prompt_allowed(e, prompt) {
         return Err(GenerateError::PromptTooLong);
     }
-    let cp = CString::new(prompt).map_err(|_| GenerateError::Failed)?;
+    let cp = CString::new(prompt).map_err(|_| {
+        log::warn!("llama-vk engine: prompt contains a NUL byte — generation refused");
+        GenerateError::Failed
+    })?;
     let cap: usize = 65536;
     let mut out = vec![0u8; cap];
     let n = unsafe {
@@ -544,10 +576,11 @@ pub fn generate_for(gguf: &str, prompt: &str, max_tokens: usize) -> Result<Strin
         return Err(GenerateError::PromptTooLong);
     }
     if n < 0 {
+        log::warn!("llama-vk engine: generate returned {n} for a {}-byte prompt (max_tokens {max_tokens})", prompt.len());
         return Err(GenerateError::Failed);
     }
     out.truncate(n as usize);
-    String::from_utf8(out).map_err(|_| GenerateError::Failed)
+    Ok(utf8_complete_prefix(out))
 }
 
 /// The engine hosts a gather-ready walk (BDA available, table built).
@@ -664,6 +697,19 @@ pub fn unload() -> bool {
             );
             return true;
         }
+        // A zero-dup walk dispatch may still be running outside the mutex (it polls the inference
+        // pause between sub-dispatches, so this is bounded by one sub-dispatch). Never free under it.
+        let wait = std::time::Instant::now();
+        while WALK_INFLIGHT.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            if wait.elapsed() > std::time::Duration::from_secs(60) {
+                log::error!(
+                    "llama-vk engine: a zero-dup walk dispatch did not finish within 60 s — NOT freeing \
+                     the engine (objects leaked deliberately rather than freed under a running dispatch)."
+                );
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         unsafe { (e.free)(e.model) };
         crate::pom_opencl::release_inprocess_vulkan_dedication();
         log::warn!(
@@ -676,35 +722,211 @@ pub fn unload() -> bool {
     }
 }
 
-pub fn pom_mine(
+/// True when the engine's walk runs the packed int8 dot-product kernel (false = scalar fallback,
+/// or no engine).
+pub fn pom_walk_dot() -> bool {
+    let Ok(g) = engine().lock() else { return false };
+    let Some(e) = g.as_ref() else { return false };
+    e.walk_dot.map_or(false, |f| unsafe { f(e.model) })
+}
+
+struct InflightGuard;
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        WALK_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Grind `batch` PoM v4 nonces from `nonce_base` over the engine-resident weights, in TDR-safe
+/// sub-dispatches (ascending, early exit on the first winning sub-batch — identical semantics to
+/// `PomMiner::mine_v4`). `p`/`s` are the POW/SEED pph words for the era (host-salted exactly like
+/// the OpenCL path), `t` the LE target words, `h10` selects the one-way H10/H14 seed. `stop()` is
+/// polled between sub-dispatches (the inference pause); the grind then returns the work completed
+/// so far. The engine mutex is NOT held across the dispatches, so an OPoI generation never waits
+/// for a whole batch: the wrapper serializes walk/generate on the device itself.
+/// Ok((lowest winning nonce, hashes_done)).
+pub fn pom_mine_v4(
     p: [u64; 4],
     s: [u64; 4],
     time: u64,
     t: [u64; 4],
     nonce_base: u64,
     batch: u64,
-    walk_v2: bool,
-) -> Option<u64> {
-    let g = engine().lock().ok()?;
-    let e = g.as_ref()?;
-    let wv2: u32 = walk_v2 as u32; // H5 era flag -> shader push-constant (v1 fold vs mix64-chain)
+    h10: bool,
+    stop: &dyn Fn() -> bool,
+) -> Result<(Option<u64>, u64), String> {
+    let (model, mine) = {
+        let g = engine().lock().map_err(|_| "engine mutex poisoned".to_string())?;
+        let e = g.as_ref().ok_or_else(|| "no engine loaded".to_string())?;
+        // Counted under the lock: `unload` takes the same lock, then waits for zero.
+        WALK_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        (e.model, e.pom_mine)
+    };
+    let _inflight = InflightGuard;
+    let sub_max = crate::pom_opencl::v4_sub_dispatch_nonces();
     let mut done: u64 = 0;
     while done < batch {
-        let sub = (batch - done).min(SUB_DISPATCH_NONCES) as u32;
+        if done > 0 && stop() {
+            break;
+        }
+        let sub = (batch - done).min(sub_max) as u32;
         let base = nonce_base.wrapping_add(done);
         let r = unsafe {
-            // p = POW words, s = SEED words (H5.1-salted at/after gate; == p pre-H5.1)
-            (e.pom_mine)(e.model, p.as_ptr(), s.as_ptr(), t.as_ptr(), time, base, sub, crate::pom::POM_WALK_STEPS, wv2)
+            (mine)(model, p.as_ptr(), s.as_ptr(), t.as_ptr(), time, base, sub, crate::pom::POM_WALK_STEPS, h10 as u32)
         };
         match r {
-            -2 => {
-                log::warn!("llama-vk engine: walk dispatch failed — no result for this batch.");
-                return None;
-            }
+            -2 => return Err("walk dispatch failed".to_string()),
             -1 => {}
-            off => return Some(base.wrapping_add(off as u64)),
+            off => return Ok((Some(base.wrapping_add(off as u64)), done + sub as u64)),
         }
         done += sub as u64;
     }
-    None
+    Ok((None, done))
+}
+
+/// GPU byte-exactness gate for the zero-dup v4 walk (ignored: needs an AMD/Vulkan GPU, the
+/// sidecar and a real GGUF). Loads the engine on `KERYX_TEST_GGUF` (copy the model to a private
+/// directory first — the possession tree is cached next to it), builds the host possession index
+/// from the same file, runs the startup byte gate plus a random-chunk sweep, then checks that the
+/// engine's lowest-winning nonce equals the CPU reference argmin for all three seed eras (pre-H10
+/// v4 fold, H10 PowHash, H14 tagged PowHash) and that a target below the minimum yields no winner.
+/// Run once per kernel variant: KERYX_VK_WALK_DOT=1 (packed int8 dot) and =0 (scalar).
+///   KERYX_LLAMA_VK_SO=<libkeryx-llama-vk.so> KERYX_TEST_GGUF=<model.gguf> [KERYX_LLAMA_VK_DEVICE=n]
+///   cargo test --release --features pom-opencl --lib vk_zero_dup_v4 -- --ignored --nocapture
+#[cfg(all(test, any(unix, windows)))]
+mod zero_dup_v4_tests {
+    use crate::pom::{self, WeightIndex};
+    use crate::pom_v4::{
+        fold64, v4_first_offset, v4_initial_state, v4_next_offset, v4_state_root, v4_transition_into, POM_V4_K,
+        POM_V4_TILE_BYTES, POM_V4_TILE_CHUNKS,
+    };
+
+    /// CPU re-walk of one seed to its `final_state` (pom_v4 primitives — the consensus mirror).
+    fn cpu_v4_final(index: &WeightIndex, seed: u64) -> u64 {
+        let n_tiles = index.n_chunks / POM_V4_TILE_CHUNKS;
+        let mut state = v4_initial_state(seed);
+        let mut next = vec![0u8; state.len()];
+        let mut tile = vec![0u8; POM_V4_TILE_BYTES];
+        let mut off = v4_first_offset(seed, n_tiles);
+        for step in 1..=POM_V4_K as u64 {
+            index.read_chunks_into(off * POM_V4_TILE_CHUNKS, &mut tile);
+            if step < POM_V4_K as u64 {
+                off = v4_next_offset(seed, step, tile[..32].try_into().unwrap(), n_tiles);
+            }
+            v4_transition_into(&mut next, &state, &tile, step as u32);
+            std::mem::swap(&mut state, &mut next);
+        }
+        fold64(&v4_state_root(&state))
+    }
+
+    fn le_le(a: &[u8; 32], b: &[u8; 32]) -> bool {
+        for k in (0..4).rev() {
+            let wa = u64::from_le_bytes(a[k * 8..k * 8 + 8].try_into().unwrap());
+            let wb = u64::from_le_bytes(b[k * 8..k * 8 + 8].try_into().unwrap());
+            if wa != wb {
+                return wa < wb;
+            }
+        }
+        true
+    }
+
+    fn words(b: &[u8; 32]) -> [u64; 4] {
+        std::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()))
+    }
+
+    #[test]
+    #[ignore]
+    fn vk_zero_dup_v4_matches_cpu_reference() {
+        let path = std::env::var("KERYX_TEST_GGUF").expect("set KERYX_TEST_GGUF");
+        let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        assert!(super::ensure_loaded(&path, gpu), "engine load failed");
+        assert!(super::pom_ready(), "engine walk not ready");
+        eprintln!("engine: packed int8 dot = {}", super::pom_walk_dot());
+
+        let gen = |label: &str| {
+            let t0 = std::time::Instant::now();
+            let r = super::generate_for(&path, "Reply with the single word pong.", 32);
+            eprintln!("generate ({label}): {:?} in {:.2}s", r.as_ref().map(|s| s.trim().chars().take(40).collect::<String>()), t0.elapsed().as_secs_f64());
+            assert!(r.is_ok(), "generation failed ({label})");
+        };
+        gen("before walk");
+        let index = WeightIndex::build_from_gguf(&path, [0x5au8; 32]).expect("WeightIndex::build_from_gguf");
+        eprintln!("index: N = {} chunks, {} tiles", index.n_chunks, index.n_chunks / POM_V4_TILE_CHUNKS);
+        assert!(super::pom_byte_gate(&index), "byte gate failed");
+
+        // Random-chunk sweep through the exact gather path (beyond the gate's evenly spaced samples).
+        {
+            let g = super::engine().lock().unwrap();
+            let e = g.as_ref().unwrap();
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            for _ in 0..8192 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let off = x % index.n_chunks;
+                let mut got = [0u8; 32];
+                assert!(unsafe { (e.pom_fetch)(e.model, off, got.as_mut_ptr()) }, "fetch dispatch failed");
+                assert_eq!(got, index.read_chunk_bytes(off), "chunk {off} differs from the GGUF");
+            }
+        }
+        eprintln!("random sweep: 8192 chunks byte-identical");
+
+        let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(23).wrapping_add(5));
+        let time: u64 = 0x0123_4567_89AB_CDEF;
+        let nn: u64 = std::env::var("KERYX_TEST_NONCES").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+        let p = pom::pph_words_for_era(&pph, true);
+        let never = || false;
+        for (h10, h14, name) in [(false, false, "pre-H10"), (true, false, "H10"), (true, true, "H14")] {
+            let t0 = std::time::Instant::now();
+            let mut best: Option<([u8; 32], u64)> = None;
+            for nonce in 0..nn {
+                let seed = if h14 {
+                    pom::pom_block_seed_h14(&pph, time, nonce)
+                } else if h10 {
+                    pom::pom_block_seed_h10(&pph, time, nonce)
+                } else {
+                    pom::pom_block_seed_v4(&pph, time, nonce)
+                };
+                let pv = pom::pom_pow_value(cpu_v4_final(&index, seed), &pph, true);
+                if best.map_or(true, |(b, _)| le_le(&pv, &b)) {
+                    best = Some((pv, nonce));
+                }
+            }
+            let (target, w_cpu) = best.unwrap();
+            eprintln!("[{name}] cpu argmin nonce = {w_cpu} ({} nonces in {:.1}s)", nn, t0.elapsed().as_secs_f64());
+            let s = if h14 {
+                pom::pph_words(&pom::seed_h14_pph(&pph))
+            } else if h10 {
+                pom::pph_words(&pph)
+            } else {
+                pom::pph_words_v4(&pph)
+            };
+            let t = words(&target);
+            let t0 = std::time::Instant::now();
+            let (w_gpu, done) = super::pom_mine_v4(p, s, time, t, 0, nn, h10, &never).expect("engine grind");
+            eprintln!("[{name}] gpu winner = {w_gpu:?} ({done} nonces counted, {:.2}s)", t0.elapsed().as_secs_f64());
+            assert_eq!(w_gpu, Some(w_cpu), "[{name}] zero-dup v4 winner mismatch");
+            // Below the minimum: no nonce may qualify (false-positive check).
+            let mut below = target;
+            let mut k = 0;
+            while k < 32 {
+                if below[k] > 0 {
+                    below[k] -= 1;
+                    break;
+                }
+                below[k] = 0xff;
+                k += 1;
+            }
+            assert!(k < 32, "target underflow");
+            let (w_none, _) = super::pom_mine_v4(p, s, time, words(&below), 0, nn, h10, &never).expect("engine grind");
+            assert_eq!(w_none, None, "[{name}] winner below the minimum pow value");
+            eprintln!("[{name}] OK");
+            gen("after walk");
+        }
+        // A longer grind (sub-dispatch loop) followed by generation — the production interleaving.
+        let s = pom::pph_words(&pom::seed_h14_pph(&pph));
+        let (_, done) = super::pom_mine_v4(p, s, time, [0u64; 4], 0, 1 << 16, true, &never).expect("engine grind");
+        eprintln!("full grind: {done} nonces");
+        gen("after 64k grind");
+    }
 }

@@ -321,3 +321,17 @@ extern "C" void keryx_vk_queue_submit(size_t dev_num, const void * submit_info, 
     dev->compute_queue.queue.submit({ *reinterpret_cast<const vk::SubmitInfo *>(submit_info) },
                                     vk::Fence((VkFence) fence));
 }
+
+// True when ggml enabled VK_KHR_shader_integer_dot_product on this device (the walk's packed
+// int8 dot-product kernel declares that SPIR-V capability; it is only legal on such a device).
+extern "C" bool keryx_vk_integer_dot_product(size_t dev_num) {
+    try {
+        if (dev_num >= vk_instance.device_indices.size()) {
+            return false;
+        }
+        vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
+        return dev->integer_dot_product;
+    } catch (...) {
+        return false;
+    }
+}

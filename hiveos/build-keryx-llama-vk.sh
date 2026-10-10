@@ -70,6 +70,7 @@ docker run --rm \
     # Our walk/fetch shaders -> SPIR-V as C initializer lists the wrapper #includes.
     G=/tmp/kvk-gen && mkdir -p $G
     glslc --target-env=vulkan1.2 -O -mfmt=c -o $G/pom_walk_vk.spv.inc  /repo/tools/keryx-llama/pom_walk_vk.comp
+    glslc --target-env=vulkan1.2 -O -DUSE_DOT=1 -mfmt=c -o $G/pom_walk_dot_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
     glslc --target-env=vulkan1.2 -O -mfmt=c -o $G/pom_fetch_vk.spv.inc /repo/tools/keryx-llama/pom_fetch_vk.comp
 
     g++ -O2 -std=c++17 -shared -fPIC -fopenmp /repo/tools/keryx-llama/keryx_llama_vk.cpp \

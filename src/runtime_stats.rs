@@ -126,6 +126,9 @@ pub struct MiningSnapshot {
     /// Cards reserved for inference because model and PoM walk cannot share their VRAM (AMD
     /// 16 GB cards on the default tier). They do not mine by design; not counted as AI pause.
     pub inference_dedicated_gpus: Vec<u32>,
+    /// Cards that host the inference model AND mine over that single resident copy (AMD zero-dup).
+    /// Shown as mining with the INF badge.
+    pub inference_host_gpus: Vec<u32>,
     pub total_hashrate_hs: f64,
     pub average_60s_hs: Option<f64>,
     pub hashrate_history_hs: Vec<f64>,
@@ -362,6 +365,7 @@ struct RuntimeStats {
     inference_pause_total_ms: AtomicU64,
     inference_pauses: Mutex<std::collections::BTreeMap<Option<usize>, usize>>,
     inference_dedicated: Mutex<std::collections::BTreeSet<u32>>,
+    inference_hosts: Mutex<std::collections::BTreeSet<u32>>,
     inference_serveable_models: AtomicU64,
     inference_staging_error: AtomicBool,
 
@@ -471,6 +475,7 @@ impl RuntimeStats {
             inference_pause_total_ms: AtomicU64::new(0),
             inference_pauses: Mutex::new(std::collections::BTreeMap::new()),
             inference_dedicated: Mutex::new(std::collections::BTreeSet::new()),
+            inference_hosts: Mutex::new(std::collections::BTreeSet::new()),
             inference_serveable_models: AtomicU64::new(0),
             inference_staging_error: AtomicBool::new(false),
             escrow_enabled: AtomicBool::new(false),
@@ -988,6 +993,17 @@ pub fn set_inference_dedicated_gpu(index: u32, dedicated: bool) {
     }
 }
 
+/// Mark (or clear) a card as the inference host that ALSO mines over the resident model
+/// (zero-dup): it keeps its hashrate and carries the INF badge.
+pub fn set_inference_host_gpu(index: u32, host: bool) {
+    let mut set = hub().inference_hosts.lock().unwrap_or_else(|p| p.into_inner());
+    if host {
+        set.insert(index);
+    } else {
+        set.remove(&index);
+    }
+}
+
 pub fn inference_pause_started() {
     update_inference_pause(None, true);
 }
@@ -1350,6 +1366,11 @@ pub fn try_snapshot() -> Option<Snapshot> {
                 .lock()
                 .map(|set| set.iter().copied().collect())
                 .unwrap_or_default(),
+            inference_host_gpus: stats
+                .inference_hosts
+                .lock()
+                .map(|set| set.iter().copied().collect())
+                .unwrap_or_default(),
             total_hashrate_hs: f64::from_bits(stats.total_hashrate_bits.load(Ordering::Relaxed)),
             average_60s_hs,
             hashrate_history_hs: recent_rates,
@@ -1473,6 +1494,17 @@ mod tests {
     // Serialize only those cases so one test's best-effort snapshot lock cannot make another test's
     // deliberately non-blocking event publication look as though production attribution failed.
     static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn inference_host_card_is_listed_separately_from_reserved_cards() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        super::set_inference_host_gpu(3, true);
+        let snapshot = read_snapshot();
+        assert_eq!(snapshot.mining.inference_host_gpus, vec![3]);
+        assert!(!snapshot.mining.inference_dedicated_gpus.contains(&3));
+        super::set_inference_host_gpu(3, false);
+        assert!(read_snapshot().mining.inference_host_gpus.is_empty());
+    }
 
     #[test]
     fn device_pause_preserves_peer_status_and_nested_accounting() {

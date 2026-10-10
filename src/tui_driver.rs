@@ -843,7 +843,11 @@ fn adapt_snapshot(snapshot: runtime::Snapshot, clocks: &mut ClockBaselines) -> U
             // need not match the OpenCL worker index shown here; trusting it alongside the reserved
             // card labelled a second, still-mining card INF on every request (field report: 3x RX
             // 6700 XT 12 GB showing two INF cards).
-            let inference_host = if snapshot.mining.inference_dedicated_gpus.is_empty() {
+            // A zero-dup card (hosts the model and mines over it) is the host too, and keeps its
+            // hashrate: MINING with the INF badge.
+            let inference_host = if !snapshot.mining.inference_host_gpus.is_empty() {
+                snapshot.mining.inference_host_gpus.contains(&device.index)
+            } else if snapshot.mining.inference_dedicated_gpus.is_empty() {
                 inference_gpu == Some(device.index)
             } else {
                 snapshot.mining.inference_dedicated_gpus.contains(&device.index)
@@ -1229,6 +1233,30 @@ mod tests {
         assert_eq!(view.devices[0].activity, crate::tui::DeviceActivity::Mining);
         assert_eq!(view.devices[1].activity, crate::tui::DeviceActivity::Mining);
         assert_eq!(view.devices[2].activity, crate::tui::DeviceActivity::Inference);
+    }
+
+    #[test]
+    fn zero_dup_card_mines_and_carries_the_inf_badge() {
+        // AMD 12 GB rig: GPU2 hosts the inference model AND mines over it (zero-dup). It is the
+        // inference host (INF badge) but shown MINING with its hashrate, not as a reserved card.
+        // The router's own card numbering (0) must not label a second card.
+        let mut snapshot = runtime::Snapshot::default();
+        snapshot.connection = runtime::ConnectionState::Connected;
+        snapshot.mining.inference_host_gpus = vec![2];
+        snapshot.inference.gpu_index = Some(0);
+        snapshot.mining.devices = (0..3)
+            .map(|index| runtime::DeviceSnapshot { index, hashrate_hs: 497_000.0, ..Default::default() })
+            .collect();
+        let view = super::adapt_snapshot(snapshot.clone(), &mut super::ClockBaselines::default());
+        let hosts: Vec<u32> = view.devices.iter().filter(|d| d.inference_host).map(|d| d.index).collect();
+        assert_eq!(hosts, vec![2]);
+        assert!(view.devices.iter().all(|d| d.activity == crate::tui::DeviceActivity::Mining));
+        // While a request is served every AMD walk pauses: the host shows INFERENCE, the rest PAUSED.
+        snapshot.mining.inference_paused = true;
+        snapshot.inference.active = 1;
+        let view = super::adapt_snapshot(snapshot, &mut super::ClockBaselines::default());
+        assert_eq!(view.devices[2].activity, crate::tui::DeviceActivity::Inference);
+        assert_eq!(view.devices[0].activity, crate::tui::DeviceActivity::Paused);
     }
 
     #[test]

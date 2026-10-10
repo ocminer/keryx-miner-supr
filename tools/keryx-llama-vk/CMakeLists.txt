@@ -42,11 +42,20 @@ add_subdirectory(${LLAMA_SRC} llama-build)
 set(KERYX_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/keryx-shaders")
 file(MAKE_DIRECTORY "${KERYX_SHADER_DIR}")
 set(KERYX_WALK_SPV  "${KERYX_SHADER_DIR}/pom_walk_vk.spv.inc")
+set(KERYX_WALK_DOT_SPV "${KERYX_SHADER_DIR}/pom_walk_dot_vk.spv.inc")
 set(KERYX_FETCH_SPV "${KERYX_SHADER_DIR}/pom_fetch_vk.spv.inc")
 add_custom_command(
   OUTPUT "${KERYX_WALK_SPV}"
   COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -mfmt=c
           -o "${KERYX_WALK_SPV}" "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_walk_vk.comp"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_walk_vk.comp"
+  VERBATIM)
+# Same v4 walk source with the packed int8 dot-product extension (selected at load time when ggml
+# enabled VK_KHR_shader_integer_dot_product on the device).
+add_custom_command(
+  OUTPUT "${KERYX_WALK_DOT_SPV}"
+  COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -DUSE_DOT=1 -mfmt=c
+          -o "${KERYX_WALK_DOT_SPV}" "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_walk_vk.comp"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_walk_vk.comp"
   VERBATIM)
 add_custom_command(
@@ -55,7 +64,7 @@ add_custom_command(
           -o "${KERYX_FETCH_SPV}" "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_fetch_vk.comp"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_fetch_vk.comp"
   VERBATIM)
-add_custom_target(keryx-pom-vk-shaders DEPENDS "${KERYX_WALK_SPV}" "${KERYX_FETCH_SPV}")
+add_custom_target(keryx-pom-vk-shaders DEPENDS "${KERYX_WALK_SPV}" "${KERYX_WALK_DOT_SPV}" "${KERYX_FETCH_SPV}")
 
 add_library(keryx-llama-vk SHARED "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/keryx_llama_vk.cpp")
 add_dependencies(keryx-llama-vk keryx-pom-vk-shaders)

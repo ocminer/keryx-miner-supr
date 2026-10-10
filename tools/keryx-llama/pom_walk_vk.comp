@@ -1,19 +1,32 @@
 #version 460
-// Keryx Proof-of-Model walk — Vulkan compute, ZERO-DUP variant: gathers the K data-dependent
-// 32-byte chunk reads DIRECTLY over the inference engine's resident weight tensors (reached by
-// buffer device address through a per-tensor prefix table) instead of a miner-owned blob copy.
+// Keryx Proof-of-Model v4 walk — Vulkan compute, ZERO-DUP variant: the K data-dependent 1 KB tile
+// reads go DIRECTLY to the inference engine's resident weight tensors (reached by buffer device
+// address through a per-tensor prefix table) instead of a miner-owned OpenCL blob copy. One AMD
+// card can therefore host the model for inference AND mine over it (model + walk no longer need
+// twice the VRAM).
 //
-// BYTE-IDENTICAL math to plugins/opencl/resources/pom_mine.cl and src/pom.rs (mix64 folds,
-// pom_block_seed, pom_pow_value, le_leq — the consensus verifier re-executes exactly this).
+// BYTE-IDENTICAL math to plugins/opencl/resources/pom_mine.cl (pom_mine_v4) and src/pom_v4.rs
+// (the host proof builder / consensus mirror): v4 seed folds (reversible v4 fold or the H10/H14
+// one-way cSHAKE256 PowHash), S_0 keystream, snippet-folded offset chain, 32x32 int8 state
+// transition with rho8, blake3 row leaves + depth-5 Merkle root, fold64, pom_pow_value, le_leq.
 // The host proves the gather path byte-exact against the possession index before mining is
-// allowed (startup byte gate through pom_fetch_vk.comp).
+// allowed (startup byte gate through pom_fetch_vk.comp), and rebuilds every winner host-side.
 //
-// One invocation = one nonce. Winner = lowest in-dispatch offset via atomicMin (host resets to
-// 0xFFFFFFFF per sub-dispatch; ascending sub-dispatches preserve lowest-nonce semantics).
+// Layout mirrors the OpenCL kernel: 256-thread workgroups of 8 sub-nonces x 32 lanes; lane x owns
+// state row x; each sub-nonce has a 384-word shared strip (1 KB tile / blake3 leaves + the largest
+// Merkle level). Winner = lowest batch-relative index via atomicMin (host resets to 0xFFFFFFFF per
+// sub-dispatch; ascending sub-dispatches preserve lowest-nonce semantics).
+//
+// USE_DOT (compile-time): int8 dot products through GL_EXT_integer_dot_product (v_dot4_i32_i8 on
+// RDNA2+/CDNA). Without it the scalar unpack path is used. Both are bit-identical (the int8 dots
+// cannot overflow i32 at this depth).
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_buffer_reference : require
+#ifdef USE_DOT
+#extension GL_EXT_integer_dot_product : require
+#endif
 
-layout(local_size_x = 64) in;
+layout(local_size_x = 256) in;
 
 // A resident weight tensor's bytes as LE u64 words, reached by device address. Canonical chunk
 // c inside tensor j = words [ (c - prefix[j])*4 .. +4 ] at addr[j] (raw GGUF quant bytes,
@@ -35,19 +48,32 @@ layout(std430, binding = 2) readonly buffer Addrs {
 } ADDRS;
 
 layout(push_constant) uniform Push {
-    uint64_t p0, p1, p2, p3;   // POW-fold pph words (H3-salted), 4 LE u64
-    uint64_t s0, s1, s2, s3;   // SEED-fold pph words (H5.1-salted at/after gate; == p pre-H5.1)
+    uint64_t p0, p1, p2, p3;   // POW-fold pph words (H3-salted)
+    uint64_t s0, s1, s2, s3;   // SEED-fold pph words (v4-salted pre-H10; RAW at H10; H14-tagged RAW at H14)
     uint64_t t0, t1, t2, t3;   // target (256-bit LE) as 4 u64
     uint64_t timestamp;
-    uint64_t n_chunks;
+    uint64_t n_tiles;          // n_chunks / 32
     uint64_t start_nonce;
-    uint     k;                // POM_WALK_STEPS (256)
+    uint     k;                // walk steps (256)
     uint     batch;            // nonces in this dispatch
     uint     n_tensors;
-    uint     walk_v2;          // H5 era flag: 0 = frozen v1 fold, 1 = non-foldable mix64-chain
+    uint     h10;              // 0 = reversible v4 seed fold; 1 = one-way H10/H14 PowHash seed
 } pc;
 
-// SplitMix64 finalizer — exactly pom.rs mix64 (u64 * wraps).
+const uint V4_D = 32u;
+const uint V4_D4 = 8u;                 // uints per row/column (32 bytes)
+const uint V4_TILE_CHUNKS = 32u;
+const uint V4_TILE_U32 = 256u;         // 1 KB tile as u32 words
+const uint V4_SP_STRIP_U32 = 384u;     // tile/leaves [0..255] + largest Merkle level [256..383]
+const uint V4_NPG = 8u;                // sub-nonces per 256-thread workgroup
+
+const uint64_t V4_S0_ROW_SALT       = 0x03421325594C3C51UL;
+const uint64_t V4_OFFSET_FIRST_SALT = 0x6D1CCF96AC4D76F9UL;
+const uint64_t V4_OFFSET_STEP_SALT  = 0x89050E78D34609EFUL;
+
+shared uint scratch[V4_NPG * V4_SP_STRIP_U32];   // 12 KB
+
+// SplitMix64 finalizer — identical to pom.rs mix64 (u64 * wraps).
 uint64_t mix64(uint64_t x) {
     x ^= x >> 30;
     x *= 0xbf58476d1ce4e5b9UL;
@@ -57,76 +83,260 @@ uint64_t mix64(uint64_t x) {
     return x;
 }
 
-// Read + fold canonical chunk `off`: binary-search the prefix table for the owning tensor
-// (table is tiny -> cache-resident; the walk is memory-latency-bound on the chunk read itself).
-uint64_t step_state(uint64_t state, uint64_t off) {
-    uint lo = 0u, hi = pc.n_tensors; // invariant: prefix[lo] <= off < prefix[hi]
+// Block seed fold (pre-H10) — identical to pom.rs pom_block_seed_v4 (host passes v4-salted words).
+uint64_t seed_fold_v4(uint64_t nonce) {
+    uint64_t s = mix64(nonce ^ 0x4B65727978531UL);
+    s = mix64(s ^ pc.timestamp);
+    s = mix64(s ^ pc.s0);
+    s = mix64(s ^ pc.s1);
+    s = mix64(s ^ pc.s2);
+    s = mix64(s ^ pc.s3);
+    return s;
+}
+
+// ---- H10 one-way seed: seed = leading 64 b of PowHash(pph,ts,nonce) = cSHAKE256("ProofOfWorkHash").
+// Byte-identical to pom.rs pom_block_seed_h10 / pom_mine.cl pom_seed_fold_h10. H14 differs only by
+// the tag XOR the host applies to the seed words. Keccak-f[1600], 24 rounds.
+const uint64_t KECCAK_RC[24] = uint64_t[24](
+    0x0000000000000001UL, 0x0000000000008082UL, 0x800000000000808aUL, 0x8000000080008000UL,
+    0x000000000000808bUL, 0x0000000080000001UL, 0x8000000080008081UL, 0x8000000000008009UL,
+    0x000000000000008aUL, 0x0000000000000088UL, 0x0000000080008009UL, 0x000000008000000aUL,
+    0x000000008000808bUL, 0x800000000000008bUL, 0x8000000000008089UL, 0x8000000000008003UL,
+    0x8000000000008002UL, 0x8000000000000080UL, 0x000000000000800aUL, 0x800000008000000aUL,
+    0x8000000080008081UL, 0x8000000000008080UL, 0x0000000080000001UL, 0x8000000080008008UL);
+const uint KECCAK_RHO[24] = uint[24](1u,3u,6u,10u,15u,21u,28u,36u,45u,55u,2u,14u,27u,41u,56u,8u,25u,43u,62u,18u,39u,61u,20u,44u);
+const uint KECCAK_PI[24]  = uint[24](10u,7u,11u,17u,18u,3u,5u,16u,8u,21u,24u,4u,15u,23u,19u,13u,12u,2u,20u,14u,22u,9u,6u,1u);
+// cSHAKE256("ProofOfWorkHash") initial sponge state — MUST equal pom.rs POW_HASH_INITIAL_STATE.
+const uint64_t POW_HASH_INITIAL_STATE[25] = uint64_t[25](
+    1242148031264380989UL, 3008272977830772284UL, 2188519011337848018UL, 1992179434288343456UL, 8876506674959887717UL,
+    5399642050693751366UL, 1745875063082670864UL, 8605242046444978844UL, 17936695144567157056UL, 3343109343542796272UL,
+    1123092876221303306UL, 4963925045340115282UL, 17037383077651887893UL, 16629644495023626889UL, 12833675776649114147UL,
+    3784524041015224902UL, 1082795874807940378UL, 13952716920571277634UL, 13411128033953605860UL, 15060696040649351053UL,
+    9928834659948351306UL, 5237849264682708699UL, 12825353012139217522UL, 6706187291358897596UL, 196324915476054915UL);
+
+uint64_t rotl64(uint64_t x, uint n) { return (x << n) | (x >> (64u - n)); }
+
+uint64_t seed_fold_h10(uint64_t nonce) {
+    uint64_t st[25];
+    for (uint i = 0u; i < 25u; ++i) st[i] = POW_HASH_INITIAL_STATE[i];
+    st[0] ^= pc.s0; st[1] ^= pc.s1; st[2] ^= pc.s2; st[3] ^= pc.s3;
+    st[4] ^= pc.timestamp;
+    st[9] ^= nonce;
+    uint64_t bc[5];
+    for (uint round = 0u; round < 24u; ++round) {
+        for (uint i = 0u; i < 5u; ++i) bc[i] = st[i] ^ st[i + 5u] ^ st[i + 10u] ^ st[i + 15u] ^ st[i + 20u];
+        for (uint i = 0u; i < 5u; ++i) {
+            uint64_t t = bc[(i + 4u) % 5u] ^ rotl64(bc[(i + 1u) % 5u], 1u);
+            for (uint j = 0u; j < 25u; j += 5u) st[j + i] ^= t;
+        }
+        uint64_t t = st[1];
+        for (uint i = 0u; i < 24u; ++i) {
+            uint j = KECCAK_PI[i];
+            uint64_t tmp = st[j];
+            st[j] = rotl64(t, KECCAK_RHO[i]);
+            t = tmp;
+        }
+        for (uint j = 0u; j < 25u; j += 5u) {
+            for (uint i = 0u; i < 5u; ++i) bc[i] = st[j + i];
+            for (uint i = 0u; i < 5u; ++i) st[j + i] ^= (~bc[(i + 1u) % 5u]) & bc[(i + 2u) % 5u];
+        }
+        st[0] ^= KECCAK_RC[round];
+    }
+    return st[0];
+}
+
+// Era select (uniform across the dispatch).
+uint64_t seed_fold_era(uint64_t nonce) {
+    return pc.h10 != 0u ? seed_fold_h10(nonce) : seed_fold_v4(nonce);
+}
+
+// Signed int8x int8 dot of 4 packed bytes — byte-exact with pom_v4::dot_i8 / __dp4a.s32 / the
+// OpenCL v4_dp4.
+int dp4(uint a, uint b, int acc) {
+#ifdef USE_DOT
+    return acc + dotPacked4x8EXT(int(a), int(b));
+#else
+    ivec4 x = ivec4(bitfieldExtract(int(a), 0, 8), bitfieldExtract(int(a), 8, 8),
+                    bitfieldExtract(int(a), 16, 8), bitfieldExtract(int(a), 24, 8));
+    ivec4 y = ivec4(bitfieldExtract(int(b), 0, 8), bitfieldExtract(int(b), 8, 8),
+                    bitfieldExtract(int(b), 16, 8), bitfieldExtract(int(b), 24, 8));
+    return acc + x.x * y.x + x.y * y.y + x.z * y.z + x.w * y.w;
+#endif
+}
+
+// rho8 finalizer -> low byte (pom_v4.rs rho8).
+uint rho8(int acc, uint tweak) {
+    uint z = uint(acc) ^ tweak;
+    z *= 0x9E3779B9u; z ^= z >> 16;
+    z *= 0x85EBCA6Bu; z ^= z >> 13;
+    return z & 0xffu;
+}
+
+// ---- blake3 (single-block paths; byte-exact with pom.rs blake / blake3 crate) ----
+const uint B3_IV[8] = uint[8](0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+                              0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u);
+const uint B3_SCHED[7][16] = uint[7][16](
+    uint[16](0u,1u,2u,3u,4u,5u,6u,7u,8u,9u,10u,11u,12u,13u,14u,15u),
+    uint[16](2u,6u,3u,10u,7u,0u,4u,13u,1u,11u,12u,5u,9u,14u,15u,8u),
+    uint[16](3u,4u,10u,12u,13u,2u,7u,14u,6u,5u,9u,0u,11u,15u,8u,1u),
+    uint[16](10u,7u,12u,9u,14u,3u,13u,15u,4u,0u,11u,2u,5u,8u,1u,6u),
+    uint[16](12u,13u,9u,11u,15u,10u,14u,8u,7u,2u,5u,3u,0u,1u,6u,4u),
+    uint[16](9u,14u,11u,5u,8u,12u,15u,1u,13u,3u,0u,10u,2u,6u,4u,7u),
+    uint[16](11u,15u,5u,0u,1u,9u,8u,6u,14u,10u,2u,12u,3u,4u,7u,13u));
+const uint B3_CHUNK_START = 1u;
+const uint B3_CHUNK_END   = 2u;
+const uint B3_ROOT        = 8u;
+
+uint rotr32(uint x, uint n) { return (x >> n) | (x << (32u - n)); }
+
+void b3_g(inout uint v[16], uint a, uint b, uint c, uint d, uint mx, uint my) {
+    v[a] += v[b] + mx; v[d] = rotr32(v[d] ^ v[a], 16u);
+    v[c] += v[d];      v[b] = rotr32(v[b] ^ v[c], 12u);
+    v[a] += v[b] + my; v[d] = rotr32(v[d] ^ v[a], 8u);
+    v[c] += v[d];      v[b] = rotr32(v[b] ^ v[c], 7u);
+}
+
+// One compression with the IV chaining value, counter 0 — returns the 8-word output cv.
+void b3_compress_iv(uint m[16], uint block_len, uint flags, out uint cv[8]) {
+    uint v[16];
+    for (uint i = 0u; i < 8u; ++i) v[i] = B3_IV[i];
+    v[8] = B3_IV[0]; v[9] = B3_IV[1]; v[10] = B3_IV[2]; v[11] = B3_IV[3];
+    v[12] = 0u; v[13] = 0u; v[14] = block_len; v[15] = flags;
+    for (uint r = 0u; r < 7u; ++r) {
+        b3_g(v, 0u, 4u, 8u, 12u,  m[B3_SCHED[r][0]],  m[B3_SCHED[r][1]]);
+        b3_g(v, 1u, 5u, 9u, 13u,  m[B3_SCHED[r][2]],  m[B3_SCHED[r][3]]);
+        b3_g(v, 2u, 6u, 10u, 14u, m[B3_SCHED[r][4]],  m[B3_SCHED[r][5]]);
+        b3_g(v, 3u, 7u, 11u, 15u, m[B3_SCHED[r][6]],  m[B3_SCHED[r][7]]);
+        b3_g(v, 0u, 5u, 10u, 15u, m[B3_SCHED[r][8]],  m[B3_SCHED[r][9]]);
+        b3_g(v, 1u, 6u, 11u, 12u, m[B3_SCHED[r][10]], m[B3_SCHED[r][11]]);
+        b3_g(v, 2u, 7u, 8u, 13u,  m[B3_SCHED[r][12]], m[B3_SCHED[r][13]]);
+        b3_g(v, 3u, 4u, 9u, 14u,  m[B3_SCHED[r][14]], m[B3_SCHED[r][15]]);
+    }
+    for (uint i = 0u; i < 8u; ++i) cv[i] = v[i] ^ v[i + 8u];
+}
+
+// blake3 of one 32 B state row (single partial block) -> 8 words at scratch[out_base..].
+void b3_hash_row32(uint row[V4_D4], uint out_base) {
+    uint m[16];
+    for (uint i = 0u; i < 8u; ++i) m[i] = row[i];
+    for (uint i = 8u; i < 16u; ++i) m[i] = 0u;
+    uint cv[8];
+    b3_compress_iv(m, 32u, B3_CHUNK_START | B3_CHUNK_END | B3_ROOT, cv);
+    for (uint i = 0u; i < 8u; ++i) scratch[out_base + i] = cv[i];
+}
+
+// blake3 of a 64 B parent (two child hashes at scratch[in_base..in_base+16]) -> scratch[out_base..].
+void b3_hash_pair(uint in_base, uint out_base) {
+    uint m[16];
+    for (uint i = 0u; i < 16u; ++i) m[i] = scratch[in_base + i];
+    uint cv[8];
+    b3_compress_iv(m, 64u, B3_CHUNK_START | B3_CHUNK_END | B3_ROOT, cv);
+    for (uint i = 0u; i < 8u; ++i) scratch[out_base + i] = cv[i];
+}
+
+// Locate canonical chunk `c` through the prefix table and return its 32 bytes as 8 LE u32 words
+// into scratch[dst_base..dst_base+8] (same u32 order as the OpenCL blob's `dst[w] = src[w]`).
+void load_chunk(uint64_t c, uint dst_base) {
+    uint lo = 0u, hi = pc.n_tensors; // invariant: prefix[lo] <= c < prefix[hi]
     while (hi - lo > 1u) {
         uint mid = (lo + hi) / 2u;
-        if (PREFIX.prefix[mid] <= off) { lo = mid; } else { hi = mid; }
+        if (PREFIX.prefix[mid] <= c) { lo = mid; } else { hi = mid; }
     }
     // Advance the buffer_reference POINTER by the 64-bit byte offset and index with small
     // constants — GLSL array subscripts are 32-bit, so the wide arithmetic must live in the
     // pointer, never the index.
-    Tensor chunk = Tensor(ADDRS.addr[lo] + (off - PREFIX.prefix[lo]) * 32UL);
-    uint64_t h = state;
-    if (pc.walk_v2 != 0u) {
-        // H5 non-foldable walk (at/after H5_ACTIVATION_DAA): chain mix64 through each of the 4
-        // chunk words so all 32 bytes are load-bearing and order-dependent — byte-exact with
-        // pom.rs transition_v2, pom_mine.cl, and pom_mine.cu. walk_v2 is uniform -> no divergence.
-        h = mix64(h ^ chunk.words[0]);
-        h = mix64(h ^ chunk.words[1]);
-        h = mix64(h ^ chunk.words[2]);
-        h = mix64(h ^ chunk.words[3]);
-        return h;
-    }
-    // Pre-H5 fold (frozen — validates every block below H5_ACTIVATION_DAA).
-    h ^= chunk.words[0];
-    h ^= chunk.words[1];
-    h ^= chunk.words[2];
-    h ^= chunk.words[3];
-    return mix64(h);
+    Tensor chunk = Tensor(ADDRS.addr[lo] + (c - PREFIX.prefix[lo]) * 32UL);
+    uint64_t w0 = chunk.words[0];
+    uint64_t w1 = chunk.words[1];
+    uint64_t w2 = chunk.words[2];
+    uint64_t w3 = chunk.words[3];
+    scratch[dst_base + 0u] = uint(w0);         scratch[dst_base + 1u] = uint(w0 >> 32);
+    scratch[dst_base + 2u] = uint(w1);         scratch[dst_base + 3u] = uint(w1 >> 32);
+    scratch[dst_base + 4u] = uint(w2);         scratch[dst_base + 5u] = uint(w2 >> 32);
+    scratch[dst_base + 6u] = uint(w3);         scratch[dst_base + 7u] = uint(w3 >> 32);
 }
 
 void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    if (idx >= pc.batch) {
-        return;
+    const uint lid  = gl_LocalInvocationID.x;
+    const uint sub  = lid >> 5;              // sub-nonce 0..7 within the group
+    const uint lane = lid & 31u;             // state row 0..31 within the sub-nonce
+    const uint gsub = gl_WorkGroupID.x * V4_NPG + sub;
+    // Sub-nonces past the batch still execute the walk with a dummy nonce (uniform barriers —
+    // every lane must reach every workgroup barrier); they just never submit.
+    const bool live  = gsub < pc.batch;
+    const uint64_t nonce = pc.start_nonce + (live ? uint64_t(gsub) : 0UL);
+    const uint64_t seed  = seed_fold_era(nonce);
+    const uint strip = sub * V4_SP_STRIP_U32; // this sub-nonce's tile/leaves + Merkle level
+
+    // S_0 row `lane`: mix64 keystream (identical to pom_v4::v4_initial_state).
+    uint row4[V4_D4];
+    {
+        uint64_t h = mix64(seed ^ (V4_S0_ROW_SALT + uint64_t(lane)));
+        for (uint k4 = 0u; k4 < V4_D4; ++k4) { h = mix64(h); row4[k4] = uint(h); }
     }
-    uint64_t nonce = pc.start_nonce + uint64_t(idx);
+    uint64_t off = mix64(seed ^ V4_OFFSET_FIRST_SALT) % pc.n_tiles;
 
-    // pom_block_seed (pom.rs): mix64 fold of (nonce, timestamp, SEED words). H5.1 swaps the seed
-    // words to the H5.1-salted set (s); the pow fold below keeps the H3-salted words (p). Pre-H5.1
-    // the host passes s == p, byte-identical to the H5 build.
-    uint64_t state = mix64(nonce ^ 0x4B65727978531UL);
-    state = mix64(state ^ pc.timestamp);
-    state = mix64(state ^ pc.s0);
-    state = mix64(state ^ pc.s1);
-    state = mix64(state ^ pc.s2);
-    state = mix64(state ^ pc.s3);
+    for (uint step = 1u; step <= pc.k; ++step) {
+        // Load this sub-nonce's 1 KB tile: lane loads canonical chunk (tile*32 + lane). Chunks are
+        // located individually, so a tile that straddles two tensors is gathered exactly.
+        load_chunk(off * uint64_t(V4_TILE_CHUNKS) + uint64_t(lane), strip + lane * V4_D4);
+        memoryBarrierShared();
+        barrier();
 
-    // walk_final: K data-dependent reads, off = state % n_chunks.
-    uint64_t off = state % pc.n_chunks;
-    for (uint i = 0u; i < pc.k; ++i) {
-        state = step_state(state, off);
-        off = state % pc.n_chunks;
+        // The final transition has no successor tile. Skip its serial snippet fold and modulo.
+        if (step < pc.k) {
+            uint64_t sf = 0UL;
+            for (uint w = 0u; w < 8u; ++w) sf = mix64(sf ^ uint64_t(scratch[strip + w]));
+            off = mix64(seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf) % pc.n_tiles;
+        }
+
+        // next[lane][j] = rho8(dot_i8(row, col_j), tweak(step, lane, j)), packed 4 bytes/uint.
+        const uint step_tweak = step * 0x9E3779B9u + lane * 0xC2B2AE35u;
+        uint new4[V4_D4];
+        for (uint j4 = 0u; j4 < V4_D4; ++j4) {
+            uint packed = 0u;
+            for (uint jj = 0u; jj < 4u; ++jj) {
+                const uint j = j4 * 4u + jj;
+                const uint col = strip + j * V4_D4;   // tile column j = 32 bytes
+                int acc = 0;
+                for (uint k = 0u; k < V4_D4; ++k) acc = dp4(row4[k], scratch[col + k], acc);
+                packed |= rho8(acc, step_tweak + j * 0x85EBCA6Bu) << (8u * jj);
+            }
+            new4[j4] = packed;
+        }
+        for (uint k4 = 0u; k4 < V4_D4; ++k4) row4[k4] = new4[k4];
+        memoryBarrierShared();
+        barrier();   // all lanes done with the tile before step+1 overwrites it
     }
 
-    // pom_pow_value: 4 keyed mix64 folds -> 256-bit LE words o0..o3.
-    uint64_t o0 = mix64(state ^ pc.p0 ^ 0x9E3779B97F4A7C15UL);
-    uint64_t o1 = mix64(o0 ^ pc.p1 ^ 0xC2B2AE3D27D4EB4FUL);
-    uint64_t o2 = mix64(o1 ^ pc.p2 ^ 0x165667B19E3779F9UL);
-    uint64_t o3 = mix64(o2 ^ pc.p3 ^ 0xD6E8FEB86659FD93UL);
+    // root_K: 32 blake3 row leaves + complete depth-5 tree (scratch reuses the tile strip).
+    b3_hash_row32(row4, strip + lane * 8u);
+    memoryBarrierShared();
+    barrier();
+    uint src = strip;
+    uint dst = strip + V4_D * 8u;
+    for (uint n = V4_D; n > 1u; n >>= 1) {
+        if (lane < n / 2u) b3_hash_pair(src + lane * 16u, dst + lane * 8u);
+        memoryBarrierShared();
+        barrier();
+        uint tmp = src; src = dst; dst = tmp;
+    }
 
-    // le_leq: unsigned 256-bit LE compare, most-significant word first.
-    bool le;
-    if (o3 != pc.t3) { le = o3 < pc.t3; }
-    else if (o2 != pc.t2) { le = o2 < pc.t2; }
-    else if (o1 != pc.t1) { le = o1 < pc.t1; }
-    else if (o0 != pc.t0) { le = o0 < pc.t0; }
-    else { le = true; }
-
-    if (le) {
-        atomicMin(OUT.offset, idx);
+    if (lane == 0u && live) {
+        const uint64_t fin = uint64_t(scratch[src]) | (uint64_t(scratch[src + 1u]) << 32);
+        // pom_pow_value: 4 keyed mix64 folds -> 256-bit LE words o0..o3 (H3-salted pph words).
+        uint64_t o0 = mix64(fin ^ pc.p0 ^ 0x9E3779B97F4A7C15UL);
+        uint64_t o1 = mix64(o0 ^ pc.p1 ^ 0xC2B2AE3D27D4EB4FUL);
+        uint64_t o2 = mix64(o1 ^ pc.p2 ^ 0x165667B19E3779F9UL);
+        uint64_t o3 = mix64(o2 ^ pc.p3 ^ 0xD6E8FEB86659FD93UL);
+        // le_leq: unsigned 256-bit LE compare, most-significant word first.
+        bool le;
+        if (o3 != pc.t3) { le = o3 < pc.t3; }
+        else if (o2 != pc.t2) { le = o2 < pc.t2; }
+        else if (o1 != pc.t1) { le = o1 < pc.t1; }
+        else { le = o0 <= pc.t0; }
+        if (le) {
+            atomicMin(OUT.offset, gsub);
+        }
     }
 }

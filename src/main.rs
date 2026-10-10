@@ -1560,8 +1560,9 @@ async fn run() -> Result<(), Error> {
                 if vram_mb > 0 && vram_mb < need_mb {
                     info!(
                         "PoM(AMD): model ({gguf_mb} MiB) + possession blob need ~{need_mb} MiB on one card; largest card has \
-                         {vram_mb} MiB — the inference card will be DEDICATED to OPoI (it will not mine, shown as \
-                         INF); all other cards mine at full rate."
+                         {vram_mb} MiB — the inference card is RESERVED for the model: it mines over that single \
+                         resident copy (zero-dup v4 walk, after the startup byte gate) instead of its own blob, or \
+                         stays inference-only (INF, 0 H/s) if the gate refuses; all other cards mine at full rate."
                     );
                     keryx_miner::pom_opencl::require_dedicated_inference_card();
                 }

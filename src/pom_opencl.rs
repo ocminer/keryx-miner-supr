@@ -712,7 +712,7 @@ const POM_V4_K: usize = 256; // walk steps
 /// Nonces per v4 sub-dispatch (must be a multiple of 8 = sub-nonces/workgroup). A v4 nonce is
 /// K×(32×32 int8 GEMM) — ~512x lighter than a v3 nonce — so batches are large; 8192 keeps each
 /// NDRange well under the Windows TDR while filling big cards. Override via KERYX_POM_V4_SUB_DISPATCH.
-fn v4_sub_dispatch_nonces() -> u64 {
+pub(crate) fn v4_sub_dispatch_nonces() -> u64 {
     std::env::var("KERYX_POM_V4_SUB_DISPATCH")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -1446,78 +1446,155 @@ fn device_pci_full(device_id: usize) -> Option<(u32, u32, u32, u32)> {
     Some((0, v[21] as u32, v[22] as u32, v[23] as u32))
 }
 
-/// True if `device_id` is a zero-dup-SAFE RDNA card (RDNA2+: gfx103x / gfx11 / gfx12) — the
-/// Vulkan zero-dup walk matches or beats the OpenCL blob walk there (measured +1.7% on gfx1102).
-/// EXCLUDED:
-/// - GCN (gfx9 and older): the Vulkan walk is ~15-24% slower at equal clocks.
-/// - RDNA1 (gfx101x, RX 5600/5700 series): FIELD-VERIFIED GPU HANG — the byte-gate fetch dispatch
-///   (buffer-device-address gather on RADV/NAVI10) hard-hangs the GPU at the first dispatch
-///   ("byte gate fetch failed at chunk 0" is the hang, not a soft failure); every later GPU call
-///   on that device blocks forever, and unloading the engine (vkDeviceWaitIdle) wedges the whole
-///   rig until reboot. Never dispatch the gate there — the policy check runs BEFORE the gate.
-/// KERYX_ZERO_DUP=force still overrides for experiments. gfx name via CL_DEVICE_NAME.
-// Retained through the v4 port though currently unreferenced: zero-dup is disabled for PoM v4
-// (the Vulkan walk shader only implemented v2), but this arch/VRAM policy — RDNA1 BDA hangs, RADV
-// GTT overcommit — is the hard-won field knowledge a future v4 zero-dup shader would reuse.
-#[allow(dead_code)]
+/// gfx name of an OpenCL card (CL_DEVICE_NAME, e.g. "gfx1031").
 #[cfg(any(unix, windows))]
-fn device_is_rdna(device_id: usize) -> bool {
-    let name = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id).name().unwrap_or_default();
-    if name.contains("gfx101") {
-        return false; // RDNA1: BDA fetch hangs the GPU (RX 5700 XT field logs)
-    }
-    name.contains("gfx10") || name.contains("gfx11") || name.contains("gfx12")
+fn device_gfx_name(device_id: usize) -> String {
+    opencl3::device::Device::new(device_id as opencl3::types::cl_device_id).name().unwrap_or_default()
 }
 
-/// Zero-dup default policy: claim only when it never costs hashrate. `KERYX_ZERO_DUP` = `force`
-/// (claim any PCI-matched card, VRAM over hashrate) / `off` (never) / unset = RDNA-only (default).
-#[allow(dead_code)]
+/// RDNA1 (gfx101x, RX 5600/5700 series): FIELD-VERIFIED GPU HANG — the byte-gate fetch dispatch
+/// (buffer-device-address gather on RADV/NAVI10) hard-hangs the GPU at the first dispatch
+/// ("byte gate fetch failed at chunk 0" is the hang, not a soft failure); every later GPU call
+/// on that device blocks forever, and unloading the engine (vkDeviceWaitIdle) wedges the whole
+/// rig until reboot. Never dispatch the gate there — the policy check runs BEFORE the gate.
 #[cfg(any(unix, windows))]
-fn zero_dup_allowed(device_id: usize) -> bool {
+fn device_is_rdna1(device_id: usize) -> bool {
+    device_gfx_name(device_id).contains("gfx101")
+}
+
+/// Zero-dup policy for `device_id`. `reserved` = the card is the inference reservation (model +
+/// OpenCL blob do not fit together, so without zero-dup it would not mine at all).
+/// `KERYX_ZERO_DUP` = `force` (claim any engine-hosted card, even where the blob would fit) /
+/// `off` (never — a reserved card then stays inference-only) / unset (default): claim exactly the
+/// reserved card, on every architecture except RDNA1 (the BDA hang above). Cards where model and
+/// blob coexist keep the OpenCL blob walk, whose RDNA3 WMMA / dp4a kernels are the measured
+/// fastest; the Vulkan walk there is an explicit opt-in until it is benchmarked faster.
+#[cfg(any(unix, windows))]
+fn zero_dup_policy(device_id: usize, reserved: bool) -> bool {
     match std::env::var("KERYX_ZERO_DUP").ok().as_deref() {
-        Some("force") => true,
+        Some("force") => !device_is_rdna1(device_id),
         Some("off") => false,
-        _ => device_is_rdna(device_id),
+        _ => reserved && !device_is_rdna1(device_id),
     }
 }
+
+/// `KERYX_ZERO_DUP=force`: prefer the engine walk on every engine-hosted card.
+#[cfg(any(unix, windows))]
+fn zero_dup_forced() -> bool {
+    std::env::var("KERYX_ZERO_DUP").ok().as_deref() == Some("force")
+}
+
+/// Cards whose zero-dup claim was refused by the byte gate / policy: the verdict is final for the
+/// process (the gate is deterministic), so the mining loop never re-dispatches it.
+static ZERO_DUP_REFUSED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Last claim attempt per card (the reserved card's loop polls `mine_v4` every 100 ms while the
+/// engine is still loading; the engine checks are cheap but logged work is not).
+static ZERO_DUP_LAST_TRY: Mutex<Vec<(usize, std::time::Instant)>> = Mutex::new(Vec::new());
 
 /// Zero-dup claim: if the in-process llama engine hosts the model on THIS card (PCI match), the
-/// policy allows it, and its gather passes the byte gate against the possession index, this card
-/// walks the engine's resident weights — no OpenCL blob is uploaded for it. Returns whether the
-/// claim succeeded (false = the card keeps its own OpenCL blob).
-/// True if this card's total VRAM comfortably holds the resident engine model PLUS the blob
-/// (gguf file size ≈ model VRAM + 1 GiB margin for KV/ctx/driver). When it does NOT, keeping the
-/// engine while installing the blob makes RADV silently OVERCOMMIT into GTT (the create/write
-/// SUCCEED — nothing fails) and the walk crawls at PCIe latency: the autotune sweep alone can run
-/// for an hour, so the card looks permanently dead at 0 hash (RX 5700 XT 8 GB field log). So the
-/// engine must be unloaded BEFORE the install on such cards, not on install *failure*.
-#[allow(dead_code)]
+/// policy allows it, and its v4 gather passes the byte gate against the possession index, this
+/// card walks the engine's resident weights through `llama_engine_vk::pom_mine_v4` — no OpenCL
+/// blob is uploaded for it, so model + walk need ONE copy of the model in VRAM. Returns whether
+/// the card is (now) the shared card; false = keep the OpenCL blob path (or, for the reserved
+/// card, stay inference-only).
 #[cfg(any(unix, windows))]
-fn model_plus_blob_fits(device_id: usize, blob_bytes: u64) -> bool {
-    let model_bytes = TIER
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|(_, path, _)| std::fs::metadata(path).ok().map(|m| m.len()))
-        .unwrap_or(6 << 30); // unknown → assume a big model (conservative: prefer unloading)
-    let Ok(total) = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id).global_mem_size() else {
+fn try_claim_shared(device_id: usize) -> bool {
+    if is_shared_dev(device_id) {
+        return true;
+    }
+    if ZERO_DUP_REFUSED.lock().unwrap_or_else(|p| p.into_inner()).contains(&device_id) {
         return false;
+    }
+    // The engine is a singleton: one shared card per process.
+    if SHARED_DEV.lock().unwrap().is_some() {
+        return false;
+    }
+    if !engine_hosts_card(device_id) {
+        return false; // engine not loaded (yet), walk not ready, or it lives on another card
+    }
+    let reserved = dedicated_device() == Some(device_id);
+    if !zero_dup_policy(device_id, reserved) {
+        log::info!(
+            "PoM: card {device_id:#x} ({}) hosts the inference model but the zero-dup policy keeps its own \
+             OpenCL blob{} (KERYX_ZERO_DUP=force overrides).",
+            device_gfx_name(device_id),
+            if reserved { "; it stays inference-only" } else { "" }
+        );
+        ZERO_DUP_REFUSED.lock().unwrap_or_else(|p| p.into_inner()).push(device_id);
+        return false;
+    }
+    let Some((index, _)) = crate::pom::active_index() else {
+        return false; // the shared possession index is built by ensure_installed / the claim caller
     };
-    total >= blob_bytes + model_bytes + (1 << 30)
-}
-
-#[cfg(any(unix, windows))]
-fn try_claim_shared(_device_id: usize) -> bool {
-    // PoM v4/v3 (post-H6): the walk is ALWAYS the OpenCL pom_mine_v4 kernel over the card's own
-    // resident blob. The zero-dup Vulkan walk only ever implemented the pre-H6 v2 shader (there is
-    // no v4 Vulkan walk), so zero-dup can never serve v4 — every card installs its own OpenCL blob.
-    // The in-process llama engine still hosts the model on its card for GPU OPoI inference; the blob
-    // and model coexist on a 24 GB card. (Kept as a stub so the install path's call site is unchanged.)
-    false
+    if !crate::llama_engine_vk::pom_byte_gate(index) {
+        // Deterministic verdict (or a hung device): never dispatch again in this process.
+        ZERO_DUP_REFUSED.lock().unwrap_or_else(|p| p.into_inner()).push(device_id);
+        log::warn!(
+            "PoM: card {device_id:#x} zero-dup claim REFUSED by the byte gate{}.",
+            if reserved { " — it stays inference-only (0 H/s)" } else { " — keeping its own OpenCL blob" }
+        );
+        return false;
+    }
+    *SHARED_DEV.lock().unwrap() = Some(device_id);
+    log::info!(
+        "PoM: card {device_id:#x} ({}) mines the v4 walk over the inference engine's resident model \
+         (zero-dup, {} int8 dot) — one VRAM copy serves inference AND mining.",
+        device_gfx_name(device_id),
+        if crate::llama_engine_vk::pom_walk_dot() { "packed" } else { "scalar" }
+    );
+    true
 }
 #[cfg(not(any(unix, windows)))]
 fn try_claim_shared(_device_id: usize) -> bool {
     false
+}
+
+/// The reserved inference card's claim, driven from its mining loop (which polls `mine_v4` every
+/// 100 ms while paused): builds the shared possession index if no other card did (single-card
+/// rigs), then attempts the claim at most every 2 s until the engine is up. The index build is
+/// CPU/disk work on this otherwise idle thread; only the byte-gate dispatch touches the GPU.
+#[cfg(any(unix, windows))]
+fn try_claim_reserved(device_id: usize) -> bool {
+    if is_shared_dev(device_id) {
+        return true;
+    }
+    {
+        let mut last = ZERO_DUP_LAST_TRY.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        match last.iter_mut().find(|(d, _)| *d == device_id) {
+            Some((_, t)) if now.duration_since(*t) < std::time::Duration::from_secs(2) => return false,
+            Some((_, t)) => *t = now,
+            None => last.push((device_id, now)),
+        }
+    }
+    if ZERO_DUP_REFUSED.lock().unwrap_or_else(|p| p.into_inner()).contains(&device_id) {
+        return false;
+    }
+    if !engine_hosts_card(device_id) {
+        return false;
+    }
+    if crate::pom::active_index().is_none() {
+        let tier = TIER.lock().unwrap().clone();
+        let Some((model_id, path, t)) = tier else { return false };
+        let _build = BUILD_LOCK.lock().unwrap();
+        if let Err(e) = ensure_index(model_id, &path, t) {
+            log::warn!("PoM: tier build for the zero-dup claim failed ({path}): {e}");
+            return false;
+        }
+    }
+    // Covers the gate dispatch like a blob install: an inference drain started meanwhile defers.
+    let Some(_setup) = GpuSetupGuard::begin(device_id) else { return false };
+    try_claim_shared(device_id)
+}
+#[cfg(not(any(unix, windows)))]
+fn try_claim_reserved(_device_id: usize) -> bool {
+    false
+}
+
+/// True when `device_id` mines over the inference engine's resident model (zero-dup): it is the
+/// inference host AND hashes.
+pub fn is_shared_inference_device(device_id: usize) -> bool {
+    is_shared_dev(device_id)
 }
 
 /// True if the in-process llama engine holds its model on this OpenCL card (PCI match).
@@ -1630,6 +1707,13 @@ pub fn is_installed() -> bool {
 /// feasibility check: if even the biggest selected card can't hold model + possession blob
 /// together, loading the model onto any mining GPU is doomed (spill/unload later).
 pub fn max_gpu_global_mem_mb() -> Option<u64> {
+    // Test knob: KERYX_POM_EMULATE_VRAM_MB=<mb> makes the inference planner treat every selected
+    // card as having at most that much VRAM (reproduces a 12 GB rig's reservation/zero-dup path on
+    // a bigger card). Planning only — allocations are not limited.
+    if let Some(mb) = std::env::var("KERYX_POM_EMULATE_VRAM_MB").ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+        log::warn!("PoM: KERYX_POM_EMULATE_VRAM_MB={mb} — the inference planner emulates {mb} MiB cards (test only).");
+        return Some(mb);
+    }
     scoped_gpu_devices()
         .into_iter()
         .filter_map(|id| opencl3::device::Device::new(id as opencl3::types::cl_device_id).global_mem_size().ok())
@@ -1775,6 +1859,21 @@ pub fn ensure_installed() {
                 mark_bound_worker_ready(id);
                 return;
             }
+            // KERYX_ZERO_DUP=force: the engine usually loads AFTER the first install attempt, so
+            // give it up to 10 minutes before falling back to the blob (which would otherwise
+            // occupy the VRAM the forced claim was meant to save).
+            #[cfg(any(unix, windows))]
+            if zero_dup_forced() && SHARED_DEV.lock().unwrap().is_none() {
+                static FORCE_WAIT_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+                let mut since = FORCE_WAIT_SINCE.lock().unwrap_or_else(|p| p.into_inner());
+                let t0 = *since.get_or_insert_with(std::time::Instant::now);
+                if t0.elapsed() < std::time::Duration::from_secs(600) {
+                    log::info!(
+                        "PoM: KERYX_ZERO_DUP=force — waiting for the inference engine before installing a blob on card {id:#x}."
+                    );
+                    return;
+                }
+            }
             match install_resident(id) {
                 Ok(()) => log::info!("PoM: tier {t} installed (GPU-resident) on card {id:#x}."),
                 // If the failing card is the one the in-process engine holds its model on (a
@@ -1869,6 +1968,20 @@ pub fn mine_v4(
         }
     }
     let t = words(target_le);
+    // Zero-dup: the card hosting the inference model walks that single resident copy through the
+    // engine. The reserved card keeps trying to claim it while the engine loads (its loop polls
+    // here every 100 ms); until then it is inference-only by design.
+    if is_shared_dev(id) || (dedicated_device() == Some(id) && try_claim_reserved(id)) {
+        let stop = || INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0;
+        return match crate::llama_engine_vk::pom_mine_v4(p, s, time, t, nonce_base, batch, h10_era, &stop) {
+            Ok((winner, hashes_done)) if hashes_done > 0 => Ok(crate::pom::GrindCompleted { winner, hashes_done }),
+            Ok(_) => Err(crate::pom::GrindError::Paused("zero-dup walk paused for GPU inference")),
+            Err(e) => {
+                log::warn!("PoM[vk]: zero-dup v4 batch failed ({e}) — batch aborted and not counted");
+                Err(crate::pom::GrindError::Backend(e))
+            }
+        };
+    }
     let Some(miner) = miner_for(id) else {
         return Err(crate::pom::GrindError::Paused("OpenCL walk not installed"));
     };
