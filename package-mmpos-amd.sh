@@ -37,7 +37,7 @@ if [[ "$(strings "$BIN" | grep -c 'pom_mine_v4' || true)" -eq 0 ]]; then
     echo "ERROR: $BIN has no embedded PoM v4 kernel — was it built with --features pom-opencl?"; exit 1
 fi
 
-STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' EXIT
+STAGE=$(mktemp -d -p "${KERYX_BUILD_TMP:-${TMPDIR:-/tmp}}"); trap 'rm -rf "$STAGE"' EXIT
 DEST="$STAGE/$PKG"
 mkdir -p "$DEST"
 

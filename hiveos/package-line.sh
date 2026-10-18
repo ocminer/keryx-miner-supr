@@ -115,7 +115,7 @@ hrename(){ # $1=dir of h-* files  $2=new miner name
          -e "s|/var/log/miner/keryx-miner-supr/|/var/log/miner/$2/|g" \
          "$1"/h-manifest.conf "$1"/h-config.sh "$1"/h-run.sh "$1"/h-stats.sh
 }
-S=$(mktemp -d); trap 'rm -rf "$S"' EXIT
+S=$(mktemp -d -p "${KERYX_BUILD_TMP:-${TMPDIR:-/tmp}}"); trap 'rm -rf "$S"' EXIT
 
 # mmpOS support files (mmp-external.conf, mmp-launch.sh + mmp-launcher.sh compat alias,
 # mmp-stats.sh, mmp-release-notes.txt) go into EVERY flavor, not just the mmpos_ tarball:

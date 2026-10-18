@@ -22,7 +22,7 @@ source "$REPO/hiveos/amd-inference-route.sh"
 [[ -f "$DIST/libkeryxopencl.so" ]] || { echo "ERROR: $DIST/libkeryxopencl.so missing — run hiveos/build-amd-glibc.sh first"; exit 1; }
 keryx_require_amd_inference_route "$DIST"
 
-STAGE=$(mktemp -d)
+STAGE=$(mktemp -d -p "${KERYX_BUILD_TMP:-${TMPDIR:-/tmp}}")
 trap 'rm -rf "$STAGE"' EXIT
 DEST="$STAGE/$NAME"
 mkdir -p "$DEST"

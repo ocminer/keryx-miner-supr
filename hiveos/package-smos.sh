@@ -15,7 +15,7 @@ CUDA_LIB=/usr/local/cuda-12.8/targets/x86_64-linux/lib
 
 [[ -f "$DIST/keryx-miner-supr" ]] || { echo "ERROR: $DIST/keryx-miner-supr missing — run hiveos/build-release.sh first"; exit 1; }
 
-STAGE=$(mktemp -d)
+STAGE=$(mktemp -d -p "${KERYX_BUILD_TMP:-${TMPDIR:-/tmp}}")
 trap 'rm -rf "$STAGE"' EXIT
 DEST="$STAGE/${NAME}-smos_${VERSION}"
 mkdir -p "$DEST/lib"

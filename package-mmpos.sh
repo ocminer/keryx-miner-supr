@@ -23,7 +23,7 @@ CUDA_LIB=/usr/local/cuda-12.8/targets/x86_64-linux/lib
 
 [[ -x "$BIN" ]] || { echo "ERROR: $BIN missing — run hiveos/build-glibc.sh first"; exit 1; }
 
-STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' EXIT
+STAGE=$(mktemp -d -p "${KERYX_BUILD_TMP:-${TMPDIR:-/tmp}}"); trap 'rm -rf "$STAGE"' EXIT
 DEST="$STAGE/$PKG"
 mkdir -p "$DEST/lib"
 
