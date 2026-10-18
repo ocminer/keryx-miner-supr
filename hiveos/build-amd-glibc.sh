@@ -18,7 +18,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="ubuntu:20.04"                 # glibc 2.31
+IMAGE="${KERYX_AMD_BUILD_IMAGE:-ubuntu:20.04}"                 # glibc 2.31
 OUT="$REPO/hiveos/dist-amd"
 MINER_ONLY=0
 case "${1:-}" in
@@ -27,12 +27,19 @@ case "${1:-}" in
   *) echo "usage: $0 [--miner-only]" >&2; exit 2 ;;
 esac
 mkdir -p "$OUT"
+BUILD_TMP="${KERYX_BUILD_TMP:-${TMPDIR:-/tmp}/keryx-amd-build}"
+CARGO_CACHE="${KERYX_CARGO_CACHE:-${HOME}/.cargo}"
+mkdir -p "$BUILD_TMP" "$CARGO_CACHE"
+chmod 1777 "$BUILD_TMP"
 
 echo ">> Building AMD flavour in $IMAGE (glibc 2.31) ..."
+GIT_META="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir)"
 docker run --rm \
   --network host \
+  -v "$GIT_META":"$GIT_META":ro -e CARGO_BUILD_JOBS="${KERYX_BUILD_JOBS:-4}" \
   -v "$REPO":/src \
-  -w /src \
+  -v "$BUILD_TMP":/tmp -v "$CARGO_CACHE":/build-cargo \
+  -e CARGO_HOME=/build-cargo -w /src \
   -e DEBIAN_FRONTEND=noninteractive \
   "$IMAGE" bash -euo pipefail -c '
     # archive.ubuntu.com resolves to IPv6-only inside the container but there is no IPv6
@@ -41,10 +48,14 @@ docker run --rm \
     apt-get update -qq
     apt-get install -y -qq curl ca-certificates build-essential pkg-config \
         protobuf-compiler cmake libssl-dev ocl-icd-opencl-dev libvulkan1 >/dev/null
-    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain stable --profile minimal >/dev/null
-    . "$HOME/.cargo/env"
+    if ! command -v cargo >/dev/null; then
+        export RUSTUP_HOME=/tmp/rustup
+        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal >/dev/null
+        . "$CARGO_HOME/env"
+    fi
 
+    git config --global --add safe.directory /src
     # protoc for the gRPC build.rs; ocl-icd-opencl-dev provides libOpenCL.so.
     export PROTOC=/usr/bin/protoc
     # Separate target dir so it never clobbers the host target/ (LLM weight cache)
@@ -78,8 +89,8 @@ done
 
 if [[ "$MINER_ONLY" == 0 ]]; then
     echo ">> Building required AMD/Vulkan inference engine (AVX + baseline ISA) ..."
-    "$REPO/hiveos/build-keryx-llama-vk.sh"
-    "$REPO/hiveos/build-keryx-llama-vk.sh" "$(nproc)" noavx
+    "$REPO/hiveos/build-keryx-llama-vk.sh" "${KERYX_LLAMA_JOBS:-8}"
+    "$REPO/hiveos/build-keryx-llama-vk.sh" "${KERYX_LLAMA_JOBS:-8}" noavx
     # shellcheck source=hiveos/amd-inference-route.sh
     source "$REPO/hiveos/amd-inference-route.sh"
     keryx_require_amd_inference_route "$OUT"

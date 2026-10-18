@@ -39,7 +39,7 @@ IMAGE="$1"; OUTDIR="$2"; SUF="$3"; CUDADIR="${4:-}"
 }
 OUT="$REPO/hiveos/$OUTDIR"
 # Resolve a symlinked scratch dir: docker refuses a symlink as a bind-mount source.
-SCRATCH=$(readlink -f /tmp/koffcargo-$SUF)
+SCRATCH=$(readlink -f "${KERYX_CARGO_CACHE:-${HOME}/.cargo}")
 TGT="target-offline-$SUF"
 LLAMA_TAG=b10015
 LLAMA_SRC="${KERYX_LLAMA_SRC:-/tmp/llama-src-$LLAMA_TAG}"
@@ -132,9 +132,13 @@ fi
 if [ ! -d "$SCRATCH/registry" ]; then echo ">> copying crate cache to scratch..."; rm -rf "$SCRATCH"; cp -a "$HOME/.cargo" "$SCRATCH"; fi
 
 rm -rf "$OUT"; mkdir -p "$OUT/lib"
+BUILD_TMP="${KERYX_BUILD_TMP:-${TMPDIR:-/tmp}/keryx-offline-$SUF}"
+mkdir -p "$BUILD_TMP"
+GIT_META="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir)"
 echo ">> offline build in $IMAGE (suffix=$SUF) $(date +%H:%M:%S)"
 docker run --rm --network none \
-  -v "$REPO":/src -w /src \
+  -v "$GIT_META":"$GIT_META":ro -e CARGO_BUILD_JOBS="${KERYX_BUILD_JOBS:-4}" \
+  -v "$REPO":/src -v "$BUILD_TMP":/tmp -w /src \
   -v "$SCRATCH":/root/.cargo "${CUDAMOUNT[@]}" \
   -v "$LLAMA_SRC":/llama:ro -v "$CMAKE_ROOT":/opt/keryx-cmake:ro \
   -e CARGO_HOME=/root/.cargo -e CARGO_NET_OFFLINE=true -e RUSTUP_HOME=/usr/local/rustup \
@@ -143,6 +147,7 @@ docker run --rm --network none \
   -e KERYX_TARGET_DIR="$TGT" -e KERYX_OUTDIR="$OUTDIR" \
   -e LLAMA_ARCHS="$LLAMA_ARCHS" -e LLAMA_JOBS="$LLAMA_JOBS" \
   "$IMAGE" bash -euo pipefail -c '
+    git config --global --add safe.directory /src
     export CUDA_HOME=$KCUDA CUDA_PATH=$KCUDA CUDA_COMPUTE_CAP=$CCAP
     export NVCC="$KCUDA/bin/nvcc" CUDACXX="$KCUDA/bin/nvcc" POM_WALK_IMAGE=fatbin
     if [ -n "$POMARCH" ]; then

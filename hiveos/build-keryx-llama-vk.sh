@@ -24,13 +24,13 @@ JOBS="${1:-$(nproc)}"
 VARIANT="${2:-avx}"
 TAG=b10015
 case "$VARIANT" in
-  avx)   OUTNAME=libkeryx-llama-vk.so;       SIMD_FLAGS=""; BCACHE=/tmp/kvk-build-cache ;;
-  noavx) OUTNAME=libkeryx-llama-vk-noavx.so; SIMD_FLAGS="-DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF -DGGML_AVX_VNNI=OFF"; BCACHE=/tmp/kvk-build-cache-noavx ;;
+  avx)   OUTNAME=libkeryx-llama-vk.so;       SIMD_FLAGS=""; BCACHE=${KERYX_VK_CACHE_ROOT:-${TMPDIR:-/tmp}/kvk-build-cache} ;;
+  noavx) OUTNAME=libkeryx-llama-vk-noavx.so; SIMD_FLAGS="-DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF -DGGML_AVX_VNNI=OFF"; BCACHE=${KERYX_VK_CACHE_ROOT:-${TMPDIR:-/tmp}/kvk-build-cache}-noavx ;;
   *) echo "usage: $0 [JOBS] [noavx]"; exit 1 ;;
 esac
 OUT="$REPO/hiveos/dist-amd"
 mkdir -p "$OUT"
-SRC=/tmp/llama-src-$TAG-vk
+SRC=${KERYX_VK_LLAMA_SRC:-${TMPDIR:-/tmp}/llama-src-$TAG-vk}
 if [ ! -d "$SRC" ]; then
   git clone --quiet --depth 1 --branch "$TAG" https://github.com/ggml-org/llama.cpp "$SRC"
 fi
@@ -53,10 +53,10 @@ if [[ "$(git -C "$SRC" describe --tags --exact-match 2>/dev/null || true)" != "$
 fi
 { printf '%s\n' "$MARK"; cat "$REPO/tools/keryx-llama/keryx_vk_exports.inc.cpp"; } >> "$GV"
 
-mkdir -p "$BCACHE"
+mkdir -p "$BCACHE" "$BCACHE/gen"
 docker run --rm \
   -v "$SRC":/llama -v "$REPO":/repo:ro -v "$OUT":/out \
-  -v "$BCACHE":/tmp/kvk-build \
+  -v "$BCACHE":/tmp/kvk-build -v "$BCACHE/gen":/tmp/kvk-gen \
   -e JOBS="$JOBS" -e KERYX_SPIKE="${KERYX_SPIKE:-0}" -e SIMD_FLAGS="$SIMD_FLAGS" -e OUTNAME="$OUTNAME" \
   llama-vk-toolchain bash -euo pipefail -c '
     B=/tmp/kvk-build
@@ -77,6 +77,7 @@ docker run --rm \
     glslc --target-env=vulkan1.3 -O -DPOM_TP_CM=1 -mfmt=c -o $G/pom_walk_tp_cm_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
     glslc --target-env=vulkan1.3 -O -DPOM_TP_CM=1 -DPOM_TP_CM_SINGLE=1 -mfmt=c -o $G/pom_walk_tp_cm_single_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
     glslc --target-env=vulkan1.2 -O -mfmt=c -o $G/pom_fetch_vk.spv.inc /repo/tools/keryx-llama/pom_fetch_vk.comp
+
 
     g++ -O2 -std=c++17 -shared -fPIC -fopenmp /repo/tools/keryx-llama/keryx_llama_vk.cpp \
       -I $G -I /llama/include -I /llama/ggml/include -I /llama/src -I /llama/common \

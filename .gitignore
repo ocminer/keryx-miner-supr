@@ -58,3 +58,7 @@ docs/*AUDIT*
 docs/*_audit*
 *-handoff.md
 *.session.md
+
+# Local Python audit bytecode
+__pycache__/
+*.pyc

@@ -3,7 +3,7 @@ name: windows-build
 # Windows (MSVC) builds for keryx-miner-supr.
 #  - windows-amd : complete OpenCL miner + in-process Vulkan inference engine
 #  - windows-cuda: developer-only legacy plugin compile artifact
-# Triggers: manual, and on a vX.Y.Z tag (assets are attached to the GitHub release).
+# Manual build; release assets are published separately after qualification.
 #
 # NOTE: the legacy ci.yaml / deploy.yaml in this dir are stale upstream (kaspa-*) workflows
 # and do not build this fork. This file supersedes them for Windows.
@@ -20,13 +20,9 @@ on:
           - all
           - amd
           - nvidia
-  push:
-    tags: ['v*']            # release builds — assets attach to the GitHub release
-  pull_request:
-    paths: ['.github/workflows/windows.yml']   # test the workflow itself on a PR
 
 permissions:
-  contents: write          # needed to attach assets to the release on tag builds
+  contents: read          # CI builds only; publication is separately verified
 
 env:
   CARGO_TERM_COLOR: always
@@ -310,14 +306,6 @@ jobs:
             SHA256SUMS-windows-amd.txt
           if-no-files-found: error
 
-      - name: Attach to release (tag builds)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            keryx-miner-supr-windows-amd.zip
-            SHA256SUMS-windows-amd.txt
-
   # ----------------------------------------------------------------------------
   # NVIDIA / CUDA plugin compile check. Tagged releases use the complete windows-cuda-pom package
   # below instead; this small artifact remains useful for ABI/build diagnostics.
@@ -581,11 +569,3 @@ jobs:
             keryx-miner-supr-windows-nvidia-pom.zip
             SHA256SUMS-windows-nvidia.txt
           if-no-files-found: error
-
-      - name: Attach to release (tag builds)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            keryx-miner-supr-windows-nvidia-pom.zip
-            SHA256SUMS-windows-nvidia.txt
