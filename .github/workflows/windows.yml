@@ -442,7 +442,13 @@ jobs:
       # Native sm_120 avoids the load-time JIT and any Blackwell-on-Windows JIT edge case (a community
       # dev found upstream's no-120 llama build crashed 5090s on every inference → strikes; ours is
       # safe because Linux ships native 120 and Windows had 90-virtual, but native 120 hardens both).
+      - name: Restore source-matched CUDA inference dependencies
+        id: cuda_engine_cache
+        shell: pwsh
+        run: python .github/scripts/restore-windows-cuda-engine.py
+
       - name: Build keryx-llama.dll (in-process llama.cpp engine)
+        if: steps.cuda_engine_cache.outputs.hit != 'true'
         shell: pwsh
         run: |
           $tag = "b10015"
@@ -465,6 +471,7 @@ jobs:
           Copy-Item $dll.FullName "keryx-llama.dll" -Force
 
       - name: Build keryx-llama-noavx.dll (baseline-ISA CPU backend)
+        if: steps.cuda_engine_cache.outputs.hit != 'true'
         shell: pwsh
         run: |
           # Same engine, ggml CPU SIMD baked DOWN to baseline (SSE4.2): the stock dll bakes
