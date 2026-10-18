@@ -25,7 +25,8 @@ def main():
  # Bind the CUDA installer and runner platform as well as both complete CMake commands.
  nvidia=workflow.split('  windows-cuda-pom:',1)[1]
  for literal in cache['required_workflow_literals']:
-  if literal not in nvidia:mismatches.append(literal)
+  matches=literal in nvidia if '\n' in literal else literal in [line.strip() for line in nvidia.splitlines()]
+  if not matches:mismatches.append(literal)
  if mismatches:
   print('CUDA inference cache miss: '+', '.join(mismatches));output(False);return 1 if '--check-only' in sys.argv else 0
  print('CUDA_ENGINE_SOURCE_MATCH: '+cache['source_commit'])
