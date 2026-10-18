@@ -21,7 +21,10 @@ extern "C" bool keryx_vk_raw_handles(size_t dev_num, void ** vk_instance_out,
         if (dev_num >= vk_instance.device_indices.size()) {
             return false;
         }
-        vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
+        // ggml_vk_get_device accepts the FILTERED ggml ordinal and performs the raw
+        // physical-device lookup itself. Applying device_indices here a second time picks
+        // the wrong card (or runs past the vector) when an ICD inserts a filtered CPU device.
+        vk_device dev = ggml_vk_get_device(dev_num);
         if (!dev->buffer_device_address) {
             return false; // no VK 1.2 bufferDeviceAddress -> tensors unreachable by raw address
         }
@@ -30,7 +33,7 @@ extern "C" bool keryx_vk_raw_handles(size_t dev_num, void ** vk_instance_out,
         *vk_device_out              = (void *) (VkDevice) dev->device;
         *compute_queue_family_index = dev->compute_queue.queue_family_index;
         return true;
-    } catch (const vk::SystemError &) {
+    } catch (...) {
         return false;
     }
 }
@@ -314,7 +317,10 @@ extern "C" int keryx_vk_ggml_index_to_discrete_ordinal(int ggml_index) {
 }
 
 extern "C" void keryx_vk_queue_submit(size_t dev_num, const void * submit_info, void * fence) {
-    vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
+    if (dev_num >= vk_instance.device_indices.size()) {
+        throw std::out_of_range("Keryx Vulkan device ordinal");
+    }
+    vk_device dev = ggml_vk_get_device(dev_num);
     // The same lock every internal ggml submission takes -> external dispatches serialize
     // cleanly against ggml's use of the shared compute queue.
     std::lock_guard<std::mutex> guard(queue_mutex);
@@ -329,7 +335,7 @@ extern "C" bool keryx_vk_integer_dot_product(size_t dev_num) {
         if (dev_num >= vk_instance.device_indices.size()) {
             return false;
         }
-        vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
+        vk_device dev = ggml_vk_get_device(dev_num);
         return dev->integer_dot_product;
     } catch (...) {
         return false;
@@ -343,7 +349,7 @@ extern "C" bool keryx_vk_coopmat_int8(size_t dev_num) {
         if (dev_num >= vk_instance.device_indices.size()) {
             return false;
         }
-        vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
+        vk_device dev = ggml_vk_get_device(dev_num);
         return dev->coopmat_support && dev->coopmat_int_support && dev->coopmat_int_m == 16 &&
                dev->coopmat_int_n == 16 && dev->coopmat_int_k == 16;
     } catch (...) {

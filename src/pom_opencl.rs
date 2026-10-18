@@ -741,7 +741,59 @@ use std::sync::Mutex;
 /// owning thread mines without blocking the other cards. Vec (tiny N) keeps a const initializer.
 /// Each card streams its blob straight from the GGUF (no host-RAM blob cache — the OS page cache
 /// makes the 2nd+ card's upload cheap).
-static POM_BY_DEV: Mutex<Vec<(usize, Arc<Mutex<PomMiner>>)>> = Mutex::new(Vec::new());
+enum ResidentMiner {
+    OpenCl(PomMiner),
+    #[cfg(any(unix, windows))]
+    Vulkan(crate::llama_engine_vk::MiningWalk),
+}
+
+impl ResidentMiner {
+    fn mine_v4(
+        &mut self,
+        p: [u64; 4],
+        s: [u64; 4],
+        time: u64,
+        t: [u64; 4],
+        base: u64,
+        batch: u64,
+        h10: u32,
+    ) -> Result<crate::pom::GrindCompleted, String> {
+        match self {
+            Self::OpenCl(miner) => miner
+                .mine_v4(p, s, time, t, base, batch, h10)
+                .map(|winner| crate::pom::GrindCompleted { winner, hashes_done: batch }),
+            #[cfg(any(unix, windows))]
+            Self::Vulkan(miner) => {
+                let stop = || INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0;
+                let (winner, hashes_done) = miner.mine_v4(p, s, time, t, base, batch, h10, &stop)?;
+                Ok(crate::pom::GrindCompleted { winner, hashes_done })
+            }
+        }
+    }
+}
+
+fn prefer_resident_vulkan(name: &str, requested: Option<&str>) -> bool {
+    // RDNA1's BDA dispatch hang is a hard exclusion, including explicit overrides.
+    let name = name.to_ascii_lowercase();
+    if name.contains("gfx101") || !name.contains("gfx") {
+        return false;
+    }
+    match requested {
+        Some("opencl") => false,
+        Some("vulkan") => true,
+        _ => device_arch_is(&name, "gfx906"),
+    }
+}
+
+static POM_BY_DEV: Mutex<Vec<(usize, Arc<Mutex<ResidentMiner>>)>> = Mutex::new(Vec::new());
+static VULKAN_FAILED: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+
+fn remember_vulkan_failure(device_id: usize, reason: &str) {
+    let mut failed = VULKAN_FAILED.lock().unwrap();
+    if !failed.iter().any(|(id, _)| *id == device_id) {
+        failed.push((device_id, reason.into()));
+    }
+}
 
 /// Exact OpenCL devices selected by the worker plugin, in worker-label order. `None` means the
 /// host has not published plugin selection yet (unit tests and legacy direct library callers), in
@@ -896,7 +948,7 @@ pub fn pause_and_drain_for_inference(
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    let residents: Vec<Arc<Mutex<PomMiner>>> =
+    let residents: Vec<Arc<Mutex<ResidentMiner>>> =
         POM_BY_DEV.lock().map(|miners| miners.iter().map(|(_, miner)| Arc::clone(miner)).collect()).unwrap_or_default();
     for miner in residents {
         // `PomMiner::mine_v4` finishes/reads its in-order queue before releasing this mutex.
@@ -964,7 +1016,7 @@ fn target_dev() -> Option<usize> {
     bound_dev().or_else(|| scoped_gpu_devices().first().copied())
 }
 
-fn miner_for(device_id: usize) -> Option<Arc<Mutex<PomMiner>>> {
+fn miner_for(device_id: usize) -> Option<Arc<Mutex<ResidentMiner>>> {
     POM_BY_DEV.lock().unwrap().iter().find(|(d, _)| *d == device_id).map(|(_, m)| m.clone())
 }
 
@@ -1063,10 +1115,10 @@ pub fn require_dedicated_inference_card() {
     }
 }
 
-/// Drop a selected worker's resident OpenCL blob before loading a non-coexistent Vulkan model on
+/// Drop a selected worker's resident walk before loading a non-coexistent Vulkan model on
 /// that same physical GPU. The caller must already hold the global inference pause: that prevents
 /// new installs and makes stale per-batch Arc clones drain quickly. Merely changing
-/// `DEDICATED_DEV` is not sufficient because an already-created `cl_mem` allocation would continue
+/// `DEDICATED_DEV` is not sufficient because an existing GPU allocation would continue
 /// occupying VRAM and make the subsequent llama model load OOM.
 fn evict_resident_for_dedication(device_id: usize) -> Result<(), String> {
     if INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) == 0 {
@@ -1085,11 +1137,9 @@ fn evict_resident_for_dedication(device_id: usize) -> Result<(), String> {
         match Arc::try_unwrap(resident) {
             Ok(miner) => {
                 // pause_and_drain_for_inference already completed its queue. Dropping the sole
-                // remaining owner now releases every cl_mem before Vulkan starts allocating.
+                // remaining owner now releases the resident walk before Vulkan starts allocating.
                 drop(miner.into_inner().unwrap_or_else(|p| p.into_inner()));
-                log::info!(
-                    "PoM: released the resident OpenCL walk on card {device_id:#x} before GPU inference model load"
-                );
+                log::info!("PoM: released the resident walk on card {device_id:#x} before GPU inference model load");
                 return Ok(());
             }
             Err(still_shared) => {
@@ -1143,8 +1193,7 @@ fn prepare_vulkan_device(device: i32, owner: DedicationOwner, route: &str) -> bo
             );
             return false;
         };
-        *DEDICATED_DEV.lock().unwrap_or_else(|p| p.into_inner()) =
-            DedicationState { device: Some(id), owner };
+        *DEDICATED_DEV.lock().unwrap_or_else(|p| p.into_inner()) = DedicationState { device: Some(id), owner };
         if let Err(error) = evict_resident_for_dedication(id) {
             clear_dedication_owned_by(owner);
             log::error!(
@@ -1616,9 +1665,12 @@ fn engine_hosts_card(_device_id: usize) -> bool {
 /// production mining threads each bind a distinct device).
 static INSTALLING: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-/// Make the resident tier GPU-resident on `device_id` — its own OpenCL context + buffer, filled
-/// by streaming from the shared WeightIndex's GGUF. Idempotent per card. The index must exist.
+/// Stream the tier to this card's selected resident backend. Idempotent per card; the shared
+/// proof index must already exist. The inference card's zero-dup path is claimed separately.
 fn install_resident(device_id: usize) -> Result<(), String> {
+    if let Some((_, reason)) = VULKAN_FAILED.lock().unwrap().iter().find(|(id, _)| *id == device_id) {
+        return Err(format!("resident Vulkan failed on this device; restart required: {reason}"));
+    }
     let wait_start = std::time::Instant::now();
     loop {
         let mut ins = INSTALLING.lock().unwrap();
@@ -1658,7 +1710,7 @@ fn install_resident(device_id: usize) -> Result<(), String> {
         }
     }
     let _claim = InstallClaim(device_id);
-    log::info!("PoM: initializing OpenCL context + kernel JIT on card {device_id:#x}…");
+    log::info!("PoM: initializing resident mining backend on card {device_id:#x}…");
     let result = (|| {
         let (index, _) = crate::pom::active_index().ok_or("PoM: no index")?;
         let n = index.n_chunks;
@@ -1668,7 +1720,34 @@ fn install_resident(device_id: usize) -> Result<(), String> {
             (n * 32) / (1024 * 1024)
         );
         let dev = opencl3::device::Device::new(device_id as opencl3::types::cl_device_id);
-        let miner = PomMiner::new(dev, index, n)?;
+        #[allow(unused_mut)]
+        let mut selected = None;
+        // An explicit OpenCL kernel choice keeps selecting OpenCL unless the operator also
+        // explicitly opts into the new Vulkan backend.
+        #[cfg(any(unix, windows))]
+        let requested_backend = std::env::var("KERYX_POM_BACKEND")
+            .ok()
+            .or_else(|| std::env::var_os("KERYX_POM_V4_MODE").map(|_| "opencl".into()));
+        #[cfg(any(unix, windows))]
+        if prefer_resident_vulkan(&dev.name().unwrap_or_default(), requested_backend.as_deref()) {
+            let path = TIER.lock().unwrap().as_ref().map(|(_, path, _)| path.clone());
+            if let (Some(path), Some(pci)) = (path, device_pci_full(device_id)) {
+                match crate::llama_engine_vk::MiningWalk::load(&path, pci, index) {
+                    Ok(walk) => selected = Some(ResidentMiner::Vulkan(walk)),
+                    Err(crate::llama_engine_vk::MiningLoadError::Unavailable(reason)) => {
+                        log::warn!("PoM: resident Vulkan unavailable on card {device_id:#x}: {reason}; using OpenCL")
+                    }
+                    Err(crate::llama_engine_vk::MiningLoadError::Failed(reason)) => {
+                        remember_vulkan_failure(device_id, &reason);
+                        return Err(reason);
+                    }
+                }
+            }
+        }
+        let miner = match selected {
+            Some(miner) => miner,
+            None => ResidentMiner::OpenCl(PomMiner::new(dev, index, n)?),
+        };
         POM_BY_DEV.lock().unwrap().push((device_id, Arc::new(Mutex::new(miner))));
         // Publication is the readiness boundary: the bound worker can now enter mine_v4 as soon
         // as the all-card latch opens. Never report before the JIT/upload and registry insertion.
@@ -1920,7 +1999,8 @@ pub fn ensure_installed() {
 /// PoM v4 (v0.11.0) grind on THIS thread's bound GPU: the D=32 int8 matrix-state walk on the
 /// resident blob. Returns the lowest winning nonce; the caller rebuilds the witness host-side
 /// (byte-exact CPU re-walk in `pow::generate_block_if_pom`), so a kernel false-positive is silently
-/// dropped, never submitted. Every card runs its own OpenCL blob (no zero-dup for v4).
+/// dropped, never submitted. The inference card shares its model; other cards use the selected
+/// OpenCL or Vulkan resident walk.
 ///
 /// Word sets mirror `pom_gpu::mine_v4` / `pom_v4.rs`: the POW fold uses the H3-salted pph words
 /// ("v4 pow uses the h3 fold") and the SEED fold uses the v4-salted words. Both are pure host-side
@@ -1995,9 +2075,16 @@ pub fn mine_v4(
         return Err(crate::pom::GrindError::Paused("OpenCL walk paused for GPU inference"));
     }
     match g.mine_v4(p, s, time, t, nonce_base, batch, if h10_era { 1 } else { 0 }) {
-        Ok(winner) => Ok(crate::pom::GrindCompleted { winner, hashes_done: batch }),
+        Ok(completed) if completed.hashes_done > 0 => Ok(completed),
+        Ok(_) => Err(crate::pom::GrindError::Paused("resident walk paused for GPU inference")),
         Err(e) => {
-            log::warn!("PoM[opencl]: v4 batch failed ({e}) — batch aborted and not counted");
+            // Keep the failure across registry eviction/model switches too: a retired handle
+            // may still own in-flight resources, so that device cannot be reinitialized safely.
+            #[cfg(any(unix, windows))]
+            if matches!(&*g, ResidentMiner::Vulkan(_)) {
+                remember_vulkan_failure(id, &e);
+            }
+            log::warn!("PoM: resident v4 batch failed ({e}) — batch aborted and not counted");
             Err(crate::pom::GrindError::Backend(e))
         }
     }
@@ -2024,6 +2111,27 @@ fn hex32(b: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod v4_wmma1_tests {
+    #[test]
+    fn failed_vulkan_device_cannot_reinstall_after_handle_eviction() {
+        let id = usize::MAX;
+        super::remember_vulkan_failure(id, "test dispatch failure");
+        // No resident handle exists. Refusal must happen before any OpenCL/Vulkan device access.
+        let result = super::install_resident(id);
+        super::VULKAN_FAILED.lock().unwrap().retain(|(device, _)| *device != id);
+        assert!(result.unwrap_err().contains("restart required: test dispatch failure"));
+    }
+    #[test]
+    fn resident_backend_policy_preserves_hardware_exclusions_and_overrides() {
+        use super::prefer_resident_vulkan;
+        assert!(prefer_resident_vulkan("gfx906:sramecc+:xnack-", None));
+        assert!(!prefer_resident_vulkan("gfx9060", None));
+        assert!(!prefer_resident_vulkan("gfx1100", None));
+        assert!(!prefer_resident_vulkan("gfx1102", None));
+        assert!(!prefer_resident_vulkan("gfx906", Some("opencl")));
+        assert!(prefer_resident_vulkan("gfx1100", Some("vulkan")));
+        assert!(!prefer_resident_vulkan("gfx1010", Some("vulkan")));
+        assert!(!prefer_resident_vulkan("NVIDIA GeForce", Some("vulkan")));
+    }
     use super::{device_arch_is, ready_key_for_bound, select_v4_mode, V4Mode, POM_SRC};
 
     #[test]
@@ -2150,16 +2258,27 @@ mod v4_byte_exact {
         // KERYX_TEST_OPENCL_ANY_VENDOR=1 opts a dedicated non-AMD OpenCL device (e.g. an idle NVIDIA
         // test card) into this byte-exactness test.
         let any_vendor = std::env::var("KERYX_TEST_OPENCL_ANY_VENDOR").ok().as_deref() == Some("1");
-        let Some(dev) = dev_ids.into_iter().map(opencl3::device::Device::new).find(|dev| {
-            any_vendor
-                || dev
-                    .vendor()
-                    .map(|vendor| {
-                        let vendor = vendor.to_ascii_lowercase();
-                        vendor.contains("advanced micro devices") || vendor.trim() == "amd"
-                    })
-                    .unwrap_or(false)
-        }) else {
+        let selected =
+            std::env::var("KERYX_TEST_CL_DEV").ok().map(|s| s.parse::<usize>().expect("KERYX_TEST_CL_DEV index"));
+        if let Some(i) = selected {
+            assert!(i < dev_ids.len(), "KERYX_TEST_CL_DEV is outside the device list");
+        }
+        let Some(dev) = dev_ids
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| selected.map_or(true, |s| s == *i))
+            .map(|(_, id)| opencl3::device::Device::new(id))
+            .find(|dev| {
+                any_vendor
+                    || dev
+                        .vendor()
+                        .map(|vendor| {
+                            let vendor = vendor.to_ascii_lowercase();
+                            vendor.contains("advanced micro devices") || vendor.trim() == "amd"
+                        })
+                        .unwrap_or(false)
+            })
+        else {
             eprintln!("no AMD OpenCL GPU — skipping v4 byte-exact test");
             return;
         };
@@ -2193,8 +2312,10 @@ mod v4_byte_exact {
         let eras = selected_h10_eras(std::env::var("KERYX_TEST_H10").ok().as_deref(), true).expect("KERYX_TEST_H10");
         // Every H10 run also validates the H14 era: the unchanged H10 kernel fed H14-TAGGED pph words
         // must equal the host's pom_block_seed_h14 walk (the production H14 path).
-        let passes: Vec<(bool, bool)> =
-            eras.iter().flat_map(|&h10| if h10 { vec![(true, false), (true, true)] } else { vec![(false, false)] }).collect();
+        let passes: Vec<(bool, bool)> = eras
+            .iter()
+            .flat_map(|&h10| if h10 { vec![(true, false), (true, true)] } else { vec![(false, false)] })
+            .collect();
         for &(h10, h14) in &passes {
             // CPU argmin pow over 0..NN with the era-correct seed; target = that min.
             let mut best = ([0xFFu8; 32], u64::MAX);

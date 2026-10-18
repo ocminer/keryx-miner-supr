@@ -1955,16 +1955,24 @@ mod tests {
         let name = opencl3::device::Device::new(devs[di]).name().unwrap_or_default();
         eprintln!("opencl walk bench on device {di} ({name})");
         crate::pom_opencl::bind_thread_device(id);
-        crate::pom_opencl::set_mining_tier([0u8; 32], path, 1);
-        crate::pom_opencl::ensure_installed();
+        // A benchmark fixture need not be a currently admitted mining tier. Load it directly;
+        // registering an all-zero model id makes the production era guard reject every batch.
+        crate::pom_opencl::load_tier(&path, 1).expect("install OpenCL benchmark model");
         let pph = blake(b"bench-llama-vk");
         let target = [0u8; 32]; // impossible target -> full grind
         let batch: u64 = 1 << 21;
-        let _ = crate::pom_opencl::mine_v4(&pph, 1_700_000_000, &target, 0, batch, 0); // warmup
+        let daa = h14_activation_daa();
+        let run = |base| {
+            let completed = crate::pom_opencl::mine_v4(&pph, 1_700_000_000, &target, base, batch, daa)
+                .expect("OpenCL benchmark dispatch must actually complete");
+            assert_eq!(completed.hashes_done, batch);
+            assert_eq!(completed.winner, None);
+        };
+        run(0); // warmup
         let start = std::time::Instant::now();
         let rounds: u64 = 8;
         for i in 0..rounds {
-            let _ = crate::pom_opencl::mine_v4(&pph, 1_700_000_000, &target, i * batch, batch, 0);
+            run(i * batch);
         }
         let secs = start.elapsed().as_secs_f64();
         eprintln!(
@@ -1993,11 +2001,17 @@ mod tests {
         let batch: u64 = 1 << 16;
         let never = || false;
         // warmup
-        let _ = crate::llama_engine_vk::pom_mine_v4(p, s, 1_700_000_000, t, 0, batch, true, &never);
+        let run = |base| {
+            let (winner, done) = crate::llama_engine_vk::pom_mine_v4(p, s, 1_700_000_000, t, base, batch, true, &never)
+                .expect("Vulkan benchmark dispatch must actually complete");
+            assert_eq!(done, batch);
+            assert_eq!(winner, None);
+        };
+        run(0);
         let start = std::time::Instant::now();
         let rounds: u64 = 8;
         for i in 0..rounds {
-            let _ = crate::llama_engine_vk::pom_mine_v4(p, s, 1_700_000_000, t, i * batch, batch, true, &never);
+            run(i * batch);
         }
         let secs = start.elapsed().as_secs_f64();
         eprintln!(

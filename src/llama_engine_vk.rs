@@ -49,6 +49,10 @@ const VK_ABI: c_int = 6; // 5->6: keryx_llama_pom_mine is the PoM v4 walk (tiles
 /// Walk dispatches in flight outside the engine mutex (see `pom_mine_v4`): `unload` must not free
 /// the model while one is running.
 static WALK_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// The pinned ggml backend initializes its instance/device registry without an internal lock.
+// Independent mining workers may now create devices alongside the inference loader. Serialize
+// setup and enumeration only; established devices still dispatch independently.
+static NATIVE_SETUP: Mutex<()> = Mutex::new(());
 
 struct Engine {
     model: *mut c_void,
@@ -204,6 +208,7 @@ pub fn auto_device_allowlist_active() -> bool {
 
 pub fn pick_discrete_ggml_device() -> Option<i32> {
     let so = so_path()?;
+    let _setup = NATIVE_SETUP.lock().ok()?;
     unsafe {
         let lib = sidecar_lib(&so)?;
         if !install_native_log_bridge(lib) && crate::tui_active() {
@@ -237,9 +242,8 @@ pub fn pick_discrete_ggml_device() -> Option<i32> {
                 let allowlist_empty = std::env::var(crate::pom_opencl::LLAMA_VK_AUTO_PCI_ALLOWLIST_ENV)
                     .map(|v| v.trim().is_empty())
                     .unwrap_or(false);
-                let pci_verifiable = sym::<PickFn>(lib, "keryx_vk_any_discrete_pci_verifiable")
-                    .map(|f| f() > 0)
-                    .unwrap_or(true);
+                let pci_verifiable =
+                    sym::<PickFn>(lib, "keryx_vk_any_discrete_pci_verifiable").map(|f| f() > 0).unwrap_or(true);
                 if allowlist_empty || !pci_verifiable {
                     if let Some(any) = sym::<PickFn>(lib, "keryx_vk_pick_discrete_device_unfiltered") {
                         let fallback = any();
@@ -275,6 +279,7 @@ pub fn ggml_device_pci(device: i32) -> Option<(u32, u32, u32, u32)> {
         return None;
     }
     let so = so_path()?;
+    let _setup = NATIVE_SETUP.lock().ok()?;
     unsafe {
         let lib = sidecar_lib(&so)?;
         if !install_native_log_bridge(lib) && crate::tui_active() {
@@ -334,6 +339,7 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
         dedication_attempt.armed = true;
     }
     let Some(so) = so_path() else { return false };
+    let Ok(_setup) = NATIVE_SETUP.lock() else { return false };
     unsafe {
         let Some(lib) = sidecar_lib(&so) else {
             return false;
@@ -419,7 +425,8 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
                     .unwrap_or(crate::models::DEFAULT_WALK_RESERVE_MIB);
                 model = load2(cg.as_ptr(), main_gpu, ladder.as_ptr(), ladder.len() as c_int, reserve);
                 if !model.is_null() {
-                    n_ctx = sym::<NCtxFn>(lib, "keryx_llama_n_ctx").map(|f| f(model)).filter(|&n| n > 0).unwrap_or(floor);
+                    n_ctx =
+                        sym::<NCtxFn>(lib, "keryx_llama_n_ctx").map(|f| f(model)).filter(|&n| n > 0).unwrap_or(floor);
                 }
             }
         }
@@ -580,7 +587,10 @@ pub fn generate_for(gguf: &str, prompt: &str, max_tokens: usize) -> Result<Strin
         return Err(GenerateError::PromptTooLong);
     }
     if n < 0 {
-        log::warn!("llama-vk engine: generate returned {n} for a {}-byte prompt (max_tokens {max_tokens})", prompt.len());
+        log::warn!(
+            "llama-vk engine: generate returned {n} for a {}-byte prompt (max_tokens {max_tokens})",
+            prompt.len()
+        );
         return Err(GenerateError::Failed);
     }
     out.truncate(n as usize);
@@ -739,6 +749,275 @@ pub fn pom_walk_kernel() -> &'static str {
     }
 }
 
+/// A resident Vulkan walk on a mining worker that does not own the inference engine.
+/// The caller's per-device mutex covers dispatch, drain and destruction. The shared
+/// library stays loaded for the process lifetime, just as for the inference engine.
+pub struct MiningWalk {
+    model: *mut c_void,
+    free: FreeFn,
+    fetch: FetchFn,
+    mine: MineFn,
+    cap: u64,
+    healthy: bool,
+}
+unsafe impl Send for MiningWalk {}
+
+#[derive(Debug)]
+pub enum MiningLoadError {
+    Unavailable(String),
+    Failed(String),
+}
+impl From<&str> for MiningLoadError {
+    fn from(message: &str) -> Self {
+        Self::Unavailable(message.into())
+    }
+}
+impl std::fmt::Display for MiningLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(message) | Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl Drop for MiningWalk {
+    fn drop(&mut self) {
+        if self.healthy {
+            unsafe { (self.free)(self.model) };
+        } else {
+            // A failed dispatch may mean a hung device. Never enter an unbounded
+            // device-idle wait while releasing that handle.
+            log::error!("PoM[vk]: retaining failed device resources until process exit");
+        }
+    }
+}
+
+impl MiningWalk {
+    pub fn load(
+        gguf: &str,
+        wanted_pci: (u32, u32, u32, u32),
+        index: &crate::pom::WeightIndex,
+    ) -> Result<Self, MiningLoadError> {
+        let so = so_path().ok_or("Vulkan sidecar unavailable")?;
+        let lib = sidecar_lib(&so).ok_or("Vulkan sidecar load failed")?;
+        if !unsafe { install_native_log_bridge(lib) } && crate::tui_active() {
+            return Err("Vulkan sidecar cannot coordinate dashboard logging".into());
+        }
+        let gpu = (0..16)
+            .find(|&i| ggml_device_pci(i) == Some(wanted_pci))
+            .ok_or("no Vulkan device matches this mining worker's full PCI identity")?;
+        let _setup = NATIVE_SETUP.lock().map_err(|_| "Vulkan setup mutex poisoned")?;
+        unsafe {
+            type MiningLoadFn = unsafe extern "C" fn(*const c_char, c_int, *mut c_int) -> *mut c_void;
+            let abi = sym::<AbiFn>(lib, "keryx_llama_vk_abi").ok_or("missing Vulkan ABI")?;
+            if abi() != VK_ABI {
+                return Err("unsupported Vulkan walk ABI".into());
+            }
+            let load =
+                sym::<MiningLoadFn>(lib, "keryx_llama_pom_load").ok_or("sidecar lacks resident Vulkan mining")?;
+            let free = sym::<FreeFn>(lib, "keryx_llama_free").ok_or("missing free")?;
+            let fetch = sym::<FetchFn>(lib, "keryx_llama_pom_fetch").ok_or("missing fetch")?;
+            let mine = sym::<MineFn>(lib, "keryx_llama_pom_mine").ok_or("missing mine")?;
+            let ready = sym::<ReadyFn>(lib, "keryx_llama_pom_ready").ok_or("missing ready")?;
+            let count = sym::<U64Fn>(lib, "keryx_llama_pom_n_chunks").ok_or("missing chunk count")?;
+            let pci = sym::<PciFn>(lib, "keryx_llama_pom_pci").ok_or("missing PCI identity")?;
+            let cap = sym::<unsafe extern "C" fn(*mut c_void) -> u32>(lib, "keryx_llama_pom_batch_max")
+                .ok_or("missing batch bound")?;
+            let path = CString::new(gguf).map_err(|_| "invalid GGUF path")?;
+            let mut device_failed = 0;
+            let model = load(path.as_ptr(), gpu, &mut device_failed);
+            if model.is_null() {
+                return Err(if device_failed != 0 {
+                    MiningLoadError::Failed("resident Vulkan device failed during setup".into())
+                } else {
+                    MiningLoadError::Unavailable("resident Vulkan allocation/upload unavailable".into())
+                });
+            }
+            let mut walk = Self { model, free, fetch, mine, cap: cap(model) as u64, healthy: true };
+            let (mut domain, mut bus, mut device, mut function) = (0, 0, 0, 0);
+            if !pci(model, &mut domain, &mut bus, &mut device, &mut function)
+                || (domain, bus, device, function) != wanted_pci
+            {
+                return Err(MiningLoadError::Failed("resident Vulkan PCI identity mismatch".into()));
+            }
+            if !ready(model) || count(model) != index.n_chunks || index.n_chunks == 0 {
+                return Err(MiningLoadError::Failed("resident Vulkan model/chunk count mismatch".into()));
+            }
+            for k in 0..=128u64 {
+                let off = if k == 128 { index.n_chunks - 1 } else { k * (index.n_chunks / 129) };
+                let mut got = [0u8; 32];
+                if !(walk.fetch)(model, off, got.as_mut_ptr()) {
+                    walk.healthy = false;
+                    return Err(MiningLoadError::Failed(format!("resident Vulkan byte-gate dispatch failed at {off}")));
+                }
+                if got != index.read_chunk_bytes(off) {
+                    return Err(MiningLoadError::Failed(format!("resident Vulkan byte-gate mismatch at {off}")));
+                }
+            }
+            log::info!(
+                "PoM[vk]: resident walk ready on PCI {:04x}:{:02x}:{:02x}.{}; 129 byte checks passed, {} MiB weights",
+                domain,
+                bus,
+                device,
+                function,
+                index.n_chunks * 32 / (1024 * 1024)
+            );
+            Ok(walk)
+        }
+    }
+
+    pub fn mine_v4(
+        &mut self,
+        p: [u64; 4],
+        s: [u64; 4],
+        time: u64,
+        t: [u64; 4],
+        base: u64,
+        batch: u64,
+        h10: u32,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(Option<u64>, u64), String> {
+        if !self.healthy {
+            return Err("resident Vulkan device previously failed".into());
+        }
+        let default_sub = if cfg!(target_os = "windows") { 32768 } else { 131072 };
+        let sub_max = if self.cap == 0 { default_sub } else { self.cap.min(default_sub) };
+        let mut done = 0;
+        while done < batch {
+            if stop() {
+                break;
+            }
+            let n = (batch - done).min(sub_max) as u32;
+            let start = base.wrapping_add(done);
+            let result = unsafe {
+                (self.mine)(
+                    self.model,
+                    p.as_ptr(),
+                    s.as_ptr(),
+                    t.as_ptr(),
+                    time,
+                    start,
+                    n,
+                    crate::pom::POM_WALK_STEPS,
+                    h10,
+                )
+            };
+            if result == -2 {
+                self.healthy = false;
+                return Err("resident Vulkan dispatch failed".into());
+            }
+            if result >= 0 {
+                if result as u64 >= n as u64 {
+                    self.healthy = false;
+                    return Err("resident Vulkan returned an out-of-range winner".into());
+                }
+                return Ok((Some(start.wrapping_add(result as u64)), done + n as u64));
+            }
+            if result != -1 {
+                self.healthy = false;
+                return Err("resident Vulkan returned an unknown status".into());
+            }
+            done += n as u64;
+        }
+        Ok((None, done))
+    }
+}
+
+#[cfg(test)]
+mod resident_dispatch_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct Driver {
+        replies: std::collections::VecDeque<i64>,
+        calls: Vec<(u64, u32)>,
+        freed: Arc<AtomicUsize>,
+    }
+    unsafe extern "C" fn mine(
+        raw: *mut c_void,
+        _: *const u64,
+        _: *const u64,
+        _: *const u64,
+        _: u64,
+        base: u64,
+        count: u32,
+        _: u32,
+        _: u32,
+    ) -> i64 {
+        let driver = &mut *(raw as *mut Driver);
+        driver.calls.push((base, count));
+        driver.replies.pop_front().unwrap_or(-1)
+    }
+    unsafe extern "C" fn free(raw: *mut c_void) {
+        let driver = Box::from_raw(raw as *mut Driver);
+        driver.freed.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn fetch(_: *mut c_void, _: u64, _: *mut u8) -> bool {
+        false
+    }
+    fn walk(replies: &[i64]) -> (MiningWalk, Arc<AtomicUsize>) {
+        let freed = Arc::new(AtomicUsize::new(0));
+        let driver =
+            Box::new(Driver { replies: replies.iter().copied().collect(), calls: vec![], freed: freed.clone() });
+        (MiningWalk { model: Box::into_raw(driver).cast(), free, fetch, mine, cap: 4, healthy: true }, freed)
+    }
+    fn run(
+        walk: &mut MiningWalk,
+        base: u64,
+        count: u64,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(Option<u64>, u64), String> {
+        walk.mine_v4([0; 4], [0; 4], 0, [0; 4], base, count, 1, stop)
+    }
+
+    #[test]
+    fn resident_counts_partial_batches_and_wrapping_nonces() {
+        let (mut walk, freed) = walk(&[]);
+        assert_eq!(run(&mut walk, u64::MAX - 2, 10, &|| false).unwrap(), (None, 10));
+        assert_eq!(unsafe { &(*(walk.model as *mut Driver)).calls }, &[(u64::MAX - 2, 4), (1, 4), (5, 2)]);
+        drop(walk);
+        assert_eq!(freed.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn resident_pause_preserves_only_completed_work() {
+        let (mut walk, _) = walk(&[]);
+        let polls = std::cell::Cell::new(0);
+        let stop = || {
+            let n = polls.get();
+            polls.set(n + 1);
+            n == 1
+        };
+        assert_eq!(run(&mut walk, 20, 10, &stop).unwrap(), (None, 4));
+        assert_eq!(run(&mut walk, 24, 6, &|| true).unwrap(), (None, 0));
+        assert_eq!(unsafe { &(*(walk.model as *mut Driver)).calls }, &[(20, 4)]);
+    }
+    #[test]
+    fn resident_stops_at_first_winning_sub_batch() {
+        let (mut walk, _) = walk(&[-1, 2, 0]);
+        assert_eq!(run(&mut walk, 100, 12, &|| false).unwrap(), (Some(106), 8));
+        assert_eq!(unsafe { &(*(walk.model as *mut Driver)).calls }, &[(100, 4), (104, 4)]);
+    }
+    #[test]
+    fn resident_failed_dispatch_never_retries_or_frees_a_pending_device() {
+        for result in [-2, -3, 4] {
+            let (mut walk, freed) = walk(&[result]);
+            let raw = walk.model as *mut Driver;
+            assert!(run(&mut walk, 0, 4, &|| false).is_err());
+            assert!(run(&mut walk, 0, 4, &|| false).is_err());
+            assert_eq!(unsafe { (*raw).calls.len() }, 1);
+            drop(walk);
+            assert_eq!(freed.load(Ordering::SeqCst), 0);
+            // A fake driver has no in-flight GPU resources; reclaim the test allocation.
+            unsafe {
+                drop(Box::from_raw(raw));
+            }
+        }
+    }
+}
+
 struct InflightGuard;
 impl Drop for InflightGuard {
     fn drop(&mut self) {
@@ -817,6 +1096,11 @@ pub fn pom_mine_v4(
 ///   cargo test --release --features pom-opencl --lib vk_zero_dup_v4 -- --ignored --nocapture
 #[cfg(all(test, any(unix, windows)))]
 mod zero_dup_v4_tests {
+    fn check_test_pci((d, b, s, f): (u32, u32, u32, u32)) {
+        if let Ok(wanted) = std::env::var("KERYX_TEST_PCI") {
+            assert_eq!(format!("{d:04x}:{b:02x}:{s:02x}.{f:x}"), wanted, "test GPU PCI mismatch");
+        }
+    }
     use crate::pom::{self, WeightIndex};
     use crate::pom_v4::{
         fold64, v4_first_offset, v4_initial_state, v4_next_offset, v4_state_root, v4_transition_into, POM_V4_K,
@@ -858,9 +1142,95 @@ mod zero_dup_v4_tests {
 
     #[test]
     #[ignore]
+    fn vk_resident_v4_matches_cpu_reference() {
+        let path = std::env::var("KERYX_TEST_GGUF").expect("set KERYX_TEST_GGUF");
+        let gpu = std::env::var("KERYX_LLAMA_VK_DEVICE").unwrap_or_else(|_| "0".into()).parse().unwrap();
+        let pci = super::ggml_device_pci(gpu).expect("selected Vulkan PCI identity");
+        check_test_pci(pci);
+        let index = WeightIndex::build_from_gguf(&path, [0x5au8; 32]).expect("fixture index");
+        let mut walk = super::MiningWalk::load(&path, pci, &index).expect("resident Vulkan walk");
+        let mut x = 0x9e3779b97f4a7c15u64;
+        for _ in 0..8192 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let off = x % index.n_chunks;
+            let mut got = [0u8; 32];
+            assert!(unsafe { (walk.fetch)(walk.model, off, got.as_mut_ptr()) });
+            assert_eq!(got, index.read_chunk_bytes(off), "resident chunk {off}");
+        }
+        let pph: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(23).wrapping_add(5));
+        let time = 0x0123_4567_89ab_cdef;
+        let p = pom::pph_words_for_era(&pph, true);
+        let nn: u64 = std::env::var("KERYX_TEST_NONCES").ok().and_then(|s| s.parse().ok()).unwrap_or(1027);
+        let never = || false;
+        for (h10, h14, label) in [(false, false, "pre-H10"), (true, false, "H10"), (true, true, "H14")] {
+            let s = if h14 {
+                pom::pph_words(&pom::seed_h14_pph(&pph))
+            } else if h10 {
+                pom::pph_words(&pph)
+            } else {
+                pom::pph_words_v4(&pph)
+            };
+            let value = |nonce| {
+                let seed = if h14 {
+                    pom::pom_block_seed_h14(&pph, time, nonce)
+                } else if h10 {
+                    pom::pom_block_seed_h10(&pph, time, nonce)
+                } else {
+                    pom::pom_block_seed_v4(&pph, time, nonce)
+                };
+                pom::pom_pow_value(cpu_v4_final(&index, seed), &pph, true)
+            };
+            let decrement = |mut v: [u8; 32]| {
+                for b in &mut v {
+                    if *b > 0 {
+                        *b -= 1;
+                        return v;
+                    }
+                    *b = 255;
+                }
+                panic!("zero target")
+            };
+            let mut best = ([255u8; 32], 0);
+            for nonce in 0..nn {
+                let v = value(nonce);
+                if le_le(&v, &best.0) {
+                    best = (v, nonce);
+                }
+            }
+            let (winner, done) = walk.mine_v4(p, s, time, words(&best.0), 0, nn, h10 as u32, &never).unwrap();
+            assert_eq!(winner, Some(best.1), "{label} resident argmin");
+            assert!(done > best.1 && done <= nn);
+            assert_eq!(
+                walk.mine_v4(p, s, time, words(&decrement(best.0)), 0, nn, h10 as u32, &never).unwrap(),
+                (None, nn)
+            );
+            // Exact value boundaries for independent nonces, including u64 wraparound:
+            // equality must win and one below must lose, detecting either direction of error.
+            for nonce in [0, 1, 31, 32, 63, 64, 65535, 65536, u64::MAX - 1, u64::MAX] {
+                let v = value(nonce);
+                assert_eq!(
+                    walk.mine_v4(p, s, time, words(&v), nonce, 1, h10 as u32, &never).unwrap(),
+                    (Some(nonce), 1)
+                );
+                assert_eq!(
+                    walk.mine_v4(p, s, time, words(&decrement(v)), nonce, 1, h10 as u32, &never).unwrap(),
+                    (None, 1)
+                );
+            }
+            eprintln!("[{label}] resident CPU exactness + boundary checks PASS ({nn} nonces)");
+        }
+        assert_eq!(walk.mine_v4(p, p, time, [0; 4], 0, 65545, 1, &never).unwrap(), (None, 65545));
+        assert_eq!(walk.mine_v4(p, p, time, [0; 4], 0, 65545, 1, &|| true).unwrap(), (None, 0));
+    }
+
+    #[test]
+    #[ignore]
     fn vk_zero_dup_v4_matches_cpu_reference() {
         let path = std::env::var("KERYX_TEST_GGUF").expect("set KERYX_TEST_GGUF");
         let gpu: usize = std::env::var("KERYX_LLAMA_VK_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        check_test_pci(super::ggml_device_pci(gpu as i32).expect("selected Vulkan PCI identity"));
         assert!(super::ensure_loaded(&path, gpu), "engine load failed");
         assert!(super::pom_ready(), "engine walk not ready");
         eprintln!("engine: walk kernel = {}", super::pom_walk_kernel());
@@ -868,7 +1238,11 @@ mod zero_dup_v4_tests {
         let gen = |label: &str| {
             let t0 = std::time::Instant::now();
             let r = super::generate_for(&path, "Reply with the single word pong.", 32);
-            eprintln!("generate ({label}): {:?} in {:.2}s", r.as_ref().map(|s| s.trim().chars().take(40).collect::<String>()), t0.elapsed().as_secs_f64());
+            eprintln!(
+                "generate ({label}): {:?} in {:.2}s",
+                r.as_ref().map(|s| s.trim().chars().take(40).collect::<String>()),
+                t0.elapsed().as_secs_f64()
+            );
             assert!(r.is_ok(), "generation failed ({label})");
         };
         gen("before walk");

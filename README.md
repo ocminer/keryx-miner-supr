@@ -165,11 +165,17 @@ through a Vulkan v4 walk kernel — after a startup byte gate that proves the ga
 exact model bytes. It is shown MINING with the `[INF]` badge. The Vulkan walk runs at OpenCL speed:
 a chase pass resolves each nonce's 256 tile addresses and the walk uses the matrix cores on RDNA3+
 (`VK_KHR_cooperative_matrix`, int8) or packed int8 dot products elsewhere — measured RX 7600 XT
-0.58 MH/s (OpenCL 0.59), RX 7900 XTX 1.44 (OpenCL 1.51), MI50 0.96 (OpenCL 0.52). Cards where
+0.58 MH/s (OpenCL 0.59), RX 7900 XTX 1.44 (OpenCL 1.51), MI50 0.96 (OpenCL 0.52). Radeon cards where
 both fit keep the OpenCL walk by default. `KERYX_ZERO_DUP=force` makes every engine-hosted card use
 the Vulkan walk, `KERYX_ZERO_DUP=off` restores the inference-only reservation. RDNA1 (RX 5600/5700)
 never uses it (driver hang on buffer-address reads). `KERYX_VK_WALK_MODE=cm|tp|sp` pins the kernel
 (matrix cores / two-phase dp4a / single-phase); the two-phase scratch takes 67 MB of VRAM.
+
+MI50/MI60 (`gfx906`) mining workers also select Vulkan when they are not hosting inference.
+Radeon mining workers retain their OpenCL defaults. `KERYX_POM_BACKEND=opencl|vulkan` overrides
+this selection for resident mining workers; it does not change the inference card's zero-dup
+policy or the RDNA1 exclusion. An older sidecar without resident Vulkan support falls back to
+OpenCL. An explicit `KERYX_POM_V4_MODE` keeps selecting OpenCL unless the backend is also overridden.
 
 **GTX 1080 Ti / Pascal notes.** Validated on a real 1080 Ti (sm_61, driver 550): the PoM walk is
 byte-exact (host↔GPU lockstep + H10 seed tests pass), pool shares are accepted, and solo mining
@@ -480,6 +486,7 @@ At startup the miner logs which mode is active: `PoM resident tree: ON` or `PoM 
 |---|---|---|
 | `KERYX_INFERENCE_GPU` | auto | Pin OPoI inference to a specific CUDA ordinal (see note in *Automatic per-card selection*). |
 | `KERYX_ZERO_DUP` | auto | AMD only. `force`: every card hosting the inference model mines through the Vulkan zero-dup walk instead of its own OpenCL blob; `off`: a reserved inference card stays inference-only; unset: zero-dup exactly on the reserved card (model + walk do not fit together). |
+| `KERYX_POM_BACKEND` | auto | AMD resident mining workers: `opencl` or `vulkan`. Auto selects Vulkan on gfx906 and OpenCL on Radeon; the inference card's zero-dup policy remains separate. RDNA1 always uses OpenCL. |
 | `KERYX_RESIDENT_TREE=1` | off | Back-compat equivalent of `--resident-tree` (the CLI flag is preferred; `--no-resident-tree` overrides it). |
 
 ## Roadmap

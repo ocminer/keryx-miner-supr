@@ -102,6 +102,9 @@ layout(push_constant) uniform Push {
     uint     pad0;
 } pc;
 
+layout(constant_id = 0) const uint SPEC_TENSORS = 0u;
+#define N_TENSORS (SPEC_TENSORS != 0u ? SPEC_TENSORS : pc.n_tensors)
+
 const uint V4_D = 32u;
 const uint V4_D4 = 8u;                 // uints per row/column (32 bytes)
 const uint V4_TILE_CHUNKS = 32u;
@@ -331,7 +334,8 @@ void b3_hash_pair(uint in_base, uint out_base) {
 // when it fits, else global) for the owning tensor. GLSL array subscripts are 32-bit, so the
 // wide arithmetic lives in the buffer_reference POINTER, never the index.
 uint locate_chunk(uint64_t c, bool lds_table, out uint64_t base) {
-    uint lo = 0u, hi = pc.n_tensors; // invariant: prefix[lo] <= c < prefix[hi]
+    if (N_TENSORS == 1u) { base = 0UL; return 0u; }
+    uint lo = 0u, hi = N_TENSORS; // invariant: prefix[lo] <= c < prefix[hi]
     if (lds_table) {
         while (hi - lo > 1u) {
             uint mid = (lo + hi) / 2u;
@@ -361,6 +365,7 @@ uint64_t chunk_addr(uint64_t c, bool lds_table) {
 // does. `addr0` receives chunk 0's address either way.
 uint64_t resolve_tile(uint64_t off, bool lds_table, out uint64_t addr0) {
     const uint64_t c0 = off * uint64_t(V4_TILE_CHUNKS);
+    if (N_TENSORS == 1u) { addr0 = ADDRS.addr[0] + c0 * 32UL; return addr0; }
     uint64_t base;
     const uint lo = locate_chunk(c0, lds_table, base);
     const uint64_t next = lds_table ? prefix_lds[lo + 1u] : PREFIX.prefix[lo + 1u];
@@ -373,7 +378,7 @@ uint64_t resolve_tile(uint64_t off, bool lds_table, out uint64_t addr0) {
 
 // Device address of chunk `lane` of a resolved tile.
 uint64_t lane_chunk_addr(uint64_t resolved, uint lane, bool lds_table) {
-    if ((resolved & 1UL) == 0UL) {
+    if (N_TENSORS == 1u || (resolved & 1UL) == 0UL) {
         return resolved + uint64_t(lane) * 32UL;
     }
     const uint64_t off = resolved >> 1;
@@ -400,9 +405,9 @@ void load_chunk(uint64_t c, uint dst_base, bool lds_table) {
 // Mirror the prefix table into shared memory (uniform decision per dispatch; every lane must
 // take part — called before any barrier-dependent work).
 bool mirror_prefix_table(uint lid, uint group_size) {
-    const bool lds_table = pc.n_tensors + 1u <= PREFIX_LDS_MAX;
+    const bool lds_table = N_TENSORS + 1u <= PREFIX_LDS_MAX;
     if (lds_table) {
-        for (uint i = lid; i <= pc.n_tensors; i += group_size) prefix_lds[i] = PREFIX.prefix[i];
+        for (uint i = lid; i <= N_TENSORS; i += group_size) prefix_lds[i] = PREFIX.prefix[i];
         memoryBarrierShared();
         barrier();
     }

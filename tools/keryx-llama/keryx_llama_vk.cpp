@@ -172,6 +172,7 @@ struct KeryxLlama {
     uint32_t n_tensors = 0;
     uint64_t supl_bytes = 0;
     bool walk_ready = false;
+    bool device_failed = false;
     bool walk_dot = false;  // packed int8 dot-product kernel selected (else scalar)
     bool walk_cm = false;   // matrix-core (cooperative matrix) kernel selected
     uint32_t walk_npg = 8;  // sub-nonces per walk workgroup (dispatch geometry)
@@ -197,41 +198,69 @@ static uint32_t find_mem_type(VkPhysicalDevice phys, uint32_t type_bits, VkMemor
 static bool make_buffer(KeryxLlama* h, VkDeviceSize size, VkBufferUsageFlags usage,
                         VkMemoryPropertyFlags props, bool bda, VkBuffer* buf, VkDeviceMemory* mem,
                         void** mapped) {
+    *buf = VK_NULL_HANDLE;
+    *mem = VK_NULL_HANDLE;
+    if (mapped) *mapped = nullptr;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage | (bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(h->dev, &bi, nullptr, buf) != VK_SUCCESS) return false;
+    VkResult result = vkCreateBuffer(h->dev, &bi, nullptr, buf);
+    if (result != VK_SUCCESS) {
+        h->device_failed |= result == VK_ERROR_DEVICE_LOST;
+        return false;
+    }
+    auto fail = [&](VkResult error) {
+        h->device_failed |= error == VK_ERROR_DEVICE_LOST;
+        vkDestroyBuffer(h->dev, *buf, nullptr);
+        if (*mem) vkFreeMemory(h->dev, *mem, nullptr);
+        *buf = VK_NULL_HANDLE;
+        *mem = VK_NULL_HANDLE;
+        return false;
+    };
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(h->dev, *buf, &req);
     uint32_t mt = find_mem_type(h->phys, req.memoryTypeBits, props);
-    if (mt == UINT32_MAX) return false;
+    if (mt == UINT32_MAX) return fail(VK_ERROR_FEATURE_NOT_PRESENT);
     VkMemoryAllocateFlagsInfo fi{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
     fi.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.pNext = bda ? &fi : nullptr;
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = mt;
-    if (vkAllocateMemory(h->dev, &ai, nullptr, mem) != VK_SUCCESS) return false;
-    if (vkBindBufferMemory(h->dev, *buf, *mem, 0) != VK_SUCCESS) return false;
+    result = vkAllocateMemory(h->dev, &ai, nullptr, mem);
+    if (result != VK_SUCCESS) return fail(result);
+    result = vkBindBufferMemory(h->dev, *buf, *mem, 0);
+    if (result != VK_SUCCESS) return fail(result);
     if (mapped) {
-        if (vkMapMemory(h->dev, *mem, 0, VK_WHOLE_SIZE, 0, mapped) != VK_SUCCESS) return false;
+        result = vkMapMemory(h->dev, *mem, 0, VK_WHOLE_SIZE, 0, mapped);
+        if (result != VK_SUCCESS) return fail(result);
     }
     return true;
 }
 
 // Submit the recorded h->cmd through ggml's queue-mutex-guarded hook and wait on our fence.
 static bool submit_and_wait(KeryxLlama* h) {
+    if (h->device_failed) return false;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &h->cmd;
-    vkResetFences(h->dev, 1, &h->fence);
-    keryx_vk_queue_submit(h->gpu, &si, (void*)h->fence);
-    return vkWaitForFences(h->dev, 1, &h->fence, VK_TRUE, 30ull * 1000 * 1000 * 1000) == VK_SUCCESS;
+    try {
+        if (vkResetFences(h->dev, 1, &h->fence) != VK_SUCCESS) {
+            h->device_failed = true;
+            return false;
+        }
+        keryx_vk_queue_submit(h->gpu, &si, (void*)h->fence);
+        h->device_failed = vkWaitForFences(h->dev, 1, &h->fence, VK_TRUE, 30ull * 1000 * 1000 * 1000) != VK_SUCCESS;
+    } catch (...) {
+        h->device_failed = true;
+    }
+    return !h->device_failed;
 }
 
 // Upload `data` into `dst` (device-local) through a bounded host-visible staging window.
-static bool staged_upload(KeryxLlama* h, VkBuffer dst, const uint8_t* data, VkDeviceSize size) {
+static bool staged_upload(KeryxLlama* h, VkBuffer dst, const uint8_t* data, VkDeviceSize size,
+                          VkDeviceSize dst_offset = 0) {
     const VkDeviceSize WINDOW = 64ull << 20;
     VkBuffer stage; VkDeviceMemory stage_mem; void* map = nullptr;
     if (!make_buffer(h, std::min(WINDOW, size), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -247,11 +276,16 @@ static bool staged_upload(KeryxLlama* h, VkBuffer dst, const uint8_t* data, VkDe
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(h->cmd, &bi);
-        VkBufferCopy c{0, off, n};
+        VkBufferCopy c{0, dst_offset + off, n};
         vkCmdCopyBuffer(h->cmd, stage, dst, 1, &c);
+        VkMemoryBarrier visible{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+        vkCmdPipelineBarrier(h->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &visible, 0, nullptr, 0, nullptr);
         vkEndCommandBuffer(h->cmd);
         ok = submit_and_wait(h);
     }
+    if (h->device_failed) return false; // pending DMA may still reference this staging allocation
     vkUnmapMemory(h->dev, stage_mem);
     vkDestroyBuffer(h->dev, stage, nullptr);
     vkFreeMemory(h->dev, stage_mem, nullptr);
@@ -287,6 +321,11 @@ static VkPipeline make_pipeline(KeryxLlama* h, const uint32_t* spv, size_t spv_b
     rss.requiredSubgroupSize = wave;
     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, wave ? &rss : nullptr, 0,
                  VK_SHADER_STAGE_COMPUTE_BIT, *sm, "main", nullptr};
+    // The standalone resident walk has one contiguous tensor. Specializing the count
+    // removes its table search and straddle path; normal zero-dup models retain theirs.
+    VkSpecializationMapEntry tensor_entry{0, 0, sizeof(h->n_tensors)};
+    VkSpecializationInfo tensor_spec{1, &tensor_entry, sizeof(h->n_tensors), &h->n_tensors};
+    cpi.stage.pSpecializationInfo = &tensor_spec;
     cpi.layout = *pl;
     VkPipeline pipe = VK_NULL_HANDLE;
     if (vkCreateComputePipelines(h->dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe) != VK_SUCCESS && wave) {
@@ -321,17 +360,29 @@ static bool walk_init(KeryxLlama* h) {
     // tensor's VkDevice against raw_handles across dev_num.
     VkDevice model_dev = VK_NULL_HANDLE;
     for (auto& name : gnames) {
-        const ggml_tensor* t = h->model->get_tensor(name.c_str());
+        const ggml_tensor* t = h->model ? h->model->get_tensor(name.c_str()) : nullptr;
         if (t) {
             if (void* d = keryx_vk_tensor_device(t)) { model_dev = (VkDevice)d; break; }
         }
     }
-    if (!model_dev) {
+    if (!model_dev && h->model) {
         KERYX_LOG_ERROR("keryx-llama-vk: no VK-resident tensor found (model on CPU?)\n");
         gguf_free(g); if (meta) ggml_free(meta);
         return false;
     }
     bool located = false;
+    if (!h->model) {
+        void *inst, *phys, *dev;
+        uint32_t qfam;
+        if (!keryx_vk_raw_handles(h->gpu, &inst, &phys, &dev, &qfam)) {
+            gguf_free(g); if (meta) ggml_free(meta);
+            return false;
+        }
+        h->dev = (VkDevice)dev;
+        h->phys = (VkPhysicalDevice)phys;
+        h->qfam = qfam;
+        located = true;
+    }
     for (size_t dn = 0; dn < 16 && !located; dn++) {
         void *inst, *phys, *dev;
         uint32_t qfam;
@@ -381,7 +432,7 @@ static bool walk_init(KeryxLlama* h) {
         const uint64_t gguf_nbytes = ggml_nbytes(mt);
         const uint64_t chunks = gguf_nbytes / CHUNK_BYTES;
         if (chunks == 0) continue;
-        const ggml_tensor* t = h->model->get_tensor(name.c_str());
+        const ggml_tensor* t = h->model ? h->model->get_tensor(name.c_str()) : nullptr;
         uint64_t addr = 0, sz = 0;
         if (t && keryx_vk_tensor_addr(t, &addr, &sz) && sz == gguf_nbytes
             && keryx_vk_tensor_device(t) == (void*)model_dev) {
@@ -410,23 +461,39 @@ static bool walk_init(KeryxLlama* h) {
         }
         FILE* f = fopen(h->gguf_path.c_str(), "rb");
         if (!f) return false;
-        std::vector<uint8_t> flat(supl_total);
+        // Mining-only cards stream the whole canonical model here. Bound host RAM rather
+        // than making a model-sized temporary copy (the shared GGUF stays on its mount).
+        const uint64_t window = 64ull << 20;
+        std::vector<uint8_t> flat((size_t)std::min(window, supl_total));
         for (size_t i = 0; i < supl_src.size(); i++) {
-            if (keryx_file_seek(f, supl_src[i].first) != 0 ||
-                fread(flat.data() + supl_off[i], 1, supl_src[i].second, f) != supl_src[i].second) {
+            if (keryx_file_seek(f, supl_src[i].first) != 0) {
                 fclose(f);
-                KERYX_LOG_ERROR("keryx-llama-vk: supplement read failed\n");
                 return false;
+            }
+            for (uint64_t off = 0; off < supl_src[i].second; off += window) {
+                const size_t n = (size_t)std::min(window, supl_src[i].second - off);
+                if (fread(flat.data(), 1, n, f) != n ||
+                    !staged_upload(h, h->supl_buf, flat.data(), n, supl_off[i] + off)) {
+                    fclose(f);
+                    KERYX_LOG_ERROR("keryx-llama-vk: supplement read/upload failed\n");
+                    return false;
+                }
             }
         }
         fclose(f);
-        if (!staged_upload(h, h->supl_buf, flat.data(), supl_total)) return false;
         VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         dai.buffer = h->supl_buf;
         uint64_t supl_bda = vkGetBufferDeviceAddress(h->dev, &dai);
         size_t si = 0;
         for (size_t j = 0; j < addrs.size() && si < supl_src.size(); j++) {
             if (addrs[j] == 0) { addrs[j] = supl_bda + supl_off[si]; si++; }
+        }
+        if (!h->model) {
+            // Every tensor was streamed in canonical order without gaps. Adjacent tensor
+            // boundaries disappear, including tiles crossing them: it is one byte-exact blob.
+            prefix = {0, h->n_chunks};
+            addrs = {supl_bda};
+            h->n_tensors = 1;
         }
     }
 
@@ -702,6 +769,32 @@ static std::string g_sys_prompt;
 static std::string keryx_system_prompt() { std::lock_guard<std::mutex> g(g_sys_mu); return g_sys_prompt; }
 
 extern "C" {
+
+void keryx_llama_free(KeryxLlama* h);
+
+// Optional ABI-6 extension: a mining-only GPU gets the same proven Vulkan walk over a
+// single canonical resident allocation. It does not load an inference model/context or
+// affect the independently selected inference card. Caller verifies PCI identity + bytes.
+KeryxLlama* keryx_llama_pom_load(const char* gguf_path, int gpu, int* device_failed) {
+    if (device_failed) *device_failed = 0;
+    if (!gguf_path || gpu < 0) return nullptr;
+    KeryxLlama* h = nullptr;
+    try {
+        h = new KeryxLlama();
+        h->gguf_path = gguf_path;
+        h->gpu = (size_t)gpu;
+        h->walk_ready = walk_init(h);
+        if (h->walk_ready) return h;
+        if (device_failed) *device_failed = h->device_failed ? 1 : 0;
+    } catch (...) {
+        // Never unwind C++ through the C ABI. Unknown native failures are fail-closed;
+        // ordinary unsupported features/allocation failures above may fall back to OpenCL.
+        if (device_failed) *device_failed = 1;
+        if (h) h->device_failed = true;
+    }
+    keryx_llama_free(h);
+    return nullptr;
+}
 
 // Core ABI (load/generate/free) matches the CUDA flavor; the _vk_abi covers the walk exports.
 int keryx_llama_abi() { return 2; }
@@ -1087,6 +1180,10 @@ int keryx_llama_prompt_guard() { return 1; }
 
 void keryx_llama_free(KeryxLlama* h) {
     if (!h) return;
+    if (h->device_failed) {
+        KERYX_LOG_ERROR("keryx-llama-vk: failed device resources retained until process exit\n");
+        return;
+    }
     if (h->dev) {
         vkDeviceWaitIdle(h->dev);
         auto dbuf = [&](VkBuffer b, VkDeviceMemory m) {
