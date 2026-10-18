@@ -68,6 +68,9 @@ static const uint32_t WALK_TP_SCALAR_SPV[] =
 static const uint32_t WALK_TP_CM_SPV[] =
 #include "pom_walk_tp_cm_vk.spv.inc"
 ;
+static const uint32_t WALK_TP_CM_SINGLE_SPV[] =
+#include "pom_walk_tp_cm_single_vk.spv.inc"
+;
 static const uint32_t FETCH_SPV[] =
 #include "pom_fetch_vk.spv.inc"
 ;
@@ -302,9 +305,20 @@ static uint32_t walk_wave_size() {
     return 0;
 }
 
+static bool prefer_single_nonce_cm(KeryxLlama* h) {
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    props.pNext = &driver;
+    vkGetPhysicalDeviceProperties2(h->phys, &props);
+    // This tuning has been qualified on the XTX with RADV. Other drivers and
+    // devices retain their existing kernel until separately measured.
+    return props.properties.vendorID == 0x1002 && driver.driverID == VK_DRIVER_ID_MESA_RADV &&
+           strstr(props.properties.deviceName, "7900 XTX") != nullptr;
+}
+
 static VkPipeline make_pipeline(KeryxLlama* h, const uint32_t* spv, size_t spv_bytes,
                                 uint32_t push_bytes, VkShaderModule* sm, VkPipelineLayout* pl,
-                                uint32_t wave = 0) {
+                                uint32_t wave = 0, bool allow_wave_fallback = true) {
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = spv_bytes;
     smi.pCode = spv;
@@ -315,7 +329,11 @@ static VkPipeline make_pipeline(KeryxLlama* h, const uint32_t* spv, size_t spv_b
     pli.pSetLayouts = &h->dsl;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(h->dev, &pli, nullptr, pl) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (vkCreatePipelineLayout(h->dev, &pli, nullptr, pl) != VK_SUCCESS) {
+        vkDestroyShaderModule(h->dev, *sm, nullptr);
+        *sm = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
     rss.requiredSubgroupSize = wave;
@@ -328,11 +346,21 @@ static VkPipeline make_pipeline(KeryxLlama* h, const uint32_t* spv, size_t spv_b
     cpi.stage.pSpecializationInfo = &tensor_spec;
     cpi.layout = *pl;
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (vkCreateComputePipelines(h->dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe) != VK_SUCCESS && wave) {
+    VkResult result = vkCreateComputePipelines(h->dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe);
+    if (result != VK_SUCCESS && wave && allow_wave_fallback) {
         KERYX_LOG_WARN("keryx-llama-vk: wave%u pipeline refused — using the driver default\n", wave);
         cpi.stage.pNext = nullptr;
+        if (pipe) vkDestroyPipeline(h->dev, pipe, nullptr);
         pipe = VK_NULL_HANDLE;
-        vkCreateComputePipelines(h->dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe);
+        result = vkCreateComputePipelines(h->dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe);
+    }
+    if (result != VK_SUCCESS) {
+        if (pipe) vkDestroyPipeline(h->dev, pipe, nullptr);
+        vkDestroyPipelineLayout(h->dev, *pl, nullptr);
+        vkDestroyShaderModule(h->dev, *sm, nullptr);
+        *pl = VK_NULL_HANDLE;
+        *sm = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
     }
     return pipe;
 }
@@ -616,20 +644,38 @@ static bool walk_init(KeryxLlama* h) {
     const bool cm_forced = mode_env && strcmp(mode_env, "cm") == 0;
     const bool cm_disabled = mode_env && !cm_forced;
     bool want_cm = tp && !cm_disabled && (cm_forced || keryx_vk_coopmat_int8(h->gpu));
-    if (const char* n = getenv("KERYX_VK_WALK_NPG")) { long v = atol(n); if (v == 2 || v == 8) h->walk_npg = (uint32_t)v; }
+    const char* npg_env = getenv("KERYX_VK_WALK_NPG");
+    if (npg_env) { long v = atol(npg_env); if (v == 1 || v == 2 || v == 8) h->walk_npg = (uint32_t)v; }
     if (!ext_spv.empty()) {
         h->walk_pipe = make_pipeline(h, ext_spv.data(), ext_spv.size() * 4, sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave);
     } else if (want_cm) {
-        // wave64 measured faster than wave32 for the matrix-core walk (RX 7600 XT / 7900 XTX).
-        h->walk_pipe = make_pipeline(h, WALK_TP_CM_SPV, sizeof(WALK_TP_CM_SPV), sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave ? wave : 64);
-        if (h->walk_pipe) {
-            h->walk_cm = true;
-            h->walk_npg = 2;
-        } else {
-            KERYX_LOG_WARN("keryx-llama-vk: matrix-core walk pipeline refused — using the dp4a kernel\n");
-            h->walk_pipe = make_pipeline(h, want_dot ? WALK_TP_DOT_SPV : WALK_TP_SCALAR_SPV,
-                                         want_dot ? sizeof(WALK_TP_DOT_SPV) : sizeof(WALK_TP_SCALAR_SPV),
-                                         sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave);
+        const bool single = (!wave || wave == 32) &&
+                            (npg_env ? h->walk_npg == 1 : prefer_single_nonce_cm(h));
+        if (single) {
+            // A 32-thread workgroup must have one complete wave32. Never retry
+            // this shader with an unknown subgroup size; fall back to the
+            // established two-nonce kernel if the requested size is refused.
+            h->walk_pipe = make_pipeline(h, WALK_TP_CM_SINGLE_SPV, sizeof(WALK_TP_CM_SINGLE_SPV),
+                                         sizeof(PushWalk), &h->walk_sm, &h->walk_pl, 32, false);
+            if (h->walk_pipe) {
+                h->walk_cm = true;
+                h->walk_npg = 1;
+                KERYX_LOG_INFO("keryx-llama-vk: matrix-core walk uses one nonce per wave32\n");
+            }
+        }
+        if (!h->walk_pipe) {
+            // The established two-nonce matrix kernel prefers wave64.
+            h->walk_pipe = make_pipeline(h, WALK_TP_CM_SPV, sizeof(WALK_TP_CM_SPV), sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave ? wave : 64);
+            if (h->walk_pipe) {
+                h->walk_cm = true;
+                h->walk_npg = 2;
+            } else {
+                KERYX_LOG_WARN("keryx-llama-vk: matrix-core walk pipeline refused — using the dp4a kernel\n");
+                h->walk_npg = 8;
+                h->walk_pipe = make_pipeline(h, want_dot ? WALK_TP_DOT_SPV : WALK_TP_SCALAR_SPV,
+                                             want_dot ? sizeof(WALK_TP_DOT_SPV) : sizeof(WALK_TP_SCALAR_SPV),
+                                             sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave);
+            }
         }
     } else if (tp && want_dot) {
         h->walk_pipe = make_pipeline(h, WALK_TP_DOT_SPV, sizeof(WALK_TP_DOT_SPV), sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave);
@@ -641,6 +687,7 @@ static bool walk_init(KeryxLlama* h) {
         h->walk_pipe = make_pipeline(h, WALK_SCALAR_SPV, sizeof(WALK_SCALAR_SPV), sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave);
     }
     if (tp) {
+        const uint32_t chase_wave = wave ? wave : (h->walk_cm && h->walk_npg == 1 ? 32 : 0);
         std::vector<uint32_t> ext_chase;
         if (const char* f = getenv("KERYX_VK_CHASE_SPV")) {
             if (FILE* fp = fopen(f, "rb")) {
@@ -651,8 +698,8 @@ static bool walk_init(KeryxLlama* h) {
             if (!ext_chase.empty()) KERYX_LOG_WARN("keryx-llama-vk: chase shader loaded from %s — DEVELOPMENT ONLY\n", f);
         }
         h->chase_pipe = ext_chase.empty()
-            ? make_pipeline(h, CHASE_SPV, sizeof(CHASE_SPV), sizeof(PushWalk), &h->chase_sm, &h->chase_pl, wave)
-            : make_pipeline(h, ext_chase.data(), ext_chase.size() * 4, sizeof(PushWalk), &h->chase_sm, &h->chase_pl, wave);
+            ? make_pipeline(h, CHASE_SPV, sizeof(CHASE_SPV), sizeof(PushWalk), &h->chase_sm, &h->chase_pl, chase_wave)
+            : make_pipeline(h, ext_chase.data(), ext_chase.size() * 4, sizeof(PushWalk), &h->chase_sm, &h->chase_pl, chase_wave);
         if (!h->chase_pipe) return false;
     }
     h->fetch_pipe = make_pipeline(h, FETCH_SPV, sizeof(FETCH_SPV), sizeof(PushFetch), &h->fetch_sm, &h->fetch_pl);
@@ -732,7 +779,7 @@ static bool run_two_phase(KeryxLlama* h, PushWalk pw, uint32_t total) {
         vkCmdDispatch(h->cmd, (p.batch + 63) / 64, 1, 1);
     };
     // walk(i) carries the chase of sub-batch i+1 as its leading workgroups (fused, concurrent).
-    const uint32_t walk_wg = h->walk_npg == 2 ? 64 : 256;
+    const uint32_t walk_wg = h->walk_npg == 1 ? 32 : (h->walk_npg == 2 ? 64 : 256);
     auto walk = [&](uint32_t i, bool fuse_next) {
         PushWalk p = sub_push(i);
         if (fuse_next) {

@@ -36,7 +36,9 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #endif
 
-#if defined(POM_CHASE) || defined(POM_TP_CM)
+#if defined(POM_TP_CM_SINGLE)
+layout(local_size_x = 32) in;
+#elif defined(POM_CHASE) || defined(POM_TP_CM)
 layout(local_size_x = 64) in;
 #else
 layout(local_size_x = 256) in;
@@ -124,13 +126,25 @@ const uint64_t V4_OFFSET_STEP_SALT  = 0x89050E78D34609EFUL;
 // 16x16 position matrix (shared by the group) that reveals the implementation's accumulator
 // element layout. The Merkle scratch aliases the tile. ~3 KB per sub-nonce. Every exchange
 // stays inside one subgroup (wave32: one sub-nonce per subgroup; wave64: both).
+#ifdef POM_TP_CM_SINGLE
+// One complete wave32 owns a nonce. The startup position matrix can reuse
+// the tile staging area once all fragment positions have been read.
+const uint CM_NPG = 1u;
+const uint CM_GROUP_SIZE = 32u;
+#else
 const uint CM_NPG = 2u;
+const uint CM_GROUP_SIZE = 64u;
+#endif
 const uint CM_TILE_STRIDE = 12u;        // words per padded 32-byte tile column
 const uint CM_TILE_WORDS = 32u * CM_TILE_STRIDE;
 const uint CM_STATE_STRIDE = 48u;       // bytes per padded 32-byte state row
 shared uint   cm_tile[CM_NPG * CM_TILE_WORDS];
 shared int8_t cm_state[CM_NPG][32 * CM_STATE_STRIDE];
+#ifdef POM_TP_CM_SINGLE
+#define cm_layout cm_tile
+#else
 shared uint   cm_layout[256];
+#endif
 #define scratch cm_tile
 #elif defined(POM_TP)
 // Tile double buffer per sub-nonce as 16-byte vectors (2 x 64 uvec4 = 2 KB): the column reads
@@ -442,6 +456,9 @@ void initial_row(uint64_t seed, uint lane, out uint row4[V4_D4]) {
 // root_K (32 blake3 row leaves + depth-5 Merkle tree over scratch[strip..]) -> fold64 -> pow fold
 // -> target check -> atomicMin. Every lane of the sub-nonce takes part (barriers).
 void finish(uint row4[V4_D4], uint strip, uint lane, uint gsub, bool live) {
+#ifdef POM_TP_CM_SINGLE
+    if (lane < 32u)
+#endif
     b3_hash_row32(row4, strip + lane * 8u);
     memoryBarrierShared();
     barrier();
@@ -619,11 +636,15 @@ void main() {
     const uint lid  = gl_LocalInvocationID.x;
     // Leading workgroups chase the NEXT sub-batch (uniform per workgroup; no barriers on this path).
     if (gl_WorkGroupID.x < pc.chase_groups) {
-        const uint cidx = gl_WorkGroupID.x * 64u + lid;
+        const uint cidx = gl_WorkGroupID.x * CM_GROUP_SIZE + lid;
         if (cidx < pc.chase_batch) chase_nonce(cidx, pc.chase_batch, pc.chase_start_nonce, false, true);
         return;
     }
+#ifdef POM_TP_CM_SINGLE
+    const uint sub = 0u;
+#else
     const uint sub  = lid >> 5;              // sub-nonce 0..1 within the group
+#endif
     const uint lane = lid & 31u;             // 0..31 within the sub-nonce
     const uint gsub = (gl_WorkGroupID.x - pc.chase_groups) * CM_NPG + sub;
     const bool live = gsub < pc.batch;
@@ -631,11 +652,16 @@ void main() {
     const bool lds_table = false;            // keep LDS for occupancy; the search is cheap
     const uint64_t seed = CHASE.tile[pc.k * pc.batch + idx];
     // Sub-nonces this subgroup computes matrices for (wave32: its own; wave64: both).
+#ifdef POM_TP_CM_SINGLE
+    const uint subs_per_sg = 1u;
+    const uint sg_first = 0u;
+#else
     const uint subs_per_sg = gl_SubgroupSize / 32u;
     const uint sg_first = gl_SubgroupID * subs_per_sg;
+#endif
 
     // Accumulator element layout: position (row*16 + col) of each element this lane holds.
-    for (uint i = lid; i < 256u; i += 64u) cm_layout[i] = i;
+    for (uint i = lid; i < 256u; i += CM_GROUP_SIZE) cm_layout[i] = i;
     memoryBarrierShared();
     barrier();
     // Per element: its tweak contribution (row*B + col*C within the block) and state byte offset.
@@ -651,8 +677,17 @@ void main() {
             state_pos[i] = r * CM_STATE_STRIDE + c;
         }
     }
+#ifdef POM_TP_CM_SINGLE
+    memoryBarrierShared();
+    barrier(); // position loads finish before the tile overwrites their storage
+#endif
     const uint n_elems = min(uint(CM_ACC_T(0).length()), CM_MAX_ELEMS);
 
+#ifdef POM_TP_CM_SINGLE
+    // Keep the row-owner guards explicit. Besides bounding the row accesses,
+    // this is the form qualified with RADV's shader scheduler.
+    if (lid < 32u)
+#endif
     {
         uint row4[V4_D4];
         initial_row(seed, lane, row4);
@@ -668,14 +703,22 @@ void main() {
 
     // Two tiles in flight: the tile of step+1 sits in `pref` while step+2's load is issued.
     uint pref[8];
-    if (pc.k > 1u) {
+    if (pc.k > 1u
+#ifdef POM_TP_CM_SINGLE
+        && lid < 32u
+#endif
+    ) {
         load_tile_chunk_regs(CHASE.tile[1u * pc.batch + idx], lane, lds_table, pref);
     }
     for (uint step = 1u; step <= pc.k; ++step) {
         const bool has_next = step < pc.k;
         const bool has_next2 = step + 1u < pc.k;
         uint pref2[8];
-        if (has_next2) {
+        if (has_next2
+#ifdef POM_TP_CM_SINGLE
+            && lid < 32u
+#endif
+        ) {
             load_tile_chunk_regs(CHASE.tile[(step + 1u) * pc.batch + idx], lane, lds_table, pref2);
         }
         const uint step_tweak = step * 0x9E3779B9u;
@@ -709,10 +752,18 @@ void main() {
                 }
             }
         }
-        if (has_next) {
+        if (has_next
+#ifdef POM_TP_CM_SINGLE
+            && lid < 32u
+#endif
+        ) {
             [[unroll]] for (uint i = 0u; i < 8u; ++i) cm_tile[sub * CM_TILE_WORDS + lane * CM_TILE_STRIDE + i] = pref[i];
         }
-        if (has_next2) {
+        if (has_next2
+#ifdef POM_TP_CM_SINGLE
+            && lid < 32u
+#endif
+        ) {
             [[unroll]] for (uint i = 0u; i < 8u; ++i) pref[i] = pref2[i];
         }
         subgroupMemoryBarrierShared();
@@ -727,7 +778,11 @@ void main() {
         row4[w] = v;
     }
     subgroupMemoryBarrierShared();
+#ifdef POM_TP_CM_SINGLE
+    finish(row4, sub * V4_SP_STRIP_U32, lid, gsub, live);
+#else
     finish(row4, sub * V4_SP_STRIP_U32, lane, gsub, live);
+#endif
 }
 
 #elif defined(POM_TP)

@@ -82,8 +82,12 @@ set(KERYX_WALK_TP_CM_SPV "${KERYX_SHADER_DIR}/pom_walk_tp_cm_vk.spv.inc")
 add_custom_command(OUTPUT "${KERYX_WALK_TP_CM_SPV}"
   COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.3 -O -DPOM_TP_CM=1 -mfmt=c -o "${KERYX_WALK_TP_CM_SPV}" "${KERYX_SHADER_SRC}"
   DEPENDS "${KERYX_SHADER_SRC}" VERBATIM)
+set(KERYX_WALK_TP_CM_SINGLE_SPV "${KERYX_SHADER_DIR}/pom_walk_tp_cm_single_vk.spv.inc")
+add_custom_command(OUTPUT "${KERYX_WALK_TP_CM_SINGLE_SPV}"
+  COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.3 -O -DPOM_TP_CM=1 -DPOM_TP_CM_SINGLE=1 -mfmt=c -o "${KERYX_WALK_TP_CM_SINGLE_SPV}" "${KERYX_SHADER_SRC}"
+  DEPENDS "${KERYX_SHADER_SRC}" VERBATIM)
 add_custom_target(keryx-pom-vk-shaders DEPENDS "${KERYX_WALK_SPV}" "${KERYX_WALK_DOT_SPV}" "${KERYX_FETCH_SPV}"
-  "${KERYX_CHASE_SPV}" "${KERYX_WALK_TP_SPV}" "${KERYX_WALK_TP_DOT_SPV}" "${KERYX_WALK_TP_CM_SPV}")
+  "${KERYX_CHASE_SPV}" "${KERYX_WALK_TP_SPV}" "${KERYX_WALK_TP_DOT_SPV}" "${KERYX_WALK_TP_CM_SPV}" "${KERYX_WALK_TP_CM_SINGLE_SPV}")
 
 add_library(keryx-llama-vk SHARED "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/keryx_llama_vk.cpp")
 add_dependencies(keryx-llama-vk keryx-pom-vk-shaders)

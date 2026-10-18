@@ -171,6 +171,10 @@ the Vulkan walk, `KERYX_ZERO_DUP=off` restores the inference-only reservation. R
 never uses it (driver hang on buffer-address reads). `KERYX_VK_WALK_MODE=cm|tp|sp` pins the kernel
 (matrix cores / two-phase dp4a / single-phase); the two-phase scratch takes 67 MB of VRAM.
 
+On RX 7900 XTX with RADV, the matrix-core walk automatically selects a tuned wave32 kernel.
+It shares the inference model and falls back to the established kernel if the required subgroup
+size is unavailable. `KERYX_VK_WALK_NPG=2` selects the established two-nonce kernel for comparison.
+
 MI50/MI60 (`gfx906`) mining workers also select Vulkan when they are not hosting inference.
 Radeon mining workers retain their OpenCL defaults. `KERYX_POM_BACKEND=opencl|vulkan` overrides
 this selection for resident mining workers; it does not change the inference card's zero-dup

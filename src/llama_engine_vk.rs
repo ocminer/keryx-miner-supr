@@ -1316,12 +1316,46 @@ mod zero_dup_v4_tests {
             assert!(k < 32, "target underflow");
             let (w_none, _) = super::pom_mine_v4(p, s, time, words(&below), 0, nn, h10, &never).expect("engine grind");
             assert_eq!(w_none, None, "[{name}] winner below the minimum pow value");
+            // Check the exact 256-bit boundary for individual nonces as well as
+            // the batch minimum. Include subgroup, dispatch and u64 boundaries.
+            for nonce in [0, 1, 31, 32, 63, 64, 16383, 16384, 65535, 65536, u64::MAX - 1, u64::MAX] {
+                let seed = if h14 {
+                    pom::pom_block_seed_h14(&pph, time, nonce)
+                } else if h10 {
+                    pom::pom_block_seed_h10(&pph, time, nonce)
+                } else {
+                    pom::pom_block_seed_v4(&pph, time, nonce)
+                };
+                let exact = pom::pom_pow_value(cpu_v4_final(&index, seed), &pph, true);
+                assert_eq!(
+                    super::pom_mine_v4(p, s, time, words(&exact), nonce, 1, h10, &never).expect("exact grind"),
+                    (Some(nonce), 1),
+                    "[{name}] exact target at nonce {nonce}"
+                );
+                let mut less = exact;
+                let mut borrow = true;
+                for byte in &mut less {
+                    if *byte != 0 {
+                        *byte -= 1;
+                        borrow = false;
+                        break;
+                    }
+                    *byte = 255;
+                }
+                assert!(!borrow, "target underflow");
+                assert_eq!(
+                    super::pom_mine_v4(p, s, time, words(&less), nonce, 1, h10, &never).expect("below exact grind"),
+                    (None, 1),
+                    "[{name}] below exact target at nonce {nonce}"
+                );
+            }
             eprintln!("[{name}] OK");
             gen("after walk");
         }
         // A longer grind (sub-dispatch loop) followed by generation — the production interleaving.
         let s = pom::pph_words(&pom::seed_h14_pph(&pph));
-        let (_, done) = super::pom_mine_v4(p, s, time, [0u64; 4], 0, 1 << 16, true, &never).expect("engine grind");
+        let (winner, done) = super::pom_mine_v4(p, s, time, [0u64; 4], 0, (1 << 16) + 9, true, &never).expect("engine grind");
+        assert_eq!((winner, done), (None, (1 << 16) + 9));
         eprintln!("full grind: {done} nonces");
         gen("after 64k grind");
     }

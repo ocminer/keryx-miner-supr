@@ -75,6 +75,7 @@ docker run --rm \
     glslc --target-env=vulkan1.2 -O -DPOM_TP=1 -mfmt=c -o $G/pom_walk_tp_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
     glslc --target-env=vulkan1.2 -O -DPOM_TP=1 -DUSE_DOT=1 -mfmt=c -o $G/pom_walk_tp_dot_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
     glslc --target-env=vulkan1.3 -O -DPOM_TP_CM=1 -mfmt=c -o $G/pom_walk_tp_cm_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
+    glslc --target-env=vulkan1.3 -O -DPOM_TP_CM=1 -DPOM_TP_CM_SINGLE=1 -mfmt=c -o $G/pom_walk_tp_cm_single_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
     glslc --target-env=vulkan1.2 -O -mfmt=c -o $G/pom_fetch_vk.spv.inc /repo/tools/keryx-llama/pom_fetch_vk.comp
 
     g++ -O2 -std=c++17 -shared -fPIC -fopenmp /repo/tools/keryx-llama/keryx_llama_vk.cpp \
