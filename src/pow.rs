@@ -645,6 +645,82 @@ mod tests {
         }
     }
 
+    /// Node-shared digest vector for the H15 header layout (upstream v0.5.8 `block_task_header_vector`):
+    /// pre-PoW (task_root appended) and full block hash (final_state/service_state/tier/task_root).
+    #[test]
+    fn block_task_header_vector() {
+        let h = RpcBlockHeader {
+            version: 1,
+            parents: vec![RpcBlockLevelParents { parent_hashes: vec!["11".repeat(32)] }],
+            hash_merkle_root: "22".repeat(32),
+            accepted_id_merkle_root: "23".repeat(32),
+            utxo_commitment: "24".repeat(32),
+            timestamp: 1_700_000_000_000,
+            bits: 0x1e7f_ffff,
+            nonce: 0x0102_0304_0506_0708,
+            daa_score: u64::MAX,
+            blue_work: "0123456789abcdef".into(),
+            blue_score: 98_765,
+            pruning_point: "33".repeat(32),
+            task_root: "44".repeat(32),
+            pom_final_state: 0xdead_beef,
+            service_state_hash: "55".repeat(32),
+            pom_tier: 3,
+            ..Default::default()
+        };
+        let digest = |pre: bool| {
+            let mut hasher = HeaderHasher::new();
+            serialize_header(&mut hasher, &h, pre);
+            hex::encode(hasher.finalize().to_le_bytes())
+        };
+        assert_eq!(digest(true), "c850d9d429ed501ce0016297999282297079f3d70c317b9b3aaf933a7868211f");
+        assert_eq!(digest(false), "346345442413f856f84442a2866100362d52f7e8426d1e19c9af5c8bae988e3a");
+    }
+
+    /// A v4 pool job hashes its header like the solo template, before and after its task root.
+    #[test]
+    fn pool_v4_job_hashes_like_solo() {
+        let h = RpcBlockHeader {
+            version: 1,
+            parents: vec![RpcBlockLevelParents { parent_hashes: vec!["11".repeat(32)] }],
+            hash_merkle_root: "22".repeat(32),
+            accepted_id_merkle_root: "23".repeat(32),
+            utxo_commitment: "24".repeat(32),
+            timestamp: 1_700_000_000_000,
+            bits: 0x1e7f_ffff,
+            daa_score: u64::MAX,
+            blue_work: "0123456789abcdef".into(),
+            pruning_point: "33".repeat(32),
+            ..Default::default()
+        };
+        let partial = |header: RpcBlockHeader, task_root: Option<[u8; 32]>| BlockSeed::PartialBlock {
+            id: "1".into(),
+            header_hash: [0; 4],
+            timestamp: header.timestamp as u64,
+            daa_score: header.daa_score,
+            nonce: 0,
+            target: crate::target::u256_from_compact_target(header.bits),
+            nonce_mask: u64::MAX,
+            nonce_fixed: 0,
+            pow_value: None,
+            network_target: None,
+            pom_proof: Vec::new(),
+            device_id: None,
+            header: Some(Box::new(header)),
+            task_root,
+        };
+        let solo = State::new(0, BlockSeed::FullBlock(Box::new(RpcBlock { header: Some(h.clone()), ..Default::default() }))).unwrap();
+        let pool = State::new(0, partial(h.clone(), None)).unwrap();
+        assert_eq!(solo.pow_hash_header, pool.pow_hash_header, "a v4 job must seed the walk like the solo template");
+        let root = [0x44u8; 32];
+        let mut with_root = h.clone();
+        with_root.task_root = hex::encode(root);
+        let solo_root = State::new(0, BlockSeed::FullBlock(Box::new(RpcBlock { header: Some(with_root), ..Default::default() }))).unwrap();
+        let committed = pool.with_task_root(&root).unwrap();
+        assert_eq!(solo_root.pow_hash_header, committed.pow_hash_header, "with_task_root must hash like a template carrying the root");
+        assert_ne!(pool.pow_hash_header, committed.pow_hash_header, "the task root must change the pre-PoW");
+    }
+
     #[test]
     fn test_serialize_header() {
         let header = RpcBlockHeader {

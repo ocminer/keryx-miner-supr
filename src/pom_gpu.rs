@@ -318,7 +318,10 @@ pub struct PomGpuMiner {
     /// extra gather segment. Lazily built on the first post-gate grind (stable per model/tier/R_T);
     /// the base fields above stay pad-free so pre-gate v4 grinding is untouched. See
     /// [`PomGpuMiner::v5_pad`].
-    v5_pad: OnceLock<V5Pad>,
+    /// PoM v5 context pad (H15). `None` until the first post-gate grind and after `release_pad`
+    /// (an inference needs the VRAM back); keyed by (seed, n_pad, k_pad) so a model/tier/R_T change
+    /// on the same miner refills instead of walking a stale pad.
+    v5_pad: Mutex<Option<Arc<V5Pad>>>,
 }
 
 /// The device-resident PoM v5 context pad plus the gather map that reaches it. `n_pad` tiles are
@@ -326,6 +329,8 @@ pub struct PomGpuMiner {
 /// by the UNCHANGED `v4_load_tile` (binary search over the extended `prefix`). `k_pad` = pad steps
 /// per walk (`pom_v5::v5_pad_steps`). The pad bytes are filled on the GPU by `pom_v5_pad_fill`.
 struct V5Pad {
+    /// Pad seed this pad was filled for (`v5_pad_seed(tier, model_id, R_T)`); a different seed rebuilds.
+    seed: [u8; 32],
     _pad_buf: CudaSlice<u32>, // kept alive so the appended gather pointer stays valid for the miner's life
     bases_dev: CudaSlice<u64>,
     prefix_dev: CudaSlice<u64>,
@@ -569,7 +574,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
-            v5_pad: OnceLock::new(),
+            v5_pad: Mutex::new(None),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
             _tensors: tensors,
@@ -641,7 +646,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
-            v5_pad: OnceLock::new(),
+            v5_pad: Mutex::new(None),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
             _tensors: Vec::new(),
@@ -726,7 +731,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
-            v5_pad: OnceLock::new(),
+            v5_pad: Mutex::new(None),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
             _tensors: raw,
@@ -874,7 +879,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
-            v5_pad: OnceLock::new(),
+            v5_pad: Mutex::new(None),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
             _tensors: Vec::new(),
@@ -952,17 +957,30 @@ impl PomGpuMiner {
     /// Build-once the PoM v5 context pad for (`pad_seed`, `n_pad`) and the v5 gather map (the base
     /// bases/prefix with the GPU-filled pad appended as one extra segment). Stable per model/tier/R_T,
     /// so memoized in `self.v5_pad`. `k_pad` = pad-step count (`pom_v5::v5_pad_steps`).
-    fn v5_pad(&self, pad_seed: &[u8; 32], n_pad: u64, k_pad: u32) -> candle_core::Result<&V5Pad> {
+    fn v5_pad(&self, pad_seed: &[u8; 32], n_pad: u64, k_pad: u32) -> candle_core::Result<Arc<V5Pad>> {
         use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-        if let Some(p) = self.v5_pad.get() {
-            return Ok(p);
+        let mut slot = self.v5_pad.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = slot.as_ref() {
+            if p.seed == *pad_seed && p.n_pad == n_pad && p.k_pad == k_pad {
+                return Ok(Arc::clone(p));
+            }
+            // Model/tier/R_T changed on this miner: drop the stale pad before filling the new one.
+            if slot.take().is_some() {
+                self.stream.synchronize().map_err(candle_core::Error::wrap)?;
+            }
         }
         if n_pad == 0 {
             return Err(candle_core::Error::Msg("PoM v5: zero pad tiles".into()));
         }
         // Device pad buffer: n_pad tiles * POM_V4_TILE_BYTES bytes, as u32 (8 u32 per 32-byte entry).
+        // The pad competes with the inference KV cache for VRAM (the caller shrank the engine
+        // context first); when it still does not fit, say so in a form the dispatcher recognises.
         let u32_len = (n_pad * crate::pom_v4::POM_V4_TILE_BYTES as u64 / 4) as usize;
-        let pad_buf = self.stream.alloc_zeros::<u32>(u32_len).map_err(candle_core::Error::wrap)?;
+        let need_mib = (u32_len as u64 * 4) >> 20;
+        let free_mib = free_vram_mib();
+        let pad_buf = self.stream.alloc_zeros::<u32>(u32_len).map_err(|e| {
+            candle_core::Error::Msg(format!("{PAD_ALLOC_ERR}: needs {need_mib} MiB, {free_mib} MiB free ({e})"))
+        })?;
         // Fill on the GPU — byte-exact mirror of pom_v5::pad_entry_into, one thread per 32-byte entry.
         let words = crate::pom_v5::v5_pad_seed_words(pad_seed);
         let first: u64 = 0;
@@ -1040,8 +1058,19 @@ impl PomGpuMiner {
         let bases_dev = self.stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
         let prefix_dev = self.stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
         let inv_p = u64::MAX / n_pad;
-        let _ = self.v5_pad.set(V5Pad { _pad_buf: pad_buf, bases_dev, prefix_dev, t_count, n_pad, k_pad, inv_p, lut, lut_sh: sh });
-        Ok(self.v5_pad.get().expect("v5 pad just set"))
+        let pad = Arc::new(V5Pad { seed: *pad_seed, _pad_buf: pad_buf, bases_dev, prefix_dev, t_count, n_pad, k_pad, inv_p, lut, lut_sh: sh });
+        log::info!("PoM v5: {} MiB context pad filled ({} tiles, {} pad steps)", need_mib, n_pad, k_pad);
+        *slot = Some(Arc::clone(&pad));
+        Ok(pad)
+    }
+
+    /// Drops this miner's context pad (an inference needs the VRAM back); the next v5 grind refills.
+    fn drop_v5_pad(&self) -> bool {
+        let taken = self.v5_pad.lock().unwrap_or_else(|p| p.into_inner()).take().is_some();
+        if taken {
+            let _ = self.stream.synchronize();
+        }
+        taken
     }
 
     /// Pre-gate v4 grind (no context pad). Thin wrapper over [`Self::mine_v4_impl`].
@@ -2088,6 +2117,39 @@ chase+tensor-core path.",
 
 // Per-GPU PoM miners. Host-side WeightIndex remains shared; only the CUDA-resident worker state
 // is duplicated per device. This avoids all workers contending over a single GPU0-bound miner.
+/// Prefix of the pad-allocation failure message (the dispatcher turns it into an actionable pause).
+const PAD_ALLOC_ERR: &str = "context pad does not fit";
+
+/// Free VRAM (MiB) of the current CUDA context, 0 when unknown.
+fn free_vram_mib() -> u64 {
+    candle_core::cuda_backend::cudarc::driver::result::mem_get_info().map_or(0, |(free, _)| free as u64 >> 20)
+}
+
+/// Runs `log` at most once per 30 s per (device, kind) — for per-batch paths that would otherwise
+/// repeat the same warning 40 times a second.
+fn log_throttled(device_id: u32, kind: &'static str, log: impl FnOnce()) {
+    static LAST: OnceLock<Mutex<HashMap<(u32, &'static str), std::time::Instant>>> = OnceLock::new();
+    let mut g = LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner());
+    let now = std::time::Instant::now();
+    if g.get(&(device_id, kind)).is_some_and(|t| now.duration_since(*t).as_secs() < 30) {
+        return;
+    }
+    g.insert((device_id, kind), now);
+    drop(g);
+    log();
+}
+
+/// Frees the PoM v5 context pad of `device_id` so an inference can take the full context back;
+/// the next post-gate grind refills it (H15 "VRAM dance", see `mine_v4`).
+pub fn release_pad(device_id: u32) {
+    let miner = miners().lock().ok().and_then(|g| g.get(&device_id).cloned());
+    if let Some(m) = miner {
+        if m.drop_v5_pad() {
+            log::info!("PoM v5: context pad released on GPU {} (inference needs the VRAM)", device_id);
+        }
+    }
+}
+
 fn miners() -> &'static Mutex<HashMap<u32, Arc<PomGpuMiner>>> {
     static MINERS: OnceLock<Mutex<HashMap<u32, Arc<PomGpuMiner>>>> = OnceLock::new();
     MINERS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -4224,12 +4286,25 @@ pub fn mine_v4(
     // PoM v5 (H15, daa >= gate): build/reuse the context pad for this device's resident model and
     // tier, then grind the state-carrying walk with it. The pad seed binds (tier, model_id, R_T) and
     // MUST match the model this device's index was built from, or the walk diverges from the node.
-    let v5_pad: Option<&V5Pad> = if crate::pom::is_pom_v5_era(daa) {
+    let v5_pad: Option<Arc<V5Pad>> = if crate::pom::is_pom_v5_era(daa) {
         let idx = crate::pom::active_index_for(device_id)
             .ok_or(crate::pom::GrindError::Paused("PoM v5: resident index not installed yet"))?;
         let model_id = crate::pom::mining_model_id(device_id)
             .ok_or(crate::pom::GrindError::Paused("PoM v5: mining model id not set yet"))?;
-        let tier = idx.1;
+        // Same tier source as the host proof rebuild (pow.rs: `current_tier(device, daa)`), so the
+        // GPU walk and the host re-check can never pad-seed different tiers. The index was built
+        // for a tier too; if the two ever disagree the index is the wrong one for this DAA — idle.
+        let tier = current_tier(device_id, daa).unwrap_or(idx.1);
+        if tier != idx.1 {
+            log_throttled(device_id, "pad-tier", || {
+                log::warn!("PoM v5[gpu{}]: index tier {} != current tier {} at DAA {} — not grinding until the index is rebuilt", device_id, idx.1, tier, daa)
+            });
+            return Err(crate::pom::GrindError::Paused("PoM v5: index tier does not match the current tier"));
+        }
+        // VRAM dance: shrink the engine's inference context to the 64-token block-task size so the
+        // pad fits in the freed KV-cache space (no-op when already shrunk). An inference restores
+        // the full context and releases the pad (`release_pad`); the next grind refills it.
+        crate::llama_engine::use_task_context(device_id as usize);
         let n_pad = crate::pom_v5::POM_V5_PAD_TILES_H14
             .get(tier as usize)
             .copied()
@@ -4238,15 +4313,27 @@ pub fn mine_v4(
         let n_tiles = miner.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
         let k_pad = crate::pom_v5::v5_pad_steps(n_tiles, n_pad) as u32;
         let pad_seed = crate::pom_v5::v5_pad_seed(tier, &model_id, &idx.0.r_t);
-        Some(
-            miner
-                .v5_pad(&pad_seed, n_pad, k_pad)
-                .map_err(|e| crate::pom::GrindError::Backend(format!("PoM v5 pad build: {e}")))?,
-        )
+        match miner.v5_pad(&pad_seed, n_pad, k_pad) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains(PAD_ALLOC_ERR) {
+                    log_throttled(device_id, "pad-alloc", || {
+                        log::warn!(
+                            "PoM[gpu{}]: {} — this card has too little VRAM for its tier's context pad; \
+                             mine a lower tier (--force-model) or free VRAM on it",
+                            device_id, msg
+                        )
+                    });
+                    return Err(crate::pom::GrindError::Paused("PoM v5: context pad does not fit"));
+                }
+                return Err(crate::pom::GrindError::Backend(format!("PoM v5 pad build: {msg}")));
+            }
+        }
     } else {
         None
     };
-    let outcome = miner.mine_v4_impl(pre_pow_hash, timestamp, target_le, start, batch, h10_era, h14_era, v5_pad);
+    let outcome = miner.mine_v4_impl(pre_pow_hash, timestamp, target_le, start, batch, h10_era, h14_era, v5_pad.as_deref());
     match outcome {
         Ok(winner) => Ok(crate::pom::GrindCompleted { winner, hashes_done: batch }),
         Err(e) => {
@@ -5576,7 +5663,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
-            v5_pad: OnceLock::new(),
+            v5_pad: Mutex::new(None),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
             _tensors: Vec::new(),
@@ -5830,7 +5917,7 @@ mod v4_kernel_tests {
         assert_eq!(re, fs, "host v5 build/verify disagree");
         let pow = crate::pom::pom_pow_value(fs, &PPH, true);
         assert_eq!(
-            miner.mine_v4_impl(&PPH, TS, &pow, nonce, 1, false, false, Some(pad)).unwrap(),
+            miner.mine_v4_impl(&PPH, TS, &pow, nonce, 1, false, false, Some(&*pad)).unwrap(),
             Some(nonce),
             "GPU v5 pad walk did not find the nonce at the host pow target — divergence"
         );

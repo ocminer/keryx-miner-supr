@@ -440,6 +440,19 @@ fn warn_legacy_task_past_gate(daa: u64) {
     }
 }
 
+/// Once a minute: the pool is still sending header-less (v3) jobs past the H15 block-task gate.
+fn warn_v3_job_past_gate(daa: u64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if now.saturating_sub(LAST.swap(now, Ordering::Relaxed)) >= 60 {
+        warn!(
+            "H15: job at DAA {} is past the block-task gate but arrived as a v3 notify (no header, no window \
+             seed) — it cannot carry a task_root and is skipped; this pool must send stratum v4 jobs",
+            daa
+        );
+    }
+}
+
 fn job_id_daa(job_id: &str) -> Option<u64> {
     let parts: Vec<&str> = job_id.split('_').collect();
     let daa_field = match parts.len() {
@@ -1218,8 +1231,7 @@ impl StratumHandler {
                                         info!("Share accepted");
                                     }
                                 } else {
-                                    info!("{:?} (Last: {})", msg.clone(), self.last_stratum_id.load(Ordering::SeqCst));
-                                    warn!("Ignoring result for now");
+                                    log::debug!("{:?} (Last: {})", msg.clone(), self.last_stratum_id.load(Ordering::SeqCst));
                                 }
                                 Ok(())
                             }
@@ -1380,6 +1392,14 @@ impl StratumHandler {
                             // models never load and post-fork PoM-PoW has no weights resident.
                             keryx_miner::slm::advance_lineup_if_due(daa_score);
                             LAST_DAA_SCORE.store(daa_score, std::sync::atomic::Ordering::Relaxed);
+                            // H15: a header-less (v3) job at/after the block-task gate can never become a
+                            // valid block — the task_root must be in the header this miner hashes. Only a
+                            // v4 notify carries the header + window seed; skip the job instead of
+                            // walking (and submitting) something the node must reject.
+                            if keryx_miner::pom::is_block_task_era(daa_score) {
+                                warn_v3_job_past_gate(daa_score);
+                                return miner.process_block(None).await;
+                            }
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
                             if !keryx_miner::slm::has_proven_serveable_model() {
@@ -1458,6 +1478,14 @@ impl StratumHandler {
                             // swap MUST happen here or post-fork PoM-PoW has no v2 weights resident.
                             keryx_miner::slm::advance_lineup_if_due(daa_score);
                             LAST_DAA_SCORE.store(daa_score, std::sync::atomic::Ordering::Relaxed);
+                            // H15: a header-less (v3) job at/after the block-task gate can never become a
+                            // valid block — the task_root must be in the header this miner hashes. Only a
+                            // v4 notify carries the header + window seed; skip the job instead of
+                            // walking (and submitting) something the node must reject.
+                            if keryx_miner::pom::is_block_task_era(daa_score) {
+                                warn_v3_job_past_gate(daa_score);
+                                return miner.process_block(None).await;
+                            }
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
                             if !keryx_miner::slm::has_proven_serveable_model() {
@@ -1553,6 +1581,14 @@ impl StratumHandler {
                                 None,
                                 self.block_bits.and_then(crate::target::network_difficulty_from_compact_target),
                             );
+                            // H15: a header-less (v3) job at/after the block-task gate can never become a
+                            // valid block — the task_root must be in the header this miner hashes. Only a
+                            // v4 notify carries the header + window seed; skip the job instead of
+                            // walking (and submitting) something the node must reject.
+                            if keryx_miner::pom::is_block_task_era(daa_score) {
+                                warn_v3_job_past_gate(daa_score);
+                                return miner.process_block(None).await;
+                            }
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
                             if !keryx_miner::slm::has_proven_serveable_model() {

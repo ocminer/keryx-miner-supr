@@ -44,21 +44,70 @@ pub fn run_block_task(device: u32, model_id: &[u8; 32], tier: u8, window_seed: &
     if !arm_trace(&gguf, device, tier) {
         return None;
     }
-    let m = TierManifest::for_chain(tier)?;
-    let (_, pctx) = trace::chain_ctx(tier)?;
-    let tokens: Vec<i32> = task_tokens(&pctx.table, window_seed).into_iter().map(|t| t as i32).collect();
-    let traced = match crate::llama_engine::trace_tokens(&gguf, device as usize, &tokens) {
-        Ok(t) => t,
-        Err(e) => {
-            log::warn!("Block task: gpu{device} task not traced ({e})");
+    // Fail fast, once: before the first task of a (device, tier) is used, prove that this engine's
+    // trace → draw → replay → opening round-trips through keryxd's own `verify_block_task`. A
+    // build whose canonical leaves disagree with the node must not mine post-gate at all (every
+    // block would be invalid), rather than fail quietly one dropped candidate at a time.
+    if let Some(idx) = crate::pom::active_index_for(device) {
+        if let Err(e) = ensure_self_checked(&gguf, device, tier, &idx.0) {
+            log::error!("Block task: gpu{device} tier {tier} FAILS the block-task self-check ({e}) — not mining post-gate on this device");
             return None;
         }
-    };
-    let record = TraceRecord::new_chain(&m, TASK_LEN, traced.ubatch, traced.leaves, &tokens);
-    if record.is_none() {
-        log::warn!("Block task: gpu{device} incomplete task trace");
     }
-    Some(ResponseTrace { record: record?, tokens })
+    match trace_task(&gguf, device, tier, window_seed) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            log::warn!("Block task: gpu{device} {e}");
+            None
+        }
+    }
+}
+
+/// One traced 32-token pass of the task seeded by `window_seed` on `device`'s armed engine.
+fn trace_task(gguf: &str, device: u32, tier: u8, window_seed: &[u8; 32]) -> Result<ResponseTrace, String> {
+    let m = TierManifest::for_chain(tier).ok_or("no chain manifest")?;
+    let (_, pctx) = trace::chain_ctx(tier).ok_or("no chain context")?;
+    let tokens: Vec<i32> = task_tokens(&pctx.table, window_seed).into_iter().map(|t| t as i32).collect();
+    let traced = crate::llama_engine::trace_tokens(gguf, device as usize, &tokens).map_err(|e| format!("task not traced ({e})"))?;
+    let record = TraceRecord::new_chain(&m, TASK_LEN, traced.ubatch, traced.leaves, &tokens).ok_or("incomplete task trace")?;
+    Ok(ResponseTrace { record, tokens })
+}
+
+/// Self-check verdict per (device, tier): `Ok` = passed, `Err` = failed (sticky for the process).
+fn self_checks() -> &'static std::sync::Mutex<std::collections::HashMap<(u32, u8), Result<(), String>>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(u32, u8), Result<(), String>>>> = std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// Runs the block-task self-check once per (device, tier); later calls return the stored verdict.
+fn ensure_self_checked(gguf: &str, device: u32, tier: u8, index: &crate::pom::WeightIndex) -> Result<(), String> {
+    if let Some(v) = self_checks().lock().unwrap_or_else(|p| p.into_inner()).get(&(device, tier)) {
+        return v.clone();
+    }
+    let t0 = std::time::Instant::now();
+    let verdict = block_task_self_check(gguf, device, tier, index);
+    match &verdict {
+        Ok(()) => log::info!("Block task: gpu{device} tier {tier} self-check passed (trace → opening → node verify, {:.1}s)", t0.elapsed().as_secs_f32()),
+        Err(e) => log::error!("Block task: gpu{device} tier {tier} self-check FAILED: {e}"),
+    }
+    self_checks().lock().unwrap_or_else(|p| p.into_inner()).insert((device, tier), verdict.clone());
+    verdict
+}
+
+/// Traces a synthetic window task and opens it for two synthetic block hashes, verifying each
+/// opening exactly as the node does. Exercises the production path end to end on this GPU.
+fn block_task_self_check(gguf: &str, device: u32, tier: u8, index: &crate::pom::WeightIndex) -> Result<(), String> {
+    let window_seed: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(0x5a));
+    let trace = trace_task(gguf, device, tier, &window_seed)?;
+    let m = TierManifest::for_chain(tier).ok_or("no chain manifest")?;
+    let (ctx, pctx) = trace::chain_ctx(tier).ok_or("no chain context")?;
+    for block_hash in [[0x11u8; 32], [0x77u8; 32]] {
+        let body = open_chain(gguf, device, &m, &task_prefix(&pctx), &trace, &draw_seed(&block_hash), &task_bytes(&window_seed), [0u8; 32], index)?;
+        let opening = keryx_verifiable_inference::opening::Opening::decode(&body).ok_or("opening does not decode")?;
+        verify_block_task(&m.tier_ctx(index), &ctx, &pctx, &trace.record.trace_root, &window_seed, &block_hash, &opening)
+            .map_err(|e| format!("node verify rejects the opening: {e:?}"))?;
+    }
+    Ok(())
 }
 
 /// The task opening of block `block_hash` from the task trace of its window, checked exactly as

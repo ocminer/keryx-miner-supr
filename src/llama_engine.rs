@@ -707,11 +707,17 @@ use crate::slm::GenerateError;
 /// different cards run concurrently. None on any failure (caller falls back).
 pub fn generate_on(gpu: usize, prompt: &str, max_tokens: usize) -> Option<String> {
     let slot = slot_for(gpu);
-    let g = match slot.inner.lock() {
+    let mut g = match slot.inner.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    let e = g.as_ref()?;
+    let e = g.as_mut()?;
+    // H15: a post-gate grind may have shrunk this context to the block-task size; inference needs
+    // the full one (this also releases the device's PoM v5 pad).
+    if let Err(err) = ensure_full_context(e, gpu) {
+        log::warn!("llama engine: cannot restore the inference context on GPU {}: {}", gpu, err);
+        return None;
+    }
     generate_locked(e, prompt, max_tokens).ok()
 }
 
@@ -720,13 +726,17 @@ pub fn generate_on(gpu: usize, prompt: &str, max_tokens: usize) -> Option<String
 /// concurrent self-test could swap models between those calls.
 pub fn generate_for(gpu: usize, gguf: &str, prompt: &str, max_tokens: usize) -> Result<String, GenerateError> {
     let slot = slot_for(gpu);
-    let g = match slot.inner.lock() {
+    let mut g = match slot.inner.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    let e = g.as_ref().ok_or(GenerateError::Failed)?;
+    let e = g.as_mut().ok_or(GenerateError::Failed)?;
     if e.gguf != gguf {
         log::warn!("llama engine: refusing generation on GPU {}: requested model is not resident", gpu);
+        return Err(GenerateError::Failed);
+    }
+    if let Err(err) = ensure_full_context(e, gpu) {
+        log::warn!("llama engine: cannot restore the inference context on GPU {}: {}", gpu, err);
         return Err(GenerateError::Failed);
     }
     generate_locked(e, prompt, max_tokens)
@@ -870,6 +880,9 @@ fn ensure_full_context(e: &mut Engine, gpu: usize) -> Result<(), String> {
     if e.ctx_full && e.ctx_now > 0 {
         return Ok(());
     }
+    // The PoM v5 pad sits in the space the full KV cache needs — give it back first.
+    #[cfg(feature = "pom-cuda")]
+    crate::pom_gpu::release_pad(gpu as u32);
     let mut got = unsafe { (e.ctx_acquire)(e.model, e.n_ctx) };
     if got < 0 {
         if let Some(floor) = crate::models::spec_for_gguf(&e.gguf).map(|m| m.ctx_floor as c_int).filter(|f| *f < e.n_ctx) {
@@ -934,6 +947,9 @@ pub fn trace_configure(gguf: &str, gpu: usize, manifest: &[u8]) -> Result<usize,
     let slot = slot_for(gpu);
     let mut g = slot.inner.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf).ok_or_else(|| "no engine hosts this model".to_string())?;
+    // max_pos = 0 sizes the pinned leaf buffer from the CURRENT context: arm with the full one
+    // resident, never with the 64-token block-task context a previous grind may have left.
+    ensure_full_context(e, gpu)?;
     let rc = unsafe { (e.trace_configure)(e.model, manifest.as_ptr() as *const c_void, manifest.len(), 0) };
     if rc != 0 {
         return Err(engine_error(e, &format!("trace configuration failed ({rc})")));

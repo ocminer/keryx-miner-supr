@@ -561,6 +561,10 @@ int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char
     if (prompt_len > kMaxPromptBytes) return -2;
     std::lock_guard<std::mutex> g(h->gen_lock);
     if (!keryx_has_ctx(h)) return -2;   // H15: the context may have been released for the pad
+    // H15: an armed canonical trace must not keep accumulating positions across untraced pool
+    // inference (the leaf buffer is sized for the block task); rewind it. Generation itself does
+    // not need the trace, so a failed rewind is not fatal here (trace_tokens rewinds again).
+    (void)keryx_trace_reset(h);
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
 
     // Apply the model's chat template so the model sees a proper USER turn and stops at the end of
