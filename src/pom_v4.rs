@@ -313,7 +313,7 @@ pub fn v4_state_root(state: &[u8]) -> [u8; 32] {
     merkle_root_32(leaves)
 }
 
-fn v4_tile_subtree_root(tile: &[u8]) -> [u8; 32] {
+pub(crate) fn v4_tile_subtree_root(tile: &[u8]) -> [u8; 32] {
     debug_assert_eq!(tile.len(), POM_V4_TILE_BYTES);
     let mut leaves = [[0u8; 32]; POM_V4_D];
     for (leaf, chunk) in leaves.iter_mut().zip(tile.chunks_exact(POM_V4_CHUNK_BYTES)) {

@@ -598,6 +598,11 @@ impl MinerManager {
                 // switching stays responsive. Bumped 2^20 -> 2^22.
                 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
                 let mut pom_cursor: Option<(usize, keryx_miner::pom::MaskedNonceCursor)> = None;
+                // H15 block task: (job state id, committed task_root, the job's State re-derived with that
+                // root in its header [the one we GRIND], this device's task). Kept across batches so a
+                // job is re-committed only when the job or the device's root changes.
+                #[allow(unused_mut, unused_variables)]
+                let mut task_state: Option<(usize, [u8; 32], Box<crate::pow::State>, Arc<keryx_miner::block_task::DeviceTask>)> = None;
                 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]
                 // Apple Silicon: at M-class PoM rates (~0.8 MH/s on an M2) the 2^22 batch above is a
                 // ~5 s blocking launch — new jobs are only picked up at batch boundaries (see the
@@ -661,8 +666,98 @@ impl MinerManager {
                     // running kHeavyHash on an H6 pool and never build a v3 proof.
                     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda", all(target_os = "macos", feature = "pom-metal")))]
                     if let Some(s0) = state.as_ref() { let _ = s0;
-                        let (job_id, pph, time, target_le, daa, nonce_mask, nonce_fixed) = {
+                        // ── H15 block task (per device) ──────────────────────────────────────────
+                        // At/after the gate every v4 job needs THIS device's task_root committed into
+                        // the header before it is walked: trace the window task on this GPU's tier model
+                        // (cached per window seed), re-derive the job's State with the root, and grind
+                        // THAT State. Without a task (seed unknown yet, trace failed) the device idles
+                        // honestly instead of mining a root-less job the node could never accept.
+                        #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+                        {
                             let s = state.as_ref().unwrap();
+                            let daa0 = s.daa_score;
+                            if keryx_miner::block_task::active(daa0) && s.has_template_header() {
+                                let dev: u32 = worker_ordinal.unwrap_or(0);
+                                // Model identity from the per-device ASSIGNMENT (set at configure
+                                // time), not from the built possession index: the index is built
+                                // lazily by the grind below, which this gate runs BEFORE — keying on
+                                // the index would idle the device forever (no task → no grind → no
+                                // index → no task). The trace runs on the engine, which is already up.
+                                let task = keryx_miner::pom_gpu::current_tier(dev, daa0)
+                                    .zip(keryx_miner::pom_gpu::device_model(dev).map(|(id, _)| id))
+                                    .zip(s.parents_key())
+                                    .and_then(|((tier, model_id), parents)| keryx_miner::block_task::task_for(dev, &model_id, tier, daa0, &parents));
+                                match task {
+                                    Some(t) if task_state.as_ref().is_some_and(|ts| ts.0 == s.id && ts.1 == t.root()) => {}
+                                    Some(t) => match s.with_task_root(&t.root()) {
+                                        Ok(ns) => {
+                                            log::info!("PoM[gpu{}]: block task root {} committed for job {} (window {})", dev, hex::encode(&t.root()[..8]), s.id, t.window);
+                                            task_state = Some((s.id, t.root(), Box::new(ns), t));
+                                        }
+                                        Err(e) => {
+                                            log::warn!("PoM[gpu{}]: block task not applied: {}", dev, e);
+                                            task_state = None;
+                                        }
+                                    },
+                                    None => {
+                                        task_state = None;
+                                        static NO_TASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                        if NO_TASK.fetch_add(1, Ordering::Relaxed) % 40 == 0 {
+                                            let w = keryx_verifiable_inference::block_task::window(daa0);
+                                            let seed_known = w.zip(s.parents_key()).is_some_and(|(w, p)| keryx_miner::block_task::seed(w, &p).is_some());
+                                            log::info!(
+                                                "PoM[gpu{}]: no block task yet (daa {}, window {:?}, seed known {}, tier {:?}) — not grinding this job",
+                                                dev, daa0, w, seed_known, keryx_miner::pom_gpu::current_tier(dev, daa0)
+                                            );
+                                        }
+                                    }
+                                }
+                                if task_state.as_ref().is_none_or(|ts| ts.0 != s.id) {
+                                    if let Some(cmd) = block_channel.get_changed()? {
+                                        state = match cmd {
+                                            Some(WorkerCommand::Job(ns)) => Some(ns),
+                                            Some(WorkerCommand::Close) => return Ok(()),
+                                            None => None,
+                                        };
+                                    } else {
+                                        std::thread::sleep(std::time::Duration::from_millis(50));
+                                    }
+                                    continue;
+                                }
+                            } else {
+                                task_state = None;
+                            }
+                        }
+                        // OpenCL / Metal: no trace engine on this backend, so no task_root can be
+                        // committed — a post-gate job walked here could never become a valid block
+                        // and every hit would die at the host v5 re-check. Idle honestly (like
+                        // upstream) instead of burning power on a root-less job.
+                        #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+                        {
+                            let s = state.as_ref().unwrap();
+                            if keryx_miner::block_task::active(s.daa_score) {
+                                static NO_ENGINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                if NO_ENGINE.fetch_add(1, Ordering::Relaxed) % 200 == 0 {
+                                    log::warn!(
+                                        "PoM: H15 block task active (daa {}) but this backend has no trace engine — cannot commit a task_root, idling (NVIDIA CUDA builds mine post-gate)",
+                                        s.daa_score
+                                    );
+                                }
+                                if let Some(cmd) = block_channel.get_changed()? {
+                                    state = match cmd {
+                                        Some(WorkerCommand::Job(ns)) => Some(ns),
+                                        Some(WorkerCommand::Close) => return Ok(()),
+                                        None => None,
+                                    };
+                                } else {
+                                    std::thread::sleep(std::time::Duration::from_millis(250));
+                                }
+                                continue;
+                            }
+                        }
+                        let (job_id, pph, time, target_le, daa, nonce_mask, nonce_fixed) = {
+                            // Grind the root-committed State when this device has a block task.
+                            let s: &crate::pow::State = task_state.as_ref().map_or(state.as_ref().unwrap(), |ts| &*ts.2);
                             let mut pph = [0u8; 32];
                             pph.copy_from_slice(&s.pow_hash_header[0..32]);
                             (
@@ -927,6 +1022,12 @@ impl MinerManager {
                                 std::thread::sleep(std::time::Duration::from_millis(ms));
                             }
                         }
+                        // H15: build the proof from the State that was GROUND (root-committed when a block
+                        // task is active) and hand the device's task to the builder for the opening.
+                        let effective_state: Option<&crate::pow::State> = task_state.as_ref().map(|ts| &*ts.2).or(state.as_deref());
+                        let task_arc: Option<Arc<keryx_miner::block_task::DeviceTask>> = task_state.as_ref().map(|ts| Arc::clone(&ts.3));
+                        #[allow(unused_variables)]
+                        let _ = (&effective_state, &task_arc);
                         if let Some(nonce) = found {
                             // NVIDIA/Apple: recompute the PoM tier per block (H2-boundary correct).
                             // POOL SHARES: overlap the host proof re-walk with grinding, like the AMD
@@ -947,7 +1048,7 @@ impl MinerManager {
                             let mut proof_spawned = false;
                             #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
                             if overlap_pool_proof {
-                                if let Some(s) = state.as_ref() {
+                                if let Some(s) = effective_state {
                                     if let (Some(proof_index), Some(tier)) = (
                                         keryx_miner::pom::active_index_for(wdid),
                                         keryx_miner::pom_gpu::current_tier(wdid, s.daa_score),
@@ -957,12 +1058,13 @@ impl MinerManager {
                                         {
                                             let s_clone = s.clone();
                                             let tx = send_channel.clone();
+                                            let task_c = task_arc.clone();
                                             proof_spawned = true;
                                             std::thread::spawn(move || {
                                                 let _permit = permit;
                                                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                                     if let Some(mut block_seed) =
-                                                        s_clone.generate_block_if_pom(nonce, &proof_index.0, tier)
+                                                        s_clone.generate_block_if_pom_task(nonce, &proof_index.0, tier, wdid, task_c.as_deref())
                                                     {
                                                         if let crate::pow::BlockSeed::PartialBlock { device_id, .. } =
                                                             &mut block_seed
@@ -987,10 +1089,10 @@ impl MinerManager {
                                 }
                             }
                             #[cfg(any(all(feature = "pom-cuda", not(feature = "pom-opencl")), all(target_os = "macos", feature = "pom-metal")))]
-                            let built = if proof_spawned { None } else { state.as_ref().and_then(|s| {
+                            let built = if proof_spawned { None } else { effective_state.and_then(|s| {
                                 keryx_miner::pom::active_index_for(wdid).and_then(|index| {
                                     let tier = keryx_miner::pom_gpu::current_tier(wdid, s.daa_score)?;
-                                    s.generate_block_if_pom(nonce, &index.0, tier)
+                                    s.generate_block_if_pom_task(nonce, &index.0, tier, wdid, task_arc.as_deref())
                                 })
                             }) };
                             // SOLO (and the overlap-declined fallback) keep the synchronous submit.
@@ -1029,7 +1131,7 @@ impl MinerManager {
                                             let _permit = permit;
                                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                                 if let Some(mut block_seed) =
-                                                    s_clone.generate_block_if_pom(nonce, proof_index, tier)
+                                                    s_clone.generate_block_if_pom(nonce, proof_index, tier, wdid)
                                                 {
                                                     if let crate::pow::BlockSeed::PartialBlock { device_id, .. } =
                                                         &mut block_seed

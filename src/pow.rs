@@ -15,6 +15,7 @@ use crate::{
 };
 use keryx_miner::pom::{self, WeightIndex};
 use keryx_miner::pom_v4;
+use keryx_miner::pom_v5;
 use keryx_miner::Worker;
 
 mod hasher;
@@ -46,6 +47,15 @@ pub enum BlockSeed {
         /// `None`; a GPU worker stamps `Some(actual_ordinal)` before submit. Threaded to
         /// `shares_pending` so ACK/reject events never guess GPU0 when attribution is unavailable.
         device_id: Option<u32>,
+        /// v4 (H15): the full template header. When present the miner hashes it ITSELF to derive the
+        /// pre-PoW hash (`serialize_header`, §4.3) instead of trusting the pool's precomputed
+        /// `header_hash` — because the pre-PoW now depends on `task_root`, which is per-device.
+        /// `None` for v3/v2 jobs (then `header_hash` is authoritative).
+        header: Option<Box<RpcBlockHeader>>,
+        /// v4 (H15): the 32-byte block-task root the device committed into `header.task_root` before
+        /// hashing it. Echoed in the 7-tuple submit so the pool can recompute the pre-PoW and block
+        /// hashes (it cannot derive it from the proof). `None` pre-gate / for v3 jobs.
+        task_root: Option<[u8; 32]>,
     },
 }
 
@@ -145,9 +155,20 @@ impl State {
                 ref target,
                 nonce_fixed: fixed,
                 nonce_mask: mask,
+                ref header,
                 ..
             } => {
-                pre_pow_hash = Hash::new(*header_hash);
+                // v4 (H15): the pool ships the full header (no pre-PoW hash) because the pre-PoW now
+                // covers task_root, which is per-device. Hash it here exactly like the solo path.
+                // v3/v2: `header_hash` is the pool's authoritative pre-PoW hash, used verbatim.
+                pre_pow_hash = match header {
+                    Some(h) => {
+                        let mut hasher = HeaderHasher::new();
+                        serialize_header(&mut hasher, h, true);
+                        hasher.finalize()
+                    }
+                    None => Hash::new(*header_hash),
+                };
                 header_timestamp = *timestamp;
                 header_target = *target;
                 daa_score = *block_daa_score;
@@ -226,7 +247,62 @@ impl State {
     /// for `nonce`, build the possession proof, set the nonce, attach the borsh-encoded proof,
     /// and return the block/share to submit. Solo (`FullBlock`) sets `RpcBlock.pomProof`; pool
     /// (`PartialBlock`) carries the proof bytes so the stratum client puts them at `params[5]`.
-    pub fn generate_block_if_pom(&self, nonce: u64, index: &WeightIndex, tier: u8) -> Option<BlockSeed> {
+    /// Whether this job carries its full header (v4), so a block task applies to it.
+    pub fn has_template_header(&self) -> bool {
+        match &*self.block {
+            BlockSeed::FullBlock(_) => true,
+            BlockSeed::PartialBlock { header, .. } => header.is_some(),
+        }
+    }
+
+    /// `block_task::parents_key` of the template's direct parents (level 0), when the header is known.
+    pub fn parents_key(&self) -> Option<String> {
+        let header = match &*self.block {
+            BlockSeed::FullBlock(block) => block.header.as_ref()?,
+            BlockSeed::PartialBlock { header, .. } => header.as_deref()?,
+        };
+        header.parents.first().map(|p| keryx_miner::block_task::parents_key(&p.parent_hashes))
+    }
+
+    /// This template with `task_root` committed into its header, as a NEW State: the pre-PoW hash
+    /// (and so the walk seed) is re-derived from the header with the root. Per device — devices on
+    /// different tiers/models commit different roots for the same job. A v3 job has no header to
+    /// commit into.
+    pub fn with_task_root(&self, root: &[u8; 32]) -> Result<State, Error> {
+        match &*self.block {
+            BlockSeed::FullBlock(block) => {
+                let mut block = block.clone();
+                block.header.as_mut().ok_or("Header is missing")?.task_root = hex::encode(root);
+                State::new(self.id, BlockSeed::FullBlock(block))
+            }
+            BlockSeed::PartialBlock { header: Some(_), .. } => {
+                let mut seed = (*self.block).clone();
+                if let BlockSeed::PartialBlock { header: Some(h), task_root, .. } = &mut seed {
+                    h.task_root = hex::encode(root);
+                    *task_root = Some(*root);
+                }
+                State::new(self.id, seed)
+            }
+            BlockSeed::PartialBlock { .. } => Err("a v3 pool job carries no block task".into()),
+        }
+    }
+
+    /// Pre-H15 / no-task entry point (keeps the existing callers): see [`Self::generate_block_if_pom_task`].
+    pub fn generate_block_if_pom(&self, nonce: u64, index: &WeightIndex, tier: u8, device_id: u32) -> Option<BlockSeed> {
+        self.generate_block_if_pom_task(nonce, index, tier, device_id, None)
+    }
+
+    /// Build the share/block for a GPU-found `nonce`. With `task` (H15, the device's block task for
+    /// this job's window) a NETWORK-target hit also carries the task opening in `proof.task`; shares
+    /// never do (the pool only verifies the opening on block candidates).
+    pub fn generate_block_if_pom_task(
+        &self,
+        nonce: u64,
+        index: &WeightIndex,
+        tier: u8,
+        device_id: u32,
+        task: Option<&keryx_miner::block_task::DeviceTask>,
+    ) -> Option<BlockSeed> {
         let mut pph = [0u8; 32];
         pph.copy_from_slice(&self.pow_hash_header[0..32]);
         let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
@@ -254,25 +330,78 @@ impl State {
             }
         }
         let seed = pom::pom_block_seed_rewalk_era(&pph, timestamp, nonce, self.daa_score);
-        let (v4, final_state) = pom_v4::build_proof_v4(tier, seed, index)
-            .map_err(|e| info!("PoM v4 proof build failed: {e}"))
-            .ok()?;
-        // "v4 pow uses the h3 fold": the POW value folds the H3-salted pph words.
+        // PoM v5 (H15, daa >= gate): the walk ALSO reads the tier's context pad. The pad seed binds
+        // (tier, model_id, R_T); `model_id` MUST be the model THIS index was built from, or the pad
+        // diverges from the node's and every share is rejected (BadTilePath-class). Pre-gate the pad
+        // is absent and the walk is byte-identical to v4. The witness shape is unchanged (pad tiles
+        // are regenerated by the verifier, never shipped), so the wire/`PomProofV4` layout is reused.
+        let pad = if pom::is_pom_v5_era(self.daa_score) {
+            let model_id = pom::mining_model_id(device_id).or_else(|| {
+                info!("PoM v5: no mining model id for device {device_id}; cannot seed the context pad");
+                None
+            })?;
+            let n = pom_v5::POM_V5_PAD_TILES_H14.get(tier as usize).copied().filter(|n| *n > 0).or_else(|| {
+                info!("PoM v5: tier {tier} has no context pad size");
+                None
+            })?;
+            Some((pom_v5::v5_pad_seed(tier, &model_id, &index.r_t), n))
+        } else {
+            None
+        };
+        let built = match &pad {
+            Some((pad_seed, n)) => pom_v5::build_proof_v5(tier, seed, index, pad_seed, *n),
+            None => pom_v4::build_proof_v4(tier, seed, index),
+        };
+        let (v4, final_state) = built.map_err(|e| info!("PoM proof build failed: {e}")).ok()?;
+        // "v4 pow uses the h3 fold": the POW value folds the H3-salted pph words (unchanged for v5).
         let pow_value = pom::pom_pow_value(final_state, &pph, true);
         if !pom::le_leq(&pow_value, &self.target.to_le_bytes()) {
             return None; // GPU grind false-positive (or clock/target drift) — drop it.
         }
-        // Pre-submit self-check: re-walk the proof against R_T and confirm the derived final_state.
-        let checked = pom_v4::verify_proof_v4(seed, &v4, &index.r_t, index.n_chunks)
-            .map_err(|e| info!("PoM v4 self-check failed: {e}"))
-            .ok()?;
+        // Pre-submit self-check: re-walk the proof against R_T (and the pad) and confirm final_state.
+        let checked = match &pad {
+            Some((pad_seed, n)) => pom_v5::verify_proof_v5(seed, &v4, &index.r_t, index.n_chunks, pad_seed, *n),
+            None => pom_v4::verify_proof_v4(seed, &v4, &index.r_t, index.n_chunks),
+        }
+        .map_err(|e| info!("PoM self-check failed: {e}"))
+        .ok()?;
         if checked != final_state {
-            info!("PoM v4 proof discarded: pre-submit self-check final_state mismatch");
+            info!("PoM proof discarded: pre-submit self-check final_state mismatch");
             return None;
         }
-        let proof = pom::PomProof::v4(tier, pow_value, final_state, v4);
+        let mut proof = pom::PomProof::v4(tier, pow_value, final_state, v4);
+        // H15 block task: a NETWORK-target hit (a real block) must carry the opening of the window's
+        // task trace, drawn from the block hash. Shares never do. Pre-gate `task` is None.
+        if let Some(t) = task {
+            if let BlockSeed::PartialBlock { header: Some(h), .. } = &*self.block {
+                let network_target = crate::target::u256_from_compact_target(h.bits);
+                if pom::le_leq(&pow_value, &network_target.to_le_bytes()) {
+                    let mut header = (**h).clone();
+                    header.nonce = nonce;
+                    header.pom_final_state = final_state;
+                    header.pom_tier = tier as u32;
+                    let block = RpcBlock { header: Some(header), ..Default::default() };
+                    let hash = block.block_hash()?.to_le_bytes();
+                    let opening = keryx_miner::task_trace::open_block_task(device_id, &t.model_id, t.tier, &t.trace, &t.seed, &hash)?;
+                    info!("PoM v5: block candidate — task opening built ({} B) for job", opening.len());
+                    proof.task = Some(opening);
+                }
+            }
+        }
         let wire = proof.to_wire_bytes();
-        info!("PoM v4: proof built + submitting (nonce {}, tier {}, {} B)", nonce, tier, wire.len());
+        let job_id = match &*self.block {
+            BlockSeed::PartialBlock { id, .. } => id.as_str(),
+            BlockSeed::FullBlock(_) => "solo",
+        };
+        info!(
+            "PoM {}: proof built + submitting (job {}, nonce {}, tier {}, pre_pow {}, {} B)",
+            if pad.is_some() { "v5" } else { "v4" },
+            job_id,
+            nonce,
+            tier,
+            hex::encode(pph),
+            wire.len()
+        );
         self.assemble_pom_block(nonce, final_state, tier, pow_value, wire)
     }
 
@@ -386,6 +515,19 @@ pub fn serialize_header<H: Hasher>(hasher: &mut H, header: &RpcBlockHeader, for_
 
     decode_to_slice(&header.pruning_point, &mut hash).unwrap();
     hasher.update(hash);
+
+    // H15 block task (keryx-node v1.6.5): at/after the block-task gate, BOTH the pre-PoW hash and the
+    // block hash commit the window's task_root (32 bytes; zeros when the header's field is empty).
+    // Mirrors the node's header hashing — the ONLY field added to the pre-PoW hash, so pre-gate
+    // hashes stay byte-identical. The pool recomputes this from the task_root the miner submits, so
+    // the two MUST agree exactly or every post-gate share is rejected.
+    if header.daa_score >= pom::block_task_activation_daa() {
+        let mut root = [0u8; 32];
+        if !header.task_root.is_empty() {
+            decode_to_slice(&header.task_root, &mut root).unwrap();
+        }
+        hasher.update(root);
+    }
 
     // H3 (keryx-node v1.3.1): at/after pom_level_activation the *block* hash commits the winning
     // walk's pom_final_state (appended LE, last field) — mirrors the node's
@@ -735,4 +877,38 @@ mod tests {
         buf.0
     }
 
+    /// H15 debugging oracle: dump the EXACT pre-PoW byte stream + hash this miner derives for a
+    /// real v4 pool header (prost hex in `H15_HDR_HEX`) with `task_root` = `H15_ROOT` (hex), so it
+    /// can be diffed byte-for-byte against the node's `hash_internal` for the same input. Set
+    /// `KERYX_BLOCK_TASK_ACTIVATION_DAA` to the pool's gate (3500 on the testnet) before running.
+    /// Run: cargo test --features pom-cuda --bin keryx-miner-supr prepow_dump -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn prepow_dump_for_real_v4_header() {
+        let hdr_hex = std::env::var("H15_HDR_HEX").expect("H15_HDR_HEX (prost RpcBlockHeader hex)");
+        let root_hex = std::env::var("H15_ROOT").expect("H15_ROOT (task_root hex)");
+        let bytes = hex::decode(hdr_hex.trim()).expect("hdr hex");
+        let mut header = <RpcBlockHeader as prost::Message>::decode(bytes.as_slice()).expect("prost decode");
+        header.task_root = root_hex.trim().to_string();
+        println!("gate block_task_activation_daa = {}", pom::block_task_activation_daa());
+        println!(
+            "header: version={} levels={} level_counts={:?} ts={} bits={} nonce={} daa={} blue_score={} blue_work={:?} task_root={}",
+            header.version,
+            header.parents.len(),
+            header.parents.iter().map(|p| p.parent_hashes.len()).collect::<Vec<_>>(),
+            header.timestamp,
+            header.bits,
+            header.nonce,
+            header.daa_score,
+            header.blue_score,
+            header.blue_work,
+            header.task_root
+        );
+        let stream = ser(&header, true);
+        println!("SUPR_PREPOW_STREAM_LEN {}", stream.len());
+        println!("SUPR_PREPOW_STREAM {}", hex::encode(&stream));
+        let mut hh = HeaderHasher::new();
+        serialize_header(&mut hh, &header, true);
+        println!("SUPR_PREPOW_HASH {}", hex::encode(hh.finalize().to_le_bytes()));
+    }
 }

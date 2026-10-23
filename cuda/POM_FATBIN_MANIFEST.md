@@ -4,12 +4,12 @@ This manifest identifies the modern walk image committed for the v0.13.0 optimiz
 it with `cuda/regenerate-pom-fatbin.sh`; the script refuses incomplete architecture coverage and can
 compare all established GA100 entry points against a baseline before an artifact is installed.
 
-- Compiler: NVIDIA CUDA 13.2, `nvcc V13.2.86` (adds pom_build_v4_tile_addrs_lut + pom_mine_v4_tc_sidecar_addr_seeded; established sm_80 SASS gate passed)
+- Compiler: NVIDIA CUDA 13.4, `nvcc V13.4.92` (PoM v5: `pom_v5_pad_fill`; `n_pad,inv_p,k_pad` appended to `pom_mine_v4_seeded` AND the chaseless `pom_mine_v4_ncf_seeded` [state-fold + Barrett pad routing]; dev build, SASS baseline gate not run)
 - Source: `src/pom_mine.cu`
-- Source SHA-256: `c719502eb71af94d84632645e08997223599911bb4d92b38f3c9c6d819fdf4ae`
+- Source SHA-256: `6af7350d55c728306bcec9d21b2f7486c26593ec4cb52ac6eaec102756e0eeef`
 - Artifact: `cuda/pom_mine.fatbin`
-- Artifact SHA-256: `cf92a92367251f078314b21d35fd906acd8cdc3b62a146c1d9d93c29839fef1b`
-- Artifact size: 4,388,256 bytes
+- Artifact SHA-256: `0a16f82a472ce70388ee89e45793193c1586607b19d64534eef45f960f98275e`
+- Artifact size: 4506920 bytes
 - Native SASS: sm_75, sm_80, sm_86, sm_87, sm_88, sm_89, sm_90, sm_100, sm_103, sm_110,
   sm_120, sm_121
 - Forward-compatible PTX: compute_75 and compute_80

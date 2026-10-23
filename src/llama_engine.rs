@@ -39,6 +39,18 @@ type FreeFn = unsafe extern "C" fn(*mut c_void);
 type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
 /// Optional (v0.14.1 engines): reason of the last failed load, "" when none.
 type LastErrorFn = unsafe extern "C" fn() -> *const c_char;
+// ── H15 block task / canonical trace ABI (libkeryx-llama ABI 3; cherry-picked from upstream v0.5.8) ──
+type CtxAcquireFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+type TraceConfigureFn = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int;
+type TraceLeafCountFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+type TraceReadFn = unsafe extern "C" fn(*mut c_void, *mut u8, usize, *mut u32, usize, *mut u32) -> c_int;
+type TraceTokensFn = unsafe extern "C" fn(*mut c_void, *const i32, c_int) -> c_int;
+type ReplayFn = unsafe extern "C" fn(*mut c_void, *const i32, c_int, c_int, u32, u32, u32, *mut u8, usize, *mut u8, usize, *mut u32, *mut u32) -> c_int;
+type ReplayMultiFn = unsafe extern "C" fn(*mut c_void, *const i32, c_int, c_int, *const u32, *const u32, u32, u32, *mut u8, usize, *mut u32) -> c_int;
+/// Context kept for the block task while the PoM v5 context pad is resident (32 task tokens).
+const TASK_CONTEXT_TOKENS: c_int = 64;
+/// Largest captured leaf the engine hands back.
+const CAPTURE_CAP: usize = 4 << 20;
 
 /// Install a process-lifetime bridge over llama.cpp/ggml's native stderr logger. Older shipped
 /// sidecars already export these stable llama API symbols, so the host fix also protects them
@@ -60,7 +72,8 @@ unsafe fn install_native_log_bridge(lib: &Library) -> bool {
     crate::native_llama_log::install(get, set)
 }
 
-const ABI: c_int = 2;
+// 3 = H15: the trace/replay/context symbols below are REQUIRED (a 2 library cannot mine post-gate).
+const ABI: c_int = 3;
 
 struct Engine {
     model: *mut c_void,
@@ -77,6 +90,23 @@ struct Engine {
     /// one that does not fit the context. Older libraries feed the whole prompt as ONE batch and
     /// llama.cpp GGML_ASSERTs `n_tokens <= n_batch` — aborting the whole miner on one request.
     prompt_guard: bool,
+    // ── H15 block task / canonical trace ──
+    ctx_acquire: CtxAcquireFn,
+    trace_configure: TraceConfigureFn,
+    trace_leaf_count: TraceLeafCountFn,
+    trace_read: TraceReadFn,
+    trace_tokens: TraceTokensFn,
+    replay: ReplayFn,
+    replay_multi: ReplayMultiFn,
+    trace_last_error: Option<LastErrorFn>,
+    /// Context currently allocated, in tokens (0: none).
+    ctx_now: c_int,
+    /// The current context is the load-size one.
+    ctx_full: bool,
+    /// Leaves per traced position, 0 until the trace is armed.
+    trace_leaves: usize,
+    /// BLAKE3 of the armed trace manifest.
+    trace_manifest: [u8; 32],
 }
 // The wrapper serializes generation internally; tensor info is read-only after load.
 unsafe impl Send for Engine {}
@@ -154,6 +184,20 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             log::warn!("llama engine: shared library ABI {} != expected {} — inference engine unavailable.", got, ABI);
             return None;
         }
+        // H15: canonical trace + replay + context control are mandatory post-gate (the block task).
+        let (Some(ctx_acquire), Some(trace_configure), Some(trace_leaf_count), Some(trace_read), Some(trace_tokens), Some(replay), Some(replay_multi)) = (
+            sym::<CtxAcquireFn>(lib, b"keryx_llama_context_acquire\0"),
+            sym::<TraceConfigureFn>(lib, b"keryx_llama_trace_configure\0"),
+            sym::<TraceLeafCountFn>(lib, b"keryx_llama_trace_leaf_count\0"),
+            sym::<TraceReadFn>(lib, b"keryx_llama_trace_read\0"),
+            sym::<TraceTokensFn>(lib, b"keryx_llama_trace_tokens\0"),
+            sym::<ReplayFn>(lib, b"keryx_llama_replay\0"),
+            sym::<ReplayMultiFn>(lib, b"keryx_llama_replay_multi\0"),
+        ) else {
+            log::warn!("llama engine: shared library is missing the H15 trace/replay/context symbols — inference engine unavailable.");
+            return None;
+        };
+        let trace_last_error = sym::<LastErrorFn>(lib, b"keryx_llama_last_error\0");
         // Optional (upstream aa29fd2): older builds lack it — the ownership gate then no-ops.
         let tensor_device = sym::<TensorDeviceFn>(lib, b"keryx_llama_tensor_device\0");
         // --force-model: NO safety check at all — the operator's contract is "load it verbatim,
@@ -285,6 +329,18 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             gguf: gguf.to_string(),
             n_ctx,
             prompt_guard,
+            ctx_acquire,
+            trace_configure,
+            trace_leaf_count,
+            trace_read,
+            trace_tokens,
+            replay,
+            replay_multi,
+            trace_last_error,
+            ctx_now: n_ctx,
+            ctx_full: true,
+            trace_leaves: 0,
+            trace_manifest: [0u8; 32],
         })
     }
 }
@@ -790,4 +846,185 @@ mod utf8_tests {
 pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
     let gpu = loaded_gpus().into_iter().next()?;
     generate_on(gpu, prompt, max_tokens)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// H15 block task / canonical trace — cherry-picked from upstream v0.5.8 llama_engine.rs onto supr's
+// per-GPU engine slots. Only what the block task needs: arm the trace, trace a raw token prompt,
+// read its leaves, replay captured leaves for an opening, and swap the context size so a small
+// block-task context can sit next to the PoM v5 pad while the full context is restored for pool
+// inference. (The self-responder's `generate_traced` and the KERYX_TRACE_DIR debug dump are NOT
+// ported — the pool serves inference.)
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+fn engine_error(e: &Engine, fallback: &str) -> String {
+    e.trace_last_error
+        .map(|f| unsafe { CStr::from_ptr(f()) }.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Brings back the load-size context (after a block-task context). Falls back to the model's
+/// context floor when the full size no longer fits next to the pad.
+fn ensure_full_context(e: &mut Engine, gpu: usize) -> Result<(), String> {
+    if e.ctx_full && e.ctx_now > 0 {
+        return Ok(());
+    }
+    let mut got = unsafe { (e.ctx_acquire)(e.model, e.n_ctx) };
+    if got < 0 {
+        if let Some(floor) = crate::models::spec_for_gguf(&e.gguf).map(|m| m.ctx_floor as c_int).filter(|f| *f < e.n_ctx) {
+            log::warn!("llama engine: {}-token context did not fit on GPU {} — retrying at the {}-token floor", e.n_ctx, gpu, floor);
+            got = unsafe { (e.ctx_acquire)(e.model, floor) };
+        }
+    }
+    e.ctx_now = got.max(0);
+    e.ctx_full = got >= 0;
+    if got < 0 {
+        return Err(engine_error(e, "context allocation failed"));
+    }
+    log::info!("llama engine: {}-token context restored on GPU {}", got, gpu);
+    Ok(())
+}
+
+/// A context covering `n_pos` positions: the block-task one when it is enough, else the full one.
+fn ensure_context_for(e: &mut Engine, gpu: usize, n_pos: usize) -> Result<(), String> {
+    if e.ctx_now > 0 && e.ctx_now as usize >= n_pos {
+        return Ok(());
+    }
+    if n_pos <= TASK_CONTEXT_TOKENS as usize {
+        let got = unsafe { (e.ctx_acquire)(e.model, TASK_CONTEXT_TOKENS) };
+        e.ctx_now = got.max(0);
+        e.ctx_full = false;
+        if got >= 0 && got as usize >= n_pos {
+            return Ok(());
+        }
+    }
+    ensure_full_context(e, gpu)
+}
+
+/// Shrinks the engine context of `gpu` to the block-task size (frees the big KV cache so the PoM
+/// v5 pad fits); a no-op when it already is.
+pub fn use_task_context(gpu: usize) {
+    let slot = slot_for(gpu);
+    let Ok(mut g) = slot.inner.lock() else { return };
+    let Some(e) = g.as_mut() else { return };
+    if !e.ctx_full && e.ctx_now > 0 {
+        return;
+    }
+    let got = unsafe { (e.ctx_acquire)(e.model, TASK_CONTEXT_TOKENS) };
+    e.ctx_now = got.max(0);
+    e.ctx_full = false;
+    if got < 0 {
+        log::warn!("llama engine: {}", engine_error(e, "block-task context allocation failed"));
+    } else {
+        log::info!("llama engine: {}-token mining context on GPU {}", got, gpu);
+    }
+}
+
+/// Restores the full inference context on `gpu` if a block-task context is active.
+pub fn use_full_context(gpu: usize) -> Result<(), String> {
+    let slot = slot_for(gpu);
+    let mut g = slot.inner.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_mut().ok_or_else(|| "no engine on this GPU".to_string())?;
+    ensure_full_context(e, gpu)
+}
+
+/// Arms the canonical trace on the engine hosting `gguf` on `gpu`; returns the leaves per position.
+pub fn trace_configure(gguf: &str, gpu: usize, manifest: &[u8]) -> Result<usize, String> {
+    let slot = slot_for(gpu);
+    let mut g = slot.inner.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf).ok_or_else(|| "no engine hosts this model".to_string())?;
+    let rc = unsafe { (e.trace_configure)(e.model, manifest.as_ptr() as *const c_void, manifest.len(), 0) };
+    if rc != 0 {
+        return Err(engine_error(e, &format!("trace configuration failed ({rc})")));
+    }
+    let nl = unsafe { (e.trace_leaf_count)(e.model) };
+    if nl <= 0 {
+        return Err("trace configured without leaves".to_string());
+    }
+    e.trace_leaves = nl as usize;
+    e.trace_manifest = *blake3::hash(manifest).as_bytes();
+    Ok(e.trace_leaves)
+}
+
+/// Whether the engine hosting `gguf` on `gpu` traces under exactly `manifest`.
+pub fn traced_with(gguf: &str, gpu: usize, manifest: &[u8]) -> bool {
+    let h = *blake3::hash(manifest).as_bytes();
+    slot_for(gpu).inner.lock().map_or(false, |g| g.as_ref().is_some_and(|e| e.gguf == gguf && e.trace_leaves > 0 && e.trace_manifest == h))
+}
+
+/// A traced evaluation of raw tokens: the ubatch size and leaves of every position.
+pub struct TracedTokens {
+    pub ubatch: Vec<u32>,
+    pub leaves: Vec<[u8; 32]>,
+}
+
+/// Traces `tokens` fed as a prompt with nothing generated (the block task).
+pub fn trace_tokens(gguf: &str, gpu: usize, tokens: &[i32]) -> Result<TracedTokens, String> {
+    let slot = slot_for(gpu);
+    let mut g = slot.inner.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
+    ensure_context_for(e, gpu, tokens.len())?;
+    let e = &*e;
+    let rc = unsafe { (e.trace_tokens)(e.model, tokens.as_ptr(), tokens.len() as c_int) };
+    if rc != 0 {
+        return Err(engine_error(e, &format!("traced evaluation failed ({rc})")));
+    }
+    let mut n_pos: u32 = 0;
+    let mut leaves = vec![[0u8; 32]; tokens.len() * e.trace_leaves];
+    let mut ubatch = vec![0u32; tokens.len()];
+    let rc = unsafe { (e.trace_read)(e.model, leaves.as_mut_ptr() as *mut u8, leaves.len() * 32, ubatch.as_mut_ptr(), ubatch.len(), &mut n_pos) };
+    if rc != 0 || n_pos as usize != tokens.len() {
+        return Err(format!("trace read failed ({rc}), {n_pos} positions traced for {} fed", tokens.len()));
+    }
+    Ok(TracedTokens { ubatch, leaves })
+}
+
+/// Replays a traced token sequence up to `pos` and returns the bytes of leaves `leaf_x` and `leaf_y`.
+pub fn replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, pos: u32, leaf_x: u32, leaf_y: u32) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let slot = slot_for(gpu);
+    let mut g = slot.inner.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
+    ensure_context_for(e, gpu, tokens.len())?;
+    let e = &*e;
+    let mut x = vec![0u8; CAPTURE_CAP];
+    let mut y = vec![0u8; CAPTURE_CAP];
+    let (mut x_len, mut y_len): (u32, u32) = (0, 0);
+    let rc = unsafe {
+        (e.replay)(e.model, tokens.as_ptr(), tokens.len() as c_int, n_prompt as c_int, pos, leaf_x, leaf_y, x.as_mut_ptr(), x.len(), y.as_mut_ptr(), y.len(), &mut x_len, &mut y_len)
+    };
+    if rc != 0 {
+        return Err(engine_error(e, &format!("replay failed ({rc})")));
+    }
+    x.truncate(x_len as usize);
+    y.truncate(y_len as usize);
+    Ok((x, y))
+}
+
+/// Most captures one replay takes.
+/// Mirror of the shim's cap (lives in `trace` so engine-less builds can test the draw against it).
+pub use crate::trace::REPLAY_MAX_CAPTURES;
+
+/// Replays a traced sequence up to the last requested position and returns the bytes of each
+/// `(position, leaf)` capture, in order. `slot_bytes` bounds every captured leaf.
+pub fn replay_multi(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, caps: &[(u32, u32)], slot_bytes: usize) -> Result<Vec<Vec<u8>>, String> {
+    if caps.is_empty() || caps.len() > REPLAY_MAX_CAPTURES || slot_bytes == 0 || slot_bytes > CAPTURE_CAP || slot_bytes % 4 != 0 {
+        return Err("invalid replay request".to_string());
+    }
+    let slot = slot_for(gpu);
+    let mut g = slot.inner.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
+    ensure_context_for(e, gpu, tokens.len())?;
+    let e = &*e;
+    let pos: Vec<u32> = caps.iter().map(|c| c.0).collect();
+    let leaf: Vec<u32> = caps.iter().map(|c| c.1).collect();
+    let mut out = vec![0u8; caps.len() * slot_bytes];
+    let mut lens = vec![0u32; caps.len()];
+    let rc = unsafe {
+        (e.replay_multi)(e.model, tokens.as_ptr(), tokens.len() as c_int, n_prompt as c_int, pos.as_ptr(), leaf.as_ptr(), caps.len() as u32, slot_bytes as u32, out.as_mut_ptr(), out.len(), lens.as_mut_ptr())
+    };
+    if rc != 0 {
+        return Err(engine_error(e, &format!("replay failed ({rc})")));
+    }
+    Ok(out.chunks(slot_bytes).zip(&lens).map(|(c, &l)| c[..(l as usize).min(slot_bytes)].to_vec()).collect())
 }

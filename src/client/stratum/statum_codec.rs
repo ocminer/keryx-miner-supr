@@ -62,6 +62,12 @@ pub(crate) enum MiningNotify {
     // "failed to parse task JSON: invalid type: integer". (Upstream ends theirs
     // in `String`, so they never hit this.) V3 first = the u32 is tried first and
     // a real task object still falls through to the V2 arm.
+    // ── keryx-stratum-v4 (H15) ───────────────────────────────────────────────
+    // V4 = job_id, FULL prost RpcBlockHeader as hex, timestamp, daa_score, block_bits, window_seed
+    // hex ("" when the pool has none). Field 1 is a STRING where every v3/v2 arm has a [u64;4] array,
+    // so an untagged match of a string at slot 1 can only be V4 and a v3 array falls through below.
+    // MUST stay FIRST. The miner decodes the header and computes the pre-PoW hash ITSELF (§4.3).
+    MiningNotifyV4((String, String, u64, u64, u32, String)),
     MiningNotifyWithTaskV3((String, [u64; 4], u64, u64, u32, Value)),
     MiningNotifyShortV3((String, [u64; 4], u64, u64, u32)),
     MiningNotifyWithTask((String, [u64; 4], u64, u64, Value)),
@@ -82,6 +88,12 @@ pub enum MiningSubmit {
     // trailing u32 makes this arity-8 shape distinct from any all-string tuple; listed first so
     // untagged deserialization never mistakes it for the 6-element PoM submit.
     MiningSubmitWithUnsignedResponse((String, String, String, String, String, String, String, u32)),
+    // 7-element (PoM + H15 block task): address, job_id, nonce, opoi_tag, ipfs_cid (or ""),
+    // pom_proof_hex, task_root_hex. `task_root_hex` is the 32-byte block-task root the device
+    // committed into the header it hashed, so the pool can recompute the pre-PoW and block hashes
+    // (it cannot derive it from the proof). All-string arity-7; above the 6-element PoM arm so
+    // untagged picks it for a 7-tuple. Sent only when a v4 job produced a task_root.
+    MiningSubmitWithPomTask((String, String, String, String, String, String, String)),
     // 6-element (PoM, post-fork): address, job_id, nonce, opoi_tag, ipfs_cid (or ""),
     // pom_proof_hex. Fixed slot layout — CID stays at params[4] even when empty so the
     // proof is always params[5]. See POM_STRATUM_RECIPE.md (pool side reconciled).
@@ -542,6 +554,47 @@ mod tests {
                 assert_eq!((id.as_str(), ts, daa), ("job4", 777, 888));
             }
             other => panic!("4-element notify must be ShortV2, got {other:?}"),
+        }
+    }
+
+    /// v4 (H15): a notify whose field 1 is a STRING (the prost header hex) must match
+    /// `MiningNotifyV4` and never a v3 arm, and a v3 notify (field 1 = array) must still NOT match
+    /// v4. The 7-tuple submit must round-trip as `MiningSubmitWithPomTask`.
+    #[test]
+    fn mining_notify_v4_and_submit_task_roundtrip() {
+        // v4: string at slot 1 -> MiningNotifyV4
+        let v4 = serde_json::from_str::<MiningNotify>(
+            r#"["jobV4","0a02deadbeef",111,222,490707704,"ff00ff00"]"#,
+        )
+        .expect("v4 notify must deserialize");
+        match v4 {
+            MiningNotify::MiningNotifyV4((id, header_hex, ts, daa, bits, seed)) => {
+                assert_eq!((id.as_str(), ts, daa, bits, seed.as_str()), ("jobV4", 111, 222, 490707704, "ff00ff00"));
+                assert_eq!(header_hex, "0a02deadbeef");
+            }
+            other => panic!("string-at-slot-1 notify must be V4, got {other:?}"),
+        }
+        // empty window seed stays a valid v4 line
+        assert!(matches!(
+            serde_json::from_str::<MiningNotify>(r#"["j","00",1,2,3,""]"#).unwrap(),
+            MiningNotify::MiningNotifyV4(_)
+        ));
+        // v3 (array at slot 1) must NOT be mistaken for v4
+        assert!(!matches!(
+            serde_json::from_str::<MiningNotify>(r#"["j3",[1,2,3,4],5,6,490707704]"#).unwrap(),
+            MiningNotify::MiningNotifyV4(_)
+        ));
+        // 7-tuple submit round-trips as MiningSubmitWithPomTask
+        let s = MiningSubmit::MiningSubmitWithPomTask((
+            "addr".into(), "job".into(), "000000000000002a".into(), "tag".into(), "".into(), "abcd".into(), "ff".repeat(32),
+        ));
+        let json = serde_json::to_string(&s).unwrap();
+        match serde_json::from_str::<MiningSubmit>(&json).unwrap() {
+            MiningSubmit::MiningSubmitWithPomTask((a, _, n, _, _, p, root)) => {
+                assert_eq!((a.as_str(), n.as_str(), p.as_str()), ("addr", "000000000000002a", "abcd"));
+                assert_eq!(root.len(), 64);
+            }
+            other => panic!("7-tuple submit must be WithPomTask, got {other:?}"),
         }
     }
 }

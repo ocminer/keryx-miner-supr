@@ -36,6 +36,35 @@ set(GGML_CUDA           ON  CACHE BOOL "" FORCE)
 set(GGML_NATIVE         OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA_NCCL      OFF CACHE BOOL "" FORCE)
 
+# H15 canonical trace: keryx_llama.cpp links against the q8canon leaves added to ggml-cuda by
+# patches/*.patch. Apply them to the (pristine, pinned b10015) checkout at configure time; a tree
+# that already carries them is accepted, anything else is a hard error (never build an engine
+# that cannot commit a block-task root).
+find_package(Git REQUIRED)
+file(GLOB _keryx_patches "${CMAKE_CURRENT_SOURCE_DIR}/patches/*.patch")
+list(SORT _keryx_patches)
+foreach(_p IN LISTS _keryx_patches)
+  execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${LLAMA_SRC}" apply --check "${_p}"
+                  RESULT_VARIABLE _fresh OUTPUT_QUIET ERROR_QUIET)
+  if(_fresh EQUAL 0)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${LLAMA_SRC}" apply "${_p}" RESULT_VARIABLE _rc)
+    if(NOT _rc EQUAL 0)
+      message(FATAL_ERROR "keryx-llama: failed to apply ${_p} to ${LLAMA_SRC}")
+    endif()
+    message(STATUS "keryx-llama: applied ${_p}")
+  else()
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${LLAMA_SRC}" apply --reverse --check "${_p}"
+                    RESULT_VARIABLE _applied OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _applied EQUAL 0)
+      message(FATAL_ERROR "keryx-llama: ${LLAMA_SRC} neither accepts nor already carries ${_p} (wrong llama.cpp pin?)")
+    endif()
+    message(STATUS "keryx-llama: ${_p} already applied")
+  endif()
+endforeach()
+if(NOT EXISTS "${LLAMA_SRC}/ggml/src/ggml-cuda/q8canon.cu")
+  message(FATAL_ERROR "keryx-llama: canonical-trace patch not present in ${LLAMA_SRC}")
+endif()
+
 add_subdirectory(${LLAMA_SRC} llama-build)
 
 add_library(keryx-llama SHARED keryx_llama.cpp)

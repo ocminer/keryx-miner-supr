@@ -38,6 +38,30 @@ pub mod pom;
 #[cfg(feature = "pom-opencl")]
 pub mod pom_opencl;
 pub mod pom_v4;
+pub mod pom_v5;
+pub mod trace;
+pub mod block_task;
+// The block-task trace runs on the CUDA engine (pom_gpu::device_model + llama_engine trace ABI);
+// other builds get a stub so `block_task` compiles and simply never produces a task (no mining
+// post-gate on those builds — they cannot commit a task_root).
+#[cfg(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal"))))]
+pub mod task_trace;
+#[cfg(not(all(feature = "pom-cuda", not(all(target_os = "macos", feature = "pom-metal")))))]
+pub mod task_trace {
+    pub fn run_block_task(_device: u32, _model_id: &[u8; 32], _tier: u8, _window_seed: &[u8; 32]) -> Option<crate::trace::ResponseTrace> {
+        None
+    }
+    pub fn open_block_task(
+        _device: u32,
+        _model_id: &[u8; 32],
+        _tier: u8,
+        _trace: &crate::trace::ResponseTrace,
+        _window_seed: &[u8; 32],
+        _block_hash: &[u8; 32],
+    ) -> Option<Vec<u8>> {
+        None
+    }
+}
 // llama.cpp llama-server inference: AMD (Vulkan) always; NVIDIA (CUDA server) since Phase 1 of
 // candle-independence — the module self-disables when no server binary is bundled/env-pointed.
 #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]

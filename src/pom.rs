@@ -177,6 +177,47 @@ pub struct PomProof {
     pub v3: Option<Vec<u8>>,
     /// v4 re-walk witness — the only populated proof body post-relaunch.
     pub v4: Option<crate::pom_v4::PomProofV4>,
+    /// Encoded opening of the block task (H15+). Trailing borsh field, same era-exact wire
+    /// mechanism as the node's `PomProof.task`: ABSENT pre-task (serialized via `PomProofPreTask`,
+    /// so no trailing `None` byte), present only on H15 block candidates. MUST stay last.
+    pub task: Option<Vec<u8>>,
+}
+
+/// Exact pre-task layout of `PomProof` (through `v4`, NO `task`) — mirror of the node's
+/// `PomProofPreTask`. A task-less proof serializes through this so it stays byte-identical to the
+/// node's v4-era bytes; appending `task: None` to the full struct would add a trailing `0x00` and
+/// every pre-H15 share would mismatch the node and be rejected. Field types mirror supr's
+/// placeholder `PomProof` (empty `Vec`/`None` serialize the same for any element type).
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct PomProofPreTask {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<[u8; 32]>,
+    pub steps_v2: Option<Vec<u8>>,
+    pub v3: Option<Vec<u8>>,
+    pub v4: Option<crate::pom_v4::PomProofV4>,
+}
+
+impl From<PomProofPreTask> for PomProof {
+    fn from(p: PomProofPreTask) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: p.steps_v2,
+            v3: p.v3,
+            v4: p.v4,
+            task: None,
+        }
+    }
 }
 
 impl PomProof {
@@ -194,18 +235,39 @@ impl PomProof {
             steps_v2: None,
             v3: None,
             v4: Some(v4),
+            task: None,
         }
     }
 
     /// Canonical borsh wire encoding (the `pomProofHex` submit param) — mirror of the node's
     /// `to_wire_bytes` for the v4 era.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        borsh::to_vec(self).expect("PomProof borsh serialize")
+        if self.task.is_some() {
+            borsh::to_vec(self).expect("PomProof borsh serialize")
+        } else {
+            // Task-less: encode through the pre-task layout so the bytes equal the node's v4-era
+            // encoding exactly (no trailing `None` byte for `task`).
+            borsh::to_vec(&PomProofPreTask {
+                tier: self.tier,
+                trace_root: self.trace_root,
+                pow_value: self.pow_value,
+                final_state: self.final_state,
+                initial_trace_path: self.initial_trace_path.clone(),
+                final_trace_path: self.final_trace_path.clone(),
+                openings: self.openings.clone(),
+                steps_v2: self.steps_v2.clone(),
+                v3: self.v3.clone(),
+                v4: self.v4.clone(),
+            })
+            .expect("PomProof borsh serialize")
+        }
     }
 
-    /// Decode the canonical wire encoding — mirror of the node's `from_wire_bytes`.
+    /// Decode the canonical wire encoding, any era — mirror of the node's `from_wire_bytes`.
+    /// The full (task) layout is tried first; a pre-task blob falls back and maps in `task: None`.
     pub fn from_wire_bytes(bytes: &[u8]) -> std::io::Result<Self> {
         borsh::from_slice::<PomProof>(bytes)
+            .or_else(|_| borsh::from_slice::<PomProofPreTask>(bytes).map(PomProof::from))
     }
 }
 
@@ -364,15 +426,49 @@ pub fn pom_block_seed_v4(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) ->
 /// H10 activation DAA (mainnet). MUST equal the node's `H10_ACTIVATION_DAA` (v1.5.7 = 87_360_000)
 /// and miner-upstream v0.5.3's `h10_activation_daa()`. Overridable via `KERYX_POM_H10_ACTIVATION_DAA`
 /// for STAGING / pre-fork live-path testing ONLY (same pattern as `activation_daa()`).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// Network gate table. `KERYX_TESTNET=1` selects the node's TESTNET gate values (mirror of
+// keryx-node consensus/core/src/config/params.rs `TESTNET_PARAMS`) for EVERY PoM / H-era gate below,
+// the same way upstream's `--testnet` does. An explicit `KERYX_*_ACTIVATION_DAA` env still wins over
+// both tables. Unset => mainnet constants, byte-for-byte what shipped before this switch existed.
+// Why this exists: a miner that only overrides the H15 gates on a testnet keeps the H10/H14 seed
+// gates at their mainnet DAAs (never reached there) and derives the PRE-H10 walk seed -> every
+// post-gate share is BadTilePath while the pre-PoW hash is byte-identical (found via pool replay,
+// 2026-10-23). The gate table MUST move as one, exactly like the node's.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+pub const TESTNET_POM_ACTIVATION_DAA: u64 = 1;
+pub const TESTNET_POM_LEVEL_ACTIVATION_DAA: u64 = 1;
+pub const TESTNET_POM_V3_ACTIVATION_DAA: u64 = 1;
+pub const TESTNET_H10_ACTIVATION_DAA: u64 = 1;
+pub const TESTNET_H14_ACTIVATION_DAA: u64 = 1;
+pub const TESTNET_REWARD_ROUTING_ACTIVATION_DAA: u64 = 0;
+pub const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
+
+/// True when `KERYX_TESTNET` is set to 1/true/yes: gate fns fall back to the testnet table.
+pub fn testnet_gates() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| {
+        matches!(
+            std::env::var("KERYX_TESTNET").ok().as_deref().map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    })
+}
+
+/// Resolve one gate: explicit `env` override > (`KERYX_TESTNET` ? `testnet` : `mainnet`).
+fn gate(env: &str, mainnet: u64, testnet: u64) -> u64 {
+    std::env::var(env)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(if testnet_gates() { testnet } else { mainnet })
+}
+
 pub const POM_H10_SEED_ACTIVATION_DAA: u64 = 87_360_000;
 
 pub fn h10_activation_daa() -> u64 {
     static G: OnceLock<u64> = OnceLock::new();
     *G.get_or_init(|| {
-        std::env::var("KERYX_POM_H10_ACTIVATION_DAA")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(POM_H10_SEED_ACTIVATION_DAA)
+        gate("KERYX_POM_H10_ACTIVATION_DAA", POM_H10_SEED_ACTIVATION_DAA, TESTNET_H10_ACTIVATION_DAA)
     })
 }
 
@@ -385,10 +481,7 @@ pub const POM_H14_ACTIVATION_DAA: u64 = 121_985_000;
 pub fn h14_activation_daa() -> u64 {
     static G: OnceLock<u64> = OnceLock::new();
     *G.get_or_init(|| {
-        std::env::var("KERYX_POM_H14_ACTIVATION_DAA")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(POM_H14_ACTIVATION_DAA)
+        gate("KERYX_POM_H14_ACTIVATION_DAA", POM_H14_ACTIVATION_DAA, TESTNET_H14_ACTIVATION_DAA)
     })
 }
 
@@ -415,6 +508,63 @@ pub fn is_h14_era(daa: u64) -> bool {
 /// True when `KERYX_POM_H14_ACTIVATION_DAA` moved the gate (testing).
 pub fn is_h14_activation_overridden() -> bool {
     h14_activation_daa() != POM_H14_ACTIVATION_DAA
+}
+
+/// H15 gate (mainnet). MUST equal the node's `H15_ACTIVATION_DAA`
+/// (consensus/core/src/config/params.rs = 140_115_000, ~2026-10-30 15:00 UTC). At/after it the PoM
+/// walk ALSO reads the tier's context pad (PoM v5) AND every header carries `task_root`, hashed into
+/// the pre-PoW and block hashes. A miner still emitting v4 (task-less) proofs past the gate produces
+/// blocks the node rejects. One DAA drives both H15 rules, exactly like the node (`pom_v5` and
+/// `block_task` activations sit at the same DAA), so they can never cross at different scores.
+/// Overridable for STAGING / testnet via `KERYX_POM_V5_ACTIVATION_DAA` /
+/// `KERYX_BLOCK_TASK_ACTIVATION_DAA` — the SAME env names the pool-side verifier reads.
+pub const POM_V5_ACTIVATION_DAA: u64 = 140_115_000;
+
+/// PoM v5 (context-pad) gate. See [`POM_V5_ACTIVATION_DAA`].
+pub fn pom_v5_activation_daa() -> u64 {
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| {
+        gate("KERYX_POM_V5_ACTIVATION_DAA", POM_V5_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+    })
+}
+
+/// Block-task gate: headers carry `task_root`. MUST equal the node's `block_task_activation` (= H15).
+pub fn block_task_activation_daa() -> u64 {
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| {
+        gate("KERYX_BLOCK_TASK_ACTIVATION_DAA", POM_V5_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+    })
+}
+
+/// Node `trace_prefix_activation` (H15): responses accepted from this DAA are opened against the
+/// prefix-bound manifests, with the request-bound prefix point. Same DAA as the other H15 gates.
+pub fn trace_prefix_activation_daa() -> u64 {
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| gate("KERYX_TRACE_PREFIX_ACTIVATION_DAA", POM_V5_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA))
+}
+
+/// Node `trace_audit_activation` (H15): every traced response is audited from this DAA.
+pub fn trace_audit_activation_daa() -> u64 {
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| gate("KERYX_TRACE_AUDIT_ACTIVATION_DAA", POM_V5_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA))
+}
+
+/// Node `trace_chain_activation` (H15): responses accepted from this DAA commit the stage-2 trace.
+pub fn trace_chain_activation_daa() -> u64 {
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| gate("KERYX_TRACE_CHAIN_ACTIVATION_DAA", POM_V5_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA))
+}
+
+/// Whether a block at `daa` is in the PoM v5 (context-pad) era.
+#[inline]
+pub fn is_pom_v5_era(daa: u64) -> bool {
+    daa >= pom_v5_activation_daa()
+}
+
+/// Whether a block at `daa` carries a block task (`task_root` in the header).
+#[inline]
+pub fn is_block_task_era(daa: u64) -> bool {
+    daa >= block_task_activation_daa()
 }
 
 /// Real formula shipped and golden-verified (node v1.5.7 + miner-upstream v0.5.3).
@@ -802,6 +952,9 @@ impl WeightIndex {
     /// bytes — the same the miner serves in VRAM and the builder pinned in `R_T`. The Merkle tree
     /// is streamed to a temp file next to the GGUF (disk, never tmpfs) so big tiers don't OOM.
     pub fn build_from_gguf(path: &str, model_id: [u8; 32]) -> candle_core::Result<Self> {
+        // Record the resident model identity for the PoM v5 pad seed (single-model/global path);
+        // mixed rigs additionally store it per device via `set_index_for`.
+        set_mining_model_id(model_id);
         let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
         let cache_path = dir.join("pom-tree.bin");
         let meta_path = dir.join("pom-tree.meta");
@@ -1459,10 +1612,7 @@ pub const POM_ACTIVATION_DAA: u64 = 37_780_000;
 /// lets startup warn loudly so an override can never be used silently in production.
 pub fn activation_daa() -> u64 {
     *ACTIVATION_DAA.get_or_init(|| {
-        std::env::var("KERYX_POM_ACTIVATION_DAA")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(POM_ACTIVATION_DAA)
+        gate("KERYX_POM_ACTIVATION_DAA", POM_ACTIVATION_DAA, TESTNET_POM_ACTIVATION_DAA)
     })
 }
 pub fn is_activation_overridden() -> bool {
@@ -1484,10 +1634,7 @@ pub const POM_LEVEL_ACTIVATION_DAA: u64 = 43_450_000;
 /// mirroring `activation_daa()`. Read once. Never set in production.
 pub fn level_activation_daa() -> u64 {
     *LEVEL_ACTIVATION_DAA.get_or_init(|| {
-        std::env::var("KERYX_POM_LEVEL_ACTIVATION_DAA")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(POM_LEVEL_ACTIVATION_DAA)
+        gate("KERYX_POM_LEVEL_ACTIVATION_DAA", POM_LEVEL_ACTIVATION_DAA, TESTNET_POM_LEVEL_ACTIVATION_DAA)
     })
 }
 pub fn is_level_activation_overridden() -> bool {
@@ -1506,10 +1653,7 @@ static LEVEL_ACTIVATION_DAA: OnceLock<u64> = OnceLock::new();
 pub const POM_V3_ACTIVATION_DAA: u64 = 0;
 pub fn pom_v3_activation_daa() -> u64 {
     *POM_V3_ACTIVATION_DAA_CELL.get_or_init(|| {
-        std::env::var("KERYX_POM_V3_ACTIVATION_DAA")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(POM_V3_ACTIVATION_DAA)
+        gate("KERYX_POM_V3_ACTIVATION_DAA", POM_V3_ACTIVATION_DAA, TESTNET_POM_V3_ACTIVATION_DAA)
     })
 }
 static POM_V3_ACTIVATION_DAA_CELL: OnceLock<u64> = OnceLock::new();
@@ -1523,10 +1667,7 @@ static POM_V3_ACTIVATION_DAA_CELL: OnceLock<u64> = OnceLock::new();
 pub fn reward_routing_activation_daa() -> u64 {
     static CELL: OnceLock<u64> = OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("KERYX_REWARD_ROUTING_ACTIVATION_DAA")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(79_251_000)
+        gate("KERYX_REWARD_ROUTING_ACTIVATION_DAA", 79_251_000, TESTNET_REWARD_ROUTING_ACTIVATION_DAA)
     })
 }
 static H4_ACTIVATION_DAA: OnceLock<u64> = OnceLock::new();
@@ -1609,6 +1750,35 @@ pub fn device_index_matches(device_id: u32, model_id: &[u8; 32]) -> bool {
     pom_indices().lock().map(|m| m.get(&device_id).map(|v| &v.model_id == model_id).unwrap_or(false)).unwrap_or(false)
 }
 
+/// Process-wide fallback mining model identity, for single-model rigs whose index is installed via
+/// the global [`set_index`] (no per-device entry). Set by [`WeightIndex::build_from_gguf`], which
+/// builds every resident index and holds the model id. Mixed rigs store the id per device in the
+/// device index registry (see [`set_index_for`]), which takes precedence in [`mining_model_id`].
+fn mining_model_id_cell() -> &'static std::sync::Mutex<Option<[u8; 32]>> {
+    static C: OnceLock<std::sync::Mutex<Option<[u8; 32]>>> = OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Record the process-wide mining model identity (the model the resident global index was built
+/// from). Last writer wins; the per-device registry overrides it for mixed rigs.
+pub fn set_mining_model_id(model_id: [u8; 32]) {
+    if let Ok(mut g) = mining_model_id_cell().lock() {
+        *g = Some(model_id);
+    }
+}
+
+/// The model identity to seed the PoM v5 context pad with for `device_id`: the per-device index's
+/// model if one is installed, else the process-wide mining model. MUST match the model the device's
+/// weight index was built from, or the pad diverges from the node's and the proof is invalid.
+pub fn mining_model_id(device_id: u32) -> Option<[u8; 32]> {
+    if let Ok(m) = pom_indices().lock() {
+        if let Some(v) = m.get(&device_id) {
+            return Some(v.model_id);
+        }
+    }
+    mining_model_id_cell().lock().ok().and_then(|g| *g)
+}
+
 /// Test-only WeightIndex over arbitrary RAM chunks (`data` = chunk-aligned canonical bytes) — real
 /// checkpoint tree + merkle paths, no GGUF. Shared by the pom.rs synth tests AND the pom_v3 mirror
 /// test (which pins the node's R_T + walk vectors over a synthetic blob).
@@ -1664,6 +1834,64 @@ pub(crate) fn index_from_ram(data: Vec<u8>) -> WeightIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A task-less v4 proof MUST encode byte-identically to the pre-task (node v4-era) layout — no
+    /// trailing `task: None` byte — or every pre-H15 share mismatches the node and is rejected. A
+    /// proof WITH a task round-trips through the full layout.
+    #[test]
+    fn task_extension_is_wire_backward_compatible() {
+        let v4 = crate::pom_v4::PomProofV4 { tier: 1, tiles: vec![], merkle: vec![] };
+        let proof = PomProof::v4(1, [7u8; 32], 0xdead_beef, v4);
+        assert!(proof.task.is_none());
+        // Pre-task layout = the exact bytes the node expects in the v4 era.
+        let pre_task = borsh::to_vec(&PomProofPreTask {
+            tier: proof.tier,
+            trace_root: proof.trace_root,
+            pow_value: proof.pow_value,
+            final_state: proof.final_state,
+            initial_trace_path: proof.initial_trace_path.clone(),
+            final_trace_path: proof.final_trace_path.clone(),
+            openings: proof.openings.clone(),
+            steps_v2: proof.steps_v2.clone(),
+            v3: proof.v3.clone(),
+            v4: proof.v4.clone(),
+        })
+        .unwrap();
+        // to_wire_bytes of a task-less proof == pre-task bytes (NOT the full struct, which would
+        // carry the extra trailing `0x00` for `task: None`).
+        assert_eq!(proof.to_wire_bytes(), pre_task);
+        assert_eq!(proof.to_wire_bytes().len() + 1, borsh::to_vec(&proof).unwrap().len());
+        // Round-trip, task absent.
+        assert_eq!(PomProof::from_wire_bytes(&pre_task).unwrap().task, None);
+        // Task present: full struct, round-trips with the task payload.
+        let with_task = PomProof { task: Some(vec![1, 2, 3]), ..proof.clone() };
+        let bytes = with_task.to_wire_bytes();
+        assert_eq!(bytes, borsh::to_vec(&with_task).unwrap());
+        assert_eq!(PomProof::from_wire_bytes(&bytes).unwrap().task, Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn h15_gates_default_to_mainnet_daa() {
+        // With no env override the H15 gates equal the node's H15_ACTIVATION_DAA.
+        assert_eq!(POM_V5_ACTIVATION_DAA, 140_115_000);
+        assert!(h14_activation_daa() < POM_V5_ACTIVATION_DAA);
+    }
+
+    /// `gate()` resolution order: explicit env > (KERYX_TESTNET ? testnet : mainnet). The test
+    /// process has KERYX_TESTNET unset, so the fallback must be the MAINNET value, and an explicit
+    /// per-gate env must win regardless. The testnet table mirrors the node's TESTNET_PARAMS.
+    #[test]
+    fn gate_resolution_order_and_testnet_table() {
+        assert_eq!(gate("KERYX_GATE_TEST_UNSET_ZZ", 11, 22), 11, "unset env + no KERYX_TESTNET => mainnet");
+        std::env::set_var("KERYX_GATE_TEST_OVERRIDE_ZZ", " 42 ");
+        assert_eq!(gate("KERYX_GATE_TEST_OVERRIDE_ZZ", 1, 2), 42, "explicit env wins (trimmed)");
+        std::env::set_var("KERYX_GATE_TEST_BAD_ZZ", "nope");
+        assert_eq!(gate("KERYX_GATE_TEST_BAD_ZZ", 7, 8), 7, "unparsable env => fallback");
+        // Node TESTNET_PARAMS mirror (consensus/core/src/config/params.rs).
+        assert_eq!((TESTNET_H10_ACTIVATION_DAA, TESTNET_H14_ACTIVATION_DAA), (1, 1));
+        assert_eq!((TESTNET_POM_ACTIVATION_DAA, TESTNET_POM_LEVEL_ACTIVATION_DAA, TESTNET_POM_V3_ACTIVATION_DAA), (1, 1, 1));
+        assert_eq!((TESTNET_REWARD_ROUTING_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA), (0, 3_500));
+    }
 
     #[test]
     fn device_index_replacement_reclaims_after_last_owner() {

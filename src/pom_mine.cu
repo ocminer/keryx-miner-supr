@@ -365,6 +365,52 @@ static_assert(V4_D == 32, "PoM v4 requires D=32");
 #define V4_OFFSET_FIRST_SALT 0x6D1CCF96AC4D76F9ULL
 #define V4_OFFSET_STEP_SALT  0x89050E78D34609EFULL
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PoM v5 (H15): context pad. Byte-exact mirror of src/pom_v5.rs / the node's pom_v5.rs.
+// k_pad == 0 keeps the pure v4 walk (pre-gate); k_pad != 0 enables the pad steps.
+// The pad tiles are NOT loaded from here — the host appends the filled pad buffer as an extra
+// (bases, prefix) segment so an offset in [n_tiles, n_tiles + n_pad) is loaded by v4_load_tile
+// exactly like a weight tile. Only the OFFSET derivation and the one-time pad fill live here.
+// ─────────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ unsigned long long v5_rotl(unsigned long long v, int r) { return (v << r) | (v >> (64 - r)); }
+
+// Whether step `step` (1-based) reads a pad tile. Mirror of pom_v5::v5_is_pad_step (k_pad = pad_steps).
+__device__ __forceinline__ bool v5_is_pad_step(unsigned int step, unsigned int K, unsigned int k_pad) {
+    return (step * k_pad) / K != ((step - 1u) * k_pad) / K;
+}
+
+// Warp-wide fold of the walk state. Lane x contributes the first two words of its state row; the
+// warp reduces them. Mirror of pom_v5::v5_state_fold (folds the first 8 bytes of each of the 32 rows).
+__device__ __forceinline__ unsigned long long v5_state_fold(unsigned int w0, unsigned int w1, unsigned int x) {
+    unsigned long long h = mix64((((unsigned long long)w1 << 32) | w0) ^ (unsigned long long)x);
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) h ^= __shfl_xor_sync(0xFFFFFFFFu, h, m);
+    return h;
+}
+
+// PoM v5 context pad fill: entries [first, first + count), one thread per entry. Byte-exact mirror
+// of pom_v5::pad_entry_into (ARX, POM_V5_P_ROUNDS rounds). `pad` is u32[*], entry i at pad + i*8.
+extern "C" __global__ void pom_v5_pad_fill(
+    unsigned int* pad, unsigned long long first, unsigned long long count,
+    unsigned long long w0, unsigned long long w1, unsigned long long w2, unsigned long long w3,
+    unsigned int rounds) {
+    const unsigned long long t = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= count) return;
+    const unsigned long long i = first + t;
+    unsigned long long a = w0, b = w1 ^ i, c = w2, d = w3;
+    for (unsigned int r = 0; r < rounds; r++) {
+        a += b; d ^= a; d = v5_rotl(d, 32);
+        c += d; b ^= c; b = v5_rotl(b, 24);
+        a += b; d ^= a; d = v5_rotl(d, 16);
+        c += d; b ^= c; b = v5_rotl(b, 63);
+    }
+    unsigned int* o = pad + i * 8ULL;
+    o[0] = (unsigned int)a; o[1] = (unsigned int)(a >> 32);
+    o[2] = (unsigned int)b; o[3] = (unsigned int)(b >> 32);
+    o[4] = (unsigned int)c; o[5] = (unsigned int)(c >> 32);
+    o[6] = (unsigned int)d; o[7] = (unsigned int)(d >> 32);
+}
+
 // One 1 KB tile (32 canonical chunks) into shared, one chunk per lane.
 __device__ __forceinline__ void v4_load_tile(
     const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
@@ -397,7 +443,8 @@ __device__ __forceinline__ void b3_hash_row32(const unsigned int row[8], unsigne
 // fold64(v4_state_root(S_K)); valid on thread 0 only.
 __device__ __forceinline__ unsigned long long v4_walk_block(
     const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
-    unsigned long long n_tiles, unsigned int K, unsigned long long seed, unsigned int* s_tile) {
+    unsigned long long n_tiles, unsigned int K, unsigned long long seed, unsigned int* s_tile,
+    unsigned long long n_pad, unsigned int k_pad) {
     const unsigned int x = threadIdx.x;   // state row, 0..31
 
     // S_0: mix64 keystream per row.
@@ -420,7 +467,10 @@ __device__ __forceinline__ unsigned long long v4_walk_block(
             unsigned long long sf = 0;
             #pragma unroll
             for (int w = 0; w < 8; w++) sf = mix64(sf ^ (unsigned long long)s_tile[w]);
-            off = mix64(seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf) % n_tiles;
+            // PoM v5: the offset also folds in the walk state and routes some steps to the pad.
+            const unsigned long long hs = k_pad != 0u ? v5_state_fold(row4[0], row4[1], x) : 0ULL;
+            const unsigned long long raw = mix64(seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf ^ hs);
+            off = v5_is_pad_step(step + 1, K, k_pad) ? n_tiles + raw % n_pad : raw % n_tiles;
         }
 
         // Transition: this thread's new row = rho(row . tile_col_j) for j in 0..32.
@@ -468,7 +518,7 @@ extern "C" __global__ void pom_mine_v4_seeded(
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
     const unsigned long long* h10_seeds, unsigned int h10,
-    unsigned long long* winner) {
+    unsigned long long* winner, unsigned long long n_pad, unsigned int k_pad) {
     extern __shared__ unsigned int s_shared[];
     if ((unsigned long long)blockIdx.x >= n_nonces) return;
     const unsigned long long nonce = nonce_base + blockIdx.x;
@@ -477,7 +527,7 @@ extern "C" __global__ void pom_mine_v4_seeded(
     unsigned long long seed = ((threadIdx.x & 31u) == 0u)
         ? pom_seed_fold_era(h10, h10_seeds, blockIdx.x, nonce, time_, s0, s1, s2, s3) : 0ULL;
     seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
-    const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared);
+    const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared, n_pad, k_pad);
     if (threadIdx.x == 0) {
         unsigned long long pv[4];
         pom_pow_fold(fin, p0, p1, p2, p3, pv);
@@ -1076,7 +1126,13 @@ extern "C" __global__ void pom_mine_v4_ncf_seeded(
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
     const unsigned short* lut, unsigned int lut_sh, unsigned long long inv_n,
-    const unsigned long long* h10_seeds, unsigned int h10, unsigned long long* winner) {
+    const unsigned long long* h10_seeds, unsigned int h10, unsigned long long* winner,
+    unsigned long long n_pad, unsigned long long inv_p, unsigned int k_pad) {
+    // PoM v5 (H15): k_pad != 0 => the offset folds the walk state and routes k_pad of the K steps to
+    // the context pad, addressed as tiles [n_tiles, n_tiles+n_pad) through the SAME lut/prefix (the
+    // host appends the pad as one extra gather segment and rebuilds the LUT over it). inv_p =
+    // Barrett reciprocal of n_pad. k_pad == 0 keeps the byte-exact v4 walk. State-carrying by
+    // construction (s_state), so this fast chaseless kernel stays the v5 production path.
     extern __shared__ unsigned int s_shared[];
     const unsigned int w = threadIdx.x >> 5;
     const unsigned int x = threadIdx.x & 31u;
@@ -1114,9 +1170,14 @@ extern "C" __global__ void pom_mine_v4_ncf_seeded(
             unsigned long long sf = 0;
             #pragma unroll
             for (int wd = 0; wd < 8; wd++) sf = mix64(sf ^ (unsigned long long)cur[wd]);
-            off = v4_barrett_mod(
-                mix64(seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf),
-                n_tiles, inv_n);
+            // PoM v5: fold S_{step-1} (first two words of every lane's row, warp-reduced) into the
+            // offset and route pad steps into the pad range. s_state still holds S_{step-1} here —
+            // v4_imma_step(step) runs below — matching pom_v5::v5_next_offset exactly.
+            const unsigned long long hs = k_pad != 0u ? v5_state_fold(s_state[x * 8u], s_state[x * 8u + 1u], x) : 0ULL;
+            const unsigned long long raw = mix64(seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf ^ hs);
+            off = v5_is_pad_step(step + 1u, K, k_pad)
+                ? n_tiles + v4_barrett_mod(raw, n_pad, inv_p)
+                : v4_barrett_mod(raw, n_tiles, inv_n);
             const ulonglong2* q = v4_chunk_addr_lut(bases, prefix, T, lut, lut_sh, off, x);
             ulonglong2* dst = (ulonglong2*)(s_tiles + ((step + 1u) & 1u) * 256u + x * 8);
             v4_cp_async16(dst, q); v4_cp_async16(dst + 1, q + 1);
@@ -1158,5 +1219,6 @@ extern "C" __global__ void pom_mine_v4_ncf_seeded(
     unsigned long long, unsigned long long, unsigned long long, unsigned long long,
     unsigned long long, unsigned long long,
     const unsigned short*, unsigned int, unsigned long long,
-    const unsigned long long*, unsigned int, unsigned long long*) {}
+    const unsigned long long*, unsigned int, unsigned long long*,
+    unsigned long long, unsigned long long, unsigned int) {}
 #endif

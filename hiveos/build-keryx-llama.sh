@@ -41,6 +41,17 @@ SRC=/tmp/llama-src-$TAG
 if [ ! -d "$SRC" ]; then
   git clone --quiet --depth 1 --branch "$TAG" https://github.com/ggml-org/llama.cpp "$SRC"
 fi
+# H15 canonical trace: apply tools/keryx-llama/patches/*.patch (q8canon leaves in ggml-cuda) to the
+# pristine b10015 tree, from a clean checkout whenever the patch set changed (stamp file).
+PATCH_DIR="$REPO/tools/keryx-llama/patches"
+STAMP="$SRC/.keryx-patches"
+WANT=$(cd "$PATCH_DIR" && for f in *.patch; do printf '%s %s\n' "$f" "$(sha256sum "$f" | cut -c1-16)"; done)
+if [ "$(cat "$STAMP" 2>/dev/null)" != "$WANT" ]; then
+  git -C "$SRC" checkout -- . && git -C "$SRC" clean -fdq -- ggml/src/ggml-cuda
+  for f in "$PATCH_DIR"/*.patch; do git -C "$SRC" apply "$f"; done
+  printf '%s\n' "$WANT" > "$STAMP"
+  echo ">> applied $(ls "$PATCH_DIR"/*.patch | wc -l) llama.cpp patch(es) to $SRC"
+fi
 
 docker run --rm --network host \
   -v "$SRC":/llama -v "$REPO":/repo:ro -v "$OUT":/out "${CUDAMOUNT[@]}" \

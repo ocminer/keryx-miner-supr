@@ -314,6 +314,30 @@ pub struct PomGpuMiner {
     _tensors: Vec<QTensor>,     // raw-loaded tensors kept alive so the gather pointers stay valid
     _shared: Vec<Arc<QTensor>>, // shared-with-inference tensors kept alive (zero-dup, Option C)
     _uploads: Vec<CudaSlice<u8>>, // our own device copies of llama-engine host-resident tensors
+    /// PoM v5 (H15) context pad + the v5 copy of (bases, prefix, t_count) with the pad appended as an
+    /// extra gather segment. Lazily built on the first post-gate grind (stable per model/tier/R_T);
+    /// the base fields above stay pad-free so pre-gate v4 grinding is untouched. See
+    /// [`PomGpuMiner::v5_pad`].
+    v5_pad: OnceLock<V5Pad>,
+}
+
+/// The device-resident PoM v5 context pad plus the gather map that reaches it. `n_pad` tiles are
+/// appended AFTER the `n_tiles` weight tiles so a walk offset in [n_tiles, n_tiles+n_pad) is loaded
+/// by the UNCHANGED `v4_load_tile` (binary search over the extended `prefix`). `k_pad` = pad steps
+/// per walk (`pom_v5::v5_pad_steps`). The pad bytes are filled on the GPU by `pom_v5_pad_fill`.
+struct V5Pad {
+    _pad_buf: CudaSlice<u32>, // kept alive so the appended gather pointer stays valid for the miner's life
+    bases_dev: CudaSlice<u64>,
+    prefix_dev: CudaSlice<u64>,
+    t_count: u32,
+    n_pad: u64,
+    k_pad: u32,
+    /// Barrett reciprocal of `n_pad` (u64::MAX / n_pad) for the chaseless kernel's pad modulo.
+    inv_p: u64,
+    /// Segment lower-bound LUT over the PADDED prefix (same construction as `v4_ncf_lut`, but it
+    /// must cover the pad segment's chunk range too), for the chaseless (ncf) v5 walk.
+    lut: Arc<CudaSlice<u16>>,
+    lut_sh: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -545,6 +569,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
+            v5_pad: OnceLock::new(),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
             _tensors: tensors,
@@ -616,6 +641,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
+            v5_pad: OnceLock::new(),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
             _tensors: Vec::new(),
@@ -700,6 +726,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
+            v5_pad: OnceLock::new(),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
             _tensors: raw,
@@ -847,6 +874,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
+            v5_pad: OnceLock::new(),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
             _tensors: Vec::new(),
@@ -921,6 +949,102 @@ impl PomGpuMiner {
     /// Byte-exact mirror of `pom_v4::v4_walk` on the GPU. Returns the lowest winning nonce
     /// (`era_pow_fold(fold64(v4_state_root(S_K))) <= target`), or None. Dynamic shared = 2 KB
     /// (one 1 KB tile + fold scratch). The v4 SEED uses the v4 pph salt; the POW fold stays H3.
+    /// Build-once the PoM v5 context pad for (`pad_seed`, `n_pad`) and the v5 gather map (the base
+    /// bases/prefix with the GPU-filled pad appended as one extra segment). Stable per model/tier/R_T,
+    /// so memoized in `self.v5_pad`. `k_pad` = pad-step count (`pom_v5::v5_pad_steps`).
+    fn v5_pad(&self, pad_seed: &[u8; 32], n_pad: u64, k_pad: u32) -> candle_core::Result<&V5Pad> {
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        if let Some(p) = self.v5_pad.get() {
+            return Ok(p);
+        }
+        if n_pad == 0 {
+            return Err(candle_core::Error::Msg("PoM v5: zero pad tiles".into()));
+        }
+        // Device pad buffer: n_pad tiles * POM_V4_TILE_BYTES bytes, as u32 (8 u32 per 32-byte entry).
+        let u32_len = (n_pad * crate::pom_v4::POM_V4_TILE_BYTES as u64 / 4) as usize;
+        let pad_buf = self.stream.alloc_zeros::<u32>(u32_len).map_err(candle_core::Error::wrap)?;
+        // Fill on the GPU — byte-exact mirror of pom_v5::pad_entry_into, one thread per 32-byte entry.
+        let words = crate::pom_v5::v5_pad_seed_words(pad_seed);
+        let first: u64 = 0;
+        let count: u64 = n_pad * crate::pom_v5::POM_V5_TILE_ENTRIES;
+        let rounds: u32 = crate::pom_v5::POM_V5_P_ROUNDS;
+        let fill_cfg = LaunchConfig {
+            grid_dim: (((count + 255) / 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let fill = load_walk_func(&self.cuda, "pom_v5_pad_fill")?;
+        {
+            let mut b = fill.builder();
+            b.arg(&pad_buf)
+                .arg(&first)
+                .arg(&count)
+                .arg(&words[0])
+                .arg(&words[1])
+                .arg(&words[2])
+                .arg(&words[3])
+                .arg(&rounds);
+            unsafe {
+                b.launch(fill_cfg).map_err(candle_core::Error::wrap)?;
+            }
+        }
+        self.stream.synchronize().map_err(candle_core::Error::wrap)?;
+        // Append the pad as ONE extra gather segment after the weight tiles. prefix counts CHUNKS.
+        // The pad MUST begin exactly at the end of the last FULL weight tile (n_tiles * TILE_CHUNKS)
+        // so a pad offset `off` in [n_tiles, n_tiles+n_pad) resolves — via idx = off*TILE_CHUNKS+lane
+        // in v4_load_tile — into the pad segment. A model whose chunk count is not a whole number of
+        // tiles has a partial trailing tile that the walk never reads (off < n_tiles); drop it from
+        // the gather map so the prefix stays monotonic and the pad starts on the tile boundary.
+        let pad_ptr = pad_buf.device_ptr(&self.stream).0 as u64;
+        let mut bases: Vec<u64> = self.stream.clone_dtoh(&self.bases_dev).map_err(candle_core::Error::wrap)?;
+        let mut prefix: Vec<u64> = self.stream.clone_dtoh(&self.prefix_dev).map_err(candle_core::Error::wrap)?;
+        let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        let weight_chunks = n_tiles * crate::pom_v4::POM_V4_TILE_CHUNKS;
+        // Previous segment's end, read before the mutable borrow below (borrow-checker).
+        let prev_bound = if prefix.len() >= 2 { prefix[prefix.len() - 2] } else { 0 };
+        if let Some(last) = prefix.last_mut() {
+            if *last > weight_chunks {
+                // Never underflow the previous segment boundary (a sub-tile final tensor is not a
+                // real model; refuse rather than build a non-monotonic gather map).
+                debug_assert!(
+                    prev_bound <= weight_chunks,
+                    "PoM v5: final weight segment is smaller than the partial tile; cannot place the pad"
+                );
+                *last = weight_chunks;
+            }
+        }
+        bases.push(pad_ptr);
+        let total_chunks = weight_chunks + n_pad * crate::pom_v4::POM_V4_TILE_CHUNKS;
+        prefix.push(total_chunks);
+        let t_count = bases.len() as u32;
+        if t_count as u64 > u16::MAX as u64 {
+            return Err(candle_core::Error::Msg("PoM v5: more segments than the u16 LUT can index".into()));
+        }
+        // Chaseless (ncf) segment LUT over the padded layout — identical construction to
+        // `v4_ncf_lut`, but spanning `total_chunks` so pad offsets resolve to the pad segment.
+        let mut sh = 0u32;
+        while (total_chunks >> sh) > 16384 {
+            sh += 1;
+        }
+        let nbuck = (total_chunks >> sh) as usize + 1;
+        let mut lut = vec![0u16; nbuck];
+        let mut lo = 0usize;
+        for (bk, e) in lut.iter_mut().enumerate() {
+            let idx = (bk as u64) << sh;
+            while lo + 1 < prefix.len() && prefix[lo + 1] <= idx {
+                lo += 1;
+            }
+            *e = lo as u16;
+        }
+        let lut = Arc::new(self.stream.clone_htod(&lut).map_err(candle_core::Error::wrap)?);
+        let bases_dev = self.stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
+        let prefix_dev = self.stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
+        let inv_p = u64::MAX / n_pad;
+        let _ = self.v5_pad.set(V5Pad { _pad_buf: pad_buf, bases_dev, prefix_dev, t_count, n_pad, k_pad, inv_p, lut, lut_sh: sh });
+        Ok(self.v5_pad.get().expect("v5 pad just set"))
+    }
+
+    /// Pre-gate v4 grind (no context pad). Thin wrapper over [`Self::mine_v4_impl`].
     pub fn mine_v4(
         &self,
         pre_pow_hash: &[u8; 32],
@@ -930,6 +1054,23 @@ impl PomGpuMiner {
         batch: u64,
         h10_era: bool,
         h14_era: bool,
+    ) -> candle_core::Result<Option<u64>> {
+        self.mine_v4_impl(pre_pow_hash, timestamp, target_le, start, batch, h10_era, h14_era, None)
+    }
+
+    /// The v4/v5 grind. `v5 = Some(pad)` (H15, `daa >= pom_v5` gate) forces the state-carrying CLASSIC
+    /// walk and reads the context pad via the appended gather segment; `None` is the pre-gate path
+    /// with the autotuned backend (ncf/tc/classic), byte-identical to before this change.
+    fn mine_v4_impl(
+        &self,
+        pre_pow_hash: &[u8; 32],
+        timestamp: u64,
+        target_le: &[u8; 32],
+        start: u64,
+        batch: u64,
+        h10_era: bool,
+        h14_era: bool,
+        v5: Option<&V5Pad>,
     ) -> candle_core::Result<Option<u64>> {
         if batch == 0 {
             return Ok(None);
@@ -998,7 +1139,22 @@ impl PomGpuMiner {
 
         // A card whose autotune measured the classic walk faster takes it even though the
         // tensor-core kernel is available and correct here.
-        let backend = self.v4_backend(n_tiles, k, &p, &s, timestamp);
+        // PoM v5 (H15) must run a STATE-carrying walk: the sidecar/LUT/chase-snippet backends derive
+        // each offset from tile snippets only and cannot honour v5's state-fold. The fastest kernel
+        // that carries state is the chaseless (ncf) tensor-core solver, so v5 takes it wherever the
+        // card can run it (sm_80+) and the classic full-state walk only where it cannot. Never a
+        // slower fallback by choice.
+        let backend = if v5.is_some() {
+            let b = if self.v4_ncf_usable(n_tiles, k, &p, &s, timestamp) { V4Backend::Chaseless } else { V4Backend::Classic };
+            static V5_BACKEND_LOGGED: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+            let ord = self.stream.context().ordinal() as u32;
+            if V5_BACKEND_LOGGED.get_or_init(|| Mutex::new(Default::default())).lock().map(|mut g| g.insert(ord)).unwrap_or(false) {
+                log::info!("PoM v5[gpu{}]: context-pad walk on the {} kernel", ord, b.label());
+            }
+            b
+        } else {
+            self.v4_backend(n_tiles, k, &p, &s, timestamp)
+        };
         if backend == V4Backend::Chaseless {
             // Chaseless tensor-core solver: ONE kernel, no chase pass, no offsets buffer. Each
             // warp derives its next tile offset from the snippet of the tile it just fetched (the
@@ -1007,7 +1163,16 @@ impl PomGpuMiner {
             // batch and +24% at 8K (byte-exact, see pom_mine_v4_ncf). KERYX_POM_V4_NCF=0 falls
             // back to the chase+tc pipeline below.
             let walk = load_walk_func(&self.cuda, "pom_mine_v4_ncf_seeded")?;
-            let (lut, lut_sh) = self.v4_ncf_lut()?;
+            // v5: gather map + LUT over the padded layout and the real pad params; pre-gate: the
+            // base map, base LUT and pad disabled (n_pad = inv_p = k_pad = 0 => byte-exact v4).
+            let (wbases, wprefix, wt_count, lut, lut_sh, v5_n_pad, v5_inv_p, v5_k_pad): (&CudaSlice<u64>, &CudaSlice<u64>, u32, Arc<CudaSlice<u16>>, u32, u64, u64, u32) =
+                match v5 {
+                    Some(pd) => (&pd.bases_dev, &pd.prefix_dev, pd.t_count, pd.lut.clone(), pd.lut_sh, pd.n_pad, pd.inv_p, pd.k_pad),
+                    None => {
+                        let (lut, lut_sh) = self.v4_ncf_lut()?;
+                        (&self.bases_dev, &self.prefix_dev, self.t_count, lut, lut_sh, 0, 0, 0)
+                    }
+                };
             let inv_n = u64::MAX / n_tiles;
             let warps = v4_ncf_warps();
             let cfg = LaunchConfig {
@@ -1016,9 +1181,9 @@ impl PomGpuMiner {
                 shared_mem_bytes: (warps as u32) * 3 * 1024, // per warp: 1 KB state + 2 tile buffers
             };
             let mut b = walk.builder();
-            b.arg(&self.bases_dev)
-                .arg(&self.prefix_dev)
-                .arg(&self.t_count)
+            b.arg(wbases)
+                .arg(wprefix)
+                .arg(&wt_count)
                 .arg(&n_tiles)
                 .arg(&k)
                 .arg(&p[0])
@@ -1041,7 +1206,10 @@ impl PomGpuMiner {
                 .arg(&inv_n)
                 .arg(&*h10_seeds)
                 .arg(&h10)
-                .arg(&*winner);
+                .arg(&*winner)
+                .arg(&v5_n_pad)
+                .arg(&v5_inv_p)
+                .arg(&v5_k_pad);
             unsafe {
                 b.launch(cfg).map_err(candle_core::Error::wrap)?;
             }
@@ -1273,11 +1441,20 @@ impl PomGpuMiner {
                 block_dim: (crate::pom_v4::POM_V4_D as u32, 1, 1),
                 shared_mem_bytes: 2048,
             };
+            // v5 (H15): use the pad-appended gather map + the real pad params. Pre-gate uses the base
+            // map with the pad disabled (n_pad = 0, k_pad = 0 => the kernel runs the pure v4 walk,
+            // byte-identical to before). `n_tiles` stays the WEIGHT-tile count; the pad is addressed
+            // by off in [n_tiles, n_tiles+n_pad) through the extended prefix.
+            let (wbases, wprefix, wt_count, v5_n_pad, v5_k_pad): (&CudaSlice<u64>, &CudaSlice<u64>, u32, u64, u32) =
+                match v5 {
+                    Some(p) => (&p.bases_dev, &p.prefix_dev, p.t_count, p.n_pad, p.k_pad),
+                    None => (&self.bases_dev, &self.prefix_dev, self.t_count, 0, 0),
+                };
             let func = load_walk_func(&self.cuda, "pom_mine_v4_seeded")?;
             let mut b = func.builder();
-            b.arg(&self.bases_dev)
-                .arg(&self.prefix_dev)
-                .arg(&self.t_count)
+            b.arg(wbases)
+                .arg(wprefix)
+                .arg(&wt_count)
                 .arg(&n_tiles)
                 .arg(&k)
                 .arg(&p[0])
@@ -1297,7 +1474,9 @@ impl PomGpuMiner {
                 .arg(&batch)
                 .arg(&*h10_seeds)
                 .arg(&h10)
-                .arg(&*winner);
+                .arg(&*winner)
+                .arg(&v5_n_pad)
+                .arg(&v5_k_pad);
             unsafe {
                 b.launch(cfg).map_err(candle_core::Error::wrap)?;
             }
@@ -1889,7 +2068,10 @@ chase+tensor-core path.",
             .arg(&inv_n)
             .arg(&*h10_seeds)
             .arg(&0u32)
-            .arg(&winner);
+            .arg(&winner)
+            .arg(&0u64) // n_pad: probe runs the pure v4 walk
+            .arg(&0u64) // inv_p
+            .arg(&0u32); // k_pad
         unsafe {
             b.launch(LaunchConfig {
                 grid_dim: (1, 1, 1),
@@ -4039,7 +4221,32 @@ pub fn mine_v4(
     if !custom_image_is_exact(device_id, &miner, h10_era) {
         return Err(crate::pom::GrindError::Backend("custom walk image failed ABI/exactness validation".into()));
     }
-    let outcome = miner.mine_v4(pre_pow_hash, timestamp, target_le, start, batch, h10_era, h14_era);
+    // PoM v5 (H15, daa >= gate): build/reuse the context pad for this device's resident model and
+    // tier, then grind the state-carrying walk with it. The pad seed binds (tier, model_id, R_T) and
+    // MUST match the model this device's index was built from, or the walk diverges from the node.
+    let v5_pad: Option<&V5Pad> = if crate::pom::is_pom_v5_era(daa) {
+        let idx = crate::pom::active_index_for(device_id)
+            .ok_or(crate::pom::GrindError::Paused("PoM v5: resident index not installed yet"))?;
+        let model_id = crate::pom::mining_model_id(device_id)
+            .ok_or(crate::pom::GrindError::Paused("PoM v5: mining model id not set yet"))?;
+        let tier = idx.1;
+        let n_pad = crate::pom_v5::POM_V5_PAD_TILES_H14
+            .get(tier as usize)
+            .copied()
+            .filter(|n| *n > 0)
+            .ok_or(crate::pom::GrindError::Paused("PoM v5: tier has no context pad"))?;
+        let n_tiles = miner.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        let k_pad = crate::pom_v5::v5_pad_steps(n_tiles, n_pad) as u32;
+        let pad_seed = crate::pom_v5::v5_pad_seed(tier, &model_id, &idx.0.r_t);
+        Some(
+            miner
+                .v5_pad(&pad_seed, n_pad, k_pad)
+                .map_err(|e| crate::pom::GrindError::Backend(format!("PoM v5 pad build: {e}")))?,
+        )
+    } else {
+        None
+    };
+    let outcome = miner.mine_v4_impl(pre_pow_hash, timestamp, target_le, start, batch, h10_era, h14_era, v5_pad);
     match outcome {
         Ok(winner) => Ok(crate::pom::GrindCompleted { winner, hashes_done: batch }),
         Err(e) => {
@@ -5369,6 +5576,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             v4_ncf_lut: OnceLock::new(),
+            v5_pad: OnceLock::new(),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
             _tensors: Vec::new(),
@@ -5591,6 +5799,47 @@ mod v4_kernel_tests {
             "[{kind}] GPU found the nonce below the host pow — divergence"
         );
         println!("BIT-EXACT OK on the {kind} walk");
+    }
+
+    /// PoM v5 (H15): the GPU context-pad walk must agree BIT-FOR-BIT with the host `pom_v5` walk.
+    /// Tile-aligned blob (whole tiles) so the pad lands exactly on the tile boundary. Forces the
+    /// state-carrying classic walk via `mine_v4_impl(.., Some(pad))` and requires the GPU to win at
+    /// the host pow target and lose one below — the same oracle as `v4_walk_kind_and_exactness`.
+    #[test]
+    #[ignore]
+    fn v5_pad_walk_host_gpu_exactness() {
+        // Small weight set + large pad => many pad steps (k_pad), so the pad-load, v5_state_fold and
+        // v5_is_pad_step routing are exercised across most of the 256-step walk (not just one step).
+        const N_TILES: usize = 64;
+        const N_PAD: u64 = 200;
+        let data = blob(N_TILES);
+        let index = crate::pom::index_from_ram(data.clone());
+        let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
+        let n_tiles = index.n_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        let pad_seed = crate::pom_v5::v5_pad_seed(0, &[7u8; 32], &index.r_t);
+        let k_pad = crate::pom_v5::v5_pad_steps(n_tiles, N_PAD) as u32;
+        let pad = miner.v5_pad(&pad_seed, N_PAD, k_pad).unwrap();
+        // v5 takes the chaseless (ncf) kernel whenever the card can run it — the same probe the v4
+        // dispatcher uses — else the classic walk. Print it so the fast path is evident, not inferred.
+        let kind = miner.v4_walk_kind();
+        println!("V5 WALK KERNEL CLASS: {}", if kind.contains("chaseless") { "chaseless (ncf, fast path)" } else { "classic (ncf not usable on this card)" });
+        let nonce = 42u64;
+        let seed = crate::pom::pom_block_seed_v4(&PPH, TS, nonce);
+        let (v5, fs) = crate::pom_v5::build_proof_v5(0, seed, &index, &pad_seed, N_PAD).unwrap();
+        let re = crate::pom_v5::verify_proof_v5(seed, &v5, &index.r_t, index.n_chunks, &pad_seed, N_PAD).unwrap();
+        assert_eq!(re, fs, "host v5 build/verify disagree");
+        let pow = crate::pom::pom_pow_value(fs, &PPH, true);
+        assert_eq!(
+            miner.mine_v4_impl(&PPH, TS, &pow, nonce, 1, false, false, Some(pad)).unwrap(),
+            Some(nonce),
+            "GPU v5 pad walk did not find the nonce at the host pow target — divergence"
+        );
+        assert_eq!(
+            miner.mine_v4_impl(&PPH, TS, &dec_le(pow), nonce, 1, false, false, Some(pad)).unwrap(),
+            None,
+            "GPU v5 pad walk found the nonce below the host pow — divergence"
+        );
+        println!("PoM v5 BIT-EXACT OK (GPU pad walk == host; n_tiles={n_tiles} n_pad={N_PAD} k_pad={k_pad})");
     }
 
     /// Little-endian 256-bit compare, matching the kernel's `pom_le_leq` ordering.

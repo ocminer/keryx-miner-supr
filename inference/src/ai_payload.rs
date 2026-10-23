@@ -541,3 +541,54 @@ mod tests {
         assert_eq!(parsed.proof_data, [0xAAu8; 32]);
     }
 }
+
+// ── H15 verifiable inference: trace commitment (upstream v0.5.8, cherry-picked) ───────────────
+/// AiResponse extension tag of the trace commitment.
+pub const AI_RESPONSE_EXT_TRACE: u8 = 0x81;
+/// `trace_root[32] ‖ n_prompt u32 ‖ n_pos u32 ‖ stage u8`.
+pub const AI_RESPONSE_TRACE_LEN: usize = 32 + 4 + 4 + 1;
+/// … plus `tokens_root[32]`.
+pub const AI_RESPONSE_TRACE_TOKENS_LEN: usize = AI_RESPONSE_TRACE_LEN + 32;
+
+/// Inference trace commitment carried by a response (H15). Byte layout mirrors the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceCommitment {
+    pub trace_root: [u8; 32],
+    pub n_prompt: u32,
+    pub n_pos: u32,
+    pub stage: u8,
+    /// BLAKE3 of the generated token ids (u32 LE, in order).
+    pub tokens_root: Option<[u8; 32]>,
+}
+
+impl TraceCommitment {
+    pub fn len(&self) -> usize {
+        if self.tokens_root.is_some() { AI_RESPONSE_TRACE_TOKENS_LEN } else { AI_RESPONSE_TRACE_LEN }
+    }
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len());
+        out.extend_from_slice(&self.trace_root);
+        out.extend_from_slice(&self.n_prompt.to_le_bytes());
+        out.extend_from_slice(&self.n_pos.to_le_bytes());
+        out.push(self.stage);
+        if let Some(t) = &self.tokens_root {
+            out.extend_from_slice(t);
+        }
+        out
+    }
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() != AI_RESPONSE_TRACE_LEN && b.len() != AI_RESPONSE_TRACE_TOKENS_LEN {
+            return None;
+        }
+        Some(Self {
+            trace_root: b[..32].try_into().ok()?,
+            n_prompt: u32::from_le_bytes(b[32..36].try_into().ok()?),
+            n_pos: u32::from_le_bytes(b[36..40].try_into().ok()?),
+            stage: b[40],
+            tokens_root: if b.len() == AI_RESPONSE_TRACE_TOKENS_LEN { Some(b[41..73].try_into().ok()?) } else { None },
+        })
+    }
+}

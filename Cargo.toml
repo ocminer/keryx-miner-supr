@@ -1,6 +1,6 @@
 [package]
 name = "keryx-miner-supr"
-version = "0.14.7"
+version = "0.15.0"
 edition = "2021"
 license = "MIT/Apache-2.0"
 repository = "https://github.com/suprnova/keryx-miner-supr"
@@ -15,6 +15,8 @@ include = [
     "cuda/pom_mine.fatbin",
     "cuda/POM_FATBIN_MANIFEST.md",
     "cuda/regenerate-pom-fatbin.sh",
+    "assets/trace-manifests/*.bin",
+    "tools/keryx-llama/patches/*.patch",
     "metal/pom_mine.metal",
     "plugins/opencl/resources/pom_mine.cl",
     "proto/**",
@@ -68,6 +70,7 @@ borsh = { version = "1", features = ["derive"] }
 blake3 = "1"
 opencl3 = { version = "0.6", optional = true }
 keryx-inference = { path = "inference" }
+keryx-verifiable-inference = { path = "verifiable-inference" }
 keryx-plugin-api = { path = "plugin-api" }
 # Optional: compile the CUDA worker straight into the binary instead of loading
 # libkeryxcuda.so at runtime. Enabled by the `static-cuda` feature for a
@@ -167,7 +170,7 @@ sha2 = "0.10"
 sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 
 [workspace]
-members = ["inference", "plugin-api", "plugins/*"]
+members = ["inference", "plugin-api", "plugins/*", "verifiable-inference"]
 default-members = [".", "plugins/cuda", "plugins/opencl"]
 
 # Vendored candle-kernels with a one-line build.rs patch: the OPoI inference PTX

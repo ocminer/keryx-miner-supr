@@ -2059,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "keryx-miner-supr"
-version = "0.14.7"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2084,6 +2084,7 @@ dependencies = [
  "kernel32-sys",
  "keryx-inference",
  "keryx-plugin-api",
+ "keryx-verifiable-inference",
  "keryxcuda",
  "libloading 0.7.4",
  "log",
@@ -2125,6 +2126,14 @@ name = "keryx-plugin-api"
 version = "0.1.0"
 dependencies = [
  "clap",
+]
+
+[[package]]
+name = "keryx-verifiable-inference"
+version = "0.5.7"
+dependencies = [
+ "blake3",
+ "libm",
 ]
 
 [[package]]

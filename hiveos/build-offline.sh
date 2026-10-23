@@ -46,6 +46,23 @@ LLAMA_SRC="${KERYX_LLAMA_SRC:-/tmp/llama-src-$LLAMA_TAG}"
 CMAKE_ROOT="${KERYX_CMAKE_ROOT:-/tmp/cmake-3.28.6-linux-x86_64}"
 LLAMA_JOBS="${KERYX_LLAMA_JOBS:-16}"
 
+# H15 canonical trace: the engine (tools/keryx-llama/keryx_llama.cpp) links against q8canon leaves that
+# only exist once tools/keryx-llama/patches/*.patch is applied to the pristine b10015 tree. /llama is
+# mounted read-only in the container, so apply on the host first (same stamp logic as
+# build-keryx-llama.sh; re-applied from a clean checkout whenever the patch set changes).
+PATCH_DIR="$REPO/tools/keryx-llama/patches"
+if [ -d "$LLAMA_SRC/.git" ] && ls "$PATCH_DIR"/*.patch >/dev/null 2>&1; then
+  STAMP="$LLAMA_SRC/.keryx-patches"
+  WANT=$(cd "$PATCH_DIR" && for f in *.patch; do printf '%s %s\n' "$f" "$(sha256sum "$f" | cut -c1-16)"; done)
+  if [ "$(cat "$STAMP" 2>/dev/null)" != "$WANT" ]; then
+    git -C "$LLAMA_SRC" checkout -- . && git -C "$LLAMA_SRC" clean -fdq -- ggml/src/ggml-cuda
+    for f in "$PATCH_DIR"/*.patch; do git -C "$LLAMA_SRC" apply "$f"; done
+    printf '%s\n' "$WANT" > "$STAMP"
+    echo ">> applied $(ls "$PATCH_DIR"/*.patch | wc -l) llama.cpp patch(es) to $LLAMA_SRC"
+  fi
+  [ -f "$LLAMA_SRC/ggml/src/ggml-cuda/q8canon.cu" ] || { echo "ERROR: canonical-trace patch not present in $LLAMA_SRC" >&2; exit 1; }
+fi
+
 case "$SUF" in
   modern)
     LLAMA_ARCHS="75;80;86;89;90;120"

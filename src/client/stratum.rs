@@ -909,9 +909,9 @@ impl StratumHandler {
         let handle = tokio::spawn(async move {
             let mut recv_stream = ReceiverStream::new(recv);
             while let Some(seed) = recv_stream.next().await {
-                let (nonce, job_id, pow_value, network_target, pom_proof, device_id) = match seed {
-                    BlockSeed::PartialBlock { nonce, id, pow_value, network_target, pom_proof, device_id, .. } => {
-                        (nonce, id, pow_value, network_target, pom_proof, device_id)
+                let (nonce, job_id, pow_value, network_target, pom_proof, device_id, task_root) = match seed {
+                    BlockSeed::PartialBlock { nonce, id, pow_value, network_target, pom_proof, device_id, task_root, .. } => {
+                        (nonce, id, pow_value, network_target, pom_proof, device_id, task_root)
                     }
                     BlockSeed::FullBlock(_) => unreachable!(),
                 };
@@ -1011,18 +1011,31 @@ impl StratumHandler {
                             proof_hex.len(),
                             job_id
                         );
+                        // v4 (H15): a job that carried a block task submits the 7-tuple with the
+                        // device's committed task_root so the pool can recompute the hashes; v3 jobs
+                        // keep the 6-tuple.
+                        let submit = match task_root {
+                            Some(root) => MiningSubmit::MiningSubmitWithPomTask((
+                                miner_address.clone(),
+                                job_id,
+                                nonce_hex,
+                                opoi_tag,
+                                cid,
+                                proof_hex,
+                                hex::encode(root),
+                            )),
+                            None => MiningSubmit::MiningSubmitWithPom((
+                                miner_address.clone(),
+                                job_id,
+                                nonce_hex,
+                                opoi_tag,
+                                cid,
+                                proof_hex,
+                            )),
+                        };
                         StratumLine {
                             id: Some(msg_id),
-                            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
-                                MiningSubmit::MiningSubmitWithPom((
-                                    miner_address.clone(),
-                                    job_id,
-                                    nonce_hex,
-                                    opoi_tag,
-                                    cid,
-                                    proof_hex,
-                                )),
-                            )),
+                            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(submit)),
                             jsonrpc: None,
                             error: None,
                         }
@@ -1229,6 +1242,121 @@ impl StratumHandler {
                             ref nonce_size,
                         ))) => self.set_extranonce(extranonce.as_str(), nonce_size),
                         StratumCommand::MiningSetDifficulty((ref difficulty,)) => self.set_difficulty(difficulty),
+                        // keryx-stratum-v4 (H15): the pool ships the FULL template header (hex) + a
+                        // window-seed hex; the miner decodes the header, commits a task_root, hashes
+                        // the pre-PoW itself, and submits the 7-tuple. No AiRequest task on this path.
+                        StratumCommand::MiningNotify(MiningNotify::MiningNotifyV4((
+                            id,
+                            header_hex,
+                            timestamp,
+                            daa_score,
+                            bits,
+                            window_seed_hex,
+                        ))) => {
+                            self.block_template_ctr
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
+                                .unwrap();
+                            self.block_bits = Some(bits);
+                            keryx_miner::runtime_stats::record_job(
+                                self.runtime_generation,
+                                Some(daa_score),
+                                None,
+                                crate::target::network_difficulty_from_compact_target(bits),
+                            );
+                            keryx_miner::slm::advance_lineup_if_due(daa_score);
+                            LAST_DAA_SCORE.store(daa_score, std::sync::atomic::Ordering::Relaxed);
+                            if !keryx_miner::slm::has_proven_serveable_model() {
+                                if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
+                                    warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
+                                }
+                                self.declare_capabilities_if_changed().await?;
+                                return miner.process_block(None).await;
+                            }
+                            self.declare_capabilities_if_changed().await?;
+                            let header_bytes = match hex::decode(&header_hex) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!("v4 mining.notify header is not hex ({e}); job skipped");
+                                    return miner.process_block(None).await;
+                                }
+                            };
+                            let mut header = match <crate::proto::RpcBlockHeader as prost::Message>::decode(header_bytes.as_slice()) {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    warn!("v4 mining.notify header does not decode ({e}); job skipped");
+                                    return miner.process_block(None).await;
+                                }
+                            };
+                            let window_seed: Option<[u8; 32]> = match window_seed_hex.as_str() {
+                                "" => None,
+                                s => {
+                                    let mut seed = [0u8; 32];
+                                    match hex::decode_to_slice(s, &mut seed) {
+                                        Ok(()) => Some(seed),
+                                        Err(e) => {
+                                            warn!("v4 window seed is not 32-byte hex ({e}); job skipped");
+                                            return miner.process_block(None).await;
+                                        }
+                                    }
+                                }
+                            };
+                            // Block task (H15): the task_root is PER DEVICE (each GPU traces the window
+                            // task on its own tier model), so it is NOT set here. The job carries the
+                            // header + window seed; each grinding worker calls block_task::task_for and
+                            // commits its own root with State::with_task_root before it walks. Post-gate
+                            // a device without a task idles instead of mining a root-less (invalid) job.
+                            header.task_root = String::new();
+                            let task_root: Option<[u8; 32]> = None;
+                            if keryx_miner::pom::is_block_task_era(daa_score) {
+                                match (keryx_verifiable_inference::block_task::window(daa_score), header.parents.first(), window_seed) {
+                                    (Some(w), Some(p0), Some(seed)) => {
+                                        keryx_miner::block_task::set_seed(w, &keryx_miner::block_task::parents_key(&p0.parent_hashes), seed);
+                                    }
+                                    _ => {
+                                        static NO_TASK_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                                        if !NO_TASK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                            warn!("Block task: the pool sends post-gate jobs without a window seed — no block can be valid on them; such jobs are skipped");
+                                        }
+                                        return miner.process_block(None).await;
+                                    }
+                                }
+                            }
+                            // H15 debug: the pre-PoW hash this miner will seed the walk from, for
+                            // field-by-field replay against the pool verifier (same header + task_root).
+                            {
+                                let mut hh = crate::pow::HeaderHasher::new();
+                                crate::pow::serialize_header(&mut hh, &header, true);
+                                let pph = hh.finalize();
+                                log::debug!(
+                                    "v4 job {}: daa {} bits {} blue_work {:?} parents_levels {} task_root {} pre_pow {}",
+                                    id,
+                                    daa_score,
+                                    bits,
+                                    header.blue_work,
+                                    header.parents.len(),
+                                    if header.task_root.is_empty() { "-" } else { header.task_root.as_str() },
+                                    hex::encode(pph.to_le_bytes())
+                                );
+                            }
+                            return miner
+                                .process_block(Some(PartialBlock {
+                                    id,
+                                    header_hash: [0; 4],
+                                    timestamp,
+                                    daa_score,
+                                    nonce: 0,
+                                    target: self.effective_target(),
+                                    nonce_mask: self.nonce_mask,
+                                    nonce_fixed: self.nonce_fixed,
+                                    pow_value: None,
+                                    network_target: crate::target::network_target_from_compact_target(bits),
+                                    pom_proof: Vec::new(),
+                                    device_id: None,
+                                    header: Some(Box::new(header)),
+                                    task_root,
+                                }))
+                                .await;
+                        }
                         // Phase 2 OPoI: bridge dispatches an AiRequest task alongside the block.
                         StratumCommand::MiningNotify(MiningNotify::MiningNotifyWithTask((
                             id,
@@ -1304,6 +1432,8 @@ impl StratumHandler {
                                             .and_then(crate::target::network_target_from_compact_target),
                                         pom_proof: Vec::new(),
                                         device_id: None,
+                                        header: None,
+                                        task_root: None,
                                     }))
                                     .await
                             }
@@ -1357,6 +1487,8 @@ impl StratumHandler {
                                         .and_then(crate::target::network_target_from_compact_target),
                                     pom_proof: Vec::new(),
                                     device_id: None,
+                                    header: None,
+                                    task_root: None,
                                 }))
                                 .await
                         }
@@ -1449,6 +1581,8 @@ impl StratumHandler {
                                         .and_then(crate::target::network_target_from_compact_target),
                                     pom_proof: Vec::new(),
                                     device_id: None,
+                                    header: None,
+                                    task_root: None,
                                 }))
                                 .await
                         }

@@ -53,6 +53,9 @@ message RpcBlockHeader {
   // H6: the winning walk's proven PoM tier, committed into the block hash. Filled on submit_block
   // from the GPU that solved the block, exactly like pomFinalState.
   uint32 pomTier = 18;
+  // H15 block task: the root of the window's task trace. Committed into BOTH the pre-PoW hash and
+  // the block hash at/after the block-task gate. Field number mirrors the node's rpc.proto. Hex.
+  string taskRoot = 19;
 }
 
 message RpcBlockLevelParents {

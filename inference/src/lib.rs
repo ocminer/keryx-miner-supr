@@ -22,6 +22,7 @@ pub use ai_payload::{
     MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN,
     SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX, SUBNETWORK_ID_AI_CHALLENGE_HEX,
 };
+pub use ai_payload::{TraceCommitment, AI_RESPONSE_EXT_TRACE, AI_RESPONSE_TRACE_LEN, AI_RESPONSE_TRACE_TOKENS_LEN};
 pub use fraud_proof::{verify_fraud_proof, compute_ai_commitment, FraudProofResult, FRAUD_PROOF_LEN};
 pub use private::{
     escrow_pubkey_of, max_private_prompt_len, open_request, open_response, seal_request, seal_request_with_rng, seal_response,
