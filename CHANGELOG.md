@@ -1,20 +1,28 @@
-# keryx-miner-supr 0.14.7
+# keryx-miner-supr 0.15.0 — H15 hard fork
 
-Faster AMD mining, with mining and inference continuing on the same card. This release improves RX 7900 XTX and Instinct MI50 performance and fixes device selection on mixed AMD rigs.
+**Mandatory update before the Keryx H15 hard fork** (mainnet DAA 140,115,000, expected around 2026-10-30 15:00 UTC). From that block on, every block needs a PoM v5 proof, a block-task root in its header and — for block candidates — a verifiable trace opening, and pools switch to stratum v4. Miners below 0.15.0 produce invalid blocks after the gate and are refused by pools that enforce the version floor.
 
-## Measured AMD performance
+The switch is driven by the block DAA in each job, never by wall-clock time: start 0.15.0 now and it keeps mining exactly like 0.14.7 until the gate, then changes over on its own. No restart, pool, wallet or model change is needed.
 
-Controlled Linux measurements with the same model and power limit in each comparison:
+## What changes at the gate
 
-| GPU | Test | Power limit | 0.14.6 | Optimized build | Gain |
-|---|---|---:|---:|---:|---:|
-| Radeon RX 7900 XTX | GPU benchmark | 244 W | 1.450 MH/s | 1.535 MH/s | +5.87% |
-| Radeon RX 7900 XTX | Pool mining | 219 W | 1.248 MH/s | 1.285 MH/s | +2.93% |
-| Instinct MI50, sample 1 | Pool mining | 100 W | 0.419 MH/s | 0.544 MH/s | +29.69% |
-| Instinct MI50, sample 2 | Pool mining | 100 W | 0.426 MH/s | 0.551 MH/s | +29.23% |
-| Radeon RX 7600 XT | Pool mining | 165 W | 0.590 MH/s | 0.590 MH/s | unchanged |
+- **PoM v5 context pad.** The possession walk reads an additional per-tier context pad next to the model weights. It is generated on the GPU and walked with the same fast kernels as before (the chaseless kernel where the card supports it). The pad takes VRAM: while mining, the inference context is shrunk to a small block-task context and restored when the pool sends an inference request. A card with too little VRAM for its tier's pad logs a clear warning and stays idle instead of mining invalid work — move it to a lower tier with `--force-model`.
+- **Block task.** For every ~64-block window the miner runs a short canonical inference pass on its own resident model and commits the resulting root into the block header before grinding. Block candidates ship a verifiable opening of that trace; the miner checks every opening with the node's own verifier before submitting, and runs a one-time self-check per card and tier when it starts mining post-gate.
+- **Stratum v4.** The pool sends the full block header and the window seed; the miner hashes the header itself and submits a 7-field share. Pre-gate v3 jobs keep working unchanged; post-gate header-less (v3) jobs are skipped with a warning because they cannot carry a block-task root.
+- **Engine.** `libkeryx-llama.so` / `keryx-llama.dll` (engine ABI 3) adds the canonical trace. Always ship the engine library that comes with this release next to the miner binary.
 
-These optimization measurements preceded release packaging. Pool figures compare the final 70 seconds of matched 180-second runs. The RX 7900 XTX and RX 7600 XT also served inference requests while mining. Results depend on the model, cooling, power limit, driver and inference activity; short tests do not establish sustained full-power performance. The measured gains apply to the tested Linux/RADV configuration.
+## Platform notes
+
+- **NVIDIA (Linux modern/legacy, Windows, Docker):** full H15 support.
+- **AMD (OpenCL/Vulkan) and Apple Silicon (Metal):** these backends have no trace engine yet and therefore cannot commit a block-task root. They mine normally until the gate and then idle honestly with a warning instead of burning power on jobs that can never become valid blocks. H15 support for these lines follows in a later release.
+
+## Testnet / staging
+
+`KERYX_TESTNET=1` switches the complete activation table to the Keryx testnet parameters (the same role as upstream's `--testnet`). Individual `KERYX_*_ACTIVATION_DAA` overrides still take precedence. Without either, all gates are the mainnet constants.
+
+## Validation
+
+Validated against a post-gate testnet pool and node: every submitted share accepted, block candidates verified by the node's `verify_block_task` and accepted into the chain; mainnet pre-gate mining verified unchanged against the production pool. Byte-exact unit vectors against the node for the v5 pad walk, the header layouts and the block-task opening are part of the test suite.
 
 ## Downloads
 
@@ -25,7 +33,7 @@ These optimization measurements preceded release packaging. Pool figures compare
 | AMD, Linux | `amd`: standalone, HiveOS, mmpos |
 | NVIDIA, Windows | `keryx-miner-supr-windows-nvidia-pom.zip` |
 | AMD, Windows | `keryx-miner-supr-windows-amd.zip` |
-| Apple Silicon, macOS | `keryx-miner-supr-macos-arm64-0.14.7.tar.gz` |
-| Docker, NVIDIA modern | `ocminersupr/keryx-miner-supr:0.14.7` |
+| Apple Silicon, macOS | `keryx-miner-supr-macos-arm64-0.15.0.tar.gz` |
+| Docker, NVIDIA modern | `ocminersupr/keryx-miner-supr:0.15.0` |
 
-Use the matching SHA256SUMS file to verify downloads. Existing pool, wallet and model settings can be retained. No protocol or model changes are required.
+Use the matching SHA256SUMS file to verify downloads.
