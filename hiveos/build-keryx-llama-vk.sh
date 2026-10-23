@@ -54,7 +54,9 @@ fi
 { printf '%s\n' "$MARK"; cat "$REPO/tools/keryx-llama/keryx_vk_exports.inc.cpp"; } >> "$GV"
 
 mkdir -p "$BCACHE" "$BCACHE/gen"
-docker run --rm \
+# --network host like build-keryx-llama.sh: the container only needs outbound access (CMake download);
+# the default bridge mode fails on hosts whose docker0 bridge is absent.
+docker run --rm --network host \
   -v "$SRC":/llama -v "$REPO":/repo:ro -v "$OUT":/out \
   -v "$BCACHE":/tmp/kvk-build -v "$BCACHE/gen":/tmp/kvk-gen \
   -e JOBS="$JOBS" -e KERYX_SPIKE="${KERYX_SPIKE:-0}" -e SIMD_FLAGS="$SIMD_FLAGS" -e OUTNAME="$OUTNAME" \
