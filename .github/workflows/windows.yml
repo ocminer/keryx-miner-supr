@@ -453,7 +453,9 @@ jobs:
         run: |
           $tag = "b10015"
           if (-not (Test-Path "llama-src")) {
-            git clone --quiet --depth 1 --branch $tag https://github.com/ggml-org/llama.cpp llama-src
+            # LF checkout: the canonical-trace patch (tools/keryx-llama/patches) is applied at CMake
+            # configure time and will not apply onto an autocrlf (CRLF) working tree.
+            git clone --quiet --depth 1 -c core.autocrlf=false -c core.eol=lf --branch $tag https://github.com/ggml-org/llama.cpp llama-src
           }
           $llamaSrc = (Resolve-Path "llama-src").Path
           cmake -S tools/keryx-llama -B build-llama `

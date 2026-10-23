@@ -8,3 +8,5 @@
 *.cuh  text eol=lf
 *.ptx  text eol=lf
 *.fatbin binary
+# llama.cpp patches are applied byte-for-byte at build time (CMake / build scripts): never convert line endings.
+tools/keryx-llama/patches/*.patch -text
