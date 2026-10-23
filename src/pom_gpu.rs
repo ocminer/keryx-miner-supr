@@ -5892,6 +5892,56 @@ mod v4_kernel_tests {
     /// Tile-aligned blob (whole tiles) so the pad lands exactly on the tile boundary. Forces the
     /// state-carrying classic walk via `mine_v4_impl(.., Some(pad))` and requires the GPU to win at
     /// the host pow target and lose one below — the same oracle as `v4_walk_kind_and_exactness`.
+    /// H15 "VRAM dance" on a real GPU with a real engine (env H15_GGUF = a GGUF the engine can host,
+    /// KERYX_LLAMA_SO = the ABI-3 engine): shrinking the inference context to the block-task size,
+    /// filling the tier-0 pad next to it, then an inference MUST release the pad and restore the
+    /// full context, and the next grind MUST refill the pad. Requires a GPU + model, hence #[ignore].
+    #[test]
+    #[ignore]
+    fn v5_pad_vram_dance_live() {
+        let gguf = std::env::var("H15_GGUF").expect("H15_GGUF=<model.gguf>");
+        let t = std::time::Instant::now();
+        assert!(crate::llama_engine::ensure_loaded(&gguf, 0), "engine did not load {gguf}");
+        println!("engine loaded in {:.1}s", t.elapsed().as_secs_f32());
+        let miner = Arc::new(PomGpuMiner::load_test_segments(0, vec![blob(64)]).unwrap());
+        miners().lock().unwrap().insert(0, Arc::clone(&miner));
+        let n_pad = crate::pom_v5::POM_V5_PAD_TILES_H14[0];
+        let k_pad = crate::pom_v5::v5_pad_steps(64, n_pad) as u32;
+        let seed = crate::pom_v5::v5_pad_seed(0, &[7u8; 32], &[9u8; 32]);
+        let free0 = free_vram_mib();
+        let t = std::time::Instant::now();
+        crate::llama_engine::use_task_context(0);
+        println!("shrink to task context: {:.2}s, free {} -> {} MiB", t.elapsed().as_secs_f32(), free0, free_vram_mib());
+        let t = std::time::Instant::now();
+        let pad = miner.v5_pad(&seed, n_pad, k_pad).unwrap();
+        println!("pad fill ({} tiles): {:.2}s, free {} MiB", n_pad, t.elapsed().as_secs_f32(), free_vram_mib());
+        assert_eq!(pad.n_pad, n_pad);
+        drop(pad);
+        assert!(miner.v5_pad.lock().unwrap().is_some(), "pad slot empty right after fill");
+        // Inference: must release the pad and bring the full context back.
+        let t = std::time::Instant::now();
+        let out = crate::llama_engine::generate_on(0, "Reply with one word: ping", 8);
+        println!("inference incl. context restore: {:.2}s -> {:?}, free {} MiB", t.elapsed().as_secs_f32(), out, free_vram_mib());
+        assert!(out.is_some(), "inference failed after the mining context was active");
+        assert!(miner.v5_pad.lock().unwrap().is_none(), "inference did not release the pad");
+        // Next grind: shrink again and refill (seed unchanged -> a fresh fill, not a stale slot).
+        let t = std::time::Instant::now();
+        crate::llama_engine::use_task_context(0);
+        let pad2 = miner.v5_pad(&seed, n_pad, k_pad).unwrap();
+        println!("re-shrink + refill: {:.2}s, free {} MiB", t.elapsed().as_secs_f32(), free_vram_mib());
+        assert_eq!(pad2.n_pad, n_pad);
+        assert!(miner.v5_pad.lock().unwrap().is_some());
+        // A different seed on the same miner must refill, never reuse (D-1).
+        let seed2 = crate::pom_v5::v5_pad_seed(0, &[8u8; 32], &[9u8; 32]);
+        let pad3 = miner.v5_pad(&seed2, n_pad, k_pad).unwrap();
+        assert_eq!(pad3.seed, seed2, "pad slot returned a stale seed");
+        // Second inference restores again (idempotent dance).
+        let out2 = crate::llama_engine::generate_on(0, "Reply with one word: pong", 8);
+        assert!(out2.is_some());
+        assert!(miner.v5_pad.lock().unwrap().is_none());
+        println!("VRAM DANCE OK");
+    }
+
     #[test]
     #[ignore]
     fn v5_pad_walk_host_gpu_exactness() {
@@ -5922,7 +5972,7 @@ mod v4_kernel_tests {
             "GPU v5 pad walk did not find the nonce at the host pow target — divergence"
         );
         assert_eq!(
-            miner.mine_v4_impl(&PPH, TS, &dec_le(pow), nonce, 1, false, false, Some(pad)).unwrap(),
+            miner.mine_v4_impl(&PPH, TS, &dec_le(pow), nonce, 1, false, false, Some(&*pad)).unwrap(),
             None,
             "GPU v5 pad walk found the nonce below the host pow — divergence"
         );
