@@ -180,12 +180,13 @@ fn proc_meminfo_total_mb() -> Option<u64> {
 
 // ── mining.telemetry (DYNAMIC) ─────────────────────────────────────────────────────────────────
 
-/// Build the `mining.telemetry` object. `per_gpu_hashrate[i]` is the miner's own H/s for device `i`
-/// (from `MinerStats.devices`, matched to NVML device `i` by index — best-effort).
+/// Build the `mining.telemetry` object. `per_gpu_hashrate` holds `(CUDA ordinal, H/s)` for every
+/// mined device (from `MinerStats.devices`); each ordinal is matched to its own NVML device by PCI
+/// bus id (`gpu_map`), so a process pinned with `CUDA_VISIBLE_DEVICES` reports its own card.
 pub fn build_telemetry(
     uptime_s: u64,
     total_hashrate: f64,
-    per_gpu_hashrate: &[f64],
+    per_gpu_hashrate: &[(u32, f64)],
     acc: u64,
     rej: u64,
     stale: u64,
@@ -262,7 +263,7 @@ fn gpu_static() -> Vec<Value> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn gpu_dynamic(per_gpu_hashrate: &[f64]) -> Vec<Value> {
+fn gpu_dynamic(per_gpu_hashrate: &[(u32, f64)]) -> Vec<Value> {
     use nvml_wrapper::{
         enum_wrappers::device::{Clock, TemperatureSensor},
         Nvml,
@@ -271,17 +272,22 @@ fn gpu_dynamic(per_gpu_hashrate: &[f64]) -> Vec<Value> {
         Ok(n) => n,
         Err(_) => return Vec::new(),
     };
-    let count = nvml.device_count().unwrap_or(0);
     let mut out = Vec::new();
-    for i in 0..count {
-        let dev = match nvml.device_by_index(i) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
+    for &(ordinal, hr) in per_gpu_hashrate {
         let mut g = Map::new();
-        g.insert("idx".into(), json!(i));
-        if let Some(hr) = per_gpu_hashrate.get(i as usize) {
-            g.insert("hashrate".into(), json!(hr.round() as u64));
+        // `idx` is the miner's device number (CUDA ordinal), the same number its log and API use.
+        g.insert("idx".into(), json!(ordinal));
+        g.insert("hashrate".into(), json!(hr.round() as u64));
+        // Sensors only when this ordinal maps to a definite NVML device; otherwise hashrate only.
+        let dev = match crate::gpu_map::nvml_index_for_cuda_ordinal(&nvml, ordinal).and_then(|i| nvml.device_by_index(i).ok()) {
+            Some(d) => d,
+            None => {
+                out.push(Value::Object(g));
+                continue;
+            }
+        };
+        if let Ok(pci) = dev.pci_info() {
+            g.insert("pci".into(), json!(pci.bus_id));
         }
         if let Ok(t) = dev.temperature(TemperatureSensor::Gpu) {
             g.insert("temp_c".into(), json!(t));
@@ -312,7 +318,7 @@ fn gpu_static() -> Vec<Value> {
     Vec::new()
 }
 #[cfg(target_os = "macos")]
-fn gpu_dynamic(_per_gpu_hashrate: &[f64]) -> Vec<Value> {
+fn gpu_dynamic(_per_gpu_hashrate: &[(u32, f64)]) -> Vec<Value> {
     Vec::new()
 }
 
@@ -339,7 +345,7 @@ mod tests {
 
     #[test]
     fn telemetry_is_wellformed() {
-        let v = build_telemetry(3600, 65_000_000.0, &[65_000_000.0], 1234, 5, 2, &["aabb".to_string()]);
+        let v = build_telemetry(3600, 65_000_000.0, &[(0, 65_000_000.0)], 1234, 5, 2, &["aabb".to_string()]);
         assert_eq!(v["v"], json!(SCHEMA_VERSION));
         assert_eq!(v["uptime_s"], json!(3600));
         assert_eq!(v["hashrate_total"], json!(65_000_000u64));

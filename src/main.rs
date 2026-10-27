@@ -325,6 +325,11 @@ fn filter_specs_by_vram(
     }
 }
 
+/// Extra free VRAM (MiB) `--tier auto` keeps in reserve when another process already uses the card.
+/// The tier floors are calibrated on otherwise empty cards; a co-tenant's allocations can grow and
+/// fragment, so without this the largest tier was picked with ~0.5 GB slack and failed to load.
+const SHARED_CARD_MARGIN_MB: u64 = 2_048;
+
 /// Conservative VRAM headroom (MiB) reserved on top of a model's `min_vram_mb` budget when
 /// auto-selecting a tier. `min_vram_mb` already covers weights + KV-cache + CUDA workspace; this
 /// margin guards against fragmentation / driver overhead / the resident PoM possession walk so the
@@ -614,11 +619,17 @@ fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier, 
                 } else {
                     let budget_mb = match free_map.get(dev) {
                         Some(&(free, _total)) if free < *vram => {
+                            // The tier floors assume an otherwise empty card. On a SHARED card the
+                            // other process's allocations grow and fragment, so the floor alone left
+                            // ~0.5 GB slack and llama.cpp then failed its compute buffer (field report:
+                            // 28,498 MiB free → Kimi-48B picked → load failed → 0 H/s). Reserve a
+                            // fixed margin on top of the actually-free VRAM.
+                            let budget = free.saturating_sub(SHARED_CARD_MARGIN_MB);
                             info!(
-                                "GPU {}: {} MiB of {} MiB VRAM already in use by other processes —                                  auto-tier budgets against the {} MiB actually FREE.",
-                                dev, *vram - free, vram, free
+                                "GPU {}: {} MiB of {} MiB VRAM already in use by other processes — auto-tier budgets against the {} MiB actually FREE minus a {} MiB shared-card margin = {} MiB.",
+                                dev, *vram - free, vram, free, SHARED_CARD_MARGIN_MB, budget
                             );
-                            free
+                            budget
                         }
                         _ => *vram,
                     };

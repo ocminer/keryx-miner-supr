@@ -3087,8 +3087,10 @@ pub fn try_load_and_run_inference_on(
                 }
                 if !crate::llama_engine::ensure_loaded_on(&gguf, gpu) {
                     log::warn!(
-                        "SlmEngine: in-process llama load failed on GPU {} — trying configured llama-server fallback.",
-                        gpu
+                        "SlmEngine: in-process llama load failed on GPU {} — trying configured llama-server fallback. \
+                         Most often this is too little free VRAM for '{}' (another process on the card, or a tier \
+                         too large for it): pin a smaller tier with --tier <very-light|light|default|high>.",
+                        gpu, spec.name
                     );
                 }
             }

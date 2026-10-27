@@ -333,6 +333,68 @@ pub struct ShareStats {
 
 static SHARE_STATS: OnceLock<Arc<ShareStats>> = OnceLock::new();
 
+/// Subscribe-result entry by which a pool announces that it accepts base64 proofs.
+const PROOF_ENCODING_KEY: &str = "keryx.proof_encoding";
+const PROOF_ENCODING_B64: &str = "b64";
+/// Tag that marks a base64 proof in `mining.submit` params[5]; hex never contains ':'.
+const PROOF_B64_PREFIX: &str = "b64:";
+
+/// Per-connection proof encoding for `mining.submit` params[5].
+///
+/// Hex (2 bytes per proof byte) is the default and what every pool understands. A pool that lists
+/// `["keryx.proof_encoding","b64"]` in its `mining.subscribe` result accepts `"b64:" + base64` instead
+/// (RFC 4648 standard alphabet, padded), a third smaller: ~650 KB instead of ~975 KB per H15 proof.
+/// Any error returned for a base64 submit switches the connection back to hex for good, so a
+/// mis-advertising pool can never strand the miner.
+#[derive(Default)]
+pub struct ProofEncoding {
+    b64: AtomicBool,
+    b64_ids: std::sync::Mutex<HashSet<u32>>,
+}
+
+impl ProofEncoding {
+    /// Called with the subscription list of every `mining.subscribe` result.
+    fn absorb_subscribe(&self, subscriptions: &[(String, String)]) {
+        let offered = subscriptions.iter().any(|(k, v)| k == PROOF_ENCODING_KEY && v == PROOF_ENCODING_B64);
+        if offered && !self.b64.swap(true, Ordering::SeqCst) {
+            info!("Pool accepts base64 proofs ({}={}) — submitting proofs base64-encoded on this connection.", PROOF_ENCODING_KEY, PROOF_ENCODING_B64);
+        }
+    }
+
+    /// Encode a proof for params[5] and remember base64 submit ids for the fallback.
+    fn encode(&self, msg_id: u32, proof: &[u8]) -> String {
+        if self.b64.load(Ordering::SeqCst) {
+            if let Ok(mut ids) = self.b64_ids.lock() {
+                if ids.len() > 4096 {
+                    ids.clear(); // unanswered ids from a pool that never replies; bound the set
+                }
+                ids.insert(msg_id);
+            }
+            let mut out = String::with_capacity(PROOF_B64_PREFIX.len() + proof.len().div_ceil(3) * 4);
+            out.push_str(PROOF_B64_PREFIX);
+            base64::Engine::encode_string(&base64::engine::general_purpose::STANDARD, proof, &mut out);
+            out
+        } else {
+            hex::encode(proof)
+        }
+    }
+
+    /// A reply for `msg_id` arrived. Returns true if it was a base64 submit.
+    fn answered(&self, msg_id: u32) -> bool {
+        self.b64_ids.lock().map(|mut ids| ids.remove(&msg_id)).unwrap_or(false)
+    }
+
+    /// An error for a base64 submit: fall back to hex for the rest of this connection.
+    fn reject_b64(&self, code: &ErrorCode, error: &str) {
+        if self.b64.swap(false, Ordering::SeqCst) {
+            warn!(
+                "Pool returned an error for a base64 proof submit ({:?}: {}) — switching this connection back to hex proofs.",
+                code, error
+            );
+        }
+    }
+}
+
 /// Live share counters for the stats API (None until a client initializes them).
 pub fn share_stats() -> Option<Arc<ShareStats>> {
     SHARE_STATS.get().cloned()
@@ -521,6 +583,7 @@ pub struct StratumHandler {
     last_stratum_id: Arc<AtomicU32>,
 
     shares_stats: Arc<ShareStats>,
+    proof_encoding: Arc<ProofEncoding>,
     block_channel: Sender<BlockSeed>,
     block_handle: BlockHandle,
     /// Signalled when the pool connection's WRITE side dies (the socket-sink
@@ -865,11 +928,13 @@ impl StratumHandler {
         // H6 pool path: the POOL builds the coinbase and therefore signs the V2 AiResponse with its
         // OWN escrow key — the miner transmits the UNSIGNED answer (reqId + response_length) and no
         // longer holds a responder signer here. (Solo/grpc self-signing lives in grpc.rs.)
+        let proof_encoding = Arc::new(ProofEncoding::default());
         let (block_channel, block_handle) = Self::create_block_channel(
             send_channel.clone(),
             miner_address.clone(),
             last_stratum_id.clone(),
             share_state.clone(),
+            proof_encoding.clone(),
             Arc::clone(&current_task_slot),
             Arc::clone(&inference_cache),
             conn_dead.clone(),
@@ -892,6 +957,7 @@ impl StratumHandler {
             extranonce: None,
             last_stratum_id,
             shares_stats: share_state,
+            proof_encoding,
             block_channel,
             block_handle,
             conn_dead,
@@ -913,6 +979,7 @@ impl StratumHandler {
         miner_address: String,
         last_stratum_id: Arc<AtomicU32>,
         share_stats: Arc<ShareStats>,
+        proof_encoding: Arc<ProofEncoding>,
         current_task_slot: Arc<Mutex<Option<CurrentTask>>>,
         inference_cache: InferenceCache,
         conn_dead: Arc<Notify>,
@@ -989,8 +1056,8 @@ impl StratumHandler {
                 let line = if !pom_proof.is_empty() {
                     // PoM (post-fork): fixed 6-slot submit — proof always at params[5], CID-or-empty
                     // at params[4]. Matches POM_STRATUM_RECIPE.md (pool relays params[5] → RpcBlock
-                    // .pomProof; it does not verify). hex is lowercase per hex::encode.
-                    let proof_hex = hex::encode(&pom_proof);
+                    // .pomProof). Lowercase hex, or "b64:"+base64 when the pool offered it.
+                    let proof_hex = proof_encoding.encode(msg_id, &pom_proof);
                     let cid = result_opt.as_ref().map(|r| r.cid_b58.clone()).unwrap_or_default();
                     if let Some((rid, response_length)) = &unsigned_response {
                         // H6 (unsigned): params[6]=reqId, params[7]=response_length. The POOL signs
@@ -1019,7 +1086,7 @@ impl StratumHandler {
                         }
                     } else {
                         info!(
-                            "PoM: submitting share with proof ({} B, {} hex chars) for job {}",
+                            "PoM: submitting share with proof ({} B, {} chars) for job {}",
                             pom_proof.len(),
                             proof_hex.len(),
                             job_id
@@ -1119,8 +1186,16 @@ impl StratumHandler {
     async fn send_telemetry(&mut self, miner: &mut MinerManager) {
         // Snapshot the miner's own per-device hashrate (std Mutex — extract + drop the guard BEFORE
         // any await; never hold it across the send).
-        let (total, per_gpu): (f64, Vec<f64>) = match miner.stats().lock() {
-            Ok(s) => (s.total_hashrate, s.devices.iter().map(|d| d.hashrate).collect()),
+        // (CUDA ordinal, H/s) per mined device — the ordinal comes from the worker label ("#N (..)")
+        // so telemetry pairs each hashrate with its own card's sensors (see keryx_miner::gpu_map).
+        let (total, per_gpu): (f64, Vec<(u32, f64)>) = match miner.stats().lock() {
+            Ok(s) => (
+                s.total_hashrate,
+                s.devices
+                    .iter()
+                    .filter_map(|d| crate::gpu_health::ordinal_from_label(&d.label).map(|o| (o, d.hashrate)))
+                    .collect(),
+            ),
             Err(_) => return,
         };
         let acc = self.shares_stats.accepted.load(Ordering::SeqCst);
@@ -1202,6 +1277,7 @@ impl StratumHandler {
                                     return Ok(());
                                 }
 
+                                self.proof_encoding.answered(rid);
                                 let pending = self.shares_stats.shares_pending.lock().await.remove(&rid);
                                 if let Some((_jobid, device_id)) = pending {
                                     let delivered_inference = if let Some(req_id) =
@@ -1235,7 +1311,8 @@ impl StratumHandler {
                                 }
                                 Ok(())
                             }
-                            StratumResult::Subscribe((ref _subscriptions, ref extranonce, ref nonce_size)) => {
+                            StratumResult::Subscribe((ref subscriptions, ref extranonce, ref nonce_size)) => {
+                                self.proof_encoding.absorb_subscribe(subscriptions);
                                 self.set_extranonce(extranonce.as_str(), nonce_size)
                                 /*for (name, value) in _subscriptions {
                                     match name.as_str() {
@@ -1245,7 +1322,32 @@ impl StratumHandler {
                                 }
                                 Ok(())*/
                             }
-                            _ => Err(format!("Inconsistent stratum message: {:?}", msg).into()),
+                            other => {
+                                // A non-true result without an error object (e.g. `false` / `null`).
+                                // For a pending share that is a rejection; anything else is a reply we
+                                // cannot attribute. Neither is a reason to drop the connection.
+                                let rid = id.expect("We checked id is not none");
+                                self.telemetry_req_ids.remove(&rid);
+                                let was_b64 = self.proof_encoding.answered(rid);
+                                if let Some((jobid, device_id)) = self.shares_stats.shares_pending.lock().await.remove(&rid) {
+                                    self.shares_stats.ai_responses_pending.lock().await.remove(&rid);
+                                    if was_b64 {
+                                        self.proof_encoding.reject_b64(&ErrorCode::Unknown, &format!("{:?}", other));
+                                    }
+                                    if let Some(device_id) = device_id {
+                                        crate::pow::record_share_rejected(device_id);
+                                    }
+                                    self.shares_stats.rejected_other.fetch_add(1, Ordering::SeqCst);
+                                    keryx_miner::runtime_stats::record_share_rejected(
+                                        keryx_miner::runtime_stats::ShareRejectKind::Other,
+                                        device_id,
+                                    );
+                                    warn!("Share not accepted by pool (Job id: {}): result {:?}", jobid, other);
+                                } else {
+                                    warn!("Ignoring unmatched pool result for id {}: {:?}", rid, other);
+                                }
+                                Ok(())
+                            }
                         }
                     }
                     StratumLinePayload::StratumCommand(command) => match command {
@@ -1638,7 +1740,13 @@ impl StratumHandler {
                         }
                         _ => Err(format!("Unexpected stratum message: {:?}", msg).into()),
                     },
-                    _ => Err(format!("Inconsistent stratum message: {:?}", msg).into()),
+                    // A result without an id (some pools answer our id-less notifications such as
+                    // mining.declare_capabilities with `{"id":null,"result":true}`). It answers
+                    // nothing we wait for; ignoring it keeps the connection — and mining — alive.
+                    StratumLinePayload::StratumResult { result } => {
+                        log::debug!("Ignoring pool result without id: {:?}", result);
+                        Ok(())
+                    }
                 }
             }
             StratumLine {
@@ -1668,6 +1776,9 @@ impl StratumHandler {
                         );
                     }
                     return Ok(());
+                }
+                if self.proof_encoding.answered(id) {
+                    self.proof_encoding.reject_b64(&code, &error.to_string());
                 }
                 let pending = self.shares_stats.shares_pending.lock().await.remove(&id);
                 self.shares_stats.ai_responses_pending.lock().await.remove(&id);
@@ -2700,5 +2811,79 @@ mod job_id_daa_tests {
         assert_eq!(job_id_daa(""), None);
         assert_eq!(job_id_daa("abcd_xyz"), None); // non-numeric daa field
         assert_eq!(job_id_daa("abcd__1"), None); // empty daa field
+    }
+}
+
+#[cfg(test)]
+mod proof_encoding_tests {
+    use super::*;
+    use crate::client::stratum::statum_codec::{StratumLinePayload, StratumResult};
+    use base64::Engine;
+
+    fn subs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn hex_until_the_pool_offers_base64() {
+        let enc = ProofEncoding::default();
+        let proof: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        assert_eq!(enc.encode(1, &proof), hex::encode(&proof));
+        enc.absorb_subscribe(&subs(&[("mining.notify", "abc"), ("keryx.proof_encoding", "hex")]));
+        assert_eq!(enc.encode(2, &proof), hex::encode(&proof));
+        assert!(!enc.answered(1) && !enc.answered(2));
+    }
+
+    #[test]
+    fn base64_round_trip_and_tag() {
+        let enc = ProofEncoding::default();
+        enc.absorb_subscribe(&subs(&[("mining.notify", "abc"), (PROOF_ENCODING_KEY, PROOF_ENCODING_B64)]));
+        for len in [0usize, 1, 2, 3, 452_705, 487_281] {
+            let proof: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let s = enc.encode(len as u32, &proof);
+            let body = s.strip_prefix(PROOF_B64_PREFIX).expect("tagged");
+            assert_eq!(body.len(), len.div_ceil(3) * 4);
+            assert!(!s.contains('\n') && !s.contains('\\'));
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(body).unwrap(), proof);
+            assert!(enc.answered(len as u32));
+        }
+        // a hex proof never contains the tag separator, so the pool can always tell them apart
+        assert!(!hex::encode([0xffu8; 64]).contains(':'));
+    }
+
+    #[test]
+    fn any_error_for_a_base64_submit_falls_back_to_hex() {
+        let enc = ProofEncoding::default();
+        enc.absorb_subscribe(&subs(&[(PROOF_ENCODING_KEY, PROOF_ENCODING_B64)]));
+        let proof = vec![1u8, 2, 3];
+        assert!(enc.encode(7, &proof).starts_with(PROOF_B64_PREFIX));
+        assert!(enc.answered(7));
+        enc.reject_b64(&ErrorCode::Unknown, "pom proof not hex");
+        assert_eq!(enc.encode(8, &proof), "010203");
+        assert!(!enc.answered(8));
+    }
+
+    #[test]
+    fn subscribe_result_with_the_encoding_entry_parses() {
+        let raw = r#"{"id":0,"result":[[["mining.notify","1"],["keryx.proof_encoding","b64"]],"a1b2",6],"error":null}"#;
+        let line: StratumLine = serde_json::from_str(raw).unwrap();
+        match line.payload {
+            StratumLinePayload::StratumResult { result: StratumResult::Subscribe((s, ex, n)) } => {
+                assert_eq!(ex, "a1b2");
+                assert_eq!(n, 6);
+                let enc = ProofEncoding::default();
+                enc.absorb_subscribe(&s);
+                assert!(enc.encode(1, &[0u8]).starts_with(PROOF_B64_PREFIX));
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[test]
+    fn id_less_result_parses_as_a_result() {
+        // `{"id":null,"result":true}` must decode (it is then ignored, not treated as fatal).
+        let line: StratumLine = serde_json::from_str(r#"{"id":null,"result":true,"error":null}"#).unwrap();
+        assert!(line.id.is_none());
+        assert!(matches!(line.payload, StratumLinePayload::StratumResult { .. }));
     }
 }

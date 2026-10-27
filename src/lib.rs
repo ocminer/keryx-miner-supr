@@ -20,6 +20,7 @@ mod native_llama_log;
 pub mod runtime_stats;
 pub mod slm;
 /// Stratum miner-telemetry (mining.hello / mining.telemetry) — display/ops only, best-effort.
+pub mod gpu_map;
 pub mod telemetry;
 pub mod wait_ready;
 // Device-mapped quantized model forks (OPoI v2 archs) — used by slm inference and the

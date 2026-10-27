@@ -595,7 +595,7 @@ fn decode_to_slice<T: AsRef<[u8]>>(data: T, out: &mut [u8]) -> Result<(), FromHe
 mod tests {
     use crate::pow::hasher::{Hasher, HeaderHasher};
     use crate::pow::{serialize_header, BlockSeed, State};
-    use crate::proto::{RpcBlockHeader, RpcBlockLevelParents};
+    use crate::proto::{RpcBlock, RpcBlockHeader, RpcBlockLevelParents};
     use crate::target::Uint256;
     use crate::Hash;
     use keryx_miner::pom;
@@ -623,6 +623,8 @@ mod tests {
             network_target: Some(Uint256([u64::MAX; 4])),
             pom_proof: Vec::new(),
             device_id: None,
+            header: None,
+            task_root: None,
         };
         let state = State::new(0, seed).expect("partial test job must be valid");
         let expected = Uint256([
@@ -725,6 +727,7 @@ mod tests {
     fn test_serialize_header() {
         let header = RpcBlockHeader {
             version: 24565,
+            task_root: String::new(),
             parents: vec![
                 RpcBlockLevelParents {
                     parent_hashes: vec![
@@ -928,6 +931,7 @@ mod tests {
     fn minimal_header(daa_score: u64, pom_final_state: u64) -> RpcBlockHeader {
         RpcBlockHeader {
             version: 1,
+            task_root: String::new(),
             parents: vec![RpcBlockLevelParents {
                 parent_hashes: vec!["62a5eee82abdf44a2d0b75fb180daf48a79ee0b10d394651850fd4a178892ee2".into()],
             }],

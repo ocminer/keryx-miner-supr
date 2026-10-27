@@ -1670,6 +1670,8 @@ mod inference_pause_tests {
             network_target: None,
             pom_proof: Vec::new(),
             device_id: None,
+            header: None,
+            task_root: None,
         };
         WorkerCommand::Job(Box::new(pow::State::new(id, seed).expect("test job must be valid")))
     }

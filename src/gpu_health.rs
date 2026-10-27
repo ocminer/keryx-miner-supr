@@ -74,14 +74,15 @@ impl GpuHealth {
     }
 }
 
-/// Sample the GPU at NVML index `ordinal`, but ONLY if its NVML name appears in
-/// `expect_label` (the worker label, e.g. `#0 (NVIDIA RTX A4000)`). A name mismatch means
-/// the CUDA and NVML orderings differ on this rig — return `None` rather than attribute
-/// another card's power draw.
+/// Sample the GPU behind CUDA ordinal `ordinal` (matched to its NVML device by PCI bus id, see
+/// `keryx_miner::gpu_map`), and ONLY if its NVML name also appears in `expect_label` (the worker
+/// label, e.g. `#0 (NVIDIA RTX A4000)`). Anything that cannot be matched returns `None` rather
+/// than attributing another card's power draw.
 #[cfg(not(target_os = "macos"))]
 pub fn sample(ordinal: u32, expect_label: &str) -> Option<GpuHealth> {
     let nvml = nvml()?;
-    let dev = nvml.device_by_index(ordinal).ok()?;
+    let index = keryx_miner::gpu_map::nvml_index_for_cuda_ordinal(nvml, ordinal)?;
+    let dev = nvml.device_by_index(index).ok()?;
     let name = dev.name().ok()?;
     if !expect_label.contains(&name) {
         return None;
