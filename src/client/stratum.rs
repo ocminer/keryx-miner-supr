@@ -348,14 +348,33 @@ const PROOF_B64_PREFIX: &str = "b64:";
 /// mis-advertising pool can never strand the miner.
 #[derive(Default)]
 pub struct ProofEncoding {
+    /// Pool address of this connection; a base64 rejection is remembered per address.
+    pool: String,
     b64: AtomicBool,
     b64_ids: std::sync::Mutex<HashSet<u32>>,
 }
 
+/// Pools that rejected a base64 submit during this process. They are only ever sent hex from then
+/// on, even after a reconnect re-advertises base64 — otherwise a pool that advertises but rejects
+/// (or rejects with an error code that forces a reconnect) would put the miner in a reconnect loop.
+static B64_REFUSED_BY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 impl ProofEncoding {
+    fn for_pool(pool: &str) -> Self {
+        ProofEncoding { pool: pool.to_string(), ..Default::default() }
+    }
+
+    fn refused_here(&self) -> bool {
+        B64_REFUSED_BY.lock().map(|v| v.iter().any(|p| p == &self.pool)).unwrap_or(false)
+    }
+
     /// Called with the subscription list of every `mining.subscribe` result.
     fn absorb_subscribe(&self, subscriptions: &[(String, String)]) {
         let offered = subscriptions.iter().any(|(k, v)| k == PROOF_ENCODING_KEY && v == PROOF_ENCODING_B64);
+        if offered && self.refused_here() {
+            info!("Pool advertises base64 proofs but rejected one earlier in this session — keeping hex proofs.");
+            return;
+        }
         if offered && !self.b64.swap(true, Ordering::SeqCst) {
             info!("Pool accepts base64 proofs ({}={}) — submitting proofs base64-encoded on this connection.", PROOF_ENCODING_KEY, PROOF_ENCODING_B64);
         }
@@ -384,11 +403,17 @@ impl ProofEncoding {
         self.b64_ids.lock().map(|mut ids| ids.remove(&msg_id)).unwrap_or(false)
     }
 
-    /// An error for a base64 submit: fall back to hex for the rest of this connection.
+    /// An error for a base64 submit: hex for the rest of this connection AND for every later
+    /// connection to the same pool in this process.
     fn reject_b64(&self, code: &ErrorCode, error: &str) {
+        if let Ok(mut v) = B64_REFUSED_BY.lock() {
+            if !v.iter().any(|p| p == &self.pool) {
+                v.push(self.pool.clone());
+            }
+        }
         if self.b64.swap(false, Ordering::SeqCst) {
             warn!(
-                "Pool returned an error for a base64 proof submit ({:?}: {}) — switching this connection back to hex proofs.",
+                "Pool returned an error for a base64 proof submit ({:?}: {}) — using hex proofs for this pool from now on.",
                 code, error
             );
         }
@@ -849,6 +874,7 @@ impl StratumHandler {
         ipfs_url: String,
     ) -> Result<Box<Self>, Error> {
         info!("Connecting to {}", address);
+        let proof_encoding = Arc::new(ProofEncoding::for_pool(&address));
         let runtime_generation = keryx_miner::runtime_stats::begin_connection(
             keryx_miner::runtime_stats::MiningMode::Pool,
             &address,
@@ -928,7 +954,6 @@ impl StratumHandler {
         // H6 pool path: the POOL builds the coinbase and therefore signs the V2 AiResponse with its
         // OWN escrow key — the miner transmits the UNSIGNED answer (reqId + response_length) and no
         // longer holds a responder signer here. (Solo/grpc self-signing lives in grpc.rs.)
-        let proof_encoding = Arc::new(ProofEncoding::default());
         let (block_channel, block_handle) = Self::create_block_channel(
             send_channel.clone(),
             miner_address.clone(),
@@ -1778,7 +1803,19 @@ impl StratumHandler {
                     return Ok(());
                 }
                 if self.proof_encoding.answered(id) {
+                    // Whatever code the pool chose (some use 25 = not subscribed, which would
+                    // otherwise force a reconnect), a refused base64 proof is just a rejected share:
+                    // fall back to hex and keep the connection.
                     self.proof_encoding.reject_b64(&code, &error.to_string());
+                    let pending = self.shares_stats.shares_pending.lock().await.remove(&id);
+                    self.shares_stats.ai_responses_pending.lock().await.remove(&id);
+                    let device_id = pending.as_ref().and_then(|(_, d)| *d);
+                    if let Some(d) = device_id {
+                        crate::pow::record_share_rejected(d);
+                    }
+                    self.shares_stats.rejected_other.fetch_add(1, Ordering::SeqCst);
+                    keryx_miner::runtime_stats::record_share_rejected(keryx_miner::runtime_stats::ShareRejectKind::Other, device_id);
+                    return Ok(());
                 }
                 let pending = self.shares_stats.shares_pending.lock().await.remove(&id);
                 self.shares_stats.ai_responses_pending.lock().await.remove(&id);
@@ -2853,7 +2890,7 @@ mod proof_encoding_tests {
 
     #[test]
     fn any_error_for_a_base64_submit_falls_back_to_hex() {
-        let enc = ProofEncoding::default();
+        let enc = ProofEncoding::for_pool("test-pool-fallback:1");
         enc.absorb_subscribe(&subs(&[(PROOF_ENCODING_KEY, PROOF_ENCODING_B64)]));
         let proof = vec![1u8, 2, 3];
         assert!(enc.encode(7, &proof).starts_with(PROOF_B64_PREFIX));
@@ -2861,6 +2898,14 @@ mod proof_encoding_tests {
         enc.reject_b64(&ErrorCode::Unknown, "pom proof not hex");
         assert_eq!(enc.encode(8, &proof), "010203");
         assert!(!enc.answered(8));
+        // a reconnect to the same pool that re-advertises base64 stays on hex
+        let again = ProofEncoding::for_pool("test-pool-fallback:1");
+        again.absorb_subscribe(&subs(&[(PROOF_ENCODING_KEY, PROOF_ENCODING_B64)]));
+        assert_eq!(again.encode(9, &proof), "010203");
+        // a different pool is unaffected
+        let other = ProofEncoding::for_pool("test-pool-other:1");
+        other.absorb_subscribe(&subs(&[(PROOF_ENCODING_KEY, PROOF_ENCODING_B64)]));
+        assert!(other.encode(10, &proof).starts_with(PROOF_B64_PREFIX));
     }
 
     #[test]
