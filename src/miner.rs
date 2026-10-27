@@ -728,18 +728,19 @@ impl MinerManager {
                                 task_state = None;
                             }
                         }
-                        // OpenCL / Metal: no trace engine on this backend, so no task_root can be
-                        // committed — a post-gate job walked here could never become a valid block
-                        // and every hit would die at the host v5 re-check. Idle honestly (like
-                        // upstream) instead of burning power on a root-less job.
+                        // OpenCL / Metal: these walks have no PoM v5 context pad, so a post-H15 job
+                        // walked here could never become a valid share or block (every hit would die
+                        // at the host v5 re-check). Idle honestly instead of burning power. (Keyed on
+                        // the v5 era, not on the block task: keryx-node 1.6.6 retired the block task,
+                        // but the context pad still activates at H15.)
                         #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
                         {
                             let s = state.as_ref().unwrap();
-                            if keryx_miner::block_task::active(s.daa_score) {
+                            if keryx_miner::pom::is_pom_v5_era(s.daa_score) {
                                 static NO_ENGINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                                 if NO_ENGINE.fetch_add(1, Ordering::Relaxed) % 200 == 0 {
                                     log::warn!(
-                                        "PoM: H15 block task active (daa {}) but this backend has no trace engine — cannot commit a task_root, idling (NVIDIA CUDA builds mine post-gate)",
+                                        "PoM: H15 (PoM v5) active (daa {}) but this backend has no context-pad walk yet — idling (NVIDIA CUDA builds mine post-gate)",
                                         s.daa_score
                                     );
                                 }

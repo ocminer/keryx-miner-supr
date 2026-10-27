@@ -928,6 +928,29 @@ mod tests {
         assert_eq!(hasher.finalize(), expected_hash);
     }
 
+    #[test]
+    fn h15_header_never_commits_task_root() {
+        // keryx-node v1.6.6 retired the block task: a post-H15 header hashes WITHOUT task_root,
+        // whatever the field holds (the node zeroes it). Both the pre-PoW and the block hash.
+        std::env::set_var("KERYX_BLOCK_TASK_ACTIVATION_DAA", "0"); // the old override must be ignored
+        assert_eq!(pom::block_task_activation_daa(), u64::MAX);
+        for daa in [pom::POM_V5_ACTIVATION_DAA - 1, pom::POM_V5_ACTIVATION_DAA, pom::POM_V5_ACTIVATION_DAA + 1_000_000] {
+            assert!(!pom::is_block_task_era(daa));
+            assert!(!keryx_miner::block_task::active(daa));
+            let plain = minimal_header(daa, 7);
+            let mut rooted = plain.clone();
+            rooted.task_root = "44".repeat(32);
+            for pre_pow in [true, false] {
+                let mut a = Buf(Vec::new());
+                let mut b = Buf(Vec::new());
+                serialize_header(&mut a, &plain, pre_pow);
+                serialize_header(&mut b, &rooted, pre_pow);
+                assert_eq!(a.0, b.0, "daa {daa} pre_pow {pre_pow}: task_root must not be hashed");
+            }
+        }
+        std::env::remove_var("KERYX_BLOCK_TASK_ACTIVATION_DAA");
+    }
+
     fn minimal_header(daa_score: u64, pom_final_state: u64) -> RpcBlockHeader {
         RpcBlockHeader {
             version: 1,

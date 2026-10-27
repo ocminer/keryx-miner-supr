@@ -512,12 +512,10 @@ pub fn is_h14_activation_overridden() -> bool {
 
 /// H15 gate (mainnet). MUST equal the node's `H15_ACTIVATION_DAA`
 /// (consensus/core/src/config/params.rs = 140_115_000, ~2026-10-30 15:00 UTC). At/after it the PoM
-/// walk ALSO reads the tier's context pad (PoM v5) AND every header carries `task_root`, hashed into
-/// the pre-PoW and block hashes. A miner still emitting v4 (task-less) proofs past the gate produces
-/// blocks the node rejects. One DAA drives both H15 rules, exactly like the node (`pom_v5` and
-/// `block_task` activations sit at the same DAA), so they can never cross at different scores.
-/// Overridable for STAGING / testnet via `KERYX_POM_V5_ACTIVATION_DAA` /
-/// `KERYX_BLOCK_TASK_ACTIVATION_DAA` — the SAME env names the pool-side verifier reads.
+/// walk ALSO reads the tier's context pad (PoM v5). A miner still emitting v4 proofs past the gate
+/// produces blocks the node rejects. (The block task / `task_root` planned for the same gate was
+/// retired by keryx-node v1.6.6 — see [`block_task_activation_daa`].) Overridable for STAGING /
+/// testnet via `KERYX_POM_V5_ACTIVATION_DAA` — the same env name the pool-side verifier reads.
 pub const POM_V5_ACTIVATION_DAA: u64 = 140_115_000;
 
 /// PoM v5 (context-pad) gate. See [`POM_V5_ACTIVATION_DAA`].
@@ -528,12 +526,22 @@ pub fn pom_v5_activation_daa() -> u64 {
     })
 }
 
-/// Block-task gate: headers carry `task_root`. MUST equal the node's `block_task_activation` (= H15).
+/// Block-task gate: headers carry `task_root`. MUST equal the node's `block_task_activation`.
+///
+/// keryx-node v1.6.6 retired the block task before it ever activated: `block_task_activation =
+/// ForkActivation::never()` on mainnet AND testnet (config/params.rs), so `task_root` is never part
+/// of the pre-PoW or block hash and a node zeroes any `task_root` it is sent. Mirrored here as
+/// `u64::MAX`; with it the header hashing, the per-device task trace, the "no block task yet" job
+/// refusal and the block-candidate opening are all inert. The former `KERYX_BLOCK_TASK_ACTIVATION_DAA`
+/// override is deliberately ignored: re-enabling the task would hash headers no 1.6.6 node accepts.
 pub fn block_task_activation_daa() -> u64 {
-    static G: OnceLock<u64> = OnceLock::new();
-    *G.get_or_init(|| {
-        gate("KERYX_BLOCK_TASK_ACTIVATION_DAA", POM_V5_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
-    })
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if std::env::var_os("KERYX_BLOCK_TASK_ACTIVATION_DAA").is_some() {
+        WARNED.call_once(|| {
+            log::warn!("KERYX_BLOCK_TASK_ACTIVATION_DAA is ignored: keryx-node 1.6.6 retired the H15 block task (never active).")
+        });
+    }
+    u64::MAX
 }
 
 /// Node `trace_prefix_activation` (H15): responses accepted from this DAA are opened against the
