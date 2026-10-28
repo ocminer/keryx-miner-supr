@@ -1,7 +1,8 @@
 ; MSVC module-definition file: exports the keryx-llama C ABI from keryx-llama.dll on Windows.
 ; On Linux/macOS the same symbols are exported by default (extern "C" + default visibility), so
 ; this file is Windows-only and keeps keryx_llama.cpp itself byte-identical across platforms.
-; Keep in lockstep with the extern "C" block in keryx_llama.cpp (ABI 2).
+; Keep in lockstep with the extern "C" blocks in keryx_llama.cpp (ABI 3). Windows CI checks every
+; symbol the miner looks up against `dumpbin /exports`; a missing line here makes the DLL unusable.
 LIBRARY keryx-llama
 EXPORTS
     keryx_llama_abi
@@ -19,3 +20,11 @@ EXPORTS
     keryx_llama_generate
     keryx_llama_prompt_guard
     keryx_llama_free
+    keryx_llama_context_acquire
+    keryx_llama_context_release
+    keryx_llama_trace_configure
+    keryx_llama_trace_leaf_count
+    keryx_llama_trace_read
+    keryx_llama_trace_tokens
+    keryx_llama_replay
+    keryx_llama_replay_multi

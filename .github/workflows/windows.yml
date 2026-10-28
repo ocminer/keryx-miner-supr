@@ -499,6 +499,28 @@ jobs:
           Write-Host "built $($dll.FullName) ($([math]::Round($dll.Length/1MB,1)) MB)"
           Copy-Item $dll.FullName "keryx-llama-noavx.dll" -Force
 
+      # Windows exports only what keryx_llama.def lists (Linux exports everything), so a symbol the
+      # miner needs but the .def omits is invisible here and silently disables inference on Windows
+      # (0.15.0/0.15.1: the H15 trace/replay/context functions were missing). Every symbol the miner
+      # looks up in src/llama_engine.rs (load_engine) must be exported by BOTH engine DLLs.
+      - name: Check keryx-llama.dll exports (every symbol the miner requires)
+        shell: pwsh
+        run: |
+          $required = @(
+            "keryx_llama_abi", "keryx_llama_load", "keryx_llama_tensor_count", "keryx_llama_tensor_info",
+            "keryx_llama_generate", "keryx_llama_free",
+            "keryx_llama_context_acquire", "keryx_llama_context_release",
+            "keryx_llama_trace_configure", "keryx_llama_trace_leaf_count", "keryx_llama_trace_read",
+            "keryx_llama_trace_tokens", "keryx_llama_replay", "keryx_llama_replay_multi")
+          foreach ($dll in @("keryx-llama.dll", "keryx-llama-noavx.dll")) {
+            if (-not (Test-Path $dll)) { throw "$dll missing" }
+            $exports = (& dumpbin /NOLOGO /EXPORTS $dll | Out-String)
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin exports failed for $dll" }
+            $missing = @($required | Where-Object { $exports -notmatch "(?m)\s$_\s*$" })
+            if ($missing.Count -gt 0) { throw "$dll does not export: $($missing -join ', ')" }
+            Write-Host "$dll exports all $($required.Count) required symbols"
+          }
+
       - name: Stage artifact (exe + bundled CUDA runtime DLLs)
         shell: pwsh
         run: |
