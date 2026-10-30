@@ -64,6 +64,109 @@ pub fn self_test_passed() -> bool {
     SELF_TEST_PASSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Engine ABI of the native trace engine this build expects (llama_engine::ABI).
+pub const ENGINE_ABI: u32 = 4;
+
+/// BLAKE3 over the llama.cpp patch series the engine is built with (0001–0005, in order): two rigs
+/// reproduce each other's traces only with the same engine arithmetic, so a replaying rig must match it.
+pub fn patch_set_hash() -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    for p in [
+        &include_bytes!("../tools/keryx-llama/patches/0001-canonical-trace.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0002-sequence-leaves.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0003-fattn-tile-f32.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0004-rope-f64-angle.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0005-attn-lse-capture.patch")[..],
+    ] {
+        h.update(&(p.len() as u64).to_le_bytes());
+        h.update(p);
+    }
+    *h.finalize().as_bytes()
+}
+
+/// Header of a `KRXREC01` compact trace record (the pool-custody format agreed in the pool exchange):
+/// `"KRXREC01" | u32 LE header_len | borsh(RecordHeader) | borsh(ResponseTrace) | blake3(header || body)`.
+#[derive(Debug, Clone, PartialEq, borsh::BorshSerialize, borsh::BorshDeserialize)]
+pub struct RecordHeader {
+    pub engine_abi: u32,
+    pub patch_set: [u8; 32],
+    pub model_id: [u8; 32],
+    pub tier: u8,
+    pub request_hash: [u8; 32],
+    pub max_tokens: u32,
+    /// The card that generated the trace (a replay must run on the same GPU model).
+    pub gpu_model: String,
+    pub sm_count: u32,
+    pub driver_version: String,
+}
+
+pub const RECORD_MAGIC: &[u8; 8] = b"KRXREC01";
+
+/// Serializes a `KRXREC01` record.
+pub fn encode_record(header: &RecordHeader, trace: &ResponseTrace) -> Vec<u8> {
+    let h = borsh::to_vec(header).expect("borsh header");
+    let b = borsh::to_vec(trace).expect("borsh trace");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&h);
+    hasher.update(&b);
+    let mut out = Vec::with_capacity(8 + 4 + h.len() + b.len() + 32);
+    out.extend_from_slice(RECORD_MAGIC);
+    out.extend_from_slice(&(h.len() as u32).to_le_bytes());
+    out.extend_from_slice(&h);
+    out.extend_from_slice(&b);
+    out.extend_from_slice(hasher.finalize().as_bytes());
+    out
+}
+
+/// Parses and integrity-checks a `KRXREC01` record.
+pub fn decode_record(blob: &[u8]) -> Option<(RecordHeader, ResponseTrace)> {
+    use borsh::BorshDeserialize;
+    if blob.len() < 8 + 4 + 32 || &blob[..8] != RECORD_MAGIC {
+        return None;
+    }
+    let hl = u32::from_le_bytes(blob[8..12].try_into().ok()?) as usize;
+    let (hb, rest) = blob.get(12..)?.split_at_checked(hl)?;
+    let (bb, digest) = rest.split_at_checked(rest.len().checked_sub(32)?)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(hb);
+    hasher.update(bb);
+    if hasher.finalize().as_bytes() != digest {
+        return None;
+    }
+    Some((RecordHeader::try_from_slice(hb).ok()?, ResponseTrace::try_from_slice(bb).ok()?))
+}
+
+/// GPU model name, SM count and driver version of CUDA ordinal `gpu` (empty/0 when unknown).
+pub fn gpu_identity(gpu: usize) -> (String, u32, String) {
+    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl"), not(target_os = "macos")))]
+    {
+        use candle_core::cuda_backend::cudarc::driver::{result, sys};
+        let sm = (|| {
+            result::init().ok()?;
+            let dev = result::device::get(gpu as i32).ok()?;
+            let n = unsafe { result::device::get_attribute(dev, sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT) }.ok()?;
+            Some(n.max(0) as u32)
+        })()
+        .unwrap_or(0);
+        let (name, driver) = match nvml_wrapper::Nvml::init() {
+            Ok(nvml) => {
+                let name = crate::gpu_map::nvml_index_for_cuda_ordinal(&nvml, gpu as u32)
+                    .and_then(|i| nvml.device_by_index(i).ok())
+                    .and_then(|d| d.name().ok())
+                    .unwrap_or_default();
+                (name, nvml.sys_driver_version().unwrap_or_default())
+            }
+            Err(_) => (String::new(), String::new()),
+        };
+        (name, sm, driver)
+    }
+    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"), not(target_os = "macos"))))]
+    {
+        let _ = gpu;
+        (String::new(), 0, String::new())
+    }
+}
+
 /// What a traced inference commits: tier, plaintext prompt length, request id and stage.
 #[derive(Clone, Copy, Debug)]
 pub struct Traced {
@@ -720,5 +823,63 @@ mod size_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    #[test]
+    fn krxrec01_round_trips_and_detects_corruption() {
+        let leaves = vec![[7u8; 32]; 2 * 5];
+        // A minimal hand-built trace in the borsh layout of `ResponseTrace` (no GPU needed).
+        let header = RecordHeader {
+            engine_abi: ENGINE_ABI,
+            patch_set: patch_set_hash(),
+            model_id: [1; 32],
+            tier: 0,
+            request_hash: [2; 32],
+            max_tokens: 64,
+            gpu_model: "NVIDIA GeForce RTX 5080".into(),
+            sm_count: 84,
+            driver_version: "615.71.09".into(),
+        };
+        let raw = {
+            // TraceRecord{stage, n_prompt, n_pos, ubatch, n_leaves, leaves, pos_roots, trace_root, tokens_root}
+            let mut v = Vec::new();
+            v.push(2u8);
+            v.extend_from_slice(&1u32.to_le_bytes());
+            v.extend_from_slice(&2u32.to_le_bytes());
+            v.extend_from_slice(&2u32.to_le_bytes());
+            v.extend_from_slice(&1u32.to_le_bytes());
+            v.extend_from_slice(&1u32.to_le_bytes());
+            v.extend_from_slice(&5u64.to_le_bytes());
+            v.extend_from_slice(&(leaves.len() as u32).to_le_bytes());
+            for l in &leaves {
+                v.extend_from_slice(l);
+            }
+            v.extend_from_slice(&2u32.to_le_bytes());
+            v.extend_from_slice(&[3u8; 64]);
+            v.extend_from_slice(&[4u8; 32]);
+            v.push(0);
+            // tokens, seq None
+            v.extend_from_slice(&2u32.to_le_bytes());
+            v.extend_from_slice(&5i32.to_le_bytes());
+            v.extend_from_slice(&6i32.to_le_bytes());
+            v.push(0);
+            v
+        };
+        use borsh::BorshDeserialize;
+        let trace = ResponseTrace::try_from_slice(&raw).expect("hand-built trace parses");
+        let blob = encode_record(&header, &trace);
+        assert_eq!(&blob[..8], b"KRXREC01");
+        let (h2, t2) = decode_record(&blob).expect("round trip");
+        assert_eq!(h2, header);
+        assert_eq!(borsh::to_vec(&t2).unwrap(), raw);
+        let mut bad = blob.clone();
+        bad[20] ^= 1;
+        assert!(decode_record(&bad).is_none(), "a flipped byte fails the blake3 check");
+        assert_ne!(patch_set_hash(), [0u8; 32]);
     }
 }

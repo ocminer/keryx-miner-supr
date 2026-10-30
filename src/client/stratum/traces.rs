@@ -58,8 +58,7 @@ fn kept() -> &'static Mutex<HashMap<String, Kept>> {
 }
 
 /// Keeps the trace of a pool-dispatched answer (memory + disk) for later openings.
-pub(super) fn keep(request_hash_hex: &str, request_hash: [u8; 32], model_id: [u8; 32], tier: u8, max_tokens: u32, gpu: usize, trace: ResponseTrace) {
-    let trace = Arc::new(trace);
+pub(super) fn keep(request_hash_hex: &str, request_hash: [u8; 32], model_id: [u8; 32], tier: u8, max_tokens: u32, gpu: usize, trace: Arc<ResponseTrace>) {
     let at = now();
     let key = request_hash_hex.to_ascii_lowercase();
     store().save_queued(StoredTraceOwned {
@@ -91,4 +90,56 @@ pub(super) fn keep(request_hash_hex: &str, request_hash: [u8; 32], model_id: [u8
 /// The kept trace of the answer to `request_hash_hex`.
 pub(super) fn get(request_hash_hex: &str) -> Option<Kept> {
     kept().lock().unwrap_or_else(|p| p.into_inner()).get(&request_hash_hex.to_ascii_lowercase()).cloned()
+}
+
+/// POSTs the `KRXREC01` compact record of a traced answer to the pool's custody endpoint (raw
+/// binary body). Retried a few times: a dropped record means the pool cannot have the answer opened
+/// once this rig is gone. Blocking — call from `spawn_blocking`.
+pub(super) fn upload(url: &str, request_hash_hex: &str, header: &keryx_miner::traced::RecordHeader, trace: &ResponseTrace) -> Result<String, String> {
+    let blob = keryx_miner::traced::encode_record(header, trace);
+    let target = format!("{}/{}", url.trim_end_matches('/'), request_hash_hex.to_ascii_lowercase());
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(15)).timeout(Duration::from_secs(300)).build();
+    let mut last = String::new();
+    for attempt in 1..=4u32 {
+        match agent.post(&target).set("Content-Type", "application/octet-stream").send_bytes(&blob) {
+            Ok(r) => return Ok(format!("{} B -> HTTP {} {}", blob.len(), r.status(), r.into_string().unwrap_or_default())),
+            // 4xx other than 408/429 will not change on retry (e.g. 403: not dispatched by this pool).
+            Err(ureq::Error::Status(code, r)) if code < 500 && code != 408 && code != 429 => {
+                return Err(format!("HTTP {} {}", code, r.into_string().unwrap_or_default()));
+            }
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(Duration::from_secs(5 * attempt as u64));
+    }
+    Err(last)
+}
+
+/// Option 3 fallback: fetches the `KRXREC01` record of an answer another rig produced and keeps it,
+/// if its engine and GPU identity match this rig (a replay only reproduces on the same engine build
+/// and the same GPU model). Blocking — call from `spawn_blocking`.
+pub(super) fn fetch_foreign(url: &str, request_hash_hex: &str) -> Result<Kept, String> {
+    use std::io::Read;
+    let r = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .get(url)
+        .call()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let mut blob = Vec::new();
+    r.into_reader().take(512 << 20).read_to_end(&mut blob).map_err(|e| e.to_string())?;
+    let (h, trace) = keryx_miner::traced::decode_record(&blob).ok_or("not a valid KRXREC01 record")?;
+    if hex::encode(h.request_hash) != request_hash_hex.to_ascii_lowercase() {
+        return Err("record is for another request".into());
+    }
+    if h.engine_abi != keryx_miner::traced::ENGINE_ABI || h.patch_set != keryx_miner::traced::patch_set_hash() {
+        return Err(format!("record engine {} / patch set differ from this build's {}", h.engine_abi, keryx_miner::traced::ENGINE_ABI));
+    }
+    let gpu = keryx_miner::slm::serveable_route_gpus(&h.model_id)
+        .into_iter()
+        .find(|&g| keryx_miner::traced::gpu_identity(g).0 == h.gpu_model)
+        .ok_or_else(|| format!("no card of model '{}' serves this tier here", h.gpu_model))?;
+    let kept = Kept { model_id: h.model_id, tier: h.tier, request_hash: h.request_hash, gpu: Some(gpu), trace: Arc::new(trace), at: now() };
+    keep(request_hash_hex, h.request_hash, h.model_id, h.tier, h.max_tokens, gpu, Arc::clone(&kept.trace));
+    Ok(kept)
 }

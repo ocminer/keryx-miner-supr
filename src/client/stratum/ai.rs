@@ -12,12 +12,14 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 pub(super) const MAX_PAYLOAD_BYTES: usize = 1_048_576;
 
 /// The H15 trace a pool asks for (0.15.3 optional 8th `mining.ai_request` param).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TraceAsk {
     pub tier: u8,
     pub prompt_len: u32,
     pub chain: bool,
     pub attention: bool,
+    /// Where to POST the `KRXREC01` compact record (pool custody, option 3); `None`: keep it local.
+    pub upload: Option<String>,
 }
 
 impl TraceAsk {
@@ -30,7 +32,12 @@ impl TraceAsk {
         let prompt_len = t.get("prompt_len").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()).ok_or("trace.prompt_len missing")?;
         let chain = t.get("chain").and_then(|v| v.as_bool()).unwrap_or(true);
         let attention = t.get("attention").and_then(|v| v.as_bool()).unwrap_or(true);
-        Ok(Some(Self { tier, prompt_len, chain, attention }))
+        let upload = match t.get("upload").and_then(|v| v.as_str()) {
+            Some(u) if u.starts_with("https://") || u.starts_with("http://") => Some(u.to_string()),
+            Some(_) => return Err("trace.upload must be an http(s) URL".into()),
+            None => None,
+        };
+        Ok(Some(Self { tier, prompt_len, chain, attention, upload }))
     }
 }
 
@@ -127,6 +134,8 @@ pub(super) struct AiOpening {
     pub seed: [u8; 32],
     pub path: Vec<u64>,
     pub prev: Vec<u8>,
+    /// Option 3 fallback: where to GET the `KRXREC01` record when this rig did not answer itself.
+    pub record_url: Option<String>,
 }
 
 impl AiOpening {
@@ -155,7 +164,12 @@ impl AiOpening {
         if path.is_empty() != prev.is_empty() {
             return Err("an attention phase needs both its path and the previous partials".into());
         }
-        Ok(Self { request_hash, response_txid, response_txid_hex, seed, path, prev })
+        let record_url = match v.get(5).and_then(|x| x.as_str()) {
+            Some(u) if u.starts_with("https://") || u.starts_with("http://") => Some(u.to_string()),
+            Some("") | None => None,
+            Some(_) => return Err("record url must be http(s)".into()),
+        };
+        Ok(Self { request_hash, response_txid, response_txid_hex, seed, path, prev, record_url })
     }
 
     /// `mining.ai_opening_result` [worker, request_hash, response_txid, path, body_hex, error].
@@ -256,7 +270,7 @@ mod tests {
         let line: StratumLine = serde_json::from_str(&raw).unwrap();
         let StratumLinePayload::StratumCommand(StratumCommand::MiningAiRequest(f)) = line.payload else { panic!("not an ai_request") };
         let req = AiRequest::parse_ext(f.fields, f.ext.as_ref()).unwrap();
-        assert_eq!(req.trace, Some(TraceAsk { tier: 2, prompt_len: 17, chain: true, attention: true }));
+        assert_eq!(req.trace, Some(TraceAsk { tier: 2, prompt_len: 17, chain: true, attention: true, upload: None }));
         assert_eq!(req.request_hash_bytes(), [0x11; 32]);
         let out = req.response_traced(9, "w".into(), "answer", Some((&[1u8, 2], &[3u8]))).unwrap();
         let json = serde_json::to_value(&out).unwrap();

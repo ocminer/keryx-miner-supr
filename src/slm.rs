@@ -2277,6 +2277,11 @@ fn proven_serveable_model_ids() -> Vec<[u8; 32]> {
 /// Exact GPU ordinals whose live proofs currently make `model_id` serveable. Keep this separate
 /// from external-request accounting: startup self-tests deliberately do not increment inference
 /// request counters, but the dashboard still needs to identify the route they proved.
+/// Cards with a proven (self-tested) serving route for `model_id`.
+pub fn serveable_route_gpus(model_id: &[u8; 32]) -> Vec<usize> {
+    proven_route_gpus(model_id)
+}
+
 fn proven_route_gpus(model_id: &[u8; 32]) -> Vec<usize> {
     if model_is_unavailable(model_id) {
         return Vec::new();

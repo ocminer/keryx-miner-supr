@@ -2070,7 +2070,7 @@ impl StratumHandler {
             return;
         }
         // H15 traced answer: the tier must be the model's own (its manifests define the trace).
-        if let Some(t) = request.trace {
+        if let Some(t) = request.trace.as_ref() {
             let own = keryx_miner::models::pom_tier_index(&request.model_id, u64::MAX);
             if own != Some(t.tier) || !keryx_miner::traced::supported() || !t.chain {
                 warn!(
@@ -2120,7 +2120,7 @@ impl StratumHandler {
                 request.max_tokens
             );
             let (model_id, prompt, max_tokens) = (request.model_id, request.prompt.clone(), request.max_tokens);
-            let traced = request.trace.map(|t| keryx_miner::traced::Traced {
+            let traced = request.trace.as_ref().map(|t| keryx_miner::traced::Traced {
                 tier: t.tier,
                 prompt_len: t.prompt_len,
                 request_hash: request.request_hash_bytes(),
@@ -2155,6 +2155,7 @@ impl StratumHandler {
             // A traced answer: the commitment + the plaintext body the pool seals; the trace is kept
             // (memory + disk) for the pool's `mining.ai_opening` when the node audits the response.
             let traced_parts = trace.map(|tr| {
+                let tr = std::sync::Arc::new(tr);
                 let commitment = tr.commitment().to_bytes();
                 let body = keryx_miner::traced::answer_body(&text, Some(&tr));
                 info!(
@@ -2164,11 +2165,34 @@ impl StratumHandler {
                     tr.record.n_prompt,
                     tr.record.n_pos
                 );
+                let tier = request.trace.as_ref().map_or(0, |t| t.tier);
+                if let Some(url) = request.trace.as_ref().and_then(|t| t.upload.clone()) {
+                    // Pool custody (option 3): the compact record, with the engine and GPU identity a
+                    // replaying rig must match, goes to the pool right after the answer.
+                    let (gpu_model, sm_count, driver_version) = keryx_miner::traced::gpu_identity(gpu);
+                    let header = keryx_miner::traced::RecordHeader {
+                        engine_abi: keryx_miner::traced::ENGINE_ABI,
+                        patch_set: keryx_miner::traced::patch_set_hash(),
+                        model_id: request.model_id,
+                        tier,
+                        request_hash: request.request_hash_bytes(),
+                        max_tokens: request.max_tokens as u32,
+                        gpu_model,
+                        sm_count,
+                        driver_version,
+                    };
+                    let rh = request.request_hash.clone();
+                    let tr2 = std::sync::Arc::clone(&tr);
+                    tokio::task::spawn_blocking(move || match traces::upload(&url, &rh, &header, &tr2) {
+                        Ok(r) => info!("AI request {:.16}: trace record uploaded ({})", rh, r),
+                        Err(e) => warn!("AI request {:.16}: trace record upload FAILED: {}", rh, e),
+                    });
+                }
                 traces::keep(
                     &request.request_hash,
                     request.request_hash_bytes(),
                     request.model_id,
-                    request.trace.map_or(0, |t| t.tier),
+                    tier,
                     request.max_tokens as u32,
                     gpu,
                     tr,
@@ -2217,10 +2241,35 @@ impl StratumHandler {
         self.ai_response_ids.insert(id);
         let send_channel = self.send_channel.clone();
         let worker = self.miner_address.clone();
-        let Some(k) = traces::get(&op.request_hash) else {
-            warn!("AI opening {:.16}: no kept trace for this request", op.request_hash);
-            let _ = send_channel.send(op.result(id, worker, Err("no kept trace for this request"))).await;
-            return;
+        let k = match traces::get(&op.request_hash) {
+            Some(k) => k,
+            None => match op.record_url.clone() {
+                // Option 3 fallback: another rig answered; replay its record if this rig matches it.
+                Some(url) => {
+                    let rh = op.request_hash.clone();
+                    match tokio::task::spawn_blocking(move || traces::fetch_foreign(&url, &rh)).await {
+                        Ok(Ok(k)) => {
+                            info!("AI opening {:.16}: replaying a record fetched from the pool (another rig answered)", op.request_hash);
+                            k
+                        }
+                        Ok(Err(e)) => {
+                            warn!("AI opening {:.16}: cannot take over the record: {}", op.request_hash, e);
+                            let _ = send_channel.send(op.result(id, worker, Err(&e))).await;
+                            return;
+                        }
+                        Err(e) => {
+                            let e = e.to_string();
+                            let _ = send_channel.send(op.result(id, worker, Err(&e))).await;
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    warn!("AI opening {:.16}: no kept trace for this request", op.request_hash);
+                    let _ = send_channel.send(op.result(id, worker, Err("no kept trace for this request"))).await;
+                    return;
+                }
+            },
         };
         tokio::spawn(async move {
             info!("AI opening {:.16}: replaying for response {:.16} (phase {})", op.request_hash, op.response_txid_hex, op.path.len());
