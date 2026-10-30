@@ -1272,6 +1272,16 @@ pub fn seq_replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, spans: 
     let mut out = Vec::with_capacity(spans.len());
     for k in 0..spans.len() {
         let (len, n) = (lens[k] as usize, n_cvs[k] as usize);
+        log::debug!(
+            "seq_replay span {k}: leaf {} [{}, {}) len {} n_cvs {} (max {}) nonzero bytes {}",
+            spans[k].0,
+            spans[k].1,
+            spans[k].2,
+            len,
+            n,
+            max_chunks,
+            bytes[bo..bo + len].iter().filter(|b| **b != 0).count()
+        );
         out.push(SeqCapture { bytes: bytes[bo..bo + len].to_vec(), cvs: cvs[co..co + n].to_vec() });
         bo += len;
         co += n;

@@ -743,6 +743,14 @@ fn tokio_blocking_threads() -> Option<usize> {
 }
 
 fn main() -> Result<(), Error> {
+    // H15 traced answers (0.15.3, upstream v0.5.8 main): the canonical trace and the sequence leaves
+    // are hashed by node hooks that do not run inside a replayed CUDA graph, and attention openings
+    // expect UNROTATED key/value cache rows (b10015 rotates quantized KV rows otherwise). Both must
+    // hold before llama.cpp / ggml initialize; an explicit GGML_CUDA_DISABLE_GRAPHS still wins.
+    if std::env::var_os("GGML_CUDA_DISABLE_GRAPHS").is_none() {
+        std::env::set_var("GGML_CUDA_DISABLE_GRAPHS", "1");
+    }
+    std::env::set_var("LLAMA_ATTN_ROT_DISABLE", "1");
     // Force CUDA's device enumeration to PCI-bus order BEFORE any CUDA library initializes. The whole
     // codebase assumes CUDA's ordinal == nvidia-smi's ordinal (see the CUDA_VISIBLE_DEVICES handling
     // below and gpu_health.rs) — an assumption that only holds under CUDA_DEVICE_ORDER=PCI_BUS_ID.
