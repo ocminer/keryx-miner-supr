@@ -148,16 +148,15 @@ pub fn gpu_identity(gpu: usize) -> (String, u32, String) {
             Some(n.max(0) as u32)
         })()
         .unwrap_or(0);
-        let (name, driver) = match nvml_wrapper::Nvml::init() {
-            Ok(nvml) => {
-                let name = crate::gpu_map::nvml_index_for_cuda_ordinal(&nvml, gpu as u32)
-                    .and_then(|i| nvml.device_by_index(i).ok())
-                    .and_then(|d| d.name().ok())
-                    .unwrap_or_default();
-                (name, nvml.sys_driver_version().unwrap_or_default())
-            }
-            Err(_) => (String::new(), String::new()),
-        };
+        // The name comes from the CUDA driver for this CUDA ordinal (it honours CUDA_VISIBLE_DEVICES;
+        // an NVML index lookup reported the wrong card on a UUID-pinned process).
+        let name = (|| {
+            result::init().ok()?;
+            let dev = result::device::get(gpu as i32).ok()?;
+            result::device::get_name(dev).ok()
+        })()
+        .unwrap_or_default();
+        let driver = nvml_wrapper::Nvml::init().ok().and_then(|n| n.sys_driver_version().ok()).unwrap_or_default();
         (name, sm, driver)
     }
     #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"), not(target_os = "macos"))))]
