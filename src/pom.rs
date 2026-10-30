@@ -1787,6 +1787,18 @@ fn mining_model_id_cell() -> &'static std::sync::Mutex<Option<[u8; 32]>> {
     C.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Builds a possession index for an opening without touching the process-wide mining model
+/// identity (`build_from_gguf` records it; an opening of a model that is not the card's mining
+/// model must not re-seed the PoM v5 pad of a single-model rig).
+pub fn build_index_preserving_mining_id(path: &str, model_id: [u8; 32]) -> candle_core::Result<WeightIndex> {
+    let prev = mining_model_id_cell().lock().ok().and_then(|g| *g);
+    let out = WeightIndex::build_from_gguf(path, model_id);
+    if let Ok(mut g) = mining_model_id_cell().lock() {
+        *g = prev;
+    }
+    out
+}
+
 /// Record the process-wide mining model identity (the model the resident global index was built
 /// from). Last writer wins; the per-device registry overrides it for mixed rigs.
 pub fn set_mining_model_id(model_id: [u8; 32]) {

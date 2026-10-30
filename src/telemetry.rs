@@ -55,6 +55,9 @@ pub fn build_hello(loaded_model: Option<(u8, String)>) -> Value {
             "features": features(),
         }),
     );
+    // 0.15.3: H15 serving capability — 1 once a traced self-check (traced generation + openings
+    // verified with keryxd's own verifiers) passed on this rig's hardware; 0 before / when it cannot.
+    o.insert("trace".into(), json!(if crate::traced::self_test_passed() { 1 } else { 0 }));
     o.insert("host".into(), host_static());
     let gpus = gpu_static();
     if !gpus.is_empty() {
@@ -196,6 +199,7 @@ pub fn build_telemetry(
     o.insert("v".into(), json!(SCHEMA_VERSION));
     o.insert("uptime_s".into(), json!(uptime_s));
     o.insert("hashrate_total".into(), json!(total_hashrate.round() as u64));
+    o.insert("trace".into(), json!(if crate::traced::self_test_passed() { 1 } else { 0 }));
     o.insert("local_shares".into(), json!({ "acc": acc, "rej": rej, "stale": stale }));
     // Live serveable model set (hex model-ids), sent on EVERY telemetry tick so the pool's view of
     // what this rig can serve reflects reality once the model finishes loading — the one-shot

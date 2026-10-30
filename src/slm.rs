@@ -2088,8 +2088,57 @@ fn probe_exact_inference_route(model_id: &[u8; 32], gpu: usize) -> SelfTestOutco
         return SelfTestOutcome::Deferred(DeferredReason::ModelNotRegistered);
     }
     probe_exact_inference_route_with(model_id, gpu, || {
-        try_load_and_run_inference_on(gpu, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS)
+        let text = try_load_and_run_inference_on(gpu, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS)?;
+        // H15 (0.15.3): a card mines its tier only if it can ANSWER it the way keryxd 1.6.6
+        // requires — a traced private answer whose openings pass the node's verifiers. No override:
+        // mining a tier that cannot be served traced manufactures strikes (owner directive).
+        traced_self_check_on(gpu, model_id)?;
+        Ok(text)
     })
+}
+
+/// The traced (H15) serving self-check of `model_id` on card `gpu`; `Err` when this build or card
+/// cannot answer a private request with a verifiable trace.
+fn traced_self_check_on(gpu: usize, model_id: &[u8; 32]) -> std::result::Result<(), InferenceError> {
+    let Some(tier) = crate::models::pom_tier_index(model_id, u64::MAX) else {
+        log::error!("H15 self-test: model {:.8} has no audited tier — not serveable", hex::encode(model_id));
+        return Err(InferenceError::Failed);
+    };
+    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    {
+        let t0 = std::time::Instant::now();
+        let out = with_traced_engine(gpu, model_id, |spec, gguf| crate::traced::self_check(spec, gguf, gpu, tier))?;
+        match out {
+            Ok(()) => {
+                log::info!(
+                    "H15 self-test: GPU {} answers tier {} traced (openings verified like keryxd) in {:.1}s",
+                    gpu,
+                    tier,
+                    t0.elapsed().as_secs_f64()
+                );
+                Ok(())
+            }
+            Err(e) => {
+                log::error!(
+                    "H15 self-test: GPU {} CANNOT answer tier {} private requests with a verifiable trace ({}) — this card will NOT mine the tier",
+                    gpu,
+                    tier,
+                    e
+                );
+                Err(InferenceError::Failed)
+            }
+        }
+    }
+    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+    {
+        let _ = gpu;
+        log::error!(
+            "H15 self-test: this build's inference engine cannot produce the verifiable trace keryxd 1.6.6 requires for private \
+             requests (tier {}) — NOT mining (a tier that cannot be served would only collect strikes). Use the NVIDIA build.",
+            tier
+        );
+        Err(InferenceError::Failed)
+    }
 }
 
 fn probe_exact_inference_route_with(

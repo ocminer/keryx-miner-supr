@@ -55,6 +55,15 @@ pub fn format_prompt_parts(name: &str, prompt: &str) -> Option<(String, String)>
     })
 }
 
+/// Set once a traced self-check (traced generation → TraceCommitment → openings verified by the
+/// node's own verifiers) passed on this rig: the `trace` capability announced to pools.
+static SELF_TEST_PASSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this rig proved it can answer an H15 private request (see [`SELF_TEST_PASSED`]).
+pub fn self_test_passed() -> bool {
+    SELF_TEST_PASSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// What a traced inference commits: tier, plaintext prompt length, request id and stage.
 #[derive(Clone, Copy, Debug)]
 pub struct Traced {
@@ -154,7 +163,7 @@ mod engine {
             return Some(IndexRef::Built(i));
         }
         log::info!("Trace '{}': building the possession index from the GGUF for openings (one-off)", spec.name);
-        match crate::pom::WeightIndex::build_from_gguf(gguf, spec.model_id) {
+        match crate::pom::build_index_preserving_mining_id(gguf, spec.model_id) {
             Ok(index) => {
                 let a = Arc::new(index);
                 if let Ok(mut m) = built_indices().lock() {
@@ -536,6 +545,14 @@ mod engine {
         open_attention(gguf, gpu, &m, trace, seed, response_txid, index.get(), path, Some(prev))
     }
 
+    /// The H15 serving self-check of `tier` on the engine hosting `spec` on `gpu` (0.15.3 mining
+    /// gate: a card that cannot answer a private request traced does not mine its tier).
+    pub fn self_check(spec: &ModelSpec, gguf: &str, gpu: usize, tier: u8) -> Result<(), String> {
+        arm_trace(spec, gguf, gpu, tier, true, true)?;
+        super::SELF_TEST_PASSED.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Engines whose trace self-check failed, so `ai:cap` and the private-request scan can skip
     /// models this rig cannot answer traced.
     pub fn self_check_failed(gguf: &str, gpu: usize) -> bool {
@@ -555,3 +572,64 @@ mod engine_stub {
 }
 #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
 pub use engine_stub::*;
+
+#[cfg(test)]
+mod size_tests {
+    use crate::trace::{leaf_cap, TierManifest};
+
+    /// Witness size of a traced answer, per tier (attention manifests): what the miner keeps
+    /// (hashes, tokens) versus what an opening-without-replay would need (every leaf's bytes at every
+    /// position, plus the full sequence leaves). Printed for the pool's custody decision.
+    #[test]
+    #[ignore = "report, run with --ignored --nocapture"]
+    fn trace_witness_sizes_per_tier() {
+        let n_gen = 2048u64;
+        for tier in 0..5u8 {
+            let Some(m) = TierManifest::for_attn(tier) else { continue };
+            let c = m.chain.unwrap();
+            let n_leaves = m.n_leaves() as u64;
+            // Product leaves: exact caps (X = q8 input, Y = f32 output). Residual/expert leaves past
+            // them are hidden-state vectors: 4 * n_embd bytes (n_embd = the most common input width).
+            let np = m.n_products as u64;
+            let prod: u64 = (0..(2 * np) as u32).map(|l| leaf_cap(&m, l) as u64).sum();
+            let mut ks: std::collections::BTreeMap<u64, u32> = Default::default();
+            for (e, _) in m.entries.iter().take(np as usize) {
+                *ks.entry(e.k).or_default() += 1;
+            }
+            let n_embd = ks.into_iter().max_by_key(|(_, c)| *c).map_or(0, |(k, _)| k);
+            let per_pos = prod + n_leaves.saturating_sub(2 * np) * 4 * n_embd;
+            for n_prompt in [64u64, 1024] {
+                let n_pos = n_prompt + n_gen;
+                let mut seq_bytes = 0u64;
+                let mut n_seq = 0u64;
+                for [_, kind, _, heads, hd] in m.seq_layers() {
+                    let (heads, hd) = (heads as u64, hd as u64);
+                    if kind == 1 || kind == 2 {
+                        let row = hd / 32 * 34;
+                        let kv = if kind == 2 { 1 } else { 2 };
+                        seq_bytes += heads * kv * n_pos * row + heads * n_pos * 4 * 8; // + lse (q heads per kv head, upper bound 8)
+                        n_seq += heads * 3;
+                    } else {
+                        let rl = keryx_verifiable_inference::seq::record_len(if kind == 4 { keryx_verifiable_inference::manifest::RECUR_KDA } else { 0 }, hd as usize) as u64;
+                        seq_bytes += heads * (n_pos * rl + keryx_verifiable_inference::seq::checkpoint_len(hd, n_pos, m.seq_interval() as u64));
+                        n_seq += heads * 2;
+                    }
+                }
+                let compact = n_pos * n_leaves * 32 + n_pos * 4 + n_pos * 4 + n_seq * 32;
+                let full = n_pos * per_pos + seq_bytes;
+                eprintln!(
+                    "tier {tier}: n_embd {n_embd} products {np} layers {} attn {} recur {} | n_prompt {n_prompt} + {n_gen} generated | leaves/pos {n_leaves} | \
+                     leaf bytes/pos {:.2} MB | compact store {:.1} MB | full witness {:.1} GB (positions {:.1} GB + sequence {:.2} GB)",
+                    c.n_layers,
+                    c.n_attn,
+                    c.n_recur,
+                    per_pos as f64 / 1e6,
+                    compact as f64 / 1e6,
+                    full as f64 / 1e9,
+                    (n_pos * per_pos) as f64 / 1e9,
+                    seq_bytes as f64 / 1e9
+                );
+            }
+        }
+    }
+}
