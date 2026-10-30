@@ -198,6 +198,15 @@ static llama_context* keryx_make_ctx(llama_model* model, int n_ctx, const char**
     *kv = "q8_0";
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) {
+        // An MLA cache (tier 4, Kimi) holds no V rows, but its value length still has to divide a
+        // quantized V type: keep the Q8_0 K cache (the trace commits its rows) with an f16 V type
+        // (upstream v0.5.8). Falling straight to f16/f16 made the K rows unhashable, so the traced
+        // self-check failed ("sequence roots unavailable (-4)") and tier 4 could not be served.
+        cp.type_v = GGML_TYPE_F16;
+        *kv = "q8_0/f16";
+        ctx = llama_init_from_model(model, cp);
+    }
+    if (!ctx) {
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         cp.type_k = GGML_TYPE_F16;
         cp.type_v = GGML_TYPE_F16;
