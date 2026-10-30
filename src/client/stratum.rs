@@ -10,6 +10,7 @@ use tokio_util::codec::Framed;
 
 mod ai;
 mod statum_codec;
+mod traces;
 
 use crate::client::stratum::statum_codec::{ErrorCode, MiningNotify, MiningSubmit, NewLineJsonCodecError, StratumLine};
 use crate::client::stratum::statum_codec::{
@@ -1749,8 +1750,12 @@ impl StratumHandler {
                                 }))
                                 .await
                         }
-                        StratumCommand::MiningAiRequest(fields) => {
-                            self.handle_ai_request(fields).await;
+                        StratumCommand::MiningAiRequest(params) => {
+                            self.handle_ai_request(params.fields, params.ext).await;
+                            Ok(())
+                        }
+                        StratumCommand::MiningAiOpening(params) => {
+                            self.handle_ai_opening(params).await;
                             Ok(())
                         }
                         StratumCommand::MiningChallenge((model_id_hex, nonce_hex)) => {
@@ -2038,8 +2043,8 @@ impl StratumHandler {
     /// (only that card's walk pauses, like the challenge path) and return the answer inline as
     /// `mining.ai_response`. The pool seals and signs it. Failures send nothing: an empty answer
     /// is never a valid response and the pool re-dispatches.
-    async fn handle_ai_request(&mut self, fields: (String, String, String, String, String, u32, String)) {
-        let request = match ai::AiRequest::parse(fields) {
+    async fn handle_ai_request(&mut self, fields: (String, String, String, String, String, u32, String), ext: Option<serde_json::Value>) {
+        let request = match ai::AiRequest::parse_ext(fields, ext.as_ref()) {
             Ok(request) => request,
             Err(error) => {
                 warn!("Invalid AI request from pool: {}", error);
@@ -2063,6 +2068,22 @@ impl StratumHandler {
                 keryx_miner::runtime_stats::InferenceKind::PoolTask,
             );
             return;
+        }
+        // H15 traced answer: the tier must be the model's own (its manifests define the trace).
+        if let Some(t) = request.trace {
+            let own = keryx_miner::models::pom_tier_index(&request.model_id, u64::MAX);
+            if own != Some(t.tier) || !keryx_miner::traced::supported() || !t.chain {
+                warn!(
+                    "AI request {:.16}: traced answer for tier {} cannot be served (model tier {:?}, trace engine {}, chain {})",
+                    request.task_id,
+                    t.tier,
+                    own,
+                    keryx_miner::traced::supported(),
+                    t.chain
+                );
+                keryx_miner::runtime_stats::record_inference_failed_request(keryx_miner::runtime_stats::InferenceKind::PoolTask);
+                return;
+            }
         }
         // The id is allocated here so the pool's ack is matched to this response, never to a share.
         let id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
@@ -2099,16 +2120,27 @@ impl StratumHandler {
                 request.max_tokens
             );
             let (model_id, prompt, max_tokens) = (request.model_id, request.prompt.clone(), request.max_tokens);
+            let traced = request.trace.map(|t| keryx_miner::traced::Traced {
+                tier: t.tier,
+                prompt_len: t.prompt_len,
+                request_hash: request.request_hash_bytes(),
+                chain: t.chain,
+                attention: t.attention,
+            });
             let result = tokio::task::spawn_blocking(move || {
-                let result = keryx_miner::slm::try_load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens);
+                let result = match traced {
+                    Some(t) => keryx_miner::slm::try_load_and_run_traced_inference_on(gpu, &model_id, &prompt, max_tokens, t)
+                        .map(|g| (g.text, g.trace)),
+                    None => keryx_miner::slm::try_load_and_run_inference_on(gpu, &model_id, &prompt, max_tokens).map(|t| (t, None)),
+                };
                 drop(lease);
                 drop(pause);
                 result
             })
             .await
             .unwrap_or(Err(InferenceError::Failed));
-            let text = match result {
-                Ok(text) if !text.is_empty() => text,
+            let (text, trace) = match result {
+                Ok((text, trace)) if !text.is_empty() && (request.trace.is_none() || trace.is_some()) => (text, trace),
                 Ok(_) | Err(InferenceError::Failed) => {
                     warn!("AI request {:.16}: inference produced no answer", request.task_id);
                     runtime_attempt.failed();
@@ -2120,7 +2152,34 @@ impl StratumHandler {
                     return;
                 }
             };
-            match request.response(id, worker, &text) {
+            // A traced answer: the commitment + the plaintext body the pool seals; the trace is kept
+            // (memory + disk) for the pool's `mining.ai_opening` when the node audits the response.
+            let traced_parts = trace.map(|tr| {
+                let commitment = tr.commitment().to_bytes();
+                let body = keryx_miner::traced::answer_body(&text, Some(&tr));
+                info!(
+                    "AI request {:.16}: traced answer (root {}, {} prompt / {} positions) kept for openings",
+                    request.task_id,
+                    hex::encode(&tr.record.trace_root[..8]),
+                    tr.record.n_prompt,
+                    tr.record.n_pos
+                );
+                traces::keep(
+                    &request.request_hash,
+                    request.request_hash_bytes(),
+                    request.model_id,
+                    request.trace.map_or(0, |t| t.tier),
+                    request.max_tokens as u32,
+                    gpu,
+                    tr,
+                );
+                (commitment, body)
+            });
+            let line = match &traced_parts {
+                Some((c, b)) => request.response_traced(id, worker, &text, Some((c.as_slice(), b.as_slice()))),
+                None => request.response(id, worker, &text),
+            };
+            match line {
                 Ok(line) => {
                     if send_channel.send(line).await.is_ok() {
                         keryx_miner::runtime_stats::record_inference_prepared();
@@ -2135,6 +2194,66 @@ impl StratumHandler {
                     runtime_attempt.failed();
                     warn!("AI request {:.16}: {}", request.task_id, error);
                 }
+            }
+        });
+    }
+
+    /// Handles a pool's `mining.ai_opening`: replays the kept trace of one of our traced answers on
+    /// the card that produced it and returns the unsigned opening (a `trace_seq::bundle` of its
+    /// pieces for the first opening, one attention phase body otherwise). The pool wraps every piece
+    /// with `opening::seeded(piece, seed_block)` and signs it with its escrow key.
+    async fn handle_ai_opening(&mut self, params: Vec<serde_json::Value>) {
+        let op = match ai::AiOpening::parse(&params) {
+            Ok(op) => op,
+            Err(e) => {
+                warn!("Invalid AI opening request from pool: {}", e);
+                return;
+            }
+        };
+        let id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
+        if self.ai_response_ids.len() > 64 {
+            self.ai_response_ids.clear();
+        }
+        self.ai_response_ids.insert(id);
+        let send_channel = self.send_channel.clone();
+        let worker = self.miner_address.clone();
+        let Some(k) = traces::get(&op.request_hash) else {
+            warn!("AI opening {:.16}: no kept trace for this request", op.request_hash);
+            let _ = send_channel.send(op.result(id, worker, Err("no kept trace for this request"))).await;
+            return;
+        };
+        tokio::spawn(async move {
+            info!("AI opening {:.16}: replaying for response {:.16} (phase {})", op.request_hash, op.response_txid_hex, op.path.len());
+            let body = tokio::task::spawn_blocking(move || {
+                let lease = match k.gpu {
+                    Some(g) => keryx_miner::slm::acquire_inference_card_on(g, 120_000),
+                    None => keryx_miner::slm::acquire_inference_card(&k.model_id, 120_000),
+                };
+                let Some(lease) = lease else { return (op, None) };
+                let _pause = crate::miner::begin_network_inference_pause();
+                let phase = (!op.path.is_empty()).then(|| (op.path.clone(), op.prev.clone()));
+                let job = keryx_miner::slm::OpenJob {
+                    tier: k.tier,
+                    trace: &k.trace,
+                    seed: op.seed,
+                    response_txid: op.response_txid,
+                    request_hash: k.request_hash,
+                    phase,
+                };
+                let out = keryx_miner::slm::try_open_trace_on(lease.gpu(), &k.model_id, job).ok();
+                (op, out)
+            })
+            .await;
+            match body {
+                Ok((op, Some(b))) => {
+                    info!("AI opening {:.16}: built ({} B)", op.request_hash, b.len());
+                    let _ = send_channel.send(op.result(id, worker, Ok(&b))).await;
+                }
+                Ok((op, None)) => {
+                    warn!("AI opening {:.16}: replay failed or no free card", op.request_hash);
+                    let _ = send_channel.send(op.result(id, worker, Err("replay failed"))).await;
+                }
+                Err(e) => warn!("AI opening: replay task failed: {}", e),
             }
         });
     }

@@ -14,6 +14,48 @@ use tokio_util::codec::{Decoder, Encoder, LinesCodec};
 /// was below a full 64 KiB private request and made the miner drop its pool connection on one.
 pub(crate) const MAX_STRATUM_LINE_BYTES: usize = 2 * 1024 * 1024;
 
+/// `mining.ai_request` params: the positional 7-tuple, and the optional 0.15.3 trace object.
+#[derive(Debug, Clone)]
+pub struct AiRequestParams {
+    pub fields: (String, String, String, String, String, u32, String),
+    pub ext: Option<Value>,
+}
+
+impl<'de> Deserialize<'de> for AiRequestParams {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let v: Vec<Value> = Vec::deserialize(d)?;
+        if v.len() != 7 && v.len() != 8 {
+            return Err(D::Error::custom(format!("mining.ai_request takes 7 or 8 params, got {}", v.len())));
+        }
+        let s = |i: usize| v[i].as_str().map(str::to_string).ok_or_else(|| D::Error::custom(format!("mining.ai_request param {i} must be a string")));
+        let n = v[5]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| D::Error::custom("mining.ai_request max_tokens must be a u32"))?;
+        Ok(Self { fields: (s(0)?, s(1)?, s(2)?, s(3)?, s(4)?, n, s(6)?), ext: v.get(7).cloned().filter(|x| !x.is_null()) })
+    }
+}
+
+impl Serialize for AiRequestParams {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        let f = &self.fields;
+        let mut v = vec![
+            Value::from(f.0.clone()),
+            Value::from(f.1.clone()),
+            Value::from(f.2.clone()),
+            Value::from(f.3.clone()),
+            Value::from(f.4.clone()),
+            Value::from(f.5),
+            Value::from(f.6.clone()),
+        ];
+        if let Some(e) = &self.ext {
+            v.push(e.clone());
+        }
+        v.serialize(ser)
+    }
+}
+
 #[derive(Serialize_repr, Deserialize_repr, Debug, Clone)]
 #[repr(u8)]
 pub enum ErrorCode {
@@ -182,12 +224,22 @@ pub(crate) enum StratumCommand {
     #[serde(rename = "mining.telemetry")]
     MiningTelemetry((Value,)),
     // Pool-dispatched AI inference (upstream 2cf7ab5; the H14 private-inference pool path): pool →
-    // miner [task_id, txid, request_hash, model_id_hex, prompt_b64, max_tokens, reward].
+    // miner [task_id, txid, request_hash, model_id_hex, prompt_b64, max_tokens, reward] plus, from
+    // 0.15.3, an OPTIONAL 8th object `{"trace":{"tier","prompt_len","chain","attention"}}` asking for
+    // an H15 traced answer.
     #[serde(rename = "mining.ai_request")]
-    MiningAiRequest((String, String, String, String, String, u32, String)),
-    // miner → pool [worker, task_id, request_hash, model_id_hex, answer_b64].
+    MiningAiRequest(AiRequestParams),
+    // miner → pool [worker, task_id, request_hash, model_id_hex, answer_b64] plus, for a traced
+    // answer, a 6th object `{"trace": hex TraceCommitment, "body": hex answer::encode(text, ids)}`.
     #[serde(rename = "mining.ai_response")]
-    MiningAiResponse((String, String, String, String, String)),
+    MiningAiResponse(Vec<Value>),
+    // 0.15.3: pool → miner — build the opening of a traced answer this rig produced:
+    // [request_hash, response_txid, seed_hex, attention_path (array of u64), prev_partials_hex].
+    #[serde(rename = "mining.ai_opening")]
+    MiningAiOpening(Vec<Value>),
+    // miner → pool [worker, request_hash, response_txid, attention_path, body_hex, error].
+    #[serde(rename = "mining.ai_opening_result")]
+    MiningAiOpeningResult(Vec<Value>),
     // Phase 2 OPoI: bridge → miner — "model_id_hex:nonce_hex" capability challenge
     #[serde(rename = "mining.challenge")]
     MiningChallenge((String, String)),
