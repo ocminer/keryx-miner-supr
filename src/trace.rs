@@ -1648,7 +1648,7 @@ mod tests {
         let m = TierManifest::for_tier(tier).expect("audited tier");
         let index = WeightIndex::build_from_gguf(&gguf, spec.model_id).unwrap();
 
-        llama_engine::ensure_loaded(&gguf, 0).unwrap();
+        assert!(llama_engine::ensure_loaded_on(&gguf, 0), "model loads on GPU 0");
         let nl = llama_engine::trace_configure(&gguf, 0, TierManifest::raw_for_tier(tier).unwrap()).unwrap();
         assert_eq!(nl, m.n_leaves());
         let prompt = "Explain in two sentences why the sky is blue.";
@@ -1715,7 +1715,7 @@ mod tests {
             assert_eq!(opened, t);
             eprintln!("seed {counter}: prefix position {t} verified, body {} B", body.len());
         }
-        llama_engine::unload(0);
+        llama_engine::unload_for_gpu(0);
         assert_eq!(n_ok, 8 * POINTS);
     }
 }

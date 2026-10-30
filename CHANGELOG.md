@@ -1,3 +1,35 @@
+# keryx-miner-supr 0.15.3 — H15 private inference (traced answers)
+
+**Mandatory for every solo miner that answers private inference requests.** Since the H15 gate
+(mainnet DAA 140,115,000, 2026-10-30) keryxd 1.6.6 requires every private answer to carry a
+verifiable inference trace, and requesters seal with key schedule 2. 0.15.0–0.15.2 mine H15 blocks
+correctly but could not open schedule-2 requests and sent answers without a trace, which the node
+rejects (`ResponseWithoutTrace`) — a missed answer costs a service-bond strike. Mining is unchanged.
+
+- **Key schedule 2.** Private requests are opened with schedule 2 (falling back to schedule 1), and
+  the answer is sealed with the per-responder key of the schedule that opened it. 66-digit V2
+  request secrets are understood everywhere.
+- **Traced answers.** Every private answer is generated on the in-process CUDA engine with the
+  canonical trace armed: position leaves, sequence leaves (KV cache, attention softmax mass,
+  recurrent state) and the token ids of the answer. The `TraceCommitment` (extension `0x81`) is
+  attached to the AiResponse **before** it is signed, and the response is only sent once its trace
+  is safely on disk.
+- **Audits and openings.** The miner follows the node's draw for every traced response (seed
+  block, audit, deadline — and the node's own `GetAwaitedOpenings` answer on keryxd ≥ 1.6.6),
+  replays the drawn positions on the card that generated the answer, checks every opening with
+  the node's verifier code and submits it (trace, attention phases, recurrent and residual
+  pieces). Pending traces survive restarts and reconnects (`<escrow state>.traces/`), and the
+  chain is rebuilt after a restart so no audit is lost.
+- **Engine.** `libkeryx-llama.so` / `keryx-llama.dll` is now engine ABI 4: four new exports for
+  traced generation and sequence leaves, and the verifier-exact attention/RoPE kernels of keryx
+  v0.5.8. Always ship the engine that comes with this release next to the miner.
+- **Backends without a trace engine** (AMD OpenCL/Vulkan, Apple Metal, CPU) no longer answer
+  private requests after the gate: they refuse instead of sending an answer the node rejects.
+- **Pool mining** is unchanged (pools seal and submit the answers they dispatch).
+- Vendored `inference` / `verifiable-inference` crates are byte-identical to keryx-miner
+  v0.5.8-PoM (= keryx-node 1.6.6 consensus code). The AiResponse is resubmitted until the mempool
+  accepts it (a response sent before its request's audit arms is refused once).
+
 # keryx-miner-supr 0.15.0 — H15 hard fork
 
 **Mandatory update before the Keryx H15 hard fork** (mainnet DAA 140,115,000, expected around 2026-10-30 15:00 UTC). From that block on, every block needs a PoM v5 proof, a block-task root in its header and — for block candidates — a verifiable trace opening, and pools switch to stratum v4. Miners below 0.15.0 produce invalid blocks after the gate and are refused by pools that enforce the version floor.

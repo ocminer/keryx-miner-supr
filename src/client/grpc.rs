@@ -3552,6 +3552,7 @@ mod grpc_tests {
             request_hash: [byte; 32],
             model_id: [0x55; 32],
             prompt: format!("prompt-{byte}"),
+            prompt_len: 8,
             max_tokens: 64,
             private: None,
         }
@@ -3688,8 +3689,9 @@ mod private_inference_tests {
 
         assert!(KeryxdHandler::open_private_request(&req, None).is_none());
         assert!(KeryxdHandler::open_private_request(&req, Some(&other)).is_none());
-        let (prompt, private) = KeryxdHandler::open_private_request(&req, Some(&mine)).unwrap();
+        let (prompt, prompt_len, private) = KeryxdHandler::open_private_request(&req, Some(&mine)).unwrap();
         assert_eq!(prompt, "sealed prompt");
+        assert_eq!(prompt_len, 13);
         assert!(matches!(private, Some(PrivateRequest::Opened(_))));
 
         // A flipped ciphertext byte still names this key: answered, with the error body.
@@ -3697,17 +3699,56 @@ mod private_inference_tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 1;
         let tampered = AiRequestPayload::deserialize(&tampered).unwrap();
-        let (prompt, private) = KeryxdHandler::open_private_request(&tampered, Some(&mine)).unwrap();
+        let (prompt, _, private) = KeryxdHandler::open_private_request(&tampered, Some(&mine)).unwrap();
         assert!(prompt.is_empty());
         assert_eq!(private, Some(PrivateRequest::Unreadable));
     }
 
-    /// The sealed answer opens with the requester's root key and nobody else's, and the signed
-    /// AiResponse carries it inline under a signature that covers it (node-verifiable).
+    /// 0.15.3 / H15: a key-schedule-2 request (the default `seal_request`, node 1.6.6) AND a
+    /// schedule-1 one both open; each sealed answer opens with the requester's secret — taken
+    /// through its hex form like a wallet stores it (66 digits for V2, 64 for V1) — and with no
+    /// other secret; under V2 a second recipient cannot open this responder's answer.
     #[test]
-    fn sealed_answer_round_trips_inline_under_the_responder_signature() {
+    fn sealed_answers_open_for_the_requester_under_both_key_schedules() {
+        use keryx_inference::private::seal_request_v1;
+        let mine = [0x11u8; 32];
+        let other = [0x22u8; 32];
+        let pubkey = escrow_pubkey_of(&mine).unwrap();
+        let other_pub = escrow_pubkey_of(&other).unwrap();
+        let request_hash = [9u8; 32];
+        for (v2, (req, secret)) in [
+            (true, seal_request([5u8; 32], 64, 1_000, 2_000, b"q", &[pubkey, other_pub]).unwrap()),
+            (false, seal_request_v1([5u8; 32], 64, 1_000, 2_000, b"q", &[pubkey, other_pub]).unwrap()),
+        ] {
+            let hex_secret = secret.to_hex();
+            assert_eq!(hex_secret.len(), if v2 { 66 } else { 64 }, "secret hex form");
+            if v2 {
+                assert!(hex_secret.starts_with("02"), "a V2 secret is 02 || seed");
+            }
+            let secret = keryx_inference::PrivateRequestSecret::from_hex(&hex_secret).unwrap();
+            let (prompt, _, private) = KeryxdHandler::open_private_request(&req, Some(&mine)).unwrap();
+            assert_eq!(prompt, "q");
+            let Some(PrivateRequest::Opened(key)) = private else { panic!("schedule {} request not opened", if v2 { 2 } else { 1 }) };
+            assert_eq!(key.responder(), &pubkey);
+            let body = keryx_inference::seal_response(&key, &request_hash, b"answer");
+            assert_eq!(open_response(&secret, &request_hash, &pubkey, &body).unwrap(), b"answer");
+            let stranger = keryx_inference::PrivateRequestSecret::from_hex(&"00".repeat(32)).unwrap();
+            assert!(open_response(&stranger, &request_hash, &pubkey, &body).is_err());
+            // The other recipient's own key cannot pass this responder's answer off as its own.
+            let (_, _, other_private) = KeryxdHandler::open_private_request(&req, Some(&other)).unwrap();
+            let Some(PrivateRequest::Opened(other_key)) = other_private else { panic!("other recipient cannot open") };
+            assert!(other_key != key, "per-responder response keys");
+            let cid = crate::ipfs::sha256_multihash(&body);
+            assert_eq!(&cid[..2], &[0x12, 0x20]);
+        }
+    }
+
+    /// The signed AiResponse carries the sealed body AND the 0x81 trace commitment under a
+    /// signature that covers both (attached BEFORE signing — the H14 ordering trap).
+    #[test]
+    fn traced_answer_is_signed_over_body_and_trace() {
         let secret_hex = "1111111111111111111111111111111111111111111111111111111111111111";
-        let dir = std::env::temp_dir().join(format!("keryx-h14-grpc-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("keryx-h15-grpc-test-{}", std::process::id()));
         let w = crate::escrow::EscrowWatcher::new(
             secret_hex,
             "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
@@ -3716,23 +3757,21 @@ mod private_inference_tests {
         .unwrap();
         let pubkey = w.pubkey_bytes();
         assert_eq!(escrow_pubkey_of(&w.secret_bytes()).unwrap(), pubkey);
-
         let (req, secret) = seal_request([5u8; 32], 64, 1_000, 2_000, b"q", &[pubkey]).unwrap();
-        let (_, private) = KeryxdHandler::open_private_request(&req, Some(&w.secret_bytes())).unwrap();
-        let Some(PrivateRequest::Opened(root_key)) = private else { panic!("not opened") };
+        let (_, _, private) = KeryxdHandler::open_private_request(&req, Some(&w.secret_bytes())).unwrap();
+        let Some(PrivateRequest::Opened(key)) = private else { panic!("not opened") };
         let request_hash = [9u8; 32];
-        let body = keryx_inference::seal_response(&root_key, &request_hash, &pubkey, b"answer");
-        assert_eq!(open_response(&secret.root_key, &request_hash, &pubkey, &body).unwrap(), b"answer");
-        assert!(open_response(&[0u8; 32], &request_hash, &pubkey, &body).is_err());
-
+        let ids = [17u32, 42, 7];
+        let plain = keryx_verifiable_inference::answer::encode(b"answer", &ids);
+        let body = keryx_inference::seal_response(&key, &request_hash, &plain);
+        assert_eq!(open_response(&secret, &request_hash, &pubkey, &body).unwrap(), plain);
+        let trace = keryx_inference::TraceCommitment { trace_root: [4; 32], n_prompt: 3, n_pos: 9, stage: 2, tokens_root: Some([6; 32]) };
         let cid = crate::ipfs::sha256_multihash(&body);
-        assert_eq!(&cid[..2], &[0x12, 0x20]);
-        let resp = KeryxdHandler::signed_response(&w, request_hash, 1_000, cid, 1, Some(body.clone()));
+        let resp = KeryxdHandler::signed_response(&w, request_hash, 1_000, cid, 1, Some(body.clone()), Some(trace));
         let wire = resp.serialize();
-        assert_eq!(wire.len(), keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN + keryx_inference::AI_RESPONSE_EXT_HEADER_LEN + body.len());
         let parsed = keryx_inference::AiResponsePayload::deserialize(&wire).unwrap();
         assert_eq!(parsed.private_body.as_deref(), Some(body.as_slice()));
-        // Node check: schnorr over blake2b-256("KeryxServiceResponderV1" || v1 head || extension).
+        assert_eq!(parsed.trace, Some(trace));
         let verify = |signed: &[u8]| {
             let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
             h.update(b"KeryxServiceResponderV1");
@@ -3745,12 +3784,23 @@ mod private_inference_tests {
         };
         assert!(verify(&parsed.signed_bytes()));
         let mut swapped = parsed.clone();
+        swapped.trace = Some(keryx_inference::TraceCommitment { trace_root: [5; 32], ..trace });
+        assert!(!verify(&swapped.signed_bytes()), "a trace swap under a signed head must fail");
+        let mut swapped = parsed.clone();
         swapped.private_body = Some(vec![0xCD; body.len()]);
-        assert!(!verify(&swapped.signed_bytes()), "body swap under a signed head must fail");
+        assert!(!verify(&swapped.signed_bytes()), "a body swap under a signed head must fail");
         // A body-less response keeps the historical 78-byte signed message (pre-H14 unchanged).
-        let plain = KeryxdHandler::signed_response(&w, request_hash, 1_000, cid, 1, None);
-        assert_eq!(plain.serialize().len(), keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN);
-        assert_eq!(plain.signed_bytes().len(), keryx_inference::AI_RESPONSE_PAYLOAD_LEN);
+        let plain_resp = KeryxdHandler::signed_response(&w, request_hash, 1_000, cid, 1, None, None);
+        assert_eq!(plain_resp.serialize().len(), keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN);
+        assert_eq!(plain_resp.signed_bytes().len(), keryx_inference::AI_RESPONSE_PAYLOAD_LEN);
+    }
+
+    #[test]
+    fn awaited_openings_need_a_recent_node() {
+        assert!(super::version_at_least("1.6.6", (1, 6, 6)));
+        assert!(super::version_at_least("1.7.0-PoM", (1, 6, 6)));
+        assert!(!super::version_at_least("1.6.5", (1, 6, 6)));
+        assert!(!super::version_at_least("", (1, 6, 6)));
     }
 
     #[test]
