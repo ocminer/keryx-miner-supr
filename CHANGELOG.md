@@ -23,9 +23,19 @@ rejects (`ResponseWithoutTrace`) — a missed answer costs a service-bond strike
 - **Engine.** `libkeryx-llama.so` / `keryx-llama.dll` is now engine ABI 4: four new exports for
   traced generation and sequence leaves, and the verifier-exact attention/RoPE kernels of keryx
   v0.5.8. Always ship the engine that comes with this release next to the miner.
-- **Backends without a trace engine** (AMD OpenCL/Vulkan, Apple Metal, CPU) no longer answer
-  private requests after the gate: they refuse instead of sending an answer the node rejects.
-- **Pool mining** is unchanged (pools seal and submit the answers they dispatch).
+- **Serving self-test gates mining.** Before a card mines its tier it must answer a private
+  request the way keryxd 1.6.6 requires: a traced generation whose openings (trace, attention,
+  recurrent, residual pieces) pass the node's own verifiers for two seeds. A card or build that
+  cannot (AMD OpenCL/Vulkan, Apple Metal, CPU, or a failed check) does not mine and says why — mining
+  a tier that cannot be served only collects service-bond strikes. `mining.hello` / `mining.telemetry`
+  carry `"trace": 1` once the self-test passed on this rig.
+- **Pool path (opt-in per request).** A pool can ask for a traced answer with an optional 8th
+  `mining.ai_request` parameter `{"trace":{"tier","prompt_len","chain","attention"}}`; the answer then
+  carries the hex `TraceCommitment` and the `answer::encode` body for the pool to seal, attach and sign.
+  The rig keeps the compact trace on disk for 9 h and builds the unsigned openings when the pool sends
+  `mining.ai_opening`. Requests without the parameter are answered exactly as before.
+- CUDA graphs and llama.cpp's KV-cache rotation are disabled in-process (as upstream keryx 0.5.8):
+  the trace hooks do not run inside a replayed CUDA graph and attention openings need unrotated rows.
 - Vendored `inference` / `verifiable-inference` crates are byte-identical to keryx-miner
   v0.5.8-PoM (= keryx-node 1.6.6 consensus code). The AiResponse is resubmitted until the mempool
   accepts it (a response sent before its request's audit arms is refused once).
