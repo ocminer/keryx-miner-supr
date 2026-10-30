@@ -2099,6 +2099,17 @@ fn probe_exact_inference_route(model_id: &[u8; 32], gpu: usize) -> SelfTestOutco
 
 /// The traced (H15) serving self-check of `model_id` on card `gpu`; `Err` when this build or card
 /// cannot answer a private request with a verifiable trace.
+fn traced_passed() -> &'static RwLock<std::collections::HashSet<SelfTestKey>> {
+    static S: OnceLock<RwLock<std::collections::HashSet<SelfTestKey>>> = OnceLock::new();
+    S.get_or_init(|| RwLock::new(std::collections::HashSet::new()))
+}
+
+/// Whether card `gpu` passed the H15 traced self-check for `model_id` (the only proof that lets it
+/// declare and mine the tier).
+pub fn traced_passed_on(model_id: &[u8; 32], gpu: usize) -> bool {
+    traced_passed().read().map(|s| s.contains(&(*model_id, gpu))).unwrap_or(false)
+}
+
 fn traced_self_check_on(gpu: usize, model_id: &[u8; 32]) -> std::result::Result<(), InferenceError> {
     let Some(tier) = crate::models::pom_tier_index(model_id, u64::MAX) else {
         log::error!("H15 self-test: model {:.8} has no audited tier — not serveable", hex::encode(model_id));
@@ -2116,6 +2127,10 @@ fn traced_self_check_on(gpu: usize, model_id: &[u8; 32]) -> std::result::Result<
                     tier,
                     t0.elapsed().as_secs_f64()
                 );
+                if let Ok(mut m) = traced_passed().write() {
+                    m.insert((*model_id, gpu));
+                }
+                record_serveable_on(model_id, gpu);
                 Ok(())
             }
             Err(e) => {
@@ -2242,6 +2257,13 @@ pub fn record_serveable(model_id: &[u8; 32]) {
 pub fn record_serveable_on(model_id: &[u8; 32], gpu: usize) {
     if !inference_card_allowed(gpu) {
         log::warn!("OPoI: refusing to record model {:.8} on disallowed GPU {}", hex::encode(model_id), gpu);
+        return;
+    }
+    // H15 (0.15.3): a plain (untraced) generation is NOT proof that this card can serve the tier —
+    // only a passed traced self-check is. Without this, the probe's first (plain) generation, or a
+    // live public answer on a build without a trace engine (AMD/Metal), declared + mined the tier.
+    if !cfg!(test) && !traced_passed_on(model_id, gpu) {
+        log::debug!("OPoI: model {:.8} on GPU {} answered, but has not passed the H15 traced self-test — not serveable yet", hex::encode(model_id), gpu);
         return;
     }
     if let Ok(mut m) = self_test_state().write() {
@@ -2383,6 +2405,9 @@ pub fn serveable_model_ids() -> Vec<[u8; 32]> {
 /// Forget a model's self-test result so it re-probes (used after a transient GPU-fault reset that
 /// rebuilds the card's engine — the prior pass no longer necessarily holds).
 pub fn clear_self_test(model_id: &[u8; 32]) {
+    if let Ok(mut t) = traced_passed().write() {
+        t.retain(|(mid, _)| mid != model_id);
+    }
     if let Ok(mut m) = self_test_state().write() {
         m.retain(|(mid, _), _| mid != model_id);
     }
