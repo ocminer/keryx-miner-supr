@@ -1,3 +1,10 @@
+# keryx-miner-supr 0.15.4 — H15 serving fixes
+
+Fixes found by the 0.15.3 test matrix on our rigs.
+
+- **Tier 4 (Kimi-Linear-48B) can be served again.** Its MLA cache now uses a Q8_0 K / f16 V cache, like keryx v0.5.8. 0.15.3 fell back to an f16/f16 cache, which the trace cannot commit. The H15 self-test therefore correctly refused tier 4, and those cards did not mine it.
+- **A card is declared to the pool only after its traced self-test passed.** In 0.15.3 the plain warm-up answer already marked the model serveable, about two seconds before the traced check finished.
+
 # keryx-miner-supr 0.15.3 — H15 private inference (traced answers)
 
 **Mandatory for every solo miner that answers private inference requests.** Since the H15 gate
