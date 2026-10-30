@@ -111,14 +111,20 @@ fi
 }
 if ls "$PATCH_DIR"/*.patch >/dev/null 2>&1; then
   # Reproducibility with the H15 patch set applied: the tree must be EXACTLY the pinned tag plus
-  # these patches — every patch reverse-applies cleanly (so the carried diff is ours, unmodified)
-  # and the only changed/untracked paths are the ones the patches touch (plus the stamp file).
-  for f in "$PATCH_DIR"/*.patch; do
-    git -C "$LLAMA_SRC" apply --reverse --check "$f" 2>/dev/null || {
-      echo "ERROR: KERYX_LLAMA_SRC does not carry exactly $(basename "$f"): $LLAMA_SRC" >&2
-      exit 2
-    }
-  done
+  # these patches, in order — the series is applied to a scratch index built from the tag and the
+  # work tree must equal it (0.15.3: patches 0002-0005 touch files 0001 created, so a per-patch
+  # reverse check no longer works), and the only changed/untracked paths are the ones the patches
+  # touch (plus the stamp file).
+  IDX=$(mktemp "${TMPDIR:-/tmp}/keryx-llama-idx.XXXXXX")
+  if ! ( export GIT_INDEX_FILE="$IDX"
+         git -C "$LLAMA_SRC" read-tree HEAD \
+         && for f in "$PATCH_DIR"/*.patch; do git -C "$LLAMA_SRC" apply --cached "$f" || exit 1; done \
+         && git -C "$LLAMA_SRC" diff --quiet ); then
+    rm -f "$IDX"
+    echo "ERROR: KERYX_LLAMA_SRC is not exactly $LLAMA_TAG + the keryx patch series: $LLAMA_SRC" >&2
+    exit 2
+  fi
+  rm -f "$IDX"
   expected=$( { for f in "$PATCH_DIR"/*.patch; do grep -E '^(\+\+\+ b/|--- a/)' "$f" | sed -E 's#^(\+\+\+ b/|--- a/)##'; done; echo .keryx-patches; } | sort -u)
   actual=$(git -C "$LLAMA_SRC" status --porcelain=v1 --untracked-files=all --ignore-submodules | cut -c4- | sort -u)
   [[ "$actual" == "$expected" ]] || {
