@@ -1422,6 +1422,12 @@ async fn run() -> Result<(), Error> {
         .max_by_key(|s| s.min_vram_mb);
     keryx_miner::slm::set_v2_lineup(specs_v2);
     keryx_miner::slm::init_supported(specs_v2);
+    // 0.15.3 diagnostic: cross-card trace reproduction (KERYX_TRACE_XCARD=gen:<file>|replay:<file>).
+    if let Ok(v) = std::env::var("KERYX_TRACE_XCARD") {
+        let (mode, path) = v.split_once(':').unwrap_or(("", ""));
+        let model = std::env::var("KERYX_TRACE_XCARD_MODEL").unwrap_or_default();
+        std::process::exit(keryx_miner::slm::trace_xcard_diagnostic(&model, mode, path));
+    }
     info!("OPoI Phase-3 — {} uncensored model(s) staged (legacy lineup dropped, post-fork).", specs_v2.len(),);
     // Prefetch BOTH lineups in the BACKGROUND (suprnova: backgrounded so a worker/plugin error
     // surfaces immediately instead of after a multi-GB download — the HiveOS "black screen" fix).

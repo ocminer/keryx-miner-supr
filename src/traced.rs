@@ -553,6 +553,95 @@ mod engine {
         Ok(())
     }
 
+    /// Cross-card reproduction diagnostic (0.15.3, the pool's "option 3" question): `gen` traces a
+    /// fixed request on `gpu` and writes the trace to `path`; `replay` traces the same request here,
+    /// compares roots/tokens with the file's, then builds and verifies the openings of the FILE's
+    /// trace on this card for three seeds (what a different rig would have to do for an audit).
+    pub fn xcard(spec: &ModelSpec, gguf: &str, gpu: usize, tier: u8, mode: &str, path: &str) -> Result<String, String> {
+        use crate::trace::{chain_ctx, verify_chain_opening};
+        use borsh::BorshDeserialize;
+        let t0 = std::time::Instant::now();
+        arm_trace(spec, gguf, gpu, tier, true, true)?;
+        let mut report = format!("model {} tier {} gpu {} — armed + self-check {:.1}s\n", spec.name, tier, gpu, t0.elapsed().as_secs_f64());
+        let prompt = "Explain in two sentences why the sky is blue, then name one consequence for photography.";
+        let request_hash: [u8; 32] = std::array::from_fn(|i| (i * 8 + 3) as u8);
+        let t = Traced { tier, prompt_len: prompt.len() as u32, request_hash, chain: true, attention: true };
+        let t1 = std::time::Instant::now();
+        let g = generate(spec, gguf, gpu, prompt, 96, t).map_err(|e| format!("traced generation: {e:?}"))?;
+        let gen_secs = t1.elapsed().as_secs_f64();
+        let mine = g.trace.ok_or("no trace")?;
+        report += &format!(
+            "generated: {} prompt + {} generated positions in {:.2}s, root {}, seq root {}\n",
+            mine.record.n_prompt,
+            mine.record.n_pos - mine.record.n_prompt,
+            gen_secs,
+            hex::encode(mine.record.trace_root),
+            mine.seq.as_ref().map(|q| hex::encode(q.root)).unwrap_or_default()
+        );
+        let target = match mode {
+            "gen" => {
+                let bytes = borsh::to_vec(&(g.text.clone(), &mine)).map_err(|e| e.to_string())?;
+                std::fs::write(path, &bytes).map_err(|e| format!("write {path}: {e}"))?;
+                report += &format!("wrote {} ({} B compact record)\n", path, bytes.len());
+                mine
+            }
+            "replay" => {
+                let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+                let (text, theirs): (String, ResponseTrace) = BorshDeserialize::try_from_slice(&bytes).map_err(|e| e.to_string())?;
+                report += &format!(
+                    "file trace: root {} | same tokens {} | same text {} | same position leaves {} | same seq leaves {} | same trace root {}\n",
+                    hex::encode(theirs.record.trace_root),
+                    theirs.tokens == mine.tokens,
+                    text == g.text,
+                    {
+                        let n = theirs.record.n_pos.min(mine.record.n_pos) as u64;
+                        match (0..n).find(|&t| theirs.record.leaves_at(t) != mine.record.leaves_at(t)) {
+                            None if theirs.record.n_pos == mine.record.n_pos => "yes".to_string(),
+                            None => "prefix only (lengths differ)".to_string(),
+                            Some(t) => format!("NO (first difference at position {t})"),
+                        }
+                    },
+                    theirs.seq.as_ref().map(|q| &q.leaves) == mine.seq.as_ref().map(|q| &q.leaves),
+                    theirs.record.trace_root == mine.record.trace_root
+                );
+                theirs
+            }
+            other => return Err(format!("unknown mode {other}")),
+        };
+        let index = weight_index(spec, gguf, gpu).ok_or("no possession index")?;
+        let m = TierManifest::for_attn(tier).ok_or("no attention manifest")?;
+        let (_, pctx) = chain_ctx(tier).ok_or("no stage-2 context")?;
+        let ctx = m.chain.ok_or("no stage-2 context")?;
+        let tier_ctx = m.tier_ctx(index.get());
+        let mut ok = 0;
+        for k in 0..3u8 {
+            let seed = *blake3::hash(&[k, 0x5e, 0xed]).as_bytes();
+            let t2 = std::time::Instant::now();
+            match open_pieces(gguf, gpu, &m, &pctx, &target, &seed, &request_hash, [k; 32], index.get()) {
+                Ok(bodies) => {
+                    let v = verify_chain_opening(&tier_ctx, &ctx, &pctx, &target.record, &seed, &request_hash, &bodies[0], bodies.last().unwrap());
+                    let sizes: Vec<usize> = bodies.iter().map(Vec::len).collect();
+                    report += &format!(
+                        "seed {k}: opening built in {:.2}s ({:.1}x generation), pieces {:?} B, node verify {}\n",
+                        t2.elapsed().as_secs_f64(),
+                        t2.elapsed().as_secs_f64() / gen_secs.max(0.001),
+                        sizes,
+                        match &v {
+                            Ok(()) => "OK".to_string(),
+                            Err(e) => format!("FAIL {e}"),
+                        }
+                    );
+                    if v.is_ok() {
+                        ok += 1;
+                    }
+                }
+                Err(e) => report += &format!("seed {k}: opening FAILED after {:.2}s: {e}\n", t2.elapsed().as_secs_f64()),
+            }
+        }
+        report += &format!("RESULT {}/3 openings verified\n", ok);
+        Ok(report)
+    }
+
     /// Engines whose trace self-check failed, so `ai:cap` and the private-request scan can skip
     /// models this rig cannot answer traced.
     pub fn self_check_failed(gguf: &str, gpu: usize) -> bool {

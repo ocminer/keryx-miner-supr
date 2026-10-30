@@ -3159,6 +3159,42 @@ pub fn try_load_and_run_traced_inference_on(
     }
 }
 
+/// Cross-card trace reproduction diagnostic (`KERYX_TRACE_XCARD=gen|replay:<file>`, model by name
+/// in `KERYX_TRACE_XCARD_MODEL`): runs on CUDA device 0 of this process and prints a report.
+pub fn trace_xcard_diagnostic(model_name: &str, mode: &str, path: &str) -> i32 {
+    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    {
+        let specs = *SUPPORTED_SPECS.read().unwrap();
+        let Some(spec) = specs.iter().copied().find(|s| s.name == model_name) else {
+            log::error!("trace xcard: model '{}' is not in the staged lineup", model_name);
+            return 2;
+        };
+        let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
+        if !crate::gguf::is_complete_file(&gguf_path_for(spec)) || !crate::llama_engine::ensure_loaded_on(&gguf, 0) {
+            log::error!("trace xcard: cannot load '{}' from {} on GPU 0", spec.name, gguf);
+            return 2;
+        }
+        let Some(tier) = crate::models::pom_tier_index(&spec.model_id, u64::MAX) else { return 2 };
+        match crate::traced::xcard(spec, &gguf, 0, tier, mode, path) {
+            Ok(r) => {
+                for line in r.lines() {
+                    log::info!("trace xcard: {}", line);
+                }
+                0
+            }
+            Err(e) => {
+                log::error!("trace xcard: {}", e);
+                1
+            }
+        }
+    }
+    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+    {
+        let _ = (model_name, mode, path);
+        2
+    }
+}
+
 /// Builds an opening (or attention phase) of an audited response on the leased card `gpu`.
 pub fn try_open_trace_on(gpu: usize, model_id: &[u8; 32], job: OpenJob<'_>) -> std::result::Result<Vec<u8>, InferenceError> {
     #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
