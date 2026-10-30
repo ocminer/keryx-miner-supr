@@ -1624,6 +1624,24 @@ pub fn acquire_inference_card(model_id: &[u8; 32], deadline_ms: u64) -> Option<I
     }
 }
 
+/// Claim the specific card `gpu` (an opening replay must run on the card that generated the trace:
+/// the sequence leaves commit that card's exact attention arithmetic), waiting up to `deadline_ms`.
+pub fn acquire_inference_card_on(gpu: usize, deadline_ms: u64) -> Option<InferenceLease> {
+    if !inference_card_allowed(gpu) {
+        return None;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bounded_deadline_ms(deadline_ms));
+    loop {
+        if try_claim_card(gpu) {
+            return Some(InferenceLease { gpu });
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Async router used by network handlers. Unlike `acquire_inference_card`, waiting for a busy card
 /// yields the Tokio worker instead of blocking one of the miner's small async-worker pool. Card
 /// ranking is resolved once per request; busy state is still checked atomically on every wake.

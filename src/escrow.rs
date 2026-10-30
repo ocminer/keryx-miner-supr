@@ -456,6 +456,19 @@ impl EscrowWatcher {
         keryx_inference::AiResponder { escrow_pubkey: self.pubkey_bytes, signature: *sig.as_ref() }
     }
 
+    /// Signed payload of an AiOpening: `body || escrow_pubkey || schnorr(opening_signature_message)`
+    /// (node `opening::SignedPayload`, upstream v0.5.8).
+    pub fn sign_opening(&self, body: &[u8]) -> Vec<u8> {
+        let msg = secp256k1::Message::from_digest(keryx_miner::trace::opening_signature_message(body));
+        let keypair = secp256k1::Keypair::from_secret_key(&self.secp, &self.secret_key);
+        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+        let mut payload = Vec::with_capacity(body.len() + 96);
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&self.pubkey_bytes);
+        payload.extend_from_slice(sig.as_ref());
+        payload
+    }
+
     /// Scan a confirmed block for the miner's escrow output and check for mature claims.
     /// Returns a claim TX to submit if one is ready; `None` otherwise.
     pub fn handle_block(&mut self, block: &crate::proto::RpcBlock) -> Option<RpcTransaction> {

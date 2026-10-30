@@ -1,6 +1,7 @@
 use crate::proto::{
-    kaspad_message::Payload, GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage,
-    GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
+    kaspad_message::Payload, GetBlockDagInfoRequestMessage, GetBlockRequestMessage, GetBlockTemplateRequestMessage,
+    GetAwaitedOpeningsRequestMessage, GetInfoRequestMessage, GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage,
+    NotifyNewBlockTemplateRequestMessage,
     NotifyVirtualSelectedParentChainChangedRequestMessage, RpcBlock, RpcTransaction,
     SubmitBlockRequestMessage, SubmitTransactionRequestMessage,
 };
@@ -45,6 +46,11 @@ impl From<GetInfoRequestMessage> for KaspadMessage {
         KaspadMessage { payload: Some(Payload::GetInfoRequest(a)) }
     }
 }
+impl From<GetBlockDagInfoRequestMessage> for KaspadMessage {
+    fn from(a: GetBlockDagInfoRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetBlockDagInfoRequest(a)) }
+    }
+}
 impl From<NotifyBlockAddedRequestMessage> for KaspadMessage {
     fn from(a: NotifyBlockAddedRequestMessage) -> Self {
         KaspadMessage { payload: Some(Payload::NotifyBlockAddedRequest(a)) }
@@ -63,9 +69,21 @@ impl From<GetServiceStrikesRequestMessage> for KaspadMessage {
     }
 }
 
+impl From<GetAwaitedOpeningsRequestMessage> for KaspadMessage {
+    fn from(a: GetAwaitedOpeningsRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetAwaitedOpeningsRequest(a)) }
+    }
+}
+
 impl From<GetBlockRequestMessage> for KaspadMessage {
     fn from(a: GetBlockRequestMessage) -> Self {
         KaspadMessage { payload: Some(Payload::GetBlockRequest(a)) }
+    }
+}
+
+impl From<crate::proto::GetVirtualSelectedParentChainFromBlockRequestMessage> for KaspadMessage {
+    fn from(a: crate::proto::GetVirtualSelectedParentChainFromBlockRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetVirtualSelectedParentChainFromBlockRequest(a)) }
     }
 }
 

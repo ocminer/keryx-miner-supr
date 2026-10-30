@@ -137,6 +137,8 @@ message KaspadMessage {
     NewBlockTemplateNotificationMessage newBlockTemplateNotification = 1083;
     GetServiceStrikesRequestMessage getServiceStrikesRequest = 1120;
     GetServiceStrikesResponseMessage getServiceStrikesResponse = 1121;
+    GetAwaitedOpeningsRequestMessage getAwaitedOpeningsRequest = 1126;
+    GetAwaitedOpeningsResponseMessage getAwaitedOpeningsResponse = 1127;
   }
 }
 
