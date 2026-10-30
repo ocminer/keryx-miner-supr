@@ -1,0 +1,3 @@
+inference/src: byte-exact mirror of keryx-miner v0.5.8-PoM (e12cc42) inference/src (= keryx-node v1.6.6 private.rs/ai_payload.rs
+consensus code; the node additionally carries non-consensus helpers). Local diffs: Cargo.toml (no candle; the Phase-1 f32 model is gone
+upstream too), LICENSE.

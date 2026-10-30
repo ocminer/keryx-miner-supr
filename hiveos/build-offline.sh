@@ -61,6 +61,7 @@ if [ -d "$LLAMA_SRC/.git" ] && ls "$PATCH_DIR"/*.patch >/dev/null 2>&1; then
     echo ">> applied $(ls "$PATCH_DIR"/*.patch | wc -l) llama.cpp patch(es) to $LLAMA_SRC"
   fi
   [ -f "$LLAMA_SRC/ggml/src/ggml-cuda/q8canon.cu" ] || { echo "ERROR: canonical-trace patch not present in $LLAMA_SRC" >&2; exit 1; }
+  [ -f "$LLAMA_SRC/ggml/src/ggml-cuda/q8seq.cu" ] || { echo "ERROR: sequence-leaves patch not present in $LLAMA_SRC" >&2; exit 1; }
 fi
 
 case "$SUF" in

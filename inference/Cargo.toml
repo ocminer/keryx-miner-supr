@@ -7,7 +7,6 @@ license = "ISC"
 description = "OPoI (Optimistic Proof of Inference) — synthetic MLP engine for Keryx miners"
 
 [dependencies]
-candle-core = { version = "0.8", default-features = false }
 # Private inference (H14) — same crates/versions as the node's keryx-inference.
 chacha20poly1305 = "0.10.1"
 hex = { version = "0.4", features = ["serde"] }

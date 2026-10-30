@@ -1,4 +1,4 @@
-Byte-exact mirror of keryx-node verifiable-inference/src at tag v1.6.5-PoM (local diffs: Cargo.toml metadata, LICENSE).
-Deliberately NOT updated to v1.6.6: in keryx-miner-supr this crate is used only by the H15 block task
-(block_task.rs / task_trace.rs / trace.rs), which keryx-node v1.6.6 retired (block_task_activation = never).
-That code is inert (pom::block_task_activation_daa() = u64::MAX). The pool path never builds trace openings.
+Byte-exact mirror of keryx-miner v0.5.8-PoM (e12cc42) verifiable-inference/src, which is byte-identical to keryx-node
+v1.6.6-PoM (293e2144) verifiable-inference/src (local diffs: Cargo.toml metadata, LICENSE).
+0.15.3: updated from v1.6.5 because the H15 private-inference answer path (trace commitment, sequence leaves,
+attention/recurrent/residual openings) needs the 1.6.6 verifier exactly.

@@ -4,7 +4,7 @@ use crate::draw;
 use crate::manifest;
 use crate::merkle::{Hash, b3_fold, b3_verify};
 use crate::opening::PrefixPoint;
-use crate::verify::{Fail, PosShape, ResponseCtx, TierCtx, layout_for, open_bytes, open_entry, open_row, x_len};
+use crate::verify::{Fail, PosShape, ResponseCtx, TierCtx, expected_ubatch, layout_for, open_bytes, open_entry, open_row, x_len};
 use crate::{q8, quant};
 
 /// Prefix tokens, one per byte of the request id.
@@ -63,7 +63,7 @@ pub fn deviation(x: &[u8], layout: u8, v: &[f64]) -> Option<f64> {
     let mut worst = 0f64;
     for (b, (d, q)) in blocks.iter().enumerate() {
         let vals = &v[b * 32..((b + 1) * 32).min(v.len())];
-        if !d.is_finite() || vals.iter().any(|a| !a.is_finite()) {
+        if !d.is_finite() || !q8::canonical(*d, q) || vals.iter().any(|a| !a.is_finite()) {
             return None;
         }
         if *d == 0.0 {
@@ -133,6 +133,9 @@ pub(crate) fn verify_prefix_point_at(
     if !b3_verify(&resp.trace_root, resp.n_pos as u64, t, &pos_root, &p.pos_path) {
         return Err(Fail::Trace);
     }
+    if p.n_ubatch != expected_ubatch(t, resp.n_prompt) {
+        return Err(Fail::Mismatch);
+    }
     if !b3_verify(&pos_root, n_pos_leaves, shape.meta_index, &shape.meta_hash(t, p.n_ubatch), &p.meta_path) {
         return Err(Fail::Trace);
     }
@@ -140,7 +143,11 @@ pub(crate) fn verify_prefix_point_at(
     let k = first.k as usize;
     let row = open_row(tier, &embd, &p.embd.1, tok as u64)?;
     let e = quant::dequant_row(embd.wtype, &row, k).ok_or(Fail::Unsupported)?;
-    let (b0, nb) = if fragment { crate::chain::norm_fragment(seed, PREFIX_POINT, k as u64) } else { (0, (k as u64).div_ceil(32)) };
+    let (b0, nb) = if fragment {
+        crate::chain::norm_fragment(crate::chain::link_block(seed, PREFIX_POINT, &p.x, layout, k as u64).ok_or(Fail::Shape)?, k as u64)
+    } else {
+        (0, (k as u64).div_ceil(32))
+    };
     let (lo, len) = (b0 * 32, (nb * 32).min(k as u64 - b0 * 32));
     let w_bytes = open_bytes(tier, &norm, &p.norm.1, 4 * lo, 4 * len)?;
     let w: Vec<f32> = w_bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();

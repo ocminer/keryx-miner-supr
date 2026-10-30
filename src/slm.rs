@@ -2983,6 +2983,137 @@ pub fn load_and_run_inference_on(gpu: usize, model_id: &[u8; 32], prompt: &str, 
     try_load_and_run_inference_on(gpu, model_id, prompt, max_tokens).ok()
 }
 
+/// What an opening replay builds: the first opening of an audited response, or one of its later
+/// attention phases (`path` + the partials `prev` of the previous phase).
+pub struct OpenJob<'a> {
+    pub tier: u8,
+    pub trace: &'a crate::trace::ResponseTrace,
+    pub seed: [u8; 32],
+    pub response_txid: [u8; 32],
+    pub request_hash: [u8; 32],
+    pub phase: Option<(Vec<u64>, Vec<u8>)>,
+}
+
+/// Runs `f` on the in-process CUDA engine of the leased card `gpu` with `model_id` resident and the
+/// card's walk paused and drained for the whole call — the same guards as a plain inference
+/// (`try_load_and_run_inference_on`), minus every fallback engine: only this engine can trace.
+#[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+fn with_traced_engine<R>(
+    gpu: usize,
+    model_id: &[u8; 32],
+    f: impl FnOnce(&'static ModelSpec, &str) -> R,
+) -> std::result::Result<R, InferenceError> {
+    if is_era_retired(model_id) {
+        return Err(InferenceError::Failed);
+    }
+    if !inference_card_allowed(gpu) {
+        log::warn!("Trace: refusing traced work on excluded GPU {}", gpu);
+        return Err(InferenceError::Failed);
+    }
+    if cpu_inference_enabled() {
+        log::warn!("Trace: CPU inference is forced — private (traced) requests are not served");
+        return Err(InferenceError::Failed);
+    }
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    let spec = specs
+        .iter()
+        .copied()
+        .find(|s| &s.model_id == model_id)
+        .ok_or(InferenceError::Deferred(DeferredReason::ModelNotRegistered))?;
+    if !crate::gguf::is_complete_file(&gguf_path_for(spec)) {
+        return Err(InferenceError::Deferred(DeferredReason::ModelIncomplete));
+    }
+    let _host_load = crate::pom_gpu::try_host_load().map_err(InferenceError::Deferred)?;
+    let _pause_stats = crate::runtime_stats::begin_gpu_inference_pause(Some(gpu));
+    let _walk_drain = crate::pom_gpu::pause_and_drain_for_inference(gpu).map_err(InferenceError::Deferred)?;
+    let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
+    if !crate::llama_engine::active_for(&gguf, gpu) {
+        // A llama-server subprocess cannot trace: stop/reap any child before the in-process load.
+        let _ = crate::llama_vulkan::reuse_exact_or_stop(&gguf, gpu);
+        if !crate::pom_gpu::uninstall_released(gpu as u32) {
+            log::error!("Trace: GPU {} walk did not drain; refusing to swap llama weights underneath it", gpu);
+            return Err(InferenceError::Deferred(DeferredReason::WalkBusy));
+        }
+        if !crate::llama_engine::ensure_loaded_on(&gguf, gpu) || !crate::llama_engine::active_for(&gguf, gpu) {
+            log::warn!("Trace: in-process llama load of '{}' failed on GPU {} — traced request not served", spec.name, gpu);
+            return Err(InferenceError::Failed);
+        }
+    }
+    Ok(f(spec, &gguf))
+}
+
+/// H15 private request: traced generation on the leased card `gpu`. Never answers untraced — a
+/// private body without a trace commitment is invalid past the transition window.
+pub fn try_load_and_run_traced_inference_on(
+    gpu: usize,
+    model_id: &[u8; 32],
+    prompt: &str,
+    max_tokens: usize,
+    traced: crate::traced::Traced,
+) -> std::result::Result<crate::traced::Generated, InferenceError> {
+    if let Err(reason) = validate_inference_request(prompt, max_tokens, DEFAULT_INFERENCE_DEADLINE_MS) {
+        log::warn!("Trace: rejected private request for GPU {}: {}", gpu, reason);
+        return Err(InferenceError::Failed);
+    }
+    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    {
+        let t0 = std::time::Instant::now();
+        let out = with_traced_engine(gpu, model_id, |spec, gguf| crate::traced::generate(spec, gguf, gpu, prompt, max_tokens, traced))?;
+        match out {
+            Ok(g) => {
+                let secs = t0.elapsed().as_secs_f64();
+                if secs > 0.0 {
+                    record_card_toks(gpu, g.text.split_whitespace().count() as f64 / secs);
+                }
+                record_serveable_on(model_id, gpu);
+                mark_model_available(model_id, "generation_success");
+                clear_inprocess_failures(model_id, gpu);
+                Ok(g)
+            }
+            Err(crate::traced::TracedError::PromptTooLong(d)) => {
+                log::warn!("Trace: private prompt does not fit GPU {} ({}) — request refused, model stays serveable", gpu, d);
+                Err(InferenceError::Failed)
+            }
+            Err(crate::traced::TracedError::Unsupported(d)) => {
+                log::error!("Trace: GPU {} cannot answer a traced request ({}) — request refused", gpu, d);
+                Err(InferenceError::Failed)
+            }
+            Err(crate::traced::TracedError::Failed(d)) => {
+                log::warn!("Trace: traced generation failed on GPU {} ({})", gpu, d);
+                Err(InferenceError::Failed)
+            }
+        }
+    }
+    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+    {
+        let _ = (gpu, model_id, traced);
+        log::warn!("Trace: this build's inference engine cannot trace — H15 private request not served");
+        Err(InferenceError::Failed)
+    }
+}
+
+/// Builds an opening (or attention phase) of an audited response on the leased card `gpu`.
+pub fn try_open_trace_on(gpu: usize, model_id: &[u8; 32], job: OpenJob<'_>) -> std::result::Result<Vec<u8>, InferenceError> {
+    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    {
+        let out = with_traced_engine(gpu, model_id, |spec, gguf| match &job.phase {
+            None => crate::traced::open_trace(spec, gguf, gpu, job.tier, job.trace, &job.seed, job.response_txid, &job.request_hash),
+            Some((path, prev)) => {
+                crate::traced::open_attention_phase(spec, gguf, gpu, job.tier, job.trace, &job.seed, job.response_txid, path, prev)
+            }
+        })?;
+        out.map_err(|e| {
+            log::warn!("Trace: opening replay failed on GPU {} ({})", gpu, e);
+            InferenceError::Failed
+        })
+    }
+    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+    {
+        let _ = (gpu, model_id, job);
+        Err(InferenceError::Failed)
+    }
+}
+
 /// Typed serving entry point. Coordination/staging delays are retryable and do not invalidate
 /// capability. Callers own the exact card lease; the backend owns the mining pause through return.
 pub fn try_load_and_run_inference_on(

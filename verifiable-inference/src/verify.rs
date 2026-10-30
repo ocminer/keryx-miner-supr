@@ -10,6 +10,8 @@ use crate::{q8, quant};
 pub const EPS: f64 = 1e-5;
 pub const EPS_GEGLU: f64 = 3e-5;
 const MMVQ_MAX_BATCH: u32 = 8;
+/// Prompt positions per batch of the traced run.
+pub const UBATCH: u32 = 512;
 const MATRIX_ROW_PADDING: u64 = 512;
 
 /// Consensus data of a tier.
@@ -131,6 +133,20 @@ pub(crate) fn open_row(tier: &TierCtx, entry: &Entry, r: &ChunkRange, row: u64) 
     open_bytes(tier, entry, r, row * rb, rb)
 }
 
+/// Batch size the traced run computes position `t` with.
+pub fn expected_ubatch(t: u64, n_prompt: u32) -> u32 {
+    if t >= n_prompt as u64 {
+        return 1;
+    }
+    let start = t / UBATCH as u64 * UBATCH as u64;
+    UBATCH.min(n_prompt - start as u32)
+}
+
+/// Q8_1 layout of the input of a product of `role` and weight type `wtype` in a batch of `n_ubatch`.
+pub fn input_layout(role: u8, n_ubatch: u32, wtype: u32) -> u8 {
+    if role == manifest::ROLE_OUTPUT { q8::MMVQ } else { layout_for(n_ubatch, wtype) }
+}
+
 pub(crate) fn layout_for(n_ubatch: u32, wtype: u32) -> u8 {
     if n_ubatch <= MMVQ_MAX_BATCH {
         q8::MMVQ
@@ -141,7 +157,7 @@ pub(crate) fn layout_for(n_ubatch: u32, wtype: u32) -> u8 {
     }
 }
 
-pub(crate) fn x_len(k: u64, layout: u8) -> u64 {
+pub fn x_len(k: u64, layout: u8) -> u64 {
     let kp = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
     if layout == q8::MMVQ { kp / 32 * 36 } else { kp / 128 * 144 }
 }
@@ -242,7 +258,7 @@ pub(crate) fn verify_point_at(
     let row = d[2] % m_out;
 
     let n_pos_leaves = shape.n_leaves;
-    let layout = if output_only { q8::MMVQ } else { layout_for(p.n_ubatch, g_entry.wtype) };
+    let layout = input_layout(first.role, p.n_ubatch, g_entry.wtype);
     let x_one = x_len(g_entry.k, layout);
     let x = match p.x.len() as u64 {
         n if n == x_one => &p.x[..],
@@ -252,6 +268,9 @@ pub(crate) fn verify_point_at(
     let pos_root = b3_fold(n_pos_leaves, 2 * g_rank, blake3::hash(&p.x).as_bytes(), &p.x_path).ok_or(Fail::Trace)?;
     if !b3_verify(&resp.trace_root, n_traced, t, &pos_root, &p.pos_path) {
         return Err(Fail::Trace);
+    }
+    if p.n_ubatch != expected_ubatch(t, resp.n_prompt) {
+        return Err(Fail::Mismatch);
     }
     if !b3_verify(&pos_root, n_pos_leaves, shape.meta_index, &shape.meta_hash(t, p.n_ubatch), &p.meta_path) {
         return Err(Fail::Trace);
@@ -288,6 +307,9 @@ pub(crate) fn verify_point_at(
     };
 
     let k = g_entry.k as usize;
+    if !q8::sums_consistent(x, layout, k) {
+        return Err(Fail::Mismatch);
+    }
     let dot_row = |entry: &Entry, r: &ChunkRange, rr: u64| -> Result<Recomputed, Fail> {
         let bytes = open_expert_row(tier, entry, r, exp, rr)?;
         dot::canonical_dot(entry.wtype, &bytes, k, x, layout).ok_or(Fail::Unsupported)
@@ -325,7 +347,7 @@ pub(crate) fn verify_point_at(
         let eps_glu = if g_entry.glu_op == manifest::GLU_GEGLU { EPS_GEGLU } else { EPS };
         (h, EPS * ((df * ru.y_hat).abs() * rg.scale + f.abs() * ru.scale) + eps_glu * (rg.y_hat * ru.y_hat).abs())
     };
-    if !((y - y_hat).abs() <= tol) {
+    if !(y.is_finite() && y_hat.is_finite() && tol.is_finite()) || !(y - y_hat).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
         return Err(Fail::Mismatch);
     }
     Ok((Report { t, rank, row, y, y_hat, tol }, Opened { pos_root, input: g_entry, layout, slot, expert: exp }))

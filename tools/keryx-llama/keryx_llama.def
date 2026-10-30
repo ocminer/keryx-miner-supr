@@ -28,3 +28,7 @@ EXPORTS
     keryx_llama_trace_tokens
     keryx_llama_replay
     keryx_llama_replay_multi
+    keryx_llama_generate_traced
+    keryx_llama_seq_configure
+    keryx_llama_seq_roots
+    keryx_llama_seq_replay

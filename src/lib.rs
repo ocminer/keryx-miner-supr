@@ -41,6 +41,10 @@ pub mod pom_opencl;
 pub mod pom_v4;
 pub mod pom_v5;
 pub mod trace;
+pub mod trace_seq;
+pub mod trace_store;
+/// 0.15.3: traced H15 private answers + openings (CUDA in-process engine; refused elsewhere).
+pub mod traced;
 pub mod block_task;
 // The block-task trace runs on the CUDA engine (pom_gpu::device_model + llama_engine trace ABI);
 // other builds get a stub so `block_task` compiles and simply never produces a task (no mining

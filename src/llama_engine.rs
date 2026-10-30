@@ -47,6 +47,43 @@ type TraceReadFn = unsafe extern "C" fn(*mut c_void, *mut u8, usize, *mut u32, u
 type TraceTokensFn = unsafe extern "C" fn(*mut c_void, *const i32, c_int) -> c_int;
 type ReplayFn = unsafe extern "C" fn(*mut c_void, *const i32, c_int, c_int, u32, u32, u32, *mut u8, usize, *mut u8, usize, *mut u32, *mut u32) -> c_int;
 type ReplayMultiFn = unsafe extern "C" fn(*mut c_void, *const i32, c_int, c_int, *const u32, *const u32, u32, u32, *mut u8, usize, *mut u32) -> c_int;
+// 0.15.3 (ABI 4): traced private answers + sequence leaves — upstream v0.5.8 ABI 9 signatures.
+type GenTracedFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_char,
+    *const i32,
+    c_int,
+    c_int,
+    *const c_char,
+    c_int,
+    *mut c_char,
+    c_int,
+    *mut i32,
+    c_int,
+    *mut c_int,
+    *mut c_int,
+    c_int,
+    c_int,
+) -> c_int;
+type SeqConfigureFn = unsafe extern "C" fn(*mut c_void, *const u32, u32, u32, u32, u32, u32) -> c_int;
+type SeqRootsFn = unsafe extern "C" fn(*mut c_void, *mut u8, usize, *mut u32) -> c_int;
+type SeqReplayFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const i32,
+    c_int,
+    c_int,
+    *const u32,
+    *const u64,
+    *const u64,
+    u32,
+    u32,
+    *mut u8,
+    usize,
+    *mut u64,
+    *mut u8,
+    usize,
+    *mut u32,
+) -> c_int;
 /// Context kept for the block task while the PoM v5 context pad is resident (32 task tokens).
 const TASK_CONTEXT_TOKENS: c_int = 64;
 /// Largest captured leaf the engine hands back.
@@ -73,7 +110,9 @@ unsafe fn install_native_log_bridge(lib: &Library) -> bool {
 }
 
 // 3 = H15: the trace/replay/context symbols below are REQUIRED (a 2 library cannot mine post-gate).
-const ABI: c_int = 3;
+// 4 = 0.15.3: traced private answers (generate_traced) + sequence leaves (seq_*), verifier-exact
+// attention/RoPE kernels (patches 0002-0005). A 3 library cannot answer an H15 private request.
+const ABI: c_int = 4;
 
 struct Engine {
     model: *mut c_void,
@@ -98,6 +137,13 @@ struct Engine {
     trace_tokens: TraceTokensFn,
     replay: ReplayFn,
     replay_multi: ReplayMultiFn,
+    generate_traced: GenTracedFn,
+    seq_configure: SeqConfigureFn,
+    seq_roots: SeqRootsFn,
+    seq_replay: SeqReplayFn,
+    /// Sequence leaves per traced response, 0 until armed, and the layout they were armed with.
+    seq_leaves: usize,
+    seq_layout: [u8; 32],
     trace_last_error: Option<LastErrorFn>,
     /// Context currently allocated, in tokens (0: none).
     ctx_now: c_int,
@@ -195,6 +241,15 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             sym::<ReplayMultiFn>(lib, b"keryx_llama_replay_multi\0"),
         ) else {
             log::warn!("llama engine: shared library is missing the H15 trace/replay/context symbols — inference engine unavailable.");
+            return None;
+        };
+        let (Some(generate_traced), Some(seq_configure), Some(seq_roots), Some(seq_replay)) = (
+            sym::<GenTracedFn>(lib, b"keryx_llama_generate_traced\0"),
+            sym::<SeqConfigureFn>(lib, b"keryx_llama_seq_configure\0"),
+            sym::<SeqRootsFn>(lib, b"keryx_llama_seq_roots\0"),
+            sym::<SeqReplayFn>(lib, b"keryx_llama_seq_replay\0"),
+        ) else {
+            log::warn!("llama engine: shared library is missing the 0.15.3 traced-answer symbols — inference engine unavailable.");
             return None;
         };
         let trace_last_error = sym::<LastErrorFn>(lib, b"keryx_llama_last_error\0");
@@ -341,6 +396,12 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             ctx_full: true,
             trace_leaves: 0,
             trace_manifest: [0u8; 32],
+            generate_traced,
+            seq_configure,
+            seq_roots,
+            seq_replay,
+            seq_leaves: 0,
+            seq_layout: [0u8; 32],
         })
     }
 }
@@ -1001,7 +1062,9 @@ pub fn replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, pos: u32, l
     let slot = slot_for(gpu);
     let mut g = slot.inner.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
-    ensure_context_for(e, gpu, tokens.len())?;
+    // 0.15.3: always the load-size context, like the traced run (n_batch, hence the ubatch
+    // boundaries the trace commits, follow the context size). Upstream v0.5.8.
+    ensure_full_context(e, gpu)?;
     let e = &*e;
     let mut x = vec![0u8; CAPTURE_CAP];
     let mut y = vec![0u8; CAPTURE_CAP];
@@ -1020,6 +1083,201 @@ pub fn replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, pos: u32, l
 /// Most captures one replay takes.
 /// Mirror of the shim's cap (lives in `trace` so engine-less builds can test the draw against it).
 pub use crate::trace::REPLAY_MAX_CAPTURES;
+pub use crate::trace::{SeqCapture, SeqLayer};
+
+/// Why a traced generation failed (upstream v0.5.8 `GenError`).
+#[derive(Debug)]
+pub enum GenError {
+    /// No traced engine hosts the model on this GPU.
+    Unavailable,
+    /// The prompt does not fit the context (detail from the engine).
+    PromptTooLong(String),
+    /// The chat-template head does not tokenize to the tier's prefix offset.
+    PromptHead(String),
+    Failed(String),
+}
+
+/// The request-bound prefix of a traced prompt: its token ids, the token count of the prompt
+/// head they follow, and the rest of the prompt after them.
+pub struct PromptPrefix<'a> {
+    pub tokens: &'a [i32],
+    pub head_tokens: u32,
+    pub rest: &'a str,
+}
+
+/// A traced generation: the text, every fed token, the prompt length, the traced positions with
+/// their ubatch sizes and leaves, and the sequence leaf hashes when armed.
+pub struct TracedGeneration {
+    pub text: String,
+    pub tokens: Vec<i32>,
+    pub n_prompt: u32,
+    pub n_pos: u32,
+    pub ubatch: Vec<u32>,
+    pub leaves: Vec<[u8; 32]>,
+    pub seq: Option<Vec<[u8; 32]>>,
+}
+
+/// Traced generation (upstream v0.5.8): the prompt is padded to `min_prompt` positions and the
+/// answer to `answer bytes / answer_bytes_per_position` generated positions (0 = no answer
+/// padding). With `prefix`, `prompt` is the template head alone. Requires an armed trace.
+pub fn generate_traced(
+    gguf: &str,
+    gpu: usize,
+    prompt: &str,
+    prefix: Option<PromptPrefix<'_>>,
+    max_tokens: usize,
+    min_prompt: u32,
+    answer_bytes_per_position: u32,
+) -> Result<TracedGeneration, GenError> {
+    let slot = slot_for(gpu);
+    let mut g = slot.inner.lock().map_err(|_| GenError::Unavailable)?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or(GenError::Unavailable)?;
+    ensure_full_context(e, gpu).map_err(GenError::Failed)?;
+    let e = &*e;
+    let cp = CString::new(prompt).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
+    let rest = CString::new(prefix.as_ref().map_or("", |p| p.rest)).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
+    let (prefix_ptr, n_prefix, head_tokens) = match &prefix {
+        Some(p) => (p.tokens.as_ptr(), p.tokens.len() as c_int, p.head_tokens.min(c_int::MAX as u32) as c_int),
+        None => (std::ptr::null(), 0, 0),
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    let n_ctx = if e.ctx_now > 0 { e.ctx_now } else { e.n_ctx };
+    let mut tokens = vec![0i32; n_ctx.max(1) as usize];
+    let (mut n_prompt, mut n_fed): (c_int, c_int) = (0, 0);
+    let n = unsafe {
+        (e.generate_traced)(
+            e.model,
+            cp.as_ptr(),
+            prefix_ptr,
+            n_prefix,
+            head_tokens,
+            rest.as_ptr(),
+            max_tokens.min(c_int::MAX as usize) as c_int,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len() as c_int,
+            tokens.as_mut_ptr(),
+            tokens.len() as c_int,
+            &mut n_prompt,
+            &mut n_fed,
+            min_prompt.min(c_int::MAX as u32) as c_int,
+            answer_bytes_per_position.min(c_int::MAX as u32) as c_int,
+        )
+    };
+    if n < 0 {
+        let detail = engine_error(e, "");
+        return Err(match n {
+            -2 => GenError::PromptTooLong(detail),
+            -8 => GenError::PromptHead(detail),
+            _ => GenError::Failed(format!("rc {n}: {detail}")),
+        });
+    }
+    buf.truncate(n as usize);
+    // The answer bytes are committed through their token ids (answer::encode); a lossy repair
+    // would desynchronise text and ids, so a non-UTF-8 answer is a failed generation.
+    let text = String::from_utf8(buf).map_err(|_| GenError::Failed("generated text is not UTF-8".to_string()))?;
+    tokens.truncate(n_fed.max(0) as usize);
+    let mut n_pos: u32 = 0;
+    let mut leaves = vec![[0u8; 32]; tokens.len() * e.trace_leaves];
+    let mut ubatch = vec![0u32; tokens.len()];
+    let rc = unsafe {
+        (e.trace_read)(e.model, leaves.as_mut_ptr() as *mut u8, leaves.len() * 32, ubatch.as_mut_ptr(), ubatch.len(), &mut n_pos)
+    };
+    if rc != 0 {
+        return Err(GenError::Failed(format!("trace read failed ({rc}), {n_pos} positions traced for {} fed", tokens.len())));
+    }
+    leaves.truncate(n_pos as usize * e.trace_leaves);
+    ubatch.truncate(n_pos as usize);
+    let seq = if e.seq_leaves > 0 { Some(read_seq_roots(e).map_err(GenError::Failed)?) } else { None };
+    Ok(TracedGeneration { text, tokens, n_prompt: n_prompt.max(0) as u32, n_pos, ubatch, leaves, seq })
+}
+
+fn read_seq_roots(e: &Engine) -> Result<Vec<[u8; 32]>, String> {
+    let mut roots = vec![[0u8; 32]; e.seq_leaves];
+    let mut n: u32 = 0;
+    let rc = unsafe { (e.seq_roots)(e.model, roots.as_mut_ptr() as *mut u8, roots.len() * 32, &mut n) };
+    if rc != 0 || n as usize != e.seq_leaves {
+        return Err(engine_error(e, &format!("sequence roots unavailable ({rc})")));
+    }
+    Ok(roots)
+}
+
+/// Enables the sequence leaves on the engine hosting `gguf` on `gpu` (`layers` empty: disables
+/// them); returns the sequence leaves per response.
+pub fn seq_configure(gguf: &str, gpu: usize, layers: &[SeqLayer], n_attn: u32, n_recur: u32, seq_heads: u32, interval: u32) -> Result<usize, String> {
+    let slot = slot_for(gpu);
+    let mut g = slot.inner.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf).ok_or_else(|| "no engine hosts this model".to_string())?;
+    let mut key = Vec::with_capacity(layers.len() * 20 + 16);
+    for v in layers.iter().flatten().chain([n_attn, n_recur, seq_heads, interval].iter()) {
+        key.extend_from_slice(&v.to_le_bytes());
+    }
+    let key = *blake3::hash(&key).as_bytes();
+    let n_leaves =
+        if layers.is_empty() { 0 } else { 2 * seq_heads as usize * (n_attn + n_recur) as usize + seq_heads as usize * n_attn as usize };
+    if e.seq_layout == key && e.seq_leaves == n_leaves {
+        return Ok(n_leaves);
+    }
+    ensure_full_context(e, gpu)?;
+    let rc = unsafe { (e.seq_configure)(e.model, layers.as_ptr() as *const u32, layers.len() as u32, n_attn, n_recur, seq_heads, interval) };
+    if rc != 0 {
+        e.seq_leaves = 0;
+        return Err(engine_error(e, &format!("sequence leaf configuration failed ({rc})")));
+    }
+    e.seq_leaves = n_leaves;
+    e.seq_layout = key;
+    Ok(n_leaves)
+}
+
+/// Replays a traced response to its end and returns bytes `[lo, hi)` of each `(leaf, lo, hi)`
+/// span, with the chunk chaining values of its leaf (at most `max_chunks`).
+pub fn seq_replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, spans: &[(u32, u64, u64)], max_chunks: u32) -> Result<Vec<SeqCapture>, String> {
+    let slot = slot_for(gpu);
+    let mut g = slot.inner.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g
+        .as_mut()
+        .filter(|e| e.gguf == gguf && e.trace_leaves > 0 && e.seq_leaves > 0)
+        .ok_or_else(|| "no sequenced engine hosts this model".to_string())?;
+    ensure_full_context(e, gpu)?;
+    let stream: Vec<u32> = spans.iter().map(|s| s.0).collect();
+    let lo: Vec<u64> = spans.iter().map(|s| s.1).collect();
+    let hi: Vec<u64> = spans.iter().map(|s| s.2).collect();
+    let total: usize = spans.iter().map(|s| (s.2 - s.1) as usize).sum();
+    let mut bytes = vec![0u8; total];
+    let mut lens = vec![0u64; spans.len()];
+    let mut cvs = vec![[0u8; 32]; spans.len() * max_chunks as usize];
+    let mut n_cvs = vec![0u32; spans.len()];
+    let rc = unsafe {
+        (e.seq_replay)(
+            e.model,
+            tokens.as_ptr(),
+            tokens.len() as c_int,
+            n_prompt as c_int,
+            stream.as_ptr(),
+            lo.as_ptr(),
+            hi.as_ptr(),
+            spans.len() as u32,
+            max_chunks,
+            bytes.as_mut_ptr(),
+            bytes.len(),
+            lens.as_mut_ptr(),
+            cvs.as_mut_ptr() as *mut u8,
+            cvs.len() * 32,
+            n_cvs.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(engine_error(e, &format!("sequence replay failed ({rc})")));
+    }
+    let (mut bo, mut co) = (0usize, 0usize);
+    let mut out = Vec::with_capacity(spans.len());
+    for k in 0..spans.len() {
+        let (len, n) = (lens[k] as usize, n_cvs[k] as usize);
+        out.push(SeqCapture { bytes: bytes[bo..bo + len].to_vec(), cvs: cvs[co..co + n].to_vec() });
+        bo += len;
+        co += n;
+    }
+    Ok(out)
+}
 
 /// Replays a traced sequence up to the last requested position and returns the bytes of each
 /// `(position, leaf)` capture, in order. `slot_bytes` bounds every captured leaf.
@@ -1030,7 +1288,9 @@ pub fn replay_multi(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, caps:
     let slot = slot_for(gpu);
     let mut g = slot.inner.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
-    ensure_context_for(e, gpu, tokens.len())?;
+    // 0.15.3: always the load-size context, like the traced run (n_batch, hence the ubatch
+    // boundaries the trace commits, follow the context size). Upstream v0.5.8.
+    ensure_full_context(e, gpu)?;
     let e = &*e;
     let pos: Vec<u32> = caps.iter().map(|c| c.0).collect();
     let leaf: Vec<u32> = caps.iter().map(|c| c.1).collect();

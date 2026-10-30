@@ -70,7 +70,7 @@ fn trace_task(gguf: &str, device: u32, tier: u8, window_seed: &[u8; 32]) -> Resu
     let tokens: Vec<i32> = task_tokens(&pctx.table, window_seed).into_iter().map(|t| t as i32).collect();
     let traced = crate::llama_engine::trace_tokens(gguf, device as usize, &tokens).map_err(|e| format!("task not traced ({e})"))?;
     let record = TraceRecord::new_chain(&m, TASK_LEN, traced.ubatch, traced.leaves, &tokens).ok_or("incomplete task trace")?;
-    Ok(ResponseTrace { record, tokens })
+    Ok(ResponseTrace { record, tokens, seq: None })
 }
 
 /// Self-check verdict per (device, tier): `Ok` = passed, `Err` = failed (sticky for the process).
@@ -157,7 +157,7 @@ fn open_chain(
     response_txid: [u8; 32],
     index: &crate::pom::WeightIndex,
 ) -> Result<Vec<u8>, String> {
-    use crate::trace::{captures_match, chain_opening_body, draw_chain, leaf_cap, Captures};
+    use crate::trace::{captures_match, chain_opening, draw_chain, leaf_cap, Captures};
     let rec = &trace.record;
     let d = draw_chain(m, pctx, rec, seed).ok_or("no stage-2 draw")?;
     let wanted = d.captures(m.n_products as u64);
@@ -167,5 +167,10 @@ fn open_chain(
     if !captures_match(rec, &caps) {
         return Err("the replay does not reproduce the committed trace".to_string());
     }
-    chain_opening_body(m, pctx, rec, &trace.tokens, seed, request_hash, response_txid, &d, &caps, index).ok_or_else(|| "no stage-2 opening".to_string())
+    // 0.15.3 / upstream v0.5.8: the trace opening carries the residual point of its residual piece
+    // inline, as the block task commits it (`inline_resid`). The block task stays retired by 1.6.6.
+    let (mut o, r) = chain_opening(m, pctx, rec, &trace.tokens, seed, request_hash, response_txid, &d, &caps, index)
+        .ok_or_else(|| "no stage-2 opening".to_string())?;
+    o.resid = Some(r.resid);
+    Ok(o.encode())
 }

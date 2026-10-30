@@ -64,6 +64,9 @@ endforeach()
 if(NOT EXISTS "${LLAMA_SRC}/ggml/src/ggml-cuda/q8canon.cu")
   message(FATAL_ERROR "keryx-llama: canonical-trace patch not present in ${LLAMA_SRC}")
 endif()
+if(NOT EXISTS "${LLAMA_SRC}/ggml/src/ggml-cuda/q8seq.cu")
+  message(FATAL_ERROR "keryx-llama: sequence-leaves patch (0002) not present in ${LLAMA_SRC}")
+endif()
 
 add_subdirectory(${LLAMA_SRC} llama-build)
 

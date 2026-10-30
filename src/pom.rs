@@ -563,6 +563,26 @@ pub fn trace_chain_activation_daa() -> u64 {
     *G.get_or_init(|| gate("KERYX_TRACE_CHAIN_ACTIVATION_DAA", POM_V5_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA))
 }
 
+/// Node `verifiable_inference_activation` (H15): an AiResponse carries its trace commitment and
+/// the miner opens the points drawn on it.
+pub fn verifiable_inference_activation_daa() -> u64 {
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| gate("KERYX_VERIFIABLE_INFERENCE_ACTIVATION_DAA", POM_V5_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA))
+}
+
+/// Node `attention_activation` (H15): traces commit sequence leaves and audits open attention and
+/// recurrent points from this DAA.
+pub fn attention_activation_daa() -> u64 {
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| gate("KERYX_ATTENTION_ACTIVATION_DAA", POM_V5_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA))
+}
+
+/// Node `trace_seed_bind_activation` (H15): openings of draws seeded from this DAA name their seed block.
+pub fn trace_seed_bind_activation_daa() -> u64 {
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| gate("KERYX_TRACE_SEED_BIND_ACTIVATION_DAA", POM_V5_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA))
+}
+
 /// Whether a block at `daa` is in the PoM v5 (context-pad) era.
 #[inline]
 pub fn is_pom_v5_era(daa: u64) -> bool {

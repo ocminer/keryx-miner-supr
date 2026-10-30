@@ -1,38 +1,34 @@
-/// Keryx OPoI (Optimistic Proof of Inference) — Phase 1 + Phase 2 + Phase 3
-///
-/// Phase 1: synthetic f32 MLP (candle-core), tag embedded in coinbase.
-/// Phase 2: fixed-point i32/i64 MLP — bit-exact on all hardware.
-///   Tags are verified on-chain; collateral is slashed for fraud.
-/// Phase 3 A: AiResponse/AiChallenge as on-chain txs, RocksDB slash state.
-/// Phase 3 B: ZK fraud proof API (Groth16 stub — circuit VK lands in Phase 3 C).
+//! Keryx OPoI (Optimistic Proof of Inference) — Phase 2 + Phase 3
+//!
+//! Phase 2: fixed-point i32/i64 MLP — bit-exact on all hardware.
+//!   Tags are verified on-chain; collateral is slashed for fraud.
+//!   (The Phase-1 f32 MLP was reference-only, never consensus post-Phase 2 — removed.)
+//! Phase 3 A: AiResponse/AiChallenge as on-chain txs, RocksDB slash state.
+//! Phase 3 B: ZK fraud proof API (Groth16 stub — circuit VK lands in Phase 3 C).
 
 pub mod ai_payload;
 pub mod fraud_proof;
-pub mod model;
 pub mod model_fixed;
 pub mod private;
 pub mod task;
 
 pub use ai_payload::{
-    AiRequestPayload, AiResponder, AiResponsePayload, AiChallengePayload,
+    AiRequestPayload, AiResponder, AiResponsePayload, AiChallengePayload, TraceCommitment,
     AI_REQUEST_HEADER_LEN, MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN,
     AI_RESPONSE_PAYLOAD_LEN, AI_RESPONSE_PAYLOAD_V2_LEN,
-    AI_RESPONSE_EXT_PRIVATE_BODY, AI_RESPONSE_EXT_HEADER_LEN, MAX_AI_RESPONSE_PRIVATE_BODY_LEN,
+    AI_RESPONSE_EXT_PRIVATE_BODY, AI_RESPONSE_EXT_TRACE, AI_RESPONSE_TRACE_LEN, AI_RESPONSE_TRACE_TOKENS_LEN, AI_RESPONSE_EXT_HEADER_LEN, MAX_AI_RESPONSE_PRIVATE_BODY_LEN, MAX_AI_RESPONSE_PRIVATE_BODY_LEN_H14,
     MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
     MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN,
-    SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX, SUBNETWORK_ID_AI_CHALLENGE_HEX,
+    SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX, SUBNETWORK_ID_AI_CHALLENGE_HEX, SUBNETWORK_ID_AI_OPENING_HEX,
 };
-pub use ai_payload::{TraceCommitment, AI_RESPONSE_EXT_TRACE, AI_RESPONSE_TRACE_LEN, AI_RESPONSE_TRACE_TOKENS_LEN};
 pub use fraud_proof::{verify_fraud_proof, compute_ai_commitment, FraudProofResult, FRAUD_PROOF_LEN};
 pub use private::{
     escrow_pubkey_of, max_private_prompt_len, open_request, open_response, seal_request, seal_request_with_rng, seal_response,
-    seal_response_with_rng, OpenedRequest, PrivateError, PrivateRecipient, PrivateRequestEnvelope, PrivateRequestSecret,
+    seal_response_with_rng, OpenedRequest, PrivateError, PrivateRecipient, PrivateRequestEnvelope, PrivateRequestSecret, ResponseKey,
     PrivateResponseEnvelope, MAX_PRIVATE_RECIPIENTS, PRIVATE_MAGIC, PRIVATE_VERSION,
 };
 
 pub use task::{InferenceResult, InferenceTask};
-
-use candle_core::Device;
 
 // ── Phase 2 — Verification helpers ───────────────────────────────────────────
 
@@ -92,15 +88,6 @@ pub fn parse_opoi(payload: &[u8]) -> Option<(u64, String)> {
     Some((nonce, claimed_tag.to_string()))
 }
 
-/// Phase 1 — verifies via candle-core f32 MLP (non-deterministic across hardware).
-/// Kept for reference only; NOT used in consensus after Phase 2 activation.
-pub fn verify_tag(nonce: u64, claimed_hex8: &str) -> bool {
-    match run_inference(nonce) {
-        Ok(result) => result.as_hex8() == claimed_hex8,
-        Err(_) => false,
-    }
-}
-
 // ── Phase 2 — Fixed-point verification ───────────────────────────────────────
 
 /// Protocol version salt for Phase 2 OPoI tags.
@@ -139,46 +126,25 @@ pub fn gen_opoi_extra_data(nonce: u64) -> Vec<u8> {
     format!("/{:016x}/ai:v1:{}", nonce, tag).into_bytes()
 }
 
-/// Errors returned by the inference engine.
-#[derive(Debug, thiserror::Error)]
-pub enum InferenceError {
-    #[error("candle error: {0}")]
-    Candle(#[from] candle_core::Error),
-}
-
-/// Runs the OPoI synthetic MLP on the given 64-bit miner nonce.
-///
-/// This is the single entry-point used by the miner.  It constructs an
-/// `InferenceTask` from the nonce, runs the forward pass on CPU, and returns
-/// an `InferenceResult` whose `as_hex8()` is appended to `extra_data`.
-pub fn run_inference(nonce: u64) -> Result<InferenceResult, InferenceError> {
-    let task = InferenceTask::from_nonce(nonce);
-    let output = model::forward(&task.input, &Device::Cpu)?;
-    Ok(InferenceResult { output })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn inference_is_deterministic() {
-        let r1 = run_inference(0xDEAD_BEEF_CAFE_1337).unwrap();
-        let r2 = run_inference(0xDEAD_BEEF_CAFE_1337).unwrap();
-        assert_eq!(r1.output, r2.output, "same nonce must produce same output");
+    fn fixed_inference_is_deterministic() {
+        let r1 = run_inference_fixed(0xDEAD_BEEF_CAFE_1337);
+        let r2 = run_inference_fixed(0xDEAD_BEEF_CAFE_1337);
+        assert_eq!(r1, r2, "same nonce must produce same output");
     }
 
     #[test]
     fn different_nonces_produce_different_outputs() {
-        let r1 = run_inference(1).unwrap();
-        let r2 = run_inference(2).unwrap();
-        assert_ne!(r1.output, r2.output, "different nonces should differ");
+        assert_ne!(run_inference_fixed(1), run_inference_fixed(2), "different nonces should differ");
     }
 
     #[test]
-    fn hex8_is_16_chars() {
-        let r = run_inference(42).unwrap();
-        assert_eq!(r.as_hex8().len(), 16);
+    fn tag_fixed_is_16_chars() {
+        assert_eq!(tag_fixed(42).len(), 16);
     }
 
     // ── Phase 2 tests ─────────────────────────────────────────────────────────
@@ -195,8 +161,7 @@ mod tests {
     #[test]
     fn parse_opoi_finds_valid_tag() {
         let nonce = 0xABCD_1234_5678_EF01u64;
-        let result = run_inference(nonce).unwrap();
-        let tag = result.as_hex8();
+        let tag = tag_fixed(nonce);
         let payload = make_coinbase_payload(nonce, &tag);
 
         let parsed = parse_opoi(&payload);
@@ -213,15 +178,13 @@ mod tests {
     }
 
     #[test]
-    fn verify_tag_accepts_correct_tag() {
+    fn verify_tag_fixed_accepts_correct_tag() {
         let nonce = 99u64;
-        let result = run_inference(nonce).unwrap();
-        assert!(verify_tag(nonce, &result.as_hex8()));
+        assert!(verify_tag_fixed(nonce, &tag_fixed(nonce)));
     }
 
     #[test]
-    fn verify_tag_rejects_wrong_tag() {
-        let nonce = 42u64;
-        assert!(!verify_tag(nonce, "0000000000000000"));
+    fn verify_tag_fixed_rejects_wrong_tag() {
+        assert!(!verify_tag_fixed(42, "0000000000000000"));
     }
 }

@@ -511,7 +511,9 @@ jobs:
             "keryx_llama_generate", "keryx_llama_free",
             "keryx_llama_context_acquire", "keryx_llama_context_release",
             "keryx_llama_trace_configure", "keryx_llama_trace_leaf_count", "keryx_llama_trace_read",
-            "keryx_llama_trace_tokens", "keryx_llama_replay", "keryx_llama_replay_multi")
+            "keryx_llama_trace_tokens", "keryx_llama_replay", "keryx_llama_replay_multi",
+            "keryx_llama_generate_traced", "keryx_llama_seq_configure", "keryx_llama_seq_roots",
+            "keryx_llama_seq_replay")
           foreach ($dll in @("keryx-llama.dll", "keryx-llama-noavx.dll")) {
             if (-not (Test-Path $dll)) { throw "$dll missing" }
             $exports = (& dumpbin /NOLOGO /EXPORTS $dll | Out-String)
