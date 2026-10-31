@@ -113,6 +113,22 @@ jobs:
           cargo build --locked --release --target $env:TARGET -p keryxopencl
           cargo build --locked --release --target $env:TARGET --features pom-opencl -p keryx-miner-supr
 
+      # 0.15.5: the engine DLLs read GGML_CUDA_DISABLE_GRAPHS / LLAMA_ATTN_ROT_DISABLE with the C
+      # runtime's getenv. std::env::set_var alone is invisible to it on Windows (0.15.4 field bug:
+      # every Windows traced self-check failed). Same main.rs path as the NVIDIA exe, which cannot
+      # start on a runner without nvcuda.dll.
+      - name: Native environment gate (C runtime sees the engine settings)
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
+          $env:KERYX_NATIVE_ENV_CHECK = "1"
+          $out = & "target\$env:TARGET\release\keryx-miner-supr.exe" 2>&1 | Out-String
+          $rc = $LASTEXITCODE
+          Write-Host $out
+          if ($rc -ne 0 -or $out -notmatch "native_env::set visible: true; trace vars missing from CRT: \[\]") {
+            throw "native environment gate failed (rc=$rc)"
+          }
+
       - name: Prepare pinned llama.cpp Vulkan source
         shell: pwsh
         run: |

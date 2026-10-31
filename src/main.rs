@@ -747,10 +747,13 @@ fn main() -> Result<(), Error> {
     // are hashed by node hooks that do not run inside a replayed CUDA graph, and attention openings
     // expect UNROTATED key/value cache rows (b10015 rotates quantized KV rows otherwise). Both must
     // hold before llama.cpp / ggml initialize; an explicit GGML_CUDA_DISABLE_GRAPHS still wins.
-    if std::env::var_os("GGML_CUDA_DISABLE_GRAPHS").is_none() {
-        std::env::set_var("GGML_CUDA_DISABLE_GRAPHS", "1");
+    // Set through the C runtime too: on Windows `std::env::set_var` is invisible to the engine
+    // DLL's `getenv` (0.15.4 field bug — every Windows traced self-check failed). See native_env.
+    if std::env::var_os("KERYX_NATIVE_ENV_CHECK").is_some_and(|v| v == "1") {
+        keryx_miner::native_env::export_trace_env();
+        std::process::exit(keryx_miner::native_env::ci_check());
     }
-    std::env::set_var("LLAMA_ATTN_ROT_DISABLE", "1");
+    keryx_miner::native_env::export_trace_env();
     // Force CUDA's device enumeration to PCI-bus order BEFORE any CUDA library initializes. The whole
     // codebase assumes CUDA's ordinal == nvidia-smi's ordinal (see the CUDA_VISIBLE_DEVICES handling
     // below and gpu_health.rs) — an assumption that only holds under CUDA_DEVICE_ORDER=PCI_BUS_ID.
@@ -761,7 +764,7 @@ fn main() -> Result<(), Error> {
     // export this, but a user running the binary directly got none of it. Guarantee it in-process;
     // an explicit operator setting still wins. (No effect on single-model / homogeneous rigs.)
     if std::env::var_os("CUDA_DEVICE_ORDER").is_none() {
-        std::env::set_var("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
+        keryx_miner::native_env::set("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
     }
     // AMD OpenCL caps a SINGLE cl_mem buffer at CL_DEVICE_MAX_MEM_ALLOC_SIZE. On Polaris (RX 580 and
     // kin) that cap is often ~25% of VRAM (or a hard ~4 GB), which is TOO SMALL for the current
@@ -773,7 +776,7 @@ fn main() -> Result<(), Error> {
     for (k, v) in [("GPU_SINGLE_ALLOC_PERCENT", "100"), ("GPU_MAX_ALLOC_PERCENT", "100"), ("GPU_MAX_HEAP_SIZE", "100")]
     {
         if std::env::var_os(k).is_none() {
-            std::env::set_var(k, v);
+            keryx_miner::native_env::set(k, v);
         }
     }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -891,6 +894,17 @@ async fn run() -> Result<(), Error> {
         let _ = env_logger::builder().filter_level(opt.log_level()).parse_default_env().try_init();
     }
     opt.process()?;
+    #[cfg(feature = "pom-cuda")]
+    {
+        let missing = keryx_miner::native_env::trace_env_missing();
+        if !missing.is_empty() {
+            log::error!(
+                "H15: the inference engine will not see {:?} — the traced self-test will fail and this rig will not mine \
+                 (unset KERYX_DIAG_NO_TRACE_ENV)",
+                missing
+            );
+        }
+    }
 
     let initial_mode = if opt.keryxd_address.starts_with("stratum+tcp://") {
         keryx_miner::runtime_stats::MiningMode::Pool

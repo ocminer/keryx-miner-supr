@@ -1,3 +1,22 @@
+# keryx-miner-supr 0.15.5 — Windows: H15 self-test fixed
+
+**Every Windows NVIDIA user of 0.15.4 must update.** On Windows no card passed the H15 traced
+self-test, so no model became ready: the miner did not mine and printed
+`OPoI: no models ready — skipping AiRequest scan` for every block. Linux and the Docker image were
+not affected.
+
+- **Windows: the inference engine now gets its trace settings.** The miner turns off CUDA graphs
+  and KV-cache rotation for the traced engine via the process environment. On Windows the setting
+  only reached the operating-system environment and not the C runtime copy that the engine DLL
+  reads, so the traced self-test failed on every card. The miner now sets these variables through
+  the C runtime as well, checks at startup that the engine can see them, and the Windows build
+  gate tests this.
+- **The "no models ready" warning now gives the reason and no longer floods.** It is printed once,
+  then at most every 60 s or when the reason changes. The reason is one of: model download in
+  progress, no model file staged (with the staging error), self-test pending, self-test FAILED on
+  GPU n (with the cause), or this build cannot produce traces (AMD/Vulkan, macOS). The pool mode
+  "mining suspended" warning works the same way.
+
 # keryx-miner-supr 0.15.4 — H15 serving fixes
 
 Fixes found by the 0.15.3 test matrix on our rigs.

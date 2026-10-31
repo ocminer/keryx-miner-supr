@@ -7,6 +7,7 @@ pub mod inference_coord;
 pub mod integrity;
 pub mod keccak;
 pub mod models;
+pub mod native_env;
 #[cfg(any(
     all(feature = "pom-opencl", any(unix, windows)),
     all(

@@ -1406,9 +1406,7 @@ impl StratumHandler {
                             keryx_miner::slm::advance_lineup_if_due(daa_score);
                             LAST_DAA_SCORE.store(daa_score, std::sync::atomic::Ordering::Relaxed);
                             if !keryx_miner::slm::has_proven_serveable_model() {
-                                if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
-                                    warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
-                                }
+                                keryx_miner::slm::warn_not_ready("mining suspended (no inference = no mining)");
                                 self.declare_capabilities_if_changed().await?;
                                 return miner.process_block(None).await;
                             }
@@ -1531,9 +1529,7 @@ impl StratumHandler {
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
                             if !keryx_miner::slm::has_proven_serveable_model() {
-                                if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
-                                    warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
-                                }
+                                keryx_miner::slm::warn_not_ready("mining suspended (no inference = no mining)");
                                 self.declare_capabilities_if_changed().await?;
                                 return miner.process_block(None).await;
                             }
@@ -1617,9 +1613,7 @@ impl StratumHandler {
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
                             if !keryx_miner::slm::has_proven_serveable_model() {
-                                if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
-                                    warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
-                                }
+                                keryx_miner::slm::warn_not_ready("mining suspended (no inference = no mining)");
                                 self.declare_capabilities_if_changed().await?;
                                 return miner.process_block(None).await;
                             }
@@ -1720,9 +1714,7 @@ impl StratumHandler {
                             // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
                             // Keryx core invariant — no inference, no PoW.
                             if !keryx_miner::slm::has_proven_serveable_model() {
-                                if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
-                                    warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
-                                }
+                                keryx_miner::slm::warn_not_ready("mining suspended (no inference = no mining)");
                                 self.declare_capabilities_if_changed().await?;
                                 return miner.process_block(None).await;
                             }

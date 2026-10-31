@@ -2088,7 +2088,18 @@ fn probe_exact_inference_route(model_id: &[u8; 32], gpu: usize) -> SelfTestOutco
         return SelfTestOutcome::Deferred(DeferredReason::ModelNotRegistered);
     }
     probe_exact_inference_route_with(model_id, gpu, || {
-        let text = try_load_and_run_inference_on(gpu, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS)?;
+        let text = match try_load_and_run_inference_on(gpu, model_id, "Reply with exactly: OK", SELF_TEST_MAX_TOKENS) {
+            Ok(text) => text,
+            Err(InferenceError::Failed) => {
+                note_self_test_failure(
+                    model_id,
+                    gpu,
+                    "the plain inference self-test failed (model load or generation error — see the log lines above)".to_string(),
+                );
+                return Err(InferenceError::Failed);
+            }
+            Err(e) => return Err(e),
+        };
         // H15 (0.15.3): a card mines its tier only if it can ANSWER it the way keryxd 1.6.6
         // requires — a traced private answer whose openings pass the node's verifiers. No override:
         // mining a tier that cannot be served traced manufactures strikes (owner directive).
@@ -2110,15 +2121,124 @@ pub fn traced_passed_on(model_id: &[u8; 32], gpu: usize) -> bool {
     traced_passed().read().map(|s| s.contains(&(*model_id, gpu))).unwrap_or(false)
 }
 
+/// Why the last self-test of (model, card) failed — for the "no models ready" status line.
+fn self_test_reasons() -> &'static RwLock<std::collections::HashMap<SelfTestKey, String>> {
+    static R: OnceLock<RwLock<std::collections::HashMap<SelfTestKey, String>>> = OnceLock::new();
+    R.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+fn note_self_test_failure(model_id: &[u8; 32], gpu: usize, reason: String) {
+    if let Ok(mut r) = self_test_reasons().write() {
+        r.insert((*model_id, gpu), reason);
+    }
+}
+
+fn clear_self_test_failure(model_id: &[u8; 32], gpu: usize) {
+    if let Ok(mut r) = self_test_reasons().write() {
+        r.remove(&(*model_id, gpu));
+    }
+}
+
+fn model_name(model_id: &[u8; 32]) -> String {
+    crate::models::REGISTRY
+        .iter()
+        .find(|s| &s.model_id == model_id)
+        .map_or_else(|| format!("{:.8}", hex::encode(model_id)), |s| s.name.to_string())
+}
+
+/// Plain-language reason why no model is serveable (empty declare set), for the rate-limited
+/// "no models ready" warnings: downloading / staging, self-test pending, self-test FAILED (with
+/// the recorded reason), build without a trace engine, or the --wait-ready hold.
+pub fn not_ready_reason() -> String {
+    let proven = proven_serveable_model_ids();
+    if !proven.is_empty() {
+        if crate::wait_ready::holds() {
+            return "--wait-ready: the declaration is held until every card is set up".to_string();
+        }
+        return "a model is ready".to_string();
+    }
+    let loaded = loaded_model_ids();
+    if loaded.is_empty() {
+        if is_downloading() {
+            return "model download in progress".to_string();
+        }
+        if let Some(e) = last_staging_error() {
+            return format!("no model file is staged: {e}");
+        }
+        return "no model file is staged yet (download pending or model files missing)".to_string();
+    }
+    let mut failed: Vec<String> = self_test_reasons()
+        .read()
+        .map(|r| {
+            r.iter()
+                .filter(|((mid, _), _)| loaded.contains(mid))
+                .map(|((mid, gpu), why)| format!("GPU {} {}: {}", gpu, model_name(mid), why))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !failed.is_empty() {
+        failed.sort();
+        return format!("inference self-test FAILED — {}", failed.join("; "));
+    }
+    if !crate::traced::supported() {
+        return "this build's inference engine cannot produce the verifiable trace keryxd 1.6.6 requires (H15) — use the NVIDIA build"
+            .to_string();
+    }
+    let names: Vec<String> = loaded.iter().map(model_name).collect();
+    format!("model files staged ({}); inference self-test pending/running", names.join(", "))
+}
+
+/// Minimum interval between two identical "no models ready" warnings of one kind.
+const NOT_READY_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a "no models ready" warning of `kind` with `reason` is due: the first one, a changed
+/// reason, or the same reason after [`NOT_READY_WARN_INTERVAL`] (0.15.5: the solo scan printed it
+/// for every block).
+fn not_ready_warning_due(kind: &str, reason: &str, now: std::time::Instant) -> bool {
+    static LAST: OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>>> = OnceLock::new();
+    let mut last = match LAST.get_or_init(Default::default).lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    match last.get(kind) {
+        Some((at, prev)) if prev == reason && now.duration_since(*at) < NOT_READY_WARN_INTERVAL => false,
+        _ => {
+            last.insert(kind.to_string(), (now, reason.to_string()));
+            true
+        }
+    }
+}
+
+/// Rate-limited "no models ready" warning: `what` says what is skipped, the reason is appended.
+pub fn warn_not_ready(what: &str) {
+    let reason = not_ready_reason();
+    if not_ready_warning_due(what, &reason, std::time::Instant::now()) {
+        log::warn!("OPoI: no models ready — {} ({})", what, reason);
+    }
+}
+
 fn traced_self_check_on(gpu: usize, model_id: &[u8; 32]) -> std::result::Result<(), InferenceError> {
     let Some(tier) = crate::models::pom_tier_index(model_id, u64::MAX) else {
         log::error!("H15 self-test: model {:.8} has no audited tier — not serveable", hex::encode(model_id));
+        note_self_test_failure(model_id, gpu, "model has no audited H15 tier".to_string());
         return Err(InferenceError::Failed);
     };
     #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
     {
         let t0 = std::time::Instant::now();
-        let out = with_traced_engine(gpu, model_id, |spec, gguf| crate::traced::self_check(spec, gguf, gpu, tier))?;
+        let out = match with_traced_engine(gpu, model_id, |spec, gguf| crate::traced::self_check(spec, gguf, gpu, tier)) {
+            Ok(out) => out,
+            Err(InferenceError::Failed) => {
+                log::error!(
+                    "H15 self-test: GPU {} could not start the traced engine for tier {} (see the lines above) — this card will NOT mine the tier",
+                    gpu,
+                    tier
+                );
+                note_self_test_failure(model_id, gpu, format!("traced engine unavailable for tier {tier} (in-process llama load failed)"));
+                return Err(InferenceError::Failed);
+            }
+            Err(e) => return Err(e),
+        };
         match out {
             Ok(()) => {
                 log::info!(
@@ -2130,6 +2250,7 @@ fn traced_self_check_on(gpu: usize, model_id: &[u8; 32]) -> std::result::Result<
                 if let Ok(mut m) = traced_passed().write() {
                     m.insert((*model_id, gpu));
                 }
+                clear_self_test_failure(model_id, gpu);
                 record_serveable_on(model_id, gpu);
                 Ok(())
             }
@@ -2140,6 +2261,7 @@ fn traced_self_check_on(gpu: usize, model_id: &[u8; 32]) -> std::result::Result<
                     tier,
                     e
                 );
+                note_self_test_failure(model_id, gpu, format!("H15 traced self-test failed for tier {tier}: {e}"));
                 Err(InferenceError::Failed)
             }
         }
@@ -2151,6 +2273,11 @@ fn traced_self_check_on(gpu: usize, model_id: &[u8; 32]) -> std::result::Result<
             "H15 self-test: this build's inference engine cannot produce the verifiable trace keryxd 1.6.6 requires for private \
              requests (tier {}) — NOT mining (a tier that cannot be served would only collect strikes). Use the NVIDIA build.",
             tier
+        );
+        note_self_test_failure(
+            model_id,
+            gpu,
+            "this build's inference engine cannot produce the verifiable trace keryxd 1.6.6 requires (H15) — use the NVIDIA build".to_string(),
         );
         Err(InferenceError::Failed)
     }
@@ -2407,6 +2534,9 @@ pub fn serveable_model_ids() -> Vec<[u8; 32]> {
 pub fn clear_self_test(model_id: &[u8; 32]) {
     if let Ok(mut t) = traced_passed().write() {
         t.retain(|(mid, _)| mid != model_id);
+    }
+    if let Ok(mut r) = self_test_reasons().write() {
+        r.retain(|(mid, _), _| mid != model_id);
     }
     if let Ok(mut m) = self_test_state().write() {
         m.retain(|(mid, _), _| mid != model_id);
@@ -3975,5 +4105,38 @@ mod inference_probe_tests {
             select_runtime_status_route(requested_model, vec![2], &candidates),
             (requested_model, vec![2])
         );
+    }
+}
+
+#[cfg(test)]
+mod not_ready_warning_tests {
+    use super::not_ready_warning_due;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn warning_is_rate_limited_per_kind_and_reason() {
+        let t0 = Instant::now();
+        assert!(not_ready_warning_due("k-test", "self-test pending", t0));
+        assert!(!not_ready_warning_due("k-test", "self-test pending", t0 + Duration::from_secs(1)));
+        assert!(!not_ready_warning_due("k-test", "self-test pending", t0 + Duration::from_secs(59)));
+        // A changed reason is printed at once.
+        assert!(not_ready_warning_due("k-test", "self-test FAILED", t0 + Duration::from_secs(59)));
+        assert!(!not_ready_warning_due("k-test", "self-test FAILED", t0 + Duration::from_secs(100)));
+        assert!(not_ready_warning_due("k-test", "self-test FAILED", t0 + Duration::from_secs(120)));
+        // Another kind has its own clock.
+        assert!(not_ready_warning_due("k-test-2", "self-test FAILED", t0 + Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn failure_reason_is_reported_and_cleared() {
+        let mid = [0xA5u8; 32];
+        super::note_self_test_failure(&mid, 7, "H15 traced self-test failed for tier 0: no sequence leaves".into());
+        let have = super::self_test_reasons().read().unwrap().get(&(mid, 7)).cloned();
+        assert_eq!(have.as_deref(), Some("H15 traced self-test failed for tier 0: no sequence leaves"));
+        super::clear_self_test_failure(&mid, 7);
+        assert!(super::self_test_reasons().read().unwrap().get(&(mid, 7)).is_none());
+        // With nothing staged the reason names the staging state, never "valid model files".
+        let r = super::not_ready_reason();
+        assert!(!r.is_empty());
     }
 }

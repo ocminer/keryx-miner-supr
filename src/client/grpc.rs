@@ -825,7 +825,7 @@ impl KeryxdHandler {
         // Prevents miners with missing/truncated model files from ever queuing inference work.
         let ready_ids = keryx_miner::slm::serveable_model_ids();
         if ready_ids.is_empty() {
-            log::warn!("OPoI: no models ready — skipping AiRequest scan (run miner with valid model files)");
+            keryx_miner::slm::warn_not_ready("skipping AiRequest scan");
             return;
         }
         log::debug!(
@@ -1613,9 +1613,7 @@ impl KeryxdHandler {
                 // Keryx core invariant — no inference, no PoW.
                 if !keryx_miner::slm::has_proven_serveable_model() {
                     self.template_deferred_for_models = true;
-                    if self.last_known_daa % 200 == 0 {
-                        log::warn!("OPoI: no models ready — mining suspended until model files are available");
-                    }
+                    keryx_miner::slm::warn_not_ready("mining suspended (no inference = no mining)");
                     miner.process_block(None).await?;
                     return Ok(());
                 }
