@@ -5,6 +5,7 @@
 - Compact trace records can be uploaded, fetched by a fresh compatible process and replayed for audits. Proof verification remains unchanged.
 - Large Vulkan allocations are split into bounded buffers, allowing additional mining cards to load models on drivers with per-allocation limits.
 - Windows AMD device selection accepts both architecture identifiers and retail GPU names. Its launcher works from another directory and preserves the exit status.
+- HiveOS statistics correctly convert both `Khash/s` and `khash/s`, and retain fractional kilohashes for rates below 1 kH/s.
 - Linux AMD packages include AVX and baseline-CPU Vulkan libraries. Keep the executable and its matching libraries together when upgrading.
 - Earlier AMD benchmark figures remain explicitly labelled as pre-H15 results. RDNA1 remains excluded from H15 mining; Apple Metal H15 support is unchanged.
 - Release packages include the existing project and third-party licenses. NVIDIA retains its established CUDA kernels and H15 proof path.

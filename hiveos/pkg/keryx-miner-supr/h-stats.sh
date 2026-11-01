@@ -48,11 +48,12 @@ to_khs() {
 				if      ($i ~ /Thash/) m = 1000000000;
 				else if ($i ~ /Ghash/) m = 1000000;
 				else if ($i ~ /Mhash/) m = 1000;
-				else if ($i ~ /khash/) m = 1;
+				else if ($i ~ /[kK]hash/) m = 1;
+				else if ($i == "hash/s") m = 0.001;
 				break;
 			}
 		}
-		printf "%.0f\n", rate * m;
+		printf "%.3f\n", rate * m;
 	}'
 }
 
