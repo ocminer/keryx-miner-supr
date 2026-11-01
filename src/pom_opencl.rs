@@ -784,21 +784,44 @@ impl ResidentMiner {
     }
 }
 
-fn prefer_resident_vulkan(name: &str, requested: Option<&str>) -> bool {
-    // RDNA1's BDA dispatch hang is a hard exclusion, including explicit overrides.
+fn radeon_rx_model(name: &str) -> Option<u32> {
+    let words: Vec<&str> = name.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).collect();
+    if !words.contains(&"radeon") { return None; }
+    words.windows(2).find_map(|w| (w[0] == "rx").then(|| w[1].parse().ok()).flatten())
+}
+
+fn is_rdna1(name: &str, gfxip: Option<(u32, u32)>) -> bool {
     let name = name.to_ascii_lowercase();
-    if name.contains("gfx101") || !name.contains("gfx") {
+    gfxip == Some((10, 1)) || name.contains("gfx101")
+        || matches!(radeon_rx_model(&name), Some(5000..=5999))
+}
+
+fn prefer_resident_vulkan(name: &str, gfxip: Option<(u32, u32)>, requested: Option<&str>) -> bool {
+    // AMD's Windows driver can expose a marketing name instead of a gfx token.
+    // Its architecture properties keep the default and the RDNA1 exclusion
+    // independent of that spelling. Unsupported properties retain name matching.
+    let name = name.to_ascii_lowercase();
+    let radeon = matches!(radeon_rx_model(&name), Some(6000..=7999 | 9000..=9999));
+    let instinct = name.contains("instinct") && name.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| matches!(word, "mi50" | "mi60"));
+    if is_rdna1(&name, gfxip) || (!name.contains("gfx") && gfxip.is_none() && !radeon && !instinct) {
         return false;
     }
     match requested {
         Some("opencl") => false,
         Some("vulkan") => true,
-        _ => device_arch_is(&name, "gfx906") || name.split(|c: char| !c.is_ascii_alphanumeric()).any(|token| {
+        _ => radeon || instinct || matches!(gfxip, Some((10, 3) | (11, _) | (12, _)))
+            || device_arch_is(&name, "gfx906") || name.split(|c: char| !c.is_ascii_alphanumeric()).any(|token| {
             let Some(arch) = token.strip_prefix("gfx") else { return false; };
             arch.len() == 4 && arch.bytes().all(|c| c.is_ascii_hexdigit())
                 && (arch.starts_with("103") || arch.starts_with("11") || arch.starts_with("12"))
         }),
     }
+}
+
+fn device_gfxip(dev: &Device) -> Option<(u32, u32)> {
+    if dev.vendor_id().ok()? != 0x1002 { return None; }
+    Some((dev.gfxip_major_amd().ok()?, dev.gfxip_minor_amd().ok()?))
 }
 
 static POM_BY_DEV: Mutex<Vec<(usize, Arc<Mutex<ResidentMiner>>)>> = Mutex::new(Vec::new());
@@ -1525,7 +1548,8 @@ fn device_gfx_name(device_id: usize) -> String {
 /// rig until reboot. Never dispatch the gate there — the policy check runs BEFORE the gate.
 #[cfg(any(unix, windows))]
 fn device_is_rdna1(device_id: usize) -> bool {
-    device_gfx_name(device_id).contains("gfx101")
+    let dev = Device::new(device_id as opencl3::types::cl_device_id);
+    is_rdna1(&dev.name().unwrap_or_default(), device_gfxip(&dev))
 }
 
 /// Share the inference model by default. H15 needs a context pad in addition
@@ -1739,7 +1763,7 @@ fn install_resident(device_id: usize) -> Result<(), String> {
             .ok()
             .or_else(|| std::env::var_os("KERYX_POM_V4_MODE").map(|_| "opencl".into()));
         #[cfg(any(unix, windows))]
-        if prefer_resident_vulkan(&dev.name().unwrap_or_default(), requested_backend.as_deref()) {
+        if prefer_resident_vulkan(&dev.name().unwrap_or_default(), device_gfxip(&dev), requested_backend.as_deref()) {
             let path = TIER.lock().unwrap().as_ref().map(|(_, path, _)| path.clone());
             if let (Some(path), Some(pci)) = (path, device_pci_full(device_id)) {
                 match crate::llama_engine_vk::MiningWalk::load(&path, pci, index) {
@@ -2158,17 +2182,31 @@ mod v4_wmma1_tests {
     #[test]
     fn resident_backend_policy_preserves_hardware_exclusions_and_overrides() {
         use super::prefer_resident_vulkan;
-        assert!(prefer_resident_vulkan("gfx906:sramecc+:xnack-", None));
-        assert!(!prefer_resident_vulkan("gfx9060", None));
-        assert!(!prefer_resident_vulkan("gfx11000", None));
-        assert!(!prefer_resident_vulkan("notgfx1100", None));
-        assert!(prefer_resident_vulkan("AMD (gfx1030:xnack-)", None));
-        assert!(prefer_resident_vulkan("gfx1100", None));
-        assert!(prefer_resident_vulkan("gfx1102", None));
-        assert!(!prefer_resident_vulkan("gfx906", Some("opencl")));
-        assert!(prefer_resident_vulkan("gfx1100", Some("vulkan")));
-        assert!(!prefer_resident_vulkan("gfx1010", Some("vulkan")));
-        assert!(!prefer_resident_vulkan("NVIDIA GeForce", Some("vulkan")));
+        assert!(prefer_resident_vulkan("gfx906:sramecc+:xnack-", None, None));
+        assert!(!prefer_resident_vulkan("gfx9060", None, None));
+        assert!(!prefer_resident_vulkan("gfx11000", None, None));
+        assert!(!prefer_resident_vulkan("notgfx1100", None, None));
+        assert!(prefer_resident_vulkan("AMD (gfx1030:xnack-)", None, None));
+        assert!(prefer_resident_vulkan("gfx1100", None, None));
+        assert!(prefer_resident_vulkan("gfx1102", None, None));
+        assert!(!prefer_resident_vulkan("gfx906", None, Some("opencl")));
+        assert!(prefer_resident_vulkan("gfx1100", None, Some("vulkan")));
+        assert!(!prefer_resident_vulkan("gfx1010", None, Some("vulkan")));
+        assert!(!prefer_resident_vulkan("NVIDIA GeForce", None, Some("vulkan")));
+        assert!(prefer_resident_vulkan("AMD Radeon RX 7900 XTX", Some((11, 0)), None));
+        assert!(prefer_resident_vulkan("AMD Radeon RX 6900 XT", Some((10, 3)), None));
+        assert!(prefer_resident_vulkan("AMD Radeon RX 9070 XT", Some((12, 0)), None));
+        assert!(!prefer_resident_vulkan("AMD Radeon RX 5700 XT", Some((10, 1)), Some("vulkan")));
+        assert!(!prefer_resident_vulkan("AMD Radeon RX 7900 XTX", Some((11, 0)), Some("opencl")));
+        // Older Windows OpenCL drivers can omit the AMD architecture extension.
+        assert!(prefer_resident_vulkan("AMD Radeon RX 7900 XTX", None, None));
+        assert!(prefer_resident_vulkan("AMD Radeon(TM) RX 6900 XT", None, None));
+        assert!(prefer_resident_vulkan("AMD Radeon RX 9070 XT", None, None));
+        assert!(prefer_resident_vulkan("AMD Instinct MI50/MI60", None, None));
+        assert!(!prefer_resident_vulkan("AMD Radeon RX 5500 XT", None, Some("vulkan")));
+        assert!(!prefer_resident_vulkan("AMD Radeon RX 5700 XT", None, Some("vulkan")));
+        assert!(!prefer_resident_vulkan("AMD Radeon RX 580", None, None));
+        assert!(!prefer_resident_vulkan("AMD Instinct MI500", None, None));
     }
     use super::{device_arch_is, ready_key_for_bound, select_v4_mode, V4Mode, POM_SRC};
 

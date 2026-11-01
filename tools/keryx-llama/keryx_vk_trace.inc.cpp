@@ -70,8 +70,14 @@ static int keryx_vk_trace_feed(KeryxLlama* h, const int32_t* tokens, uint32_t st
             batch.logits[j] = j + 1 == n;
         }
         const int rc = llama_decode(h->ctx, batch);
+        // Decode can leave backend transfers and host copies pending. Complete
+        // them before releasing the batch or advancing the trace's positions;
+        // waiting on the Vulkan queue alone does not submit pending work.
+        llama_synchronize(h->ctx);
         llama_batch_free(batch);
         if (rc != 0) return keryx_vk_fail(h, "Vulkan traced decode failed", -3);
+        const char* trace_error = ggml_backend_vk_keryx_trace_error(h->gpu);
+        if (trace_error && *trace_error) return keryx_vk_fail(h, "Vulkan traced node failed");
         if (h->trace->after_batch && h->trace->after_batch(h->trace->callback_data, n) != 0)
             return keryx_vk_fail(h, "Vulkan sequence capture failed");
         consumed += n;
@@ -106,7 +112,7 @@ const char* keryx_llama_last_error() { return keryx_vk_trace_error.c_str(); }
 // Identity comes from the physical device owning the model, not an OpenCL or
 // ggml ordinal in a different enumeration. Driver identity also binds replay.
 int keryx_llama_vk_trace_identity(KeryxLlama* h, char* name, size_t name_cap,
-                                 char* driver, size_t driver_cap) {
+                                 char* driver, size_t driver_cap) try {
     if (!h || !h->phys || !name || name_cap < 2 || !driver || driver_cap < 2) return -1;
     VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -121,9 +127,15 @@ int keryx_llama_vk_trace_identity(KeryxLlama* h, char* name, size_t name_cap,
     memcpy(name, gpu.c_str(), gpu.size() + 1);
     memcpy(driver, version.c_str(), version.size() + 1);
     return 0;
+} catch (const std::exception& e) {
+    keryx_vk_trace_error = std::string("Vulkan trace operation failed: ") + e.what();
+    return -5;
+} catch (...) {
+    keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
+    return -5;
 }
 
-int keryx_llama_trace_configure(KeryxLlama* h, const void* manifest, size_t manifest_len, int max_pos) {
+int keryx_llama_trace_configure(KeryxLlama* h, const void* manifest, size_t manifest_len, int max_pos) try {
     if (!h || !h->model || !h->loaded_context || !manifest || !manifest_len || max_pos < 0) return -1;
     std::lock_guard<std::mutex> guard(h->gen_lock);
     if (!h->trace) {
@@ -140,58 +152,106 @@ int keryx_llama_trace_configure(KeryxLlama* h, const void* manifest, size_t mani
     h->trace->configured = rc == 0;
     h->trace->sequence = false;
     return rc ? keryx_vk_fail(h, "Vulkan trace configuration failed") : 0;
+} catch (const std::exception& e) {
+    keryx_vk_trace_error = std::string("Vulkan trace operation failed: ") + e.what();
+    return -5;
+} catch (...) {
+    keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
+    return -5;
 }
 
-int keryx_llama_trace_leaf_count(KeryxLlama* h) {
+int keryx_llama_trace_leaf_count(KeryxLlama* h) try {
     return h && h->trace && h->trace->configured ? ggml_backend_vk_keryx_trace_leaf_count(h->gpu) : -1;
+} catch (const std::exception& e) {
+    keryx_vk_trace_error = std::string("Vulkan trace operation failed: ") + e.what();
+    return -5;
+} catch (...) {
+    keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
+    return -5;
 }
 
 int keryx_llama_trace_read(KeryxLlama* h, uint8_t* leaves, size_t leaves_cap,
-                          uint32_t* ubatch, size_t ubatch_cap, uint32_t* n_pos) {
+                          uint32_t* ubatch, size_t ubatch_cap, uint32_t* n_pos) try {
     if (!h || !h->trace || !h->trace->configured) return -1;
     return ggml_backend_vk_keryx_trace_read(h->gpu, leaves, leaves_cap, ubatch, ubatch_cap, n_pos);
+} catch (const std::exception& e) {
+    keryx_vk_trace_error = std::string("Vulkan trace operation failed: ") + e.what();
+    return -5;
+} catch (...) {
+    keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
+    return -5;
 }
 
 int keryx_llama_vk_sequence_configure(KeryxLlama* h, uint32_t layers, uint32_t heads,
-                                     const uint32_t* recurrent, uint32_t n_recur, uint32_t interval) {
+                                     const uint32_t* recurrent, uint32_t n_recur, uint32_t interval) try {
     if (!h || !h->trace || !h->trace->configured || (n_recur && !recurrent)) return -1;
     int rc = ggml_backend_vk_keryx_lse_configure(h->gpu, layers, heads);
     if (!rc) rc = ggml_backend_vk_keryx_recur_configure(h->gpu, recurrent, n_recur, interval);
     h->trace->sequence = !rc && (layers || n_recur);
     return rc ? keryx_vk_fail(h, "Vulkan sequence configuration failed") : 0;
+} catch (const std::exception& e) {
+    keryx_vk_trace_error = std::string("Vulkan trace operation failed: ") + e.what();
+    return -5;
+} catch (...) {
+    keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
+    return -5;
 }
 
-int keryx_llama_vk_batch_callback(KeryxLlama* h, int (*callback)(void*, uint32_t), void* data) {
+int keryx_llama_vk_batch_callback(KeryxLlama* h, int (*callback)(void*, uint32_t), void* data) try {
     if (!h || !h->trace) return -1;
     h->trace->after_batch = callback;
     h->trace->callback_data = data;
     return 0;
+} catch (const std::exception& e) {
+    keryx_vk_trace_error = std::string("Vulkan trace operation failed: ") + e.what();
+    return -5;
+} catch (...) {
+    keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
+    return -5;
 }
 
 int keryx_llama_vk_recurrent_read(KeryxLlama* h, uint8_t* records, size_t records_cap,
                                  uint8_t* checkpoints, size_t checkpoints_cap,
-                                 uint32_t* n_tokens, uint32_t* has_checkpoint) {
+                                 uint32_t* n_tokens, uint32_t* has_checkpoint) try {
     if (!h || !h->trace) return -1;
     return ggml_backend_vk_keryx_recur_read(h->gpu, records, records_cap, checkpoints,
                                          checkpoints_cap, n_tokens, has_checkpoint);
+} catch (const std::exception& e) {
+    keryx_vk_trace_error = std::string("Vulkan trace operation failed: ") + e.what();
+    return -5;
+} catch (...) {
+    keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
+    return -5;
 }
 
-size_t keryx_llama_vk_sequence_state(KeryxLlama* h, uint8_t* out, size_t cap) {
+size_t keryx_llama_vk_sequence_state(KeryxLlama* h, uint8_t* out, size_t cap) try {
     if (!h || !h->ctx || !h->trace) return 0;
     const size_t need = llama_state_seq_get_size_ext(h->ctx, 0, 1u << 31);
     if (!out) return need;
     if (cap < need) return 0;
     return llama_state_seq_get_data_ext(h->ctx, out, cap, 0, 1u << 31);
+} catch (const std::exception& e) {
+    keryx_vk_trace_error = std::string("Vulkan trace operation failed: ") + e.what();
+    return 0;
+} catch (...) {
+    keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
+    return 0;
 }
 
-int keryx_llama_vk_lse_read(KeryxLlama* h, float* out, size_t cap, uint32_t n_pos) {
+int keryx_llama_vk_lse_read(KeryxLlama* h, float* out, size_t cap, uint32_t n_pos) try {
     return h && h->trace ? ggml_backend_vk_keryx_lse_read(h->gpu, out, cap, n_pos) : -1;
+} catch (const std::exception& e) {
+    keryx_vk_trace_error = std::string("Vulkan trace operation failed: ") + e.what();
+    return -5;
+} catch (...) {
+    keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
+    return -5;
 }
 
 int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, const int32_t* prefix, int n_prefix,
                                int head_tokens, const char* rest, int max_tokens, char* out, int cap,
                                int32_t* tokens, int tokens_cap, int* n_prompt_out, int* n_fed_out,
-                               int min_prompt, int answer_bytes_per_position) {
+                               int min_prompt, int answer_bytes_per_position) try {
     if (!h || !h->trace || !h->trace->configured || !prompt || !out || cap < 2 || !tokens ||
         tokens_cap < 1 || !n_prompt_out || !n_fed_out || max_tokens < 0 || max_tokens > 2048 ||
         n_prefix < 0 || min_prompt < 0 || answer_bytes_per_position < 0 || (n_prefix && (!prefix || !rest))) return -1;
@@ -258,11 +318,17 @@ int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, const int32_t
     *n_prompt_out = n;
     *n_fed_out = fed;
     return written;
+} catch (const std::exception& e) {
+    keryx_vk_trace_error = std::string("Vulkan trace operation failed: ") + e.what();
+    return -5;
+} catch (...) {
+    keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
+    return -5;
 }
 
 int keryx_llama_replay_multi(KeryxLlama* h, const int32_t* tokens, int n_tokens, int n_prompt,
                             const uint32_t* pos, const uint32_t* leaf, uint32_t n_capture,
-                            uint32_t slot_bytes, uint8_t* out, size_t out_cap, uint32_t* lens) {
+                            uint32_t slot_bytes, uint8_t* out, size_t out_cap, uint32_t* lens) try {
     if (!h || !h->trace || !tokens || n_tokens <= 0 || n_prompt <= 0 || n_prompt > n_tokens ||
         !pos || !leaf || !n_capture || n_capture > 32 || !slot_bytes || slot_bytes % 4 ||
         !out || !lens || out_cap < (uint64_t)n_capture * slot_bytes || (uint32_t)n_tokens > h->trace->max_ctx) return -1;
@@ -277,9 +343,15 @@ int keryx_llama_replay_multi(KeryxLlama* h, const int32_t* tokens, int n_tokens,
     const int ended = ggml_backend_vk_keryx_trace_end(h->gpu);
     if (!rc && !ended) rc = ggml_backend_vk_keryx_trace_read_captures(h->gpu, out, out_cap, lens, n_capture);
     return rc || ended ? keryx_vk_fail(h, "Vulkan product replay failed") : 0;
+} catch (const std::exception& e) {
+    keryx_vk_trace_error = std::string("Vulkan trace operation failed: ") + e.what();
+    return -5;
+} catch (...) {
+    keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
+    return -5;
 }
 
-int keryx_llama_vk_replay_sequence(KeryxLlama* h, const int32_t* tokens, int n_tokens, int n_prompt) {
+int keryx_llama_vk_replay_sequence(KeryxLlama* h, const int32_t* tokens, int n_tokens, int n_prompt) try {
     if (!h || !h->trace || !tokens || n_tokens <= 0 || n_prompt <= 0 || n_prompt > n_tokens ||
         (uint32_t)n_tokens > h->trace->max_ctx) return -1;
     std::lock_guard<std::mutex> guard(h->gen_lock);
@@ -289,6 +361,12 @@ int keryx_llama_vk_replay_sequence(KeryxLlama* h, const int32_t* tokens, int n_t
     if (!rc) rc = keryx_vk_replay_to(h, tokens, n_tokens, n_prompt, n_tokens - 1);
     const int ended = ggml_backend_vk_keryx_trace_end(h->gpu);
     return rc || ended ? keryx_vk_fail(h, "Vulkan sequence replay failed") : 0;
+} catch (const std::exception& e) {
+    keryx_vk_trace_error = std::string("Vulkan trace operation failed: ") + e.what();
+    return -5;
+} catch (...) {
+    keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
+    return -5;
 }
 
 } // extern "C"

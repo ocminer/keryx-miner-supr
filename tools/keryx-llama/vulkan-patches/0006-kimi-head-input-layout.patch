@@ -1,0 +1,12 @@
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2755,6 +2755,9 @@
+             // It's preferable to do the calculation as a matrix-matrix multiplication with n_tokens in dimension 1.
+             // The permutations are noops and only change how the tensor data is interpreted.
+             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
++            // Kimi's canonical head-slice product consumes contiguous q8_1
++            // inputs, including the one-token head permutation used for tracing.
++            if (arch == LLM_ARCH_KIMI_LINEAR) cur = ggml_cont(ctx0, cur);
+             cur = ggml_mul_mat(ctx0, v_mla, cur);
+             cb(cur, "fattn_mla", il);
+             cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);

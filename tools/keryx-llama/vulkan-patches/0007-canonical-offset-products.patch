@@ -1,0 +1,41 @@
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -12398,7 +12398,7 @@
+ // the batch is committed past 8 tokens, the weight is Q4_K/Q5_K, and the product is not the head,
+ // whose input the verifier always reads in the MMVQ layout.
+ static bool ggml_vk_keryx_mmq_tiles(const vk_device & device, const ggml_tensor * w) {
+-    if (!ggml_vk_keryx_armed(device) || !w || (w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q5_K)) {
++    if (!ggml_vk_keryx_armed(device) || !w || (w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q5_K && w->type != GGML_TYPE_Q4_0 && w->type != GGML_TYPE_Q5_0)) {
+         return false;
+     }
+     const vk_keryx_trace & t = vk_keryx_traces[device->idx];
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+@@ -85,6 +85,13 @@
+ }
+ 
+ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
++    // Batched canonical Q4_0/Q5_0 products use the sum of the quantized
++    // activations. The stored half-precision sum belongs to the MMVQ path.
++    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_KERYX_DS4) != 0) {
++        const int32_t qs = dotPacked4x8EXT(0x01010101, cache_b_qs[0])
++                         + dotPacked4x8EXT(0x01010101, cache_b_qs[1]);
++        return FLOAT_TYPE(da * dsb.x * float(q_sum - 8 * qs));
++    }
+     return FLOAT_TYPE(da * (float(q_sum) * dsb.x - (8 / sum_divisor) * dsb.y));
+ }
+ #endif
+@@ -119,6 +126,13 @@
+ }
+ 
+ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
++    // Batched canonical Q4_0/Q5_0 products use the sum of the quantized
++    // activations. The stored half-precision sum belongs to the MMVQ path.
++    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_KERYX_DS4) != 0) {
++        const int32_t qs = dotPacked4x8EXT(0x01010101, cache_b_qs[0])
++                         + dotPacked4x8EXT(0x01010101, cache_b_qs[1]);
++        return FLOAT_TYPE(da * dsb.x * float(q_sum - 16 * qs));
++    }
+     return FLOAT_TYPE(da * (float(q_sum) * dsb.x - (16 / sum_divisor) * dsb.y));
+ }
+ #endif

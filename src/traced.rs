@@ -98,6 +98,9 @@ pub fn patch_set_hash() -> [u8; 32] {
         &include_bytes!("../tools/keryx-llama/vulkan-patches/0002-trace-device-identity.patch")[..],
         &include_bytes!("../tools/keryx-llama/vulkan-patches/0003-full-swa-trace-state.patch")[..],
         &include_bytes!("../tools/keryx-llama/vulkan-patches/0004-grouped-product-traces.patch")[..],
+        &include_bytes!("../tools/keryx-llama/vulkan-patches/0005-kimi-mla-cache-validation.patch")[..],
+        &include_bytes!("../tools/keryx-llama/vulkan-patches/0006-kimi-head-input-layout.patch")[..],
+        &include_bytes!("../tools/keryx-llama/vulkan-patches/0007-canonical-offset-products.patch")[..],
         &include_bytes!("../tools/keryx-llama/keryx_vk_trace.inc.cpp")[..],
         &include_bytes!("vulkan_trace_seq.rs")[..],
     ] {
@@ -326,7 +329,10 @@ mod engine {
             .map_err(|e| format!("{e} for captures {wanted:?}"))?;
         let caps: Captures = wanted.iter().copied().zip(bytes).collect();
         if !captures_match(rec, &caps) {
-            return Err("the replay does not reproduce the committed trace".to_string());
+            let mismatched: Vec<_> = caps.iter().filter_map(|(&(t, leaf), b)| {
+                ((t as u64) >= rec.n_pos as u64 || *blake3::hash(b).as_bytes() != rec.leaf(t as u64, leaf)).then_some((t, leaf))
+            }).collect();
+            return Err(format!("the replay does not reproduce the committed trace at {mismatched:?}"));
         }
         Ok(caps)
     }
@@ -454,7 +460,7 @@ mod engine {
         }
         let ctx = m.chain.ok_or("no stage-2 context")?;
         crate::trace::verify_chain_opening(&m.tier_ctx(index), &ctx, pctx, rec, seed, request_hash, &body, &resid)
-            .map_err(|e| format!("stage-2 opening fails its own check: {e}"))?;
+            .map_err(|e| format!("stage-2 opening fails its own check: {e}; draw {:?}", d.points))?;
         Ok((body, resid))
     }
 
@@ -765,6 +771,34 @@ mod engine {
                         }
                     );
                     if v.is_ok() {
+                        // A non-leaf attention opening only commits the next phase.
+                        // Exercise continuation as well before calling replay verified.
+                        if let Some(seq) = &target.seq {
+                            use keryx_verifiable_inference::chain::{verify_attn_phase, AttnStep};
+                            use keryx_verifiable_inference::opening::AttnOpening;
+                            let resp = crate::trace_seq::seq_response_ctx(&target.record, seq);
+                            let mut op = AttnOpening::decode(&bodies[1]).ok_or("malformed attention diagnostic")?;
+                            let mut parent = None;
+                            let mut phases = 0;
+                            loop {
+                                phases += 1;
+                                if phases > 32 { return Err("attention diagnostic exceeds phase bound".into()); }
+                                match verify_attn_phase(&tier_ctx, &ctx, &resp, &seed, &op.path, parent.as_ref(), &op)
+                                    .map_err(|e| format!("diagnostic attention phase {phases}: {e:?}"))? {
+                                    AttnStep::Done => break,
+                                    AttnStep::Next { root, weights, .. } => {
+                                        let child = weights.iter().enumerate().max_by_key(|(_, w)| **w)
+                                            .filter(|(_, w)| **w > 0).ok_or("attention diagnostic has no child")?.0 as u64;
+                                        let mut path = op.path.clone();
+                                        path.push(child);
+                                        let body = open_attention(gguf, gpu, &m, &target, &seed, [k; 32], index.get(), &path, Some(&op.partials))?;
+                                        op = AttnOpening::decode(&body).ok_or("malformed continued attention diagnostic")?;
+                                        parent = Some(root);
+                                    }
+                                }
+                            }
+                            report += &format!("seed {k}: attention complete after {phases} phase(s)\n");
+                        }
                         ok += 1;
                     }
                 }

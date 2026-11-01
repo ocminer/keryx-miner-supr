@@ -163,29 +163,22 @@ Windows AMD users should download `keryx-miner-supr-windows-amd.zip`. It include
 mining worker and both variants of the in-process Vulkan inference engine; keep every extracted
 file together and install a current AMD graphics driver. CPU inference is not used by default.
 
-**AMD: one model copy for inference and mining (zero-dup, v0.14.6).** On AMD, inference runs in
-llama.cpp (Vulkan) and the PoM walk in OpenCL, so a card that does both used to need the model
-twice. When model + walk do not fit together (for example Qwen3.5-9B on a 12 GB RX 6700 XT), the
-miner reserves one card for inference and that card now **mines over the engine's resident copy**
-through a Vulkan v4 walk kernel — after a startup byte gate that proves the gather path returns the
-exact model bytes. It is shown MINING with the `[INF]` badge. The Vulkan walk runs at OpenCL speed:
-a chase pass resolves each nonce's 256 tile addresses and the walk uses the matrix cores on RDNA3+
-(`VK_KHR_cooperative_matrix`, int8) or packed int8 dot products elsewhere — measured RX 7600 XT
-0.58 MH/s (OpenCL 0.59), RX 7900 XTX 1.44 (OpenCL 1.51), MI50 0.96 (OpenCL 0.52). Radeon cards where
-both fit keep the OpenCL walk by default. `KERYX_ZERO_DUP=force` makes every engine-hosted card use
-the Vulkan walk, `KERYX_ZERO_DUP=off` restores the inference-only reservation. RDNA1 (RX 5600/5700)
-never uses it (driver hang on buffer-address reads). `KERYX_VK_WALK_MODE=cm|tp|sp` pins the kernel
-(matrix cores / two-phase dp4a / single-phase); the two-phase scratch takes 67 MB of VRAM.
+**AMD mining and inference on the same card.** The Vulkan engine shares one resident model
+between mining, inference and audit replay. Mining pauses while an inference or audit request runs,
+then resumes on that card. The H15 context pad is released for inference and rebuilt when mining
+resumes. Keep the miner and its bundled Vulkan libraries together when upgrading.
 
-On RX 7900 XTX with RADV, the matrix-core walk automatically selects a tuned wave32 kernel.
-It shares the inference model and falls back to the established kernel if the required subgroup
-size is unavailable. `KERYX_VK_WALK_NPG=2` selects the established two-nonce kernel for comparison.
+Vulkan mining is selected automatically on MI50/MI60, RDNA2, RDNA3 and RDNA4 cards. Leave
+`KERYX_ZERO_DUP` and `KERYX_POM_BACKEND` unset for normal use. `KERYX_ZERO_DUP=off` disables
+model sharing and may reserve the inference card. `KERYX_POM_BACKEND=opencl|vulkan` overrides
+the mining backend on cards that do not host inference; the OpenCL-only path does not support
+H15 context-pad jobs. RDNA1 (RX 5600/5700) remains excluded from Vulkan mining because of a
+known buffer-address driver hang. These cards are not qualified for H15 mining by this release.
 
-MI50/MI60 (`gfx906`) mining workers also select Vulkan when they are not hosting inference.
-Radeon mining workers retain their OpenCL defaults. `KERYX_POM_BACKEND=opencl|vulkan` overrides
-this selection for resident mining workers; it does not change the inference card's zero-dup
-policy or the RDNA1 exclusion. An older sidecar without resident Vulkan support falls back to
-OpenCL. An explicit `KERYX_POM_V4_MODE` keeps selecting OpenCL unless the backend is also overridden.
+The earlier v4 measurements below are historical and are **not H15 hashrates**: RX 7600 XT
+0.58 MH/s, RX 7900 XTX 1.44 MH/s and MI50 0.96 MH/s with shared Vulkan weights.
+The v4 kernel controls (`KERYX_VK_WALK_MODE` and `KERYX_VK_WALK_NPG`) do not select the H15
+context-pad kernel. H15 mining uses bounded dispatches so inference can take over promptly.
 
 **GTX 1080 Ti / Pascal notes.** Validated on a real 1080 Ti (sm_61, driver 550): the PoM walk is
 byte-exact (host↔GPU lockstep + H10 seed tests pass), pool shares are accepted, and solo mining
@@ -495,8 +488,8 @@ At startup the miner logs which mode is active: `PoM resident tree: ON` or `PoM 
 | Variable | Default | Effect |
 |---|---|---|
 | `KERYX_INFERENCE_GPU` | auto | Pin OPoI inference to a specific CUDA ordinal (see note in *Automatic per-card selection*). |
-| `KERYX_ZERO_DUP` | auto | AMD only. `force`: every card hosting the inference model mines through the Vulkan zero-dup walk instead of its own OpenCL blob; `off`: a reserved inference card stays inference-only; unset: zero-dup exactly on the reserved card (model + walk do not fit together). |
-| `KERYX_POM_BACKEND` | auto | AMD resident mining workers: `opencl` or `vulkan`. Auto selects Vulkan on gfx906 and OpenCL on Radeon; the inference card's zero-dup policy remains separate. RDNA1 always uses OpenCL. |
+| `KERYX_ZERO_DUP` | auto | AMD: share the inference model with Vulkan mining by default. `off` disables sharing and may reserve the inference card; `force` explicitly requests sharing. RDNA1 remains excluded. |
+| `KERYX_POM_BACKEND` | auto | AMD mining workers: `opencl` or `vulkan`. Auto selects Vulkan on gfx906 and RDNA2/3/4. H15 requires Vulkan; the inference card's sharing policy remains separate. RDNA1 is excluded. |
 | `KERYX_RESIDENT_TREE=1` | off | Back-compat equivalent of `--resident-tree` (the CLI flag is preferred; `--no-resident-tree` overrides it). |
 
 ## Roadmap

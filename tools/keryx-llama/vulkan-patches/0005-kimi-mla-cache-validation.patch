@@ -1,0 +1,13 @@
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3862,7 +3862,9 @@
+         }
+     }
+ 
+-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
++    // Kimi MLA stores only the latent K cache. Its nominal 72-wide V head
++    // has no V allocation and must not reject an otherwise valid q8_0 K cache.
++    if (model->arch != LLM_ARCH_KIMI_LINEAR && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
+         const uint32_t blck_size = ggml_blck_size(params.type_v);
+         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+             if (model->hparams.n_embd_head_v(il) % blck_size != 0) {

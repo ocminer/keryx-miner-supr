@@ -17,6 +17,8 @@ include = [
     "cuda/regenerate-pom-fatbin.sh",
     "assets/trace-manifests/*.bin",
     "tools/keryx-llama/patches/*.patch",
+    "tools/keryx-llama/vulkan-patches/*.patch",
+    "tools/keryx-llama/keryx_vk_trace.inc.cpp",
     "metal/pom_mine.metal",
     "plugins/opencl/resources/pom_mine.cl",
     "proto/**",
