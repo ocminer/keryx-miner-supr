@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Reuse released CUDA inference dependencies only when all source/build inputs match."""
-import hashlib,json,os,re,sys,tempfile,urllib.request,zipfile
+import hashlib,json,os,re,subprocess,sys,tempfile,urllib.request,zipfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
 MANIFEST=Path(__file__).with_name('windows-cuda-engine-cache.json')
@@ -16,8 +16,12 @@ def output(hit):
 def main():
  cache=json.loads(MANIFEST.read_text(encoding='utf-8'));workflow=(ROOT/'.github/workflows/windows.yml').read_text(encoding='utf-8')
  mismatches=[]
+ # A newly added patch can change the engine without changing any previously
+ # recorded file. Bind the complete tracked engine tree, including its file list.
+ sources=set(subprocess.check_output(['git','ls-files','--','tools/keryx-llama'],cwd=ROOT,text=True).splitlines())
+ if sources!=set(cache['source_sha256']):mismatches.append('engine source file inventory')
  for path,expected in cache['source_sha256'].items():
-  if digest((ROOT/path).read_text(encoding='utf-8').encode())!=expected:mismatches.append(path)
+  if not (ROOT/path).is_file() or digest((ROOT/path).read_text(encoding='utf-8').encode())!=expected:mismatches.append(path)
  for name,expected in cache['recipe_sha256'].items():
   try:actual=digest(step_script(workflow,name).encode())
   except (ValueError,IndexError):actual='missing'
