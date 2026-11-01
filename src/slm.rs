@@ -2223,7 +2223,7 @@ fn traced_self_check_on(gpu: usize, model_id: &[u8; 32]) -> std::result::Result<
         note_self_test_failure(model_id, gpu, "model has no audited H15 tier".to_string());
         return Err(InferenceError::Failed);
     };
-    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    #[cfg(any(feature = "pom-cuda", feature = "pom-opencl"))]
     {
         let t0 = std::time::Instant::now();
         let out = match with_traced_engine(gpu, model_id, |spec, gguf| crate::traced::self_check(spec, gguf, gpu, tier)) {
@@ -2266,7 +2266,7 @@ fn traced_self_check_on(gpu: usize, model_id: &[u8; 32]) -> std::result::Result<
             }
         }
     }
-    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+    #[cfg(not(any(feature = "pom-cuda", feature = "pom-opencl")))]
     {
         let _ = gpu;
         log::error!(
@@ -3269,6 +3269,39 @@ fn with_traced_engine<R>(
     Ok(f(spec, &gguf))
 }
 
+/// AMD keeps one inference model owner; its existing global drain covers model swaps
+/// and same-card Vulkan mining until all trace generation/replay readbacks are complete.
+#[cfg(feature = "pom-opencl")]
+fn with_traced_engine<R>(gpu: usize, model_id: &[u8; 32], f: impl FnOnce(&'static ModelSpec, &str) -> R) -> std::result::Result<R, InferenceError> {
+    if is_era_retired(model_id) || !inference_card_allowed(gpu) || cpu_inference_enabled() {
+        return Err(InferenceError::Failed);
+    }
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    let spec = specs.iter().copied().find(|s| &s.model_id == model_id)
+        .ok_or(InferenceError::Deferred(DeferredReason::ModelNotRegistered))?;
+    if !crate::gguf::is_complete_file(&gguf_path_for(spec)) {
+        return Err(InferenceError::Deferred(DeferredReason::ModelIncomplete));
+    }
+    let _pause_stats = crate::runtime_stats::begin_gpu_inference_pause(None);
+    let _walk_drain = crate::pom_opencl::pause_and_drain_for_inference(gpu).map_err(InferenceError::Deferred)?;
+    let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
+    if !crate::llama_engine_vk::active_for(&gguf) {
+        crate::llama_vulkan::stop();
+        if crate::llama_engine_vk::available() && !crate::llama_engine_vk::unload() {
+            return Err(InferenceError::Deferred(DeferredReason::WalkBusy));
+        }
+        if !crate::llama_engine_vk::ensure_loaded(&gguf, gpu) {
+            log::warn!("Trace: Vulkan model load failed for '{}'", spec.name);
+            return Err(InferenceError::Failed);
+        }
+    }
+    if !crate::pom_opencl::dedicate_loaded_engine_card_if_required() {
+        crate::llama_engine_vk::unload();
+        return Err(InferenceError::Failed);
+    }
+    Ok(f(spec, &gguf))
+}
+
 /// H15 private request: traced generation on the leased card `gpu`. Never answers untraced — a
 /// private body without a trace commitment is invalid past the transition window.
 pub fn try_load_and_run_traced_inference_on(
@@ -3282,7 +3315,7 @@ pub fn try_load_and_run_traced_inference_on(
         log::warn!("Trace: rejected private request for GPU {}: {}", gpu, reason);
         return Err(InferenceError::Failed);
     }
-    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    #[cfg(any(feature = "pom-cuda", feature = "pom-opencl"))]
     {
         let t0 = std::time::Instant::now();
         let out = with_traced_engine(gpu, model_id, |spec, gguf| crate::traced::generate(spec, gguf, gpu, prompt, max_tokens, traced))?;
@@ -3311,7 +3344,7 @@ pub fn try_load_and_run_traced_inference_on(
             }
         }
     }
-    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+    #[cfg(not(any(feature = "pom-cuda", feature = "pom-opencl")))]
     {
         let _ = (gpu, model_id, traced);
         log::warn!("Trace: this build's inference engine cannot trace — H15 private request not served");
@@ -3322,7 +3355,7 @@ pub fn try_load_and_run_traced_inference_on(
 /// Cross-card trace reproduction diagnostic (`KERYX_TRACE_XCARD=gen|replay:<file>`, model by name
 /// in `KERYX_TRACE_XCARD_MODEL`): runs on CUDA device 0 of this process and prints a report.
 pub fn trace_xcard_diagnostic(model_name: &str, mode: &str, path: &str) -> i32 {
-    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    #[cfg(any(feature = "pom-cuda", feature = "pom-opencl"))]
     {
         let specs = *SUPPORTED_SPECS.read().unwrap();
         let Some(spec) = specs.iter().copied().find(|s| s.name == model_name) else {
@@ -3330,7 +3363,11 @@ pub fn trace_xcard_diagnostic(model_name: &str, mode: &str, path: &str) -> i32 {
             return 2;
         };
         let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
-        if !crate::gguf::is_complete_file(&gguf_path_for(spec)) || !crate::llama_engine::ensure_loaded_on(&gguf, 0) {
+        #[cfg(not(feature = "pom-opencl"))]
+        let loaded = crate::llama_engine::ensure_loaded_on(&gguf, 0);
+        #[cfg(feature = "pom-opencl")]
+        let loaded = crate::llama_engine_vk::ensure_loaded(&gguf, 0);
+        if !crate::gguf::is_complete_file(&gguf_path_for(spec)) || !loaded {
             log::error!("trace xcard: cannot load '{}' from {} on GPU 0", spec.name, gguf);
             return 2;
         }
@@ -3348,7 +3385,7 @@ pub fn trace_xcard_diagnostic(model_name: &str, mode: &str, path: &str) -> i32 {
             }
         }
     }
-    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+    #[cfg(not(any(feature = "pom-cuda", feature = "pom-opencl")))]
     {
         let _ = (model_name, mode, path);
         2
@@ -3357,7 +3394,7 @@ pub fn trace_xcard_diagnostic(model_name: &str, mode: &str, path: &str) -> i32 {
 
 /// Builds an opening (or attention phase) of an audited response on the leased card `gpu`.
 pub fn try_open_trace_on(gpu: usize, model_id: &[u8; 32], job: OpenJob<'_>) -> std::result::Result<Vec<u8>, InferenceError> {
-    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    #[cfg(any(feature = "pom-cuda", feature = "pom-opencl"))]
     {
         let out = with_traced_engine(gpu, model_id, |spec, gguf| match &job.phase {
             None => crate::traced::open_trace(spec, gguf, gpu, job.tier, job.trace, &job.seed, job.response_txid, &job.request_hash),
@@ -3370,7 +3407,7 @@ pub fn try_open_trace_on(gpu: usize, model_id: &[u8; 32], job: OpenJob<'_>) -> s
             InferenceError::Failed
         })
     }
-    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+    #[cfg(not(any(feature = "pom-cuda", feature = "pom-opencl")))]
     {
         let _ = (gpu, model_id, job);
         Err(InferenceError::Failed)

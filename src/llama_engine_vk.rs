@@ -15,6 +15,9 @@ use std::sync::{Mutex, OnceLock};
 
 use libloading::Library;
 
+#[path = "llama_engine_vk_trace.rs"]
+pub mod tracing;
+
 type AbiFn = unsafe extern "C" fn() -> c_int;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
 type Load2Fn = unsafe extern "C" fn(*const c_char, c_int, *const c_int, c_int, c_int) -> *mut c_void;
@@ -73,6 +76,7 @@ struct Engine {
     /// `llama_engine::unguarded_prompt_cap` (same llama.cpp b10015 batch assert).
     n_ctx: c_int,
     prompt_guard: bool,
+    trace: Option<tracing::State>,
 }
 // The wrapper serializes generation + walk dispatches internally (gen_lock / walk_lock).
 unsafe impl Send for Engine {}
@@ -470,6 +474,7 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
             gguf: gguf.to_string(),
             n_ctx,
             prompt_guard: sym::<AbiFn>(lib, "keryx_llama_prompt_guard").map_or(false, |f| f() == 1),
+            trace: tracing::State::load(lib),
         });
         dedication_attempt.armed = false;
         true

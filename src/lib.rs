@@ -43,6 +43,8 @@ pub mod pom_v4;
 pub mod pom_v5;
 pub mod trace;
 pub mod trace_seq;
+#[cfg(feature = "pom-opencl")]
+pub(crate) mod vulkan_trace_seq;
 pub mod trace_store;
 /// 0.15.3: traced H15 private answers + openings (CUDA in-process engine; refused elsewhere).
 pub mod traced;

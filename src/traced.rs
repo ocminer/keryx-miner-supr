@@ -65,10 +65,14 @@ pub fn self_test_passed() -> bool {
 }
 
 /// Engine ABI of the native trace engine this build expects (llama_engine::ABI).
+#[cfg(not(feature = "pom-opencl"))]
 pub const ENGINE_ABI: u32 = 4;
+#[cfg(feature = "pom-opencl")]
+pub const ENGINE_ABI: u32 = 0x564b0001;
 
 /// BLAKE3 over the llama.cpp patch series the engine is built with (0001–0005, in order): two rigs
 /// reproduce each other's traces only with the same engine arithmetic, so a replaying rig must match it.
+#[cfg(not(feature = "pom-opencl"))]
 pub fn patch_set_hash() -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     for p in [
@@ -77,6 +81,23 @@ pub fn patch_set_hash() -> [u8; 32] {
         &include_bytes!("../tools/keryx-llama/patches/0003-fattn-tile-f32.patch")[..],
         &include_bytes!("../tools/keryx-llama/patches/0004-rope-f64-angle.patch")[..],
         &include_bytes!("../tools/keryx-llama/patches/0005-attn-lse-capture.patch")[..],
+    ] {
+        h.update(&(p.len() as u64).to_le_bytes());
+        h.update(p);
+    }
+    *h.finalize().as_bytes()
+}
+
+/// Vulkan records bind both the native arithmetic and the host sequence layout.
+#[cfg(feature = "pom-opencl")]
+pub fn patch_set_hash() -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"keryx-vulkan-h15-d81235049384534c167caea52b85a694f6103d14-v1");
+    for p in [
+        &include_bytes!("../tools/keryx-llama/vulkan-patches/0001-h15-vulkan-trace.patch")[..],
+        &include_bytes!("../tools/keryx-llama/vulkan-patches/0002-trace-device-identity.patch")[..],
+        &include_bytes!("../tools/keryx-llama/keryx_vk_trace.inc.cpp")[..],
+        &include_bytes!("vulkan_trace_seq.rs")[..],
     ] {
         h.update(&(p.len() as u64).to_le_bytes());
         h.update(p);
@@ -210,13 +231,16 @@ pub fn truncate_answer(mut text: String, max_tokens: usize) -> String {
     text
 }
 
-#[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+#[cfg(any(feature = "pom-cuda", feature = "pom-opencl"))]
 pub use engine::*;
 
-#[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+#[cfg(any(feature = "pom-cuda", feature = "pom-opencl"))]
 mod engine {
     use super::*;
+    #[cfg(not(feature = "pom-opencl"))]
     use crate::llama_engine::{self, GenError, PromptPrefix};
+    #[cfg(feature = "pom-opencl")]
+    use crate::llama_engine_vk::tracing::{self as llama_engine, GenError, PromptPrefix};
     use std::collections::{BTreeSet, HashMap};
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -755,13 +779,13 @@ mod engine {
 }
 
 /// Stub for builds without the CUDA in-process engine: private answers are refused.
-#[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+#[cfg(not(any(feature = "pom-cuda", feature = "pom-opencl")))]
 mod engine_stub {
     pub fn supported() -> bool {
         false
     }
 }
-#[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+#[cfg(not(any(feature = "pom-cuda", feature = "pom-opencl")))]
 pub use engine_stub::*;
 
 #[cfg(test)]
