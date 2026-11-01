@@ -1,3 +1,12 @@
+# keryx-miner-supr 0.15.6 — Windows launcher and AMD status
+
+- The Windows AMD launcher now starts from its own folder, finds the adjacent executable even when launched from another directory, and preserves the miner's exit status.
+- AMD instructions now state the H15 limitation explicitly. The current Vulkan inference engine cannot generate the required proofs, so AMD mining remains paused on Windows, Linux and HiveOS even when a model loads successfully. This release does not restore AMD H15 mining.
+- Earlier AMD benchmark results are labelled as historical, pre-H15 measurements.
+- Release archives and the Docker image now include the existing project licenses and third-party notices.
+
+Mining kernels and proof validation are unchanged. NVIDIA retains the H15 fixes from 0.15.5.
+
 # keryx-miner-supr 0.15.5 — Windows: H15 self-test fixed
 
 **Every Windows NVIDIA user of 0.15.4 must update.** On Windows no card passed the H15 traced

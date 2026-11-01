@@ -94,6 +94,7 @@ jobs:
           echo "Packaging macOS arm64 tarball for VER=${VER} (source: ${GITHUB_REF})"
           DIR="keryx-miner-supr-macos-arm64"
           rm -rf "$DIR"; mkdir -p "$DIR"
+          cp LICENSE-APACHE LICENSE-MIT THIRD_PARTY_NOTICES.txt "$DIR/"
           strip target/release/keryx-miner-supr
           cp target/release/keryx-miner-supr "$DIR/"
           # In-process llama.cpp (Metal) engine: src/llama_engine.rs dlopens this next to the

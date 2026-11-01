@@ -261,6 +261,7 @@ jobs:
           $rel = "target\$env:TARGET\release"
           $out = "dist-win-amd"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item LICENSE-APACHE, LICENSE-MIT, THIRD_PARTY_NOTICES.txt -Destination $out
           Copy-Item "$rel\keryx-miner-supr.exe" $out\
           Copy-Item "$rel\keryxopencl.dll"      $out\
           Copy-Item "keryx-llama-vk.dll"         $out\
@@ -317,6 +318,7 @@ jobs:
           foreach ($file in $requiredFiles) {
             if (-not (Test-Path "$out\$file")) { throw "staged package is missing $file" }
           }
+          & ./tools/test-windows-launcher.ps1 -Launcher "$out\start.bat"
           Compress-Archive -Path "$out\*" -DestinationPath "keryx-miner-supr-windows-amd.zip" -Force
           $hash = (Get-FileHash "keryx-miner-supr-windows-amd.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  keryx-miner-supr-windows-amd.zip" |
@@ -553,6 +555,7 @@ jobs:
           $rel = "target\$env:TARGET\release"
           $out = "dist-win-cuda-pom"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item LICENSE-APACHE, LICENSE-MIT, THIRD_PARTY_NOTICES.txt -Destination $out
           Copy-Item "$rel\keryx-miner-supr.exe" $out\
           # In-process llama.cpp engine — REQUIRED to serve H4/H6 models on Windows/NVIDIA.
           if (Test-Path "keryx-llama.dll") {

@@ -2,4 +2,7 @@
 *
 !hiveos/dist-modern
 !docker
+!LICENSE-APACHE
+!LICENSE-MIT
+!THIRD_PARTY_NOTICES.txt
 hiveos/dist-modern/**/*.lock

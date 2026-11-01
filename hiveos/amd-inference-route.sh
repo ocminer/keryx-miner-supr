@@ -218,6 +218,9 @@ keryx_copy_amd_inference_route() {
     local src="$1" dest="$2" dep deps binary ldd_output
     keryx_require_amd_inference_route "$src" || return 1
 
+    cp "$KERYX_AMD_ROUTE_REPO/LICENSE-APACHE" "$KERYX_AMD_ROUTE_REPO/LICENSE-MIT" \
+       "$KERYX_AMD_ROUTE_REPO/THIRD_PARTY_NOTICES.txt" "$dest/" || return 1
+
     cp -P "$src/libkeryx-llama-vk.so" "$src/libkeryx-llama-vk.so.manifest" "$dest/"
     cp -P "$src/libkeryx-llama-vk-noavx.so" "$src/libkeryx-llama-vk-noavx.so.manifest" "$dest/"
     cp -P "$src"/libvulkan.so.1* "$dest/"
