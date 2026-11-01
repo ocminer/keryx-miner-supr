@@ -52,8 +52,10 @@ mod tests {
     use crate::{pom, pom_v4 as v4, pom_v5 as v5};
 
     fn cpu_value(index: &pom::WeightIndex, pad: &[u8], seed: u64, pph: &[u8; 32]) -> [u8; 32] {
+        cpu_value_with(index, pad.len() as u64 / 1024, seed, pph, |off| pad[off as usize * 1024..(off + 1) as usize * 1024].to_vec())
+    }
+    fn cpu_value_with(index: &pom::WeightIndex, np: u64, seed: u64, pph: &[u8; 32], mut read_pad: impl FnMut(u64) -> Vec<u8>) -> [u8; 32] {
         let nt = index.n_chunks / 32;
-        let np = pad.len() as u64 / 1024;
         let kp = v5::v5_pad_steps(nt, np);
         let mut state = v4::v4_initial_state(seed);
         let mut next = vec![0; state.len()];
@@ -61,7 +63,7 @@ mod tests {
         let mut off = v5::v5_first_offset(seed, nt);
         for step in 1..=256 {
             if off < nt { index.read_chunks_into(off * 32, &mut tile); }
-            else { tile.copy_from_slice(&pad[(off - nt) as usize * 1024..(off - nt + 1) as usize * 1024]); }
+            else { tile.copy_from_slice(&read_pad(off - nt)); }
             if step < 256 { off = v5::v5_next_offset(seed, step, tile[..32].try_into().unwrap(), v5::v5_state_fold(&state), nt, np, kp); }
             v4::v4_transition_into(&mut next, &state, &tile, step as u32);
             std::mem::swap(&mut state, &mut next);
@@ -128,5 +130,46 @@ mod tests {
             assert_eq!(walk.mine_v5(p,s,time,[0;4],0,11,&sw,np,&||true).unwrap(),(None,0));
         }
         eprintln!("Vulkan PoM v5 pad bytes/state-fold/pad routing/target boundaries/refill PASS");
+    }
+
+    /// Exercise real allocations on both sides of the 1-GiB pad boundary without
+    /// materializing a gigabyte-sized CPU reference. Each sampled tile and each
+    /// full walk is independently derived with the node-matching scalar code.
+    #[test]
+    #[ignore]
+    fn vk_v5_sharded_pad_matches_node() {
+        crate::native_env::export_trace_env();
+        let root = std::path::PathBuf::from(std::env::var("KERYX_TEST_OUTPUT").expect("KERYX_TEST_OUTPUT"));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("v5-shard-fixture.gguf"); fixture(&path);
+        let device = std::env::var("KERYX_LLAMA_VK_DEVICE").unwrap_or_else(|_| "0".into()).parse().unwrap();
+        let pci = super::super::ggml_device_pci(device).expect("selected Vulkan GPU PCI");
+        assert_eq!(format!("{:04x}:{:02x}:{:02x}.{:x}",pci.0,pci.1,pci.2,pci.3), std::env::var("KERYX_TEST_PCI").expect("KERYX_TEST_PCI"));
+        let index = pom::WeightIndex::build_from_gguf(path.to_str().unwrap(), [0x52;32]).unwrap();
+        let mut walk = super::super::MiningWalk::load(path.to_str().unwrap(), pci, &index).unwrap();
+        let api = walk.v5.expect("PoM v5 native ABI");
+        let boundary = 1u64 << 20;
+        let np = boundary + 257;
+        let pph = [0x45;32]; let time = 0x1020_3040_5060_7080;
+        let p = pom::pph_words_for_era(&pph, true); let s = pom::pph_words(&pom::seed_h14_pph(&pph));
+        for id in [0x63u8, 0x71] {
+            let seed = v5::v5_pad_seed(0, &[id;32], &index.r_t); let sw = v5::v5_pad_seed_words(&seed);
+            for nonce in [0u64, 7, u64::MAX] {
+                let value = cpu_value_with(&index, np, pom::pom_block_seed_h14(&pph,time,nonce), &pph, |off| v5::v5_pad_tile(&seed,off));
+                assert_eq!(walk.mine_v5(p,s,time,words(&value),nonce,1,&sw,np,&||false).unwrap(),(Some(nonce),1));
+                assert_eq!(walk.mine_v5(p,s,time,words(&decrement(value)),nonce,1,&sw,np,&||false).unwrap(),(None,1));
+            }
+            for tile in [0, boundary-1, boundary, np-1] {
+                let mut actual = vec![0;1024];
+                assert_eq!(unsafe{(api.read)(walk.model,tile*1024,actual.as_mut_ptr(),actual.len())},0);
+                assert_eq!(actual,v5::v5_pad_tile(&seed,tile),"tile {tile}");
+            }
+            let mut crossing = vec![0;2048];
+            assert_eq!(unsafe{(api.read)(walk.model,(boundary-1)*1024,crossing.as_mut_ptr(),crossing.len())},0);
+            let expected: Vec<_> = [boundary-1,boundary].into_iter().flat_map(|tile|v5::v5_pad_tile(&seed,tile)).collect();
+            assert_eq!(crossing,expected,"readback spanning two allocations");
+            unsafe{(api.release)(walk.model)};
+        }
+        eprintln!("Vulkan PoM v5 multi-allocation pad/boundary readback/full walk/seed replacement PASS");
     }
 }

@@ -103,7 +103,7 @@ layout(push_constant) uniform Push {
     uint     chase_batch;
     uint     pad0;
 #ifdef POM_V5
-    uint64_t pad_addr;
+    uint64_t pad_addr; // BDA table of 1-GiB context-pad allocations
     uint64_t n_pad;
     uint64_t pad_inv;
     uint     k_pad;
@@ -380,7 +380,10 @@ uint locate_chunk(uint64_t c, bool lds_table, out uint64_t base) {
 uint64_t chunk_addr(uint64_t c, bool lds_table) {
 #ifdef POM_V5
     const uint64_t weights_end = pc.n_tiles * uint64_t(V4_TILE_CHUNKS);
-    if (c >= weights_end) return pc.pad_addr + (c - weights_end) * 32UL;
+    if (c >= weights_end) {
+        const uint64_t byte = (c - weights_end) * 32UL;
+        return Tensor(pc.pad_addr).words[uint(byte >> 30)] + (byte & 0x3fffffffUL);
+    }
 #endif
     uint64_t base;
     uint lo = locate_chunk(c, lds_table, base);

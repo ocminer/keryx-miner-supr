@@ -183,8 +183,9 @@ struct KeryxLlama {
     VkDeviceMemory winner_mem = VK_NULL_HANDLE, out32_mem = VK_NULL_HANDLE;
     void *winner_map = nullptr, *out32_map = nullptr;
 
-    VkBuffer prefix_buf = VK_NULL_HANDLE, addrs_buf = VK_NULL_HANDLE, supl_buf = VK_NULL_HANDLE;
-    VkDeviceMemory prefix_mem = VK_NULL_HANDLE, addrs_mem = VK_NULL_HANDLE, supl_mem = VK_NULL_HANDLE;
+    VkBuffer prefix_buf = VK_NULL_HANDLE, addrs_buf = VK_NULL_HANDLE;
+    VkDeviceMemory prefix_mem = VK_NULL_HANDLE, addrs_mem = VK_NULL_HANDLE;
+    std::vector<std::pair<VkBuffer, VkDeviceMemory>> supplements;
 
     uint64_t n_chunks = 0;
     uint32_t n_tensors = 0;
@@ -199,6 +200,11 @@ struct KeryxLlama {
 };
 
 static void keryx_vk_trace_free(KeryxLlama* h);
+
+// A model or context pad can exceed a driver's single-allocation limit even
+// when the card has enough total VRAM. Keep every allocation below 1 GiB;
+// canonical byte offsets are translated through the existing address tables.
+static constexpr uint64_t KERYX_VK_ALLOC_BYTES = 1ull << 30;
 
 // ── small Vulkan helpers ────────────────────────────────────────────────────────────────────
 
@@ -498,48 +504,75 @@ static bool walk_init(KeryxLlama* h) {
     h->supl_bytes = supl_total;
     if (h->n_chunks == 0) return false;
 
-    // Supplement buffer (device-local, BDA), filled straight from the GGUF file.
+    // Supplement allocations (device-local, BDA), filled directly from the GGUF.
+    // Bound each allocation independently of model size. In particular, a
+    // mining-only card must not allocate the entire canonical model in one BO.
     if (supl_total > 0) {
-        if (!make_buffer(h, supl_total, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true, &h->supl_buf, &h->supl_mem, nullptr)) {
-            return false;
+        std::vector<uint64_t> addresses;
+        for (uint64_t first = 0; first < supl_total; first += KERYX_VK_ALLOC_BYTES) {
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            if (!make_buffer(h, std::min(KERYX_VK_ALLOC_BYTES, supl_total - first),
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true, &buffer, &memory, nullptr)) return false;
+            h->supplements.emplace_back(buffer, memory);
+            VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            dai.buffer = buffer;
+            const uint64_t address = vkGetBufferDeviceAddress(h->dev, &dai);
+            if (!address) return false;
+            addresses.push_back(address);
         }
         FILE* f = fopen(h->gguf_path.c_str(), "rb");
         if (!f) return false;
-        // Mining-only cards stream the whole canonical model here. Bound host RAM rather
-        // than making a model-sized temporary copy (the shared GGUF stays on its mount).
-        const uint64_t window = 64ull << 20;
+        constexpr uint64_t window = 64ull << 20;
         std::vector<uint8_t> flat((size_t)std::min(window, supl_total));
         for (size_t i = 0; i < supl_src.size(); i++) {
-            if (keryx_file_seek(f, supl_src[i].first) != 0) {
-                fclose(f);
-                return false;
-            }
-            for (uint64_t off = 0; off < supl_src[i].second; off += window) {
-                const size_t n = (size_t)std::min(window, supl_src[i].second - off);
+            if (keryx_file_seek(f, supl_src[i].first) != 0) { fclose(f); return false; }
+            for (uint64_t off = 0; off < supl_src[i].second;) {
+                const uint64_t absolute = supl_off[i] + off;
+                const size_t shard = (size_t)(absolute / KERYX_VK_ALLOC_BYTES);
+                const uint64_t local = absolute % KERYX_VK_ALLOC_BYTES;
+                const size_t n = (size_t)std::min({window, supl_src[i].second - off, KERYX_VK_ALLOC_BYTES - local});
                 if (fread(flat.data(), 1, n, f) != n ||
-                    !staged_upload(h, h->supl_buf, flat.data(), n, supl_off[i] + off)) {
+                    !staged_upload(h, h->supplements[shard].first, flat.data(), n, local)) {
                     fclose(f);
                     KERYX_LOG_ERROR("keryx-llama-vk: supplement read/upload failed\n");
                     return false;
                 }
+                off += n;
             }
         }
         fclose(f);
-        VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-        dai.buffer = h->supl_buf;
-        uint64_t supl_bda = vkGetBufferDeviceAddress(h->dev, &dai);
-        size_t si = 0;
-        for (size_t j = 0; j < addrs.size() && si < supl_src.size(); j++) {
-            if (addrs[j] == 0) { addrs[j] = supl_bda + supl_off[si]; si++; }
-        }
         if (!h->model) {
-            // Every tensor was streamed in canonical order without gaps. Adjacent tensor
-            // boundaries disappear, including tiles crossing them: it is one byte-exact blob.
-            prefix = {0, h->n_chunks};
-            addrs = {supl_bda};
-            h->n_tensors = 1;
+            // Merge canonical tensor boundaries, but retain allocation boundaries.
+            // Every boundary is tile-aligned; the byte gate also covers each side.
+            prefix.clear(); addrs = addresses;
+            for (size_t j = 0; j < addresses.size(); j++) prefix.push_back(j * (KERYX_VK_ALLOC_BYTES / CHUNK_BYTES));
+            prefix.push_back(h->n_chunks);
+        } else {
+            std::vector<uint64_t> split_prefix{0}, split_addrs;
+            size_t si = 0;
+            for (size_t j = 0; j < addrs.size(); j++) {
+                const uint64_t bytes = (prefix[j+1] - prefix[j]) * CHUNK_BYTES;
+                if (addrs[j]) {
+                    split_addrs.push_back(addrs[j]);
+                    split_prefix.push_back(split_prefix.back() + bytes / CHUNK_BYTES);
+                } else {
+                    for (uint64_t off = 0; off < bytes;) {
+                        const uint64_t absolute = supl_off[si] + off;
+                        const size_t shard = (size_t)(absolute / KERYX_VK_ALLOC_BYTES);
+                        const uint64_t local = absolute % KERYX_VK_ALLOC_BYTES;
+                        const uint64_t n = std::min(bytes - off, KERYX_VK_ALLOC_BYTES - local);
+                        split_addrs.push_back(addresses[shard] + local);
+                        split_prefix.push_back(split_prefix.back() + n / CHUNK_BYTES);
+                        off += n;
+                    }
+                    si++;
+                }
+            }
+            prefix = std::move(split_prefix); addrs = std::move(split_addrs);
         }
+        h->n_tensors = (uint32_t)addrs.size();
     }
 
     // Table + result buffers. The table is hot (binary-searched every gather) -> device-local.
@@ -1278,7 +1311,7 @@ void keryx_llama_free(KeryxLlama* h) {
         dbuf(h->out32_buf, h->out32_mem);
         dbuf(h->prefix_buf, h->prefix_mem);
         dbuf(h->addrs_buf, h->addrs_mem);
-        dbuf(h->supl_buf, h->supl_mem);
+        for (const auto& b : h->supplements) dbuf(b.first, b.second);
         dbuf(h->chase_buf[0], h->chase_mem[0]);
         dbuf(h->chase_buf[1], h->chase_mem[1]);
         if (h->chase_pipe) vkDestroyPipeline(h->dev, h->chase_pipe, nullptr);

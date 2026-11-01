@@ -1,11 +1,13 @@
-# keryx-miner-supr 0.15.6 — Windows launcher and AMD status
+# keryx-miner-supr 0.15.6 — AMD H15 mining and verifiable inference
 
-- The Windows AMD launcher now starts from its own folder, finds the adjacent executable even when launched from another directory, and preserves the miner's exit status.
-- AMD instructions now state the H15 limitation explicitly. The current Vulkan inference engine cannot generate the required proofs, so AMD mining remains paused on Windows, Linux and HiveOS even when a model loads successfully. This release does not restore AMD H15 mining.
-- Earlier AMD benchmark results are labelled as historical, pre-H15 measurements.
-- Release archives and the Docker image now include the existing project licenses and third-party notices.
-
-Mining kernels and proof validation are unchanged. NVIDIA retains the H15 fixes from 0.15.5.
+- AMD now supports H15 context-pad mining, traced inference and multi-phase audits through the bundled Vulkan engine.
+- Mining and inference share one resident model on the same card. Mining pauses during inference and resumes afterward; a dedicated inference-only card is not required.
+- Compact trace records can be uploaded, fetched by a fresh compatible process and replayed for audits. Proof verification remains unchanged.
+- Large Vulkan allocations are split into bounded buffers, allowing additional mining cards to load models on drivers with per-allocation limits.
+- Windows AMD device selection accepts both architecture identifiers and retail GPU names. Its launcher works from another directory and preserves the exit status.
+- Linux AMD packages include AVX and baseline-CPU Vulkan libraries. Keep the executable and its matching libraries together when upgrading.
+- Earlier AMD benchmark figures remain explicitly labelled as pre-H15 results. RDNA1 remains excluded from H15 mining; Apple Metal H15 support is unchanged.
+- Release packages include the existing project and third-party licenses. NVIDIA retains its established CUDA kernels and H15 proof path.
 
 # keryx-miner-supr 0.15.5 — Windows: H15 self-test fixed
 

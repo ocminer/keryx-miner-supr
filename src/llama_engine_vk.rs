@@ -855,8 +855,15 @@ impl MiningWalk {
             if !ready(model) || count(model) != index.n_chunks || index.n_chunks == 0 {
                 return Err(MiningLoadError::Failed("resident Vulkan model/chunk count mismatch".into()));
             }
-            for k in 0..=128u64 {
-                let off = if k == 128 { index.n_chunks - 1 } else { k * (index.n_chunks / 129) };
+            let mut samples: Vec<u64> = (0..128).map(|k| k * (index.n_chunks / 129)).collect();
+            samples.push(index.n_chunks - 1);
+            // Standalone Vulkan weights use bounded allocations. Check both
+            // sides of every 1-GiB boundary as well as the distributed samples.
+            for boundary in ((1u64 << 30) / 32..index.n_chunks).step_by((1usize << 30) / 32) {
+                samples.extend([boundary - 1, boundary]);
+            }
+            samples.sort_unstable(); samples.dedup();
+            for &off in &samples {
                 let mut got = [0u8; 32];
                 if !(walk.fetch)(model, off, got.as_mut_ptr()) {
                     walk.healthy = false;
@@ -867,11 +874,12 @@ impl MiningWalk {
                 }
             }
             log::info!(
-                "PoM[vk]: resident walk ready on PCI {:04x}:{:02x}:{:02x}.{}; 129 byte checks passed, {} MiB weights",
+                "PoM[vk]: resident walk ready on PCI {:04x}:{:02x}:{:02x}.{}; {} byte checks passed, {} MiB weights",
                 domain,
                 bus,
                 device,
                 function,
+                samples.len(),
                 index.n_chunks * 32 / (1024 * 1024)
             );
             Ok(walk)

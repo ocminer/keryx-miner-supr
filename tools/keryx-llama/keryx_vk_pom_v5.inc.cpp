@@ -2,6 +2,8 @@
 // resident; inference releases only this regenerable pad. V4 pipelines are kept
 // separate: a v5 offset depends on the current state and cannot be pre-chased.
 struct KeryxVkPad {
+    std::vector<std::pair<VkBuffer, VkDeviceMemory>> shards;
+    // This small buffer contains the BDA of each 1-GiB shard.
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     uint64_t address = 0, tiles = 0, seed[4]{};
@@ -27,6 +29,11 @@ static void keryx_vk_pad_release(KeryxLlama* h) {
     auto& p = *h->pad;
     if (p.buffer) vkDestroyBuffer(h->dev, p.buffer, nullptr);
     if (p.memory) vkFreeMemory(h->dev, p.memory, nullptr);
+    for (const auto& b : p.shards) {
+        if (b.first) vkDestroyBuffer(h->dev, b.first, nullptr);
+        if (b.second) vkFreeMemory(h->dev, b.second, nullptr);
+    }
+    p.shards.clear();
     p.buffer = VK_NULL_HANDLE; p.memory = VK_NULL_HANDLE;
     p.address = p.tiles = 0;
 }
@@ -64,8 +71,25 @@ static bool keryx_vk_pad_ensure(KeryxLlama* h, const uint64_t seed[4], uint64_t 
     // keeps the model weights but trades the idle KV context for the context pad;
     // the next generation releases the pad and recreates its full context.
     if (h->ctx) { llama_free(h->ctx); h->ctx = nullptr; }
-    if (!make_buffer(h, tiles * 1024, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true, &p.buffer, &p.memory, nullptr)) return false;
+    std::vector<uint64_t> addresses;
+    for (uint64_t first = 0; first < tiles * 1024; first += KERYX_VK_ALLOC_BYTES) {
+        VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
+        if (!make_buffer(h, std::min(KERYX_VK_ALLOC_BYTES, tiles * 1024 - first),
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true, &buffer, &memory, nullptr)) {
+            keryx_vk_pad_release(h); return false;
+        }
+        p.shards.emplace_back(buffer, memory);
+        VkBufferDeviceAddressInfo shard{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; shard.buffer = buffer;
+        const uint64_t address = vkGetBufferDeviceAddress(h->dev, &shard);
+        if (!address) { keryx_vk_pad_release(h); return false; }
+        addresses.push_back(address);
+    }
+    if (!make_buffer(h, addresses.size() * sizeof(uint64_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true, &p.buffer, &p.memory, nullptr) ||
+        !staged_upload(h, p.buffer, reinterpret_cast<const uint8_t*>(addresses.data()), addresses.size() * sizeof(uint64_t))) {
+        keryx_vk_pad_release(h); return false;
+    }
     VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     dai.buffer = p.buffer;
     p.address = vkGetBufferDeviceAddress(h->dev, &dai);
@@ -75,7 +99,9 @@ static bool keryx_vk_pad_ensure(KeryxLlama* h, const uint64_t seed[4], uint64_t 
     constexpr uint32_t slice = 32768;
     for (uint64_t first = 0; first < entries; first += slice) {
         const uint32_t n = (uint32_t)std::min<uint64_t>(slice, entries - first);
-        PushPadFill pf{p.address + first * 32, first, {seed[0], seed[1], seed[2], seed[3]}, n, 1920};
+        const uint64_t byte = first * 32;
+        PushPadFill pf{addresses[byte / KERYX_VK_ALLOC_BYTES] + byte % KERYX_VK_ALLOC_BYTES,
+                       first, {seed[0], seed[1], seed[2], seed[3]}, n, 1920};
         if (!run_dispatch(h, p.fill_pipe, p.fill_pl, h->walk_ds, &pf, sizeof(pf), (n + 63) / 64, VK_NULL_HANDLE)) {
             keryx_vk_pad_release(h); return false;
         }
@@ -124,7 +150,7 @@ int64_t keryx_llama_pom_mine_v5(KeryxLlama* h, const uint64_t p[4], const uint64
 // Bounded diagnostic readback of the actual device-filled pad. This is also used
 // by the host's exactness test before a v5 backend is qualified for release.
 int keryx_llama_pom_pad_read(KeryxLlama* h, uint64_t first, uint8_t* out, size_t bytes) {
-    if (!h || !out || !bytes || bytes > 65536) return -1;
+    if (!h || !out || !bytes || bytes > 65536 || first % 4 || bytes % 4) return -1;
     std::lock_guard<std::mutex> lock(h->walk_lock);
     if (!h->pad || first > h->pad->tiles * 1024 || bytes > h->pad->tiles * 1024 - first) return -1;
     VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; void* mapped = nullptr;
@@ -136,7 +162,14 @@ int keryx_llama_pom_pad_read(KeryxLlama* h, uint64_t first, uint8_t* out, size_t
     vkBeginCommandBuffer(h->cmd, &bi);
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
     vkCmdPipelineBarrier(h->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    VkBufferCopy copy{first, 0, bytes}; vkCmdCopyBuffer(h->cmd, h->pad->buffer, buffer, 1, &copy);
+    for (size_t done = 0; done < bytes;) {
+        const uint64_t absolute = first + done;
+        const uint64_t local = absolute % KERYX_VK_ALLOC_BYTES;
+        const size_t n = (size_t)std::min<uint64_t>(bytes - done, KERYX_VK_ALLOC_BYTES - local);
+        VkBufferCopy copy{local, done, n};
+        vkCmdCopyBuffer(h->cmd, h->pad->shards[absolute / KERYX_VK_ALLOC_BYTES].first, buffer, 1, &copy);
+        done += n;
+    }
     VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
     vkCmdPipelineBarrier(h->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0, nullptr);
     vkEndCommandBuffer(h->cmd);
