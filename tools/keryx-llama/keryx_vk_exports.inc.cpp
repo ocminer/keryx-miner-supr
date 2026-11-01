@@ -1,3 +1,9 @@
+#if defined(_WIN32)
+#define KERYX_VK_EXPORT
+#else
+#define KERYX_VK_EXPORT __attribute__((visibility("default")))
+#endif
+
 // Keryx zero-dup exports for ggml-vulkan — APPENDED to ggml-vulkan.cpp by
 // hiveos/build-keryx-llama-vk.sh at build time (every symbol referenced below is file-scope
 // static inside ggml-vulkan.cpp, so an end-of-file append compiles against any nearby pin;
@@ -13,7 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 
-extern "C" bool keryx_vk_raw_handles(size_t dev_num, void ** vk_instance_out,
+extern "C" KERYX_VK_EXPORT bool keryx_vk_raw_handles(size_t dev_num, void ** vk_instance_out,
                                      void ** vk_physical_device_out, void ** vk_device_out,
                                      uint32_t * compute_queue_family_index) {
     try {
@@ -31,14 +37,14 @@ extern "C" bool keryx_vk_raw_handles(size_t dev_num, void ** vk_instance_out,
         *vk_instance_out            = (void *) (VkInstance) vk_instance.instance;
         *vk_physical_device_out     = (void *) (VkPhysicalDevice) dev->physical_device;
         *vk_device_out              = (void *) (VkDevice) dev->device;
-        *compute_queue_family_index = dev->compute_queue.queue_family_index;
+        *compute_queue_family_index = dev->compute_queue->queue_family_index;
         return true;
     } catch (...) {
         return false;
     }
 }
 
-extern "C" bool keryx_vk_tensor_addr(const struct ggml_tensor * tensor,
+extern "C" KERYX_VK_EXPORT bool keryx_vk_tensor_addr(const struct ggml_tensor * tensor,
                                      uint64_t * gpu_addr, uint64_t * size_bytes) {
     if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_vk(tensor->buffer)) {
         return false; // not VK-resident (e.g. a ggml-cpu host buffer) -> caller supplements
@@ -60,7 +66,7 @@ extern "C" bool keryx_vk_tensor_addr(const struct ggml_tensor * tensor,
 // are only dereferenceable on their owning device, so the walk matches this against
 // keryx_vk_raw_handles across dev_num to self-locate the model's device — the loader's main_gpu
 // request and ggml's device numbering do not always agree.
-extern "C" void * keryx_vk_tensor_device(const struct ggml_tensor * tensor) {
+extern "C" KERYX_VK_EXPORT void * keryx_vk_tensor_device(const struct ggml_tensor * tensor) {
     if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_vk(tensor->buffer)) {
         return nullptr;
     }
@@ -107,7 +113,7 @@ static bool keryx_vk_physical_device_pci(
 // before model allocation/spawn so a selected non-largest card is dedicated and its resident walk
 // released in time; an explicitly pinned inference-only card outside the mining subset instead
 // releases the provisional reservation. The index is resolved inside ggml's own filtered list.
-extern "C" bool keryx_vk_device_pci(
+extern "C" KERYX_VK_EXPORT bool keryx_vk_device_pci(
         int dev_num, uint32_t * domain, uint32_t * bus, uint32_t * device, uint32_t * function) {
     if (domain == nullptr || bus == nullptr || device == nullptr || function == nullptr) {
         return false;
@@ -171,11 +177,11 @@ static bool keryx_vk_auto_pci_allowed(vk::PhysicalDevice physical) {
 // Optional capability probe used by a new miner with an older sidecar. Auto-placement is allowed
 // to proceed under an active PCI allowlist only when this symbol is present and >= 1; otherwise the
 // Rust host refuses to trust an old picker which can still select an unrelated platform/card.
-extern "C" int keryx_vk_picker_abi() {
+extern "C" KERYX_VK_EXPORT int keryx_vk_picker_abi() {
     return 1;
 }
 
-extern "C" int keryx_vk_pick_discrete_device() {
+extern "C" KERYX_VK_EXPORT int keryx_vk_pick_discrete_device() {
     try {
         ggml_vk_instance_init();
         std::vector<vk::PhysicalDevice> phys = vk_instance.instance.enumeratePhysicalDevices();
@@ -217,7 +223,7 @@ extern "C" int keryx_vk_pick_discrete_device() {
 // PCI identity on this system, so the allowlist cannot be enforced either way and a strict
 // fail-closed would needlessly suspend an all-AMD rig that served inference fine before. Never used
 // when PCI is available (the strict keryx_vk_pick_discrete_device governs then).
-extern "C" int keryx_vk_pick_discrete_device_unfiltered() {
+extern "C" KERYX_VK_EXPORT int keryx_vk_pick_discrete_device_unfiltered() {
     try {
         ggml_vk_instance_init();
         std::vector<vk::PhysicalDevice> phys = vk_instance.instance.enumeratePhysicalDevices();
@@ -259,7 +265,7 @@ extern "C" int keryx_vk_pick_discrete_device_unfiltered() {
 // The Rust host consults this to distinguish "PCI is readable but no device matched the allowlist"
 // (a genuine wrong-card hazard — stay fail-closed) from "no device can report PCI at all" (the
 // allowlist is unenforceable, so fall back to the unfiltered pick).
-extern "C" int keryx_vk_any_discrete_pci_verifiable() {
+extern "C" KERYX_VK_EXPORT int keryx_vk_any_discrete_pci_verifiable() {
     try {
         ggml_vk_instance_init();
         std::vector<vk::PhysicalDevice> phys = vk_instance.instance.enumeratePhysicalDevices();
@@ -290,7 +296,7 @@ extern "C" int keryx_vk_any_discrete_pci_verifiable() {
 // device index. On a rig with an integrated GPU enumerated before the discrete cards (common on
 // AMD/Intel desktop CPUs) the two disagree and llama rejects "invalid value for main_gpu". Returns
 // the discrete ordinal, or -1 if the index is invalid or does not name a discrete GPU.
-extern "C" int keryx_vk_ggml_index_to_discrete_ordinal(int ggml_index) {
+extern "C" KERYX_VK_EXPORT int keryx_vk_ggml_index_to_discrete_ordinal(int ggml_index) {
     try {
         ggml_vk_instance_init();
         if (ggml_index < 0 || (size_t) ggml_index >= vk_instance.device_indices.size()) {
@@ -316,21 +322,20 @@ extern "C" int keryx_vk_ggml_index_to_discrete_ordinal(int ggml_index) {
     }
 }
 
-extern "C" void keryx_vk_queue_submit(size_t dev_num, const void * submit_info, void * fence) {
+extern "C" KERYX_VK_EXPORT void keryx_vk_queue_submit(size_t dev_num, const void * submit_info, void * fence) {
     if (dev_num >= vk_instance.device_indices.size()) {
         throw std::out_of_range("Keryx Vulkan device ordinal");
     }
     vk_device dev = ggml_vk_get_device(dev_num);
     // The same lock every internal ggml submission takes -> external dispatches serialize
     // cleanly against ggml's use of the shared compute queue.
-    std::lock_guard<std::mutex> guard(queue_mutex);
-    dev->compute_queue.queue.submit({ *reinterpret_cast<const vk::SubmitInfo *>(submit_info) },
-                                    vk::Fence((VkFence) fence));
+    dev->compute_queue->handle->submit({ *reinterpret_cast<const vk::SubmitInfo *>(submit_info) },
+                                      vk::Fence((VkFence) fence));
 }
 
 // True when ggml enabled VK_KHR_shader_integer_dot_product on this device (the walk's packed
 // int8 dot-product kernel declares that SPIR-V capability; it is only legal on such a device).
-extern "C" bool keryx_vk_integer_dot_product(size_t dev_num) {
+extern "C" KERYX_VK_EXPORT bool keryx_vk_integer_dot_product(size_t dev_num) {
     try {
         if (dev_num >= vk_instance.device_indices.size()) {
             return false;
@@ -344,7 +349,7 @@ extern "C" bool keryx_vk_integer_dot_product(size_t dev_num) {
 
 // True when ggml found 16x16x16 int8 x int8 -> int32 cooperative-matrix support on this device
 // (VK_KHR_cooperative_matrix enabled): the walk's matrix-core kernel can be used.
-extern "C" bool keryx_vk_coopmat_int8(size_t dev_num) {
+extern "C" KERYX_VK_EXPORT bool keryx_vk_coopmat_int8(size_t dev_num) {
     try {
         if (dev_num >= vk_instance.device_indices.size()) {
             return false;

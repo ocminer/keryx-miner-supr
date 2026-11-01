@@ -22,6 +22,19 @@ EXPORTS
     keryx_llama_pom_pci
     keryx_llama_generate
     keryx_llama_free
+    keryx_llama_vk_trace_abi
+    keryx_llama_trace_configure
+    keryx_llama_trace_leaf_count
+    keryx_llama_trace_read
+    keryx_llama_generate_traced
+    keryx_llama_replay_multi
+    keryx_llama_vk_sequence_configure
+    keryx_llama_vk_batch_callback
+    keryx_llama_vk_recurrent_read
+    keryx_llama_vk_sequence_state
+    keryx_llama_vk_lse_read
+    keryx_llama_vk_replay_sequence
+    keryx_llama_last_error
     keryx_vk_raw_handles
     keryx_vk_tensor_addr
     keryx_vk_tensor_device

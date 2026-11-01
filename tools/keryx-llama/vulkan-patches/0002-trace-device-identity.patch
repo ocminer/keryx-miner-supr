@@ -1,0 +1,33 @@
+Vulkan API indices are logical indices into the filtered GGML device registry.
+The internal ggml_vk_get_device already maps them to physical Vulkan indices.
+Do not apply the mapping twice on filtered or mixed-GPU systems.
+
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -15618,7 +15618,7 @@
+         if (dev_num >= vk_instance.device_indices.size()) {
+             return false;
+         }
+-        vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
++        vk_device dev = ggml_vk_get_device(dev_num);
+         if (!dev->buffer_device_address) {
+             return false; // no BDA → tensors cannot be reached by raw address
+         }
+@@ -15649,7 +15649,7 @@
+ }
+ 
+ void ggml_backend_vk_keryx_queue_submit(size_t dev_num, const void * submit_info, void * fence) {
+-    vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
++    vk_device dev = ggml_vk_get_device(dev_num);
+     // The queue handle's own submit takes the lock every internal ggml_vk_submit takes (none
+     // when the queue is internally synchronized): external dispatches can never race ggml's own
+     // submissions on the shared compute queue.
+@@ -15668,7 +15668,7 @@
+     if (dev_num >= vk_instance.device_indices.size()) {
+         return nullptr;
+     }
+-    vk_device dev = ggml_vk_get_device(vk_instance.device_indices[dev_num]);
++    vk_device dev = ggml_vk_get_device(dev_num);
+     return dev && dev->idx < GGML_VK_MAX_DEVICES ? dev : nullptr;
+ }
+ 

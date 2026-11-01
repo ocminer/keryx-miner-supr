@@ -9,7 +9,11 @@ cmake_minimum_required(VERSION 3.24)
 project(keryx_llama_vk LANGUAGES C CXX)
 
 if(NOT DEFINED LLAMA_SRC)
-  message(FATAL_ERROR "Set -DLLAMA_SRC=<path to a clean llama.cpp b10015 checkout>")
+  message(FATAL_ERROR "Set -DLLAMA_SRC=<Vulkan checkout prepared by tools/prepare-llama-vulkan.py>")
+endif()
+
+if(NOT EXISTS "${LLAMA_SRC}/.keryx-vulkan-prepared.json")
+  message(FATAL_ERROR "Prepare the pinned Vulkan trace backend before configuring")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)

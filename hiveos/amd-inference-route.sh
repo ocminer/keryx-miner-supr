@@ -9,7 +9,7 @@
 
 KERYX_AMD_ROUTE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERYX_AMD_ROUTE_REPO="$(cd "$KERYX_AMD_ROUTE_DIR/.." && pwd)"
-KERYX_LLAMA_VK_TAG="b10015"
+KERYX_LLAMA_VK_TAG="d812350-h15"
 
 _keryx_sha256() {
     sha256sum "$1" | awk '{print $1}'
@@ -23,10 +23,16 @@ _keryx_manifest_value() {
 _keryx_engine_sources() {
     printf '%s\n' \
         "tools/keryx-llama/keryx_llama_vk.cpp" \
+        "tools/keryx-llama/keryx_vk_trace.inc.cpp" \
         "tools/keryx-llama/keryx_vk_exports.inc.cpp" \
         "tools/keryx-llama/pom_walk_vk.comp" \
         "tools/keryx-llama/pom_fetch_vk.comp" \
-        "hiveos/build-keryx-llama-vk.sh"
+        "hiveos/build-keryx-llama-vk.sh" \
+        "tools/prepare-llama-vulkan.py"
+    local patch
+    for patch in "$KERYX_AMD_ROUTE_REPO"/tools/keryx-llama/vulkan-patches/*.patch; do
+        printf '%s\n' "${patch#"$KERYX_AMD_ROUTE_REPO"/}"
+    done
 }
 
 # Write a provenance manifest next to a freshly built engine.  Packaging validates every input
@@ -134,7 +140,11 @@ keryx_validate_amd_engine() {
         keryx_llama_generate keryx_llama_pom_ready keryx_llama_pom_n_chunks \
         keryx_llama_pom_supl_bytes keryx_llama_pom_fetch keryx_llama_pom_mine \
         keryx_llama_pom_pci keryx_vk_picker_abi keryx_vk_pick_discrete_device \
-        keryx_vk_device_pci; do
+        keryx_vk_device_pci keryx_llama_vk_trace_abi keryx_llama_trace_configure \
+        keryx_llama_trace_leaf_count keryx_llama_trace_read keryx_llama_generate_traced \
+        keryx_llama_replay_multi keryx_llama_vk_sequence_configure keryx_llama_vk_sequence_state \
+        keryx_llama_vk_replay_sequence keryx_llama_vk_lse_read keryx_llama_vk_recurrent_read \
+        keryx_llama_vk_batch_callback keryx_llama_last_error; do
         grep -qx "$symbol" <<< "$symbols" || {
             echo "ERROR: $engine is missing required export $symbol" >&2
             return 1

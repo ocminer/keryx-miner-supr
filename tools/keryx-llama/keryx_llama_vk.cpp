@@ -16,6 +16,7 @@
 #include "llama.h"
 #include "llama-model.h"
 #include "ggml.h"
+#include "ggml-vulkan.h"
 #include "gguf.h"
 #include <vulkan/vulkan.h>
 #include <algorithm>
@@ -135,6 +136,7 @@ struct PushFetch {
 // whole tier through this window; the startup byte gate fetches single chunks.
 static constexpr uint32_t FETCH_WINDOW_CHUNKS = 131072;
 
+struct KeryxVkTrace;
 struct KeryxLlama {
     llama_model*   model = nullptr;
     llama_context* ctx   = nullptr;
@@ -142,6 +144,7 @@ struct KeryxLlama {
     std::vector<std::string> names; // canonical (byte-lexicographic) order — matches pom.rs
     std::string gguf_path;          // supplements pread their bytes straight from the file
     std::mutex gen_lock;
+    KeryxVkTrace* trace = nullptr;
 
     // ── zero-dup walk state (all on ggml's own VkDevice) ──
     size_t   gpu = 0;
@@ -182,6 +185,8 @@ struct KeryxLlama {
     std::mutex walk_lock; // one dispatch at a time on our cmd buffer/fence
     std::string ctx_info;           // "n_ctx=… kv=… flash_attn=…" for the miner log
 };
+
+static void keryx_vk_trace_free(KeryxLlama* h);
 
 // ── small Vulkan helpers ────────────────────────────────────────────────────────────────────
 
@@ -957,7 +962,7 @@ static KeryxLlama* keryx_load_impl(const char* gguf_path, int gpu, const int* la
     mp.n_gpu_layers = 999;
     mp.split_mode   = LLAMA_SPLIT_MODE_NONE; // ONE GPU — never layer-split across mining cards
     mp.main_gpu     = main_gpu;
-    mp.use_mmap     = true;
+    mp.load_mode    = LLAMA_LOAD_MODE_MMAP;
     llama_model_kv_override overrides[2] = {};               // zeroed tail terminates the list
     if (keryx_needs_glm4_rope_fix(gguf_path)) {
         overrides[0].tag = LLAMA_KV_OVERRIDE_TYPE_INT;
@@ -989,7 +994,7 @@ static KeryxLlama* keryx_load_impl(const char* gguf_path, int gpu, const int* la
     // Repeat penalty before top_p/temp — stops Q4 small-model sentence loops; NOT consensus
     // (OPoI text only). 256-tok window / 1.10, mirrors keryx_llama.cpp (upstream 76047d9).
     // ⚠️ AMD claude: rebuild libkeryx-llama-vk.so to pick this up.
-    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, 1.10f, 0.0f, 0.0f));
+    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(llama_vocab_n_tokens(llama_model_get_vocab(model)), 256, 1.10f, 0.0f, 0.0f));
     llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
@@ -1258,6 +1263,7 @@ void keryx_llama_free(KeryxLlama* h) {
         if (h->fence) vkDestroyFence(h->dev, h->fence, nullptr);
         if (h->cpool) vkDestroyCommandPool(h->dev, h->cpool, nullptr);
     }
+    keryx_vk_trace_free(h);
     if (h->smpl) llama_sampler_free(h->smpl);
     if (h->ctx) llama_free(h->ctx);
     if (h->model) llama_model_free(h->model);
@@ -1265,3 +1271,5 @@ void keryx_llama_free(KeryxLlama* h) {
 }
 
 } // extern "C"
+
+#include "keryx_vk_trace.inc.cpp"
