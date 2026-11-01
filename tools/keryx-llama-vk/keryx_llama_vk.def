@@ -23,6 +23,7 @@ EXPORTS
     keryx_llama_generate
     keryx_llama_free
     keryx_llama_vk_trace_abi
+    keryx_llama_vk_trace_identity
     keryx_llama_trace_configure
     keryx_llama_trace_leaf_count
     keryx_llama_trace_read
@@ -47,3 +48,7 @@ EXPORTS
     keryx_vk_queue_submit
     keryx_vk_integer_dot_product
     keryx_vk_coopmat_int8
+    keryx_llama_pom_v5_abi
+    keryx_llama_pom_mine_v5
+    keryx_llama_pom_release_pad
+    keryx_llama_pom_pad_read

@@ -5,6 +5,7 @@
 
 struct KeryxVkTrace {
     uint32_t max_ctx = 0;
+    uint32_t physical_batch = 8;
     bool configured = false;
     bool sequence = false;
     int (*after_batch)(void*, uint32_t) = nullptr;
@@ -31,6 +32,7 @@ static void keryx_vk_trace_free(KeryxLlama* h) {
 
 static int keryx_vk_trace_context(KeryxLlama* h) {
     if (!h || !h->trace || !h->trace->configured) return -5;
+    keryx_llama_pom_release_pad(h);
     if (h->ctx) { llama_free(h->ctx); h->ctx = nullptr; }
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = h->trace->max_ctx;
@@ -55,7 +57,7 @@ static int keryx_vk_trace_feed(KeryxLlama* h, const int32_t* tokens, uint32_t st
         const uint32_t pos = start + consumed;
         const uint32_t declared = pos < n_prompt ? std::min(512u, n_prompt - pos / 512u * 512u) : 1u;
         const uint32_t boundary = pos < n_prompt ? std::min(n_prompt, (pos / 512u + 1) * 512u) : pos + 1;
-        const uint32_t n = std::min({8u, count - consumed, boundary - pos});
+        const uint32_t n = std::min({h->trace->physical_batch, count - consumed, boundary - pos});
         if (!n || ggml_backend_vk_keryx_trace_ubatch_as(h->gpu, pos, n, declared) != 0)
             return keryx_vk_fail(h, "Vulkan trace batch refused");
         llama_batch batch = llama_batch_init(n, 0, 1);
@@ -101,12 +103,37 @@ extern "C" {
 int keryx_llama_vk_trace_abi() { return 1; }
 const char* keryx_llama_last_error() { return keryx_vk_trace_error.c_str(); }
 
+// Identity comes from the physical device owning the model, not an OpenCL or
+// ggml ordinal in a different enumeration. Driver identity also binds replay.
+int keryx_llama_vk_trace_identity(KeryxLlama* h, char* name, size_t name_cap,
+                                 char* driver, size_t driver_cap) {
+    if (!h || !h->phys || !name || name_cap < 2 || !driver || driver_cap < 2) return -1;
+    VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    props.pNext = &dp;
+    vkGetPhysicalDeviceProperties2(h->phys, &props);
+    const auto& p = props.properties;
+    const std::string gpu = std::string(p.deviceName) + ":" + std::to_string(p.vendorID) + ":" + std::to_string(p.deviceID);
+    std::string version = std::to_string(dp.driverID) + ":" + std::to_string(p.driverVersion) + ":" + dp.driverName + ":" + dp.driverInfo + ":";
+    const char* hex = "0123456789abcdef";
+    for (uint8_t b : p.pipelineCacheUUID) { version += hex[b >> 4]; version += hex[b & 15]; }
+    if (gpu.size() >= name_cap || version.size() >= driver_cap) return -1;
+    memcpy(name, gpu.c_str(), gpu.size() + 1);
+    memcpy(driver, version.c_str(), version.size() + 1);
+    return 0;
+}
+
 int keryx_llama_trace_configure(KeryxLlama* h, const void* manifest, size_t manifest_len, int max_pos) {
-    if (!h || !h->ctx || !manifest || !manifest_len || max_pos < 0) return -1;
+    if (!h || !h->model || !h->loaded_context || !manifest || !manifest_len || max_pos < 0) return -1;
     std::lock_guard<std::mutex> guard(h->gen_lock);
     if (!h->trace) {
         h->trace = new KeryxVkTrace();
-        h->trace->max_ctx = llama_n_ctx(h->ctx);
+        h->trace->max_ctx = h->loaded_context;
+        // Head-slice MLA products run one token at a time. Their declared
+        // prompt batch/layout remains the consensus 512-token rule.
+        char arch[64] = {};
+        if (llama_model_meta_val_str(h->model, "general.architecture", arch, sizeof(arch)) > 0 && strcmp(arch, "kimi-linear") == 0)
+            h->trace->physical_batch = 1;
     }
     const uint32_t capacity = max_pos ? (uint32_t)max_pos : h->trace->max_ctx;
     const int rc = ggml_backend_vk_keryx_trace_configure(h->gpu, manifest, manifest_len, capacity);
@@ -151,10 +178,10 @@ int keryx_llama_vk_recurrent_read(KeryxLlama* h, uint8_t* records, size_t record
 
 size_t keryx_llama_vk_sequence_state(KeryxLlama* h, uint8_t* out, size_t cap) {
     if (!h || !h->ctx || !h->trace) return 0;
-    const size_t need = llama_state_seq_get_size_ext(h->ctx, 0, 0);
+    const size_t need = llama_state_seq_get_size_ext(h->ctx, 0, 1u << 31);
     if (!out) return need;
     if (cap < need) return 0;
-    return llama_state_seq_get_data_ext(h->ctx, out, cap, 0, 0);
+    return llama_state_seq_get_data_ext(h->ctx, out, cap, 0, 1u << 31);
 }
 
 int keryx_llama_vk_lse_read(KeryxLlama* h, float* out, size_t cap, uint32_t n_pos) {

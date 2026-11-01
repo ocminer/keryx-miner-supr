@@ -1,0 +1,14 @@
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2096,7 +2096,10 @@
+             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+ 
+             // check the cell is not SWA-masked
+-            if (add_cell && seq_id != -1) {
++            // H15 trace readback needs every retained SWA row, including rows
++            // outside the final token window. This private flag is used only
++            // by the miner with a full-size cache; ordinary saves are unchanged.
++            if (add_cell && seq_id != -1 && (flags & (1u << 31)) == 0) {
+                 const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
+ 
+                 add_cell = !is_masked;

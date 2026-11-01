@@ -11,6 +11,10 @@ const GGML_Q8_0: u32 = 8;
 /// One attention layer of the sequence layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeqAttn {
+    /// SWA caches are serialized after all global layers.
+    pub swa: bool,
+    /// MLA stores its latent key only; the node commits an empty value leaf.
+    pub mla: bool,
     pub layer: u32,
     pub slot: u32,
     pub n_head: u32,
@@ -31,6 +35,7 @@ pub struct SeqRecur {
 
 /// Sequence layer kind of a delta-rule layer with one decay per head (`RECUR_GDA`).
 pub const SEQ_KIND_GDA: u32 = 3;
+pub const SEQ_KIND_KDA: u32 = 4;
 
 /// The sequence leaves a manifest under the attention rule commits.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,7 +63,7 @@ impl SeqSpec {
 
     /// Bytes of one record of a recurrent head (`seq::record_len` of a one-decay layer).
     pub(crate) fn record_len(&self) -> usize {
-        self.recur.first().map_or(0, |r| 8 * r.head_dim as usize + 8)
+        self.recur.first().map_or(0, |r| 8 * r.head_dim as usize + if r.kind == SEQ_KIND_KDA { 4 + 2 * r.head_dim as usize } else { 8 })
     }
 
     /// The backend's rows of the recurrent layers: (layer, kind, slot, heads, head_dim).
@@ -83,7 +88,7 @@ impl SeqSpec {
                 return Err(anyhow!("recurrent checkpoints every {} positions fall inside traced batches", self.interval));
             }
             for (i, r) in self.recur.iter().enumerate() {
-                if r.slot as usize != i || r.kind != SEQ_KIND_GDA || r.n_v_heads != first.n_v_heads || r.head_dim != first.head_dim {
+                if r.slot as usize != i || !matches!(r.kind, SEQ_KIND_GDA | SEQ_KIND_KDA) || r.kind != first.kind || r.n_v_heads != first.n_v_heads || r.head_dim != first.head_dim {
                     return Err(anyhow!("unsupported recurrent layer {}", r.layer));
                 }
             }
@@ -237,11 +242,11 @@ pub(crate) struct LayerCache {
 /// state follows (`llama_memory_hybrid::state_write`) and is skipped. A cell of an M-RoPE model
 /// carries its 2D position and token (`llama_kv_cell_ext`, 12 bytes) after its sequence count; the
 /// state does not say so, and only one of the two readings holds positions `0..n_pos` in order.
-pub(crate) fn parse_kv_state(b: &[u8], n_pos: usize, hybrid: bool) -> Result<Vec<LayerCache>> {
-    parse_kv_state_ext(b, n_pos, hybrid, 0).or_else(|e| parse_kv_state_ext(b, n_pos, hybrid, 12).map_err(|_| e))
+pub(crate) fn parse_kv_state(b: &[u8], n_pos: usize, spec: &SeqSpec) -> Result<Vec<LayerCache>> {
+    parse_kv_state_ext(b, n_pos, spec, 0).or_else(|e| parse_kv_state_ext(b, n_pos, spec, 12).map_err(|_| e))
 }
 
-fn parse_kv_state_ext(b: &[u8], n_pos: usize, hybrid: bool, cell_ext: usize) -> Result<Vec<LayerCache>> {
+fn parse_kv_state_ext(b: &[u8], n_pos: usize, spec: &SeqSpec, cell_ext: usize) -> Result<Vec<LayerCache>> {
     let mut o = 0usize;
     let mut take = |n: usize| -> Result<&[u8]> {
         let end = o.checked_add(n).ok_or_else(|| anyhow!("cache state offset overflow"))?;
@@ -250,55 +255,51 @@ fn parse_kv_state_ext(b: &[u8], n_pos: usize, hybrid: bool, cell_ext: usize) -> 
         Ok(s)
     };
     let u32_at = |s: &[u8]| u32::from_le_bytes(s.try_into().unwrap());
-    // `llama_context::state_seq_get_data`: its magic and the sequence id, then the cache's state.
     let (magic, seq) = (u32_at(take(4)?), u32_at(take(4)?));
     if magic != 0xaf14_3cd8 || seq != 0 {
         return Err(anyhow!("not a state of sequence 0 (magic {magic:#x}, sequence {seq})"));
     }
-    if u32_at(take(4)?) != 1 {
-        return Err(anyhow!("the cache has several streams"));
-    }
-    let cells = u32_at(take(4)?) as usize;
-    if cells != n_pos {
-        return Err(anyhow!("the cache holds {cells} cells for {n_pos} positions"));
-    }
-    for i in 0..cells {
-        let pos = u32_at(take(4)?);
-        let n_seq = u32_at(take(4)?);
-        take(cell_ext)?;
-        let seq = if n_seq == 1 { u32_at(take(4)?) } else { u32::MAX };
-        if pos as usize != i || seq != 0 {
-            return Err(anyhow!("cache cell {i} holds position {pos} of {n_seq} sequences"));
+    // llama_kv_cache_iswa writes global layers first, then sliding-window
+    // layers. Reassemble by manifest slot, never guess from the row size.
+    let mut layers: Vec<Option<LayerCache>> = (0..spec.attn.len()).map(|_| None).collect();
+    for swa in [false, true] {
+        let mut group: Vec<_> = spec.attn.iter().filter(|a| a.swa == swa).collect();
+        group.sort_by_key(|a| a.layer);
+        if group.is_empty() { continue; }
+        if u32_at(take(4)?) != 1 { return Err(anyhow!("the cache has several streams")); }
+        let cells = u32_at(take(4)?) as usize;
+        if cells != n_pos { return Err(anyhow!("the cache holds {cells} cells for {n_pos} positions")); }
+        for i in 0..cells {
+            let pos = u32_at(take(4)?);
+            let n_seq = u32_at(take(4)?);
+            take(cell_ext)?;
+            let seq = if n_seq == 1 { u32_at(take(4)?) } else { u32::MAX };
+            if pos as usize != i || seq != 0 { return Err(anyhow!("cache cell {i} holds position {pos} of {n_seq} sequences")); }
+        }
+        let v_trans = u32_at(take(4)?);
+        let n_layer = u32_at(take(4)?) as usize;
+        if n_layer != group.len() { return Err(anyhow!("cache has {n_layer} layers, expected {}", group.len())); }
+        let (rot_k, rot_v) = (u32_at(take(4)?), u32_at(take(4)?));
+        if v_trans != 0 || rot_k != 0 || rot_v != 0 {
+            return Err(anyhow!("the cache is transposed or rotated (v_trans {v_trans}, rotation {rot_k}/{rot_v})"));
+        }
+        for which in 0..2 {
+            for a in &group {
+                if which == 1 && a.mla { continue; }
+                let ty = u32_at(take(4)?);
+                let row = usize::try_from(u64::from_le_bytes(take(8)?.try_into().unwrap()))?;
+                if ty != GGML_Q8_0 { return Err(anyhow!("cache layer {} is not q8_0 (type {ty})", a.layer)); }
+                let expected = a.n_head_kv as usize * (a.head_dim as usize / 32 * 34);
+                if row != expected { return Err(anyhow!("cache layer {} row has {row} bytes, expected {expected}", a.layer)); }
+                let rows = take(row.checked_mul(cells).ok_or_else(|| anyhow!("cache row size overflow"))?)?.to_vec();
+                let entry = layers.get_mut(a.slot as usize).ok_or_else(|| anyhow!("cache slot outside layout"))?;
+                if which == 0 { *entry = Some(LayerCache { k: rows, v: Vec::new(), k_row: row, v_row: 0 }); }
+                else { let l = entry.as_mut().ok_or_else(|| anyhow!("value cache precedes key"))?; l.v = rows; l.v_row = row; }
+            }
         }
     }
-    let v_trans = u32_at(take(4)?);
-    let n_layer = u32_at(take(4)?) as usize;
-    if n_layer > 4096 { return Err(anyhow!("invalid cache layer count")); }
-    let (rot_k, rot_v) = (u32_at(take(4)?), u32_at(take(4)?));
-    if v_trans != 0 || rot_k != 0 || rot_v != 0 {
-        return Err(anyhow!("the cache is transposed or rotated (v_trans {v_trans}, rotation {rot_k}/{rot_v})"));
-    }
-    let mut layers: Vec<LayerCache> = Vec::with_capacity(n_layer);
-    for which in 0..2 {
-        for l in 0..n_layer {
-            let ty = u32_at(take(4)?);
-            let row = u64::from_le_bytes(take(8)?.try_into().unwrap()) as usize;
-            if ty != GGML_Q8_0 {
-                return Err(anyhow!("cache layer {l} is not q8_0 (type {ty})"));
-            }
-            let rows = take(row.checked_mul(cells).ok_or_else(|| anyhow!("cache row size overflow"))?)?.to_vec();
-            if which == 0 {
-                layers.push(LayerCache { k: rows, v: Vec::new(), k_row: row, v_row: 0 });
-            } else {
-                layers[l].v = rows;
-                layers[l].v_row = row;
-            }
-        }
-    }
-    if o != b.len() && !hybrid {
-        return Err(anyhow!("{} bytes past the cache state", b.len() - o));
-    }
-    Ok(layers)
+    if o != b.len() && spec.n_recur == 0 { return Err(anyhow!("{} bytes past the cache state", b.len() - o)); }
+    layers.into_iter().map(|l| l.ok_or_else(|| anyhow!("cache layer missing"))).collect()
 }
 
 /// The bytes of every sequence leaf of `spec`, in leaf order, from the cache rows and the masses
@@ -318,7 +319,7 @@ pub(crate) fn seq_leaf_bytes(spec: &SeqSpec, cache: &[LayerCache], lse: &[f32], 
         let lc = cache.get(at).ok_or_else(|| anyhow!("no cache for layer {}", a.layer))?;
         let hb = a.head_dim as usize / 32 * 34;
         let nkv = a.n_head_kv as usize;
-        if lc.k_row != nkv * hb || lc.v_row != nkv * hb {
+        if lc.k_row != nkv * hb || lc.v_row != if a.mla { 0 } else { nkv * hb } {
             return Err(anyhow!("cache rows of layer {} are {}/{} bytes for {nkv} heads of {hb}", a.layer, lc.k_row, lc.v_row));
         }
         let g = (a.n_head / a.n_head_kv) as usize;
@@ -330,7 +331,7 @@ pub(crate) fn seq_leaf_bytes(spec: &SeqSpec, cache: &[LayerCache], lse: &[f32], 
             let mut m = Vec::with_capacity(n_pos * g * 4);
             for t in 0..n_pos {
                 k.extend_from_slice(&lc.k[t * lc.k_row + h * hb..t * lc.k_row + (h + 1) * hb]);
-                v.extend_from_slice(&lc.v[t * lc.v_row + h * hb..t * lc.v_row + (h + 1) * hb]);
+                if !a.mla { v.extend_from_slice(&lc.v[t * lc.v_row + h * hb..t * lc.v_row + (h + 1) * hb]); }
                 for qi in 0..g {
                     let x = lse[(a.layer as usize * n_pos + t) * lse_heads + h * g + qi];
                     if !x.is_finite() {
@@ -393,22 +394,22 @@ mod tests {
     #[test]
     fn sequence_leaves_follow_the_node_layout() {
         let (n_pos, hb) = (3usize, 34usize);
-        let spec = SeqSpec { n_attn: 1, n_recur: 0, heads: 2, attn: vec![SeqAttn { layer: 0, slot: 0, n_head: 4, n_head_kv: 2, head_dim: 32 }], recur: vec![], interval: 0 };
+        let spec = SeqSpec { n_attn: 1, n_recur: 0, heads: 2, attn: vec![SeqAttn { swa: false, mla: false, layer: 0, slot: 0, n_head: 4, n_head_kv: 2, head_dim: 32 }], recur: vec![], interval: 0 };
         spec.check().unwrap();
         let k: Vec<u8> = (0..n_pos * 2 * hb).map(|i| i as u8).collect();
         let v: Vec<u8> = (0..n_pos * 2 * hb).map(|i| (i as u8).wrapping_mul(7)).collect();
         let state = kv_state(n_pos as u32, &[(k.clone(), v.clone())], 2 * hb as u64);
-        let cache = parse_kv_state(&state, n_pos, false).unwrap();
-        assert!(parse_kv_state(&state, n_pos + 1, false).is_err());
-        assert!(parse_kv_state(&state[..state.len() - 1], n_pos, false).is_err());
+        let cache = parse_kv_state(&state, n_pos, &spec).unwrap();
+        assert!(parse_kv_state(&state, n_pos + 1, &spec).is_err());
+        assert!(parse_kv_state(&state[..state.len() - 1], n_pos, &spec).is_err());
         // A hybrid memory's recurrent state follows the cache.
         let mut hybrid = state.clone();
         hybrid.extend_from_slice(&[1, 2, 3]);
-        assert!(parse_kv_state(&hybrid, n_pos, false).is_err());
-        assert_eq!(parse_kv_state(&hybrid, n_pos, true).unwrap().len(), 1);
+        assert!(parse_kv_state(&hybrid, n_pos, &spec).is_err());
+        assert_eq!(parse_kv_state(&hybrid, n_pos, &SeqSpec { n_recur: 1, ..spec.clone() }).unwrap().len(), 1);
         // An M-RoPE cache's cells carry their 2D position and token.
         let mrope = kv_state_cells(n_pos as u32, &[(k.clone(), v.clone())], 2 * hb as u64, true);
-        let ext = parse_kv_state(&mrope, n_pos, false).unwrap();
+        let ext = parse_kv_state(&mrope, n_pos, &spec).unwrap();
         assert_eq!((ext[0].k.as_slice(), ext[0].v.as_slice()), (cache[0].k.as_slice(), cache[0].v.as_slice()));
         let lse: Vec<f32> = (0..n_pos * 4).map(|i| i as f32 * 0.5).collect();
         let leaves = seq_leaf_bytes(&spec, &cache, &lse, n_pos).unwrap();
@@ -430,7 +431,7 @@ mod tests {
         let mut rotated = state.clone();
         let rot = 16 + 12 * n_pos + 8;
         rotated[rot..rot + 4].copy_from_slice(&64u32.to_le_bytes());
-        assert!(parse_kv_state(&rotated, n_pos, false).is_err());
+        assert!(parse_kv_state(&rotated, n_pos, &spec).is_err());
     }
 
     /// Recurrent leaves land where the node's layout puts each head's records and checkpoints,
@@ -444,7 +445,7 @@ mod tests {
             n_attn: 1,
             n_recur: 2,
             heads: 4,
-            attn: vec![SeqAttn { layer: 1, slot: 0, n_head: 4, n_head_kv: 2, head_dim: 32 }],
+            attn: vec![SeqAttn { swa: false, mla: false, layer: 1, slot: 0, n_head: 4, n_head_kv: 2, head_dim: 32 }],
             recur: vec![recur(0, 0), recur(2, 1)],
             interval: 16,
         };
@@ -492,6 +493,55 @@ mod tests {
         let small = seq_capture(&leaf[..100], 0, 100).unwrap();
         assert_eq!(small.cvs, vec![*blake3::hash(&leaf[..100]).as_bytes()]);
         assert!(seq_capture(&leaf, 4096, 6000).is_err());
+    }
+
+    #[test]
+    fn split_swa_and_mla_caches_follow_manifest_slots() {
+        let a = SeqAttn { layer: 0, slot: 0, n_head: 1, n_head_kv: 1, head_dim: 32, swa: true, mla: false };
+        let spec = SeqSpec { n_attn: 2, n_recur: 0, heads: 1,
+            attn: vec![a, SeqAttn { layer: 1, slot: 1, swa: false, ..a }], recur: vec![], interval: 0 };
+        let global = kv_state(2, &[(vec![11; 68], vec![12; 68])], 34);
+        let swa = kv_state(2, &[(vec![21; 68], vec![22; 68])], 34);
+        let mut state = global.clone(); state.extend_from_slice(&swa[8..]);
+        let cache = parse_kv_state(&state, 2, &spec).unwrap();
+        let leaves = seq_leaf_bytes(&spec, &cache, &[0.0; 4], 2).unwrap();
+        assert_eq!(leaves[0], vec![21; 68]); assert_eq!(leaves[1], vec![22; 68]);
+        assert_eq!(leaves[2], vec![11; 68]); assert_eq!(leaves[3], vec![12; 68]);
+        assert!(parse_kv_state(&global, 2, &spec).is_err());
+        // A final-window-only SWA save cannot silently commit a partial history.
+        let mut partial = global;
+        partial.extend_from_slice(&kv_state(1, &[(vec![21; 34], vec![22; 34])], 34)[8..]);
+        assert!(parse_kv_state(&partial, 2, &spec).is_err());
+        let mla = SeqSpec { n_attn: 1, n_recur: 1, heads: 1,
+            attn: vec![SeqAttn { swa: false, mla: true, ..a }], recur: vec![], interval: 32 };
+        let mut state = kv_state(2, &[(vec![31; 68], vec![0; 68])], 34);
+        state.truncate(state.len() - 12 - 68); // MLA has no value tensor or descriptor.
+        let cache = parse_kv_state(&state, 2, &mla).unwrap();
+        let leaves = seq_leaf_bytes(&mla, &cache, &[0.0; 2], 2).unwrap();
+        assert_eq!(leaves[0], vec![31; 68]); assert!(leaves[1].is_empty());
+    }
+
+    #[test]
+    fn kda_records_and_checkpoints_match_node_sizes_and_hashes() {
+        use keryx_verifiable_inference::{manifest::RECUR_KDA, seq};
+        let spec = SeqSpec { n_attn: 0, n_recur: 1, heads: 1, attn: vec![],
+            recur: vec![SeqRecur { layer: 0, slot: 0, kind: SEQ_KIND_KDA, n_v_heads: 1, head_dim: 32 }], interval: 16 };
+        spec.check().unwrap();
+        let rlen = seq::record_len(RECUR_KDA, 32);
+        assert_eq!(spec.record_len(), rlen);
+        let mut sink = RecurSink::new(&spec, &[0, 1]).unwrap();
+        for batch in 0..2 {
+            sink.after_batch_with(8, |records, ckpt| {
+                records[..8 * rlen].fill(batch + 7); ckpt.fill(9); Ok((8, batch as u32))
+            }).unwrap();
+        }
+        sink.check_end(16).unwrap();
+        let records: Vec<_> = [vec![7; 8 * rlen], vec![8; 8 * rlen]].concat();
+        assert_eq!(sink.kept(0).unwrap(), records);
+        assert_eq!(sink.kept(1).unwrap(), vec![9; 32 * 32 * 4]);
+        let mut hashes = vec![[0; 32]; 2]; sink.hashes_into(&mut hashes);
+        assert_eq!(hashes[0], *blake3::hash(&records).as_bytes());
+        assert_eq!(hashes[1], *blake3::hash(&vec![9; 32 * 32 * 4]).as_bytes());
     }
 
 }

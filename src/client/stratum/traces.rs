@@ -137,7 +137,16 @@ pub(super) fn fetch_foreign(url: &str, request_hash_hex: &str) -> Result<Kept, S
     }
     let gpu = keryx_miner::slm::serveable_route_gpus(&h.model_id)
         .into_iter()
-        .find(|&g| keryx_miner::traced::gpu_identity(g).0 == h.gpu_model)
+        .find(|&g| {
+            let identity = keryx_miner::traced::gpu_identity(g);
+            if h.gpu_model.is_empty() || identity.0 != h.gpu_model { return false; }
+            // Vulkan arithmetic can differ between RADV/AMDVLK and driver releases.
+            // CUDA's established replay policy remains unchanged.
+            #[cfg(feature = "pom-opencl")]
+            { !h.driver_version.is_empty() && identity.2 == h.driver_version }
+            #[cfg(not(feature = "pom-opencl"))]
+            { true }
+        })
         .ok_or_else(|| format!("no card of model '{}' serves this tier here", h.gpu_model))?;
     let kept = Kept { model_id: h.model_id, tier: h.tier, request_hash: h.request_hash, gpu: Some(gpu), trace: Arc::new(trace), at: now() };
     keep(request_hash_hex, h.request_hash, h.model_id, h.tier, h.max_tokens, gpu, Arc::clone(&kept.trace));

@@ -70,7 +70,7 @@ jobs:
           "LIB=$root\lib;$env:LIB"         | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "INCLUDE=$root\include;$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      # Use llama.cpp b10015's own pinned Windows SDK/install route. Extracting the older SDK's
+      # Use the pinned Windows Vulkan SDK/install route. Extracting the older SDK's
       # self-extractor with 7-Zip supplies glslc but omits the SPIRV-Headers CMake package; running
       # the official installer supplies the complete development SDK required by ggml-vulkan.
       # The user's AMD driver supplies vulkan-1.dll and the ICD at runtime; SDK DLLs are not shipped.
@@ -175,16 +175,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $required = @(
-            "keryx_llama_abi", "keryx_llama_vk_abi", "keryx_llama_log_get_v1",
-            "keryx_llama_log_set_v1", "keryx_llama_load", "keryx_llama_free",
-            "keryx_llama_generate", "keryx_llama_pom_ready", "keryx_llama_pom_n_chunks",
-            "keryx_llama_pom_supl_bytes", "keryx_llama_pom_fetch", "keryx_llama_pom_mine",
-            "keryx_llama_pom_load", "keryx_llama_pom_batch_max",
-            "keryx_llama_pom_pci", "keryx_vk_picker_abi", "keryx_vk_pick_discrete_device",
-            "keryx_vk_pick_discrete_device_unfiltered", "keryx_vk_any_discrete_pci_verifiable",
-            "keryx_vk_device_pci"
-          )
+          # Check the complete ABI shipped in the export definition, including traces and v5.
+          $required = @(Get-Content tools/keryx-llama-vk/keryx_llama_vk.def |
+            ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^keryx_\w+$' })
+          if ($required.Count -lt 49) { throw "Incomplete Vulkan export definition" }
           foreach ($dll in @("keryx-llama-vk.dll", "keryx-llama-vk-noavx.dll")) {
             if (-not (Test-Path $dll)) { throw "$dll is missing" }
             $exports = (& dumpbin /NOLOGO /EXPORTS $dll | Out-String)
@@ -221,22 +215,36 @@ jobs:
               [DllImport("keryx-llama-vk.dll", CallingConvention = CallingConvention.Cdecl,
                          EntryPoint = "keryx_llama_vk_abi")]
               public static extern int AvxVkAbi();
+              [DllImport("keryx-llama-vk.dll", CallingConvention = CallingConvention.Cdecl,
+                         EntryPoint = "keryx_llama_vk_trace_abi")]
+              public static extern int AvxTraceAbi();
+              [DllImport("keryx-llama-vk.dll", CallingConvention = CallingConvention.Cdecl,
+                         EntryPoint = "keryx_llama_pom_v5_abi")]
+              public static extern int AvxV5Abi();
               [DllImport("keryx-llama-vk-noavx.dll", CallingConvention = CallingConvention.Cdecl,
                          EntryPoint = "keryx_llama_abi")]
               public static extern int NoAvxAbi();
               [DllImport("keryx-llama-vk-noavx.dll", CallingConvention = CallingConvention.Cdecl,
                          EntryPoint = "keryx_llama_vk_abi")]
               public static extern int NoAvxVkAbi();
+              [DllImport("keryx-llama-vk-noavx.dll", CallingConvention = CallingConvention.Cdecl,
+                         EntryPoint = "keryx_llama_vk_trace_abi")]
+              public static extern int NoAvxTraceAbi();
+              [DllImport("keryx-llama-vk-noavx.dll", CallingConvention = CallingConvention.Cdecl,
+                         EntryPoint = "keryx_llama_pom_v5_abi")]
+              public static extern int NoAvxV5Abi();
           }
           '@
           if (-not [KeryxVkSmoke]::SetDllDirectory((Get-Location).Path)) {
             throw "SetDllDirectory failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
           }
           if ([KeryxVkSmoke]::AvxAbi() -ne 2 -or [KeryxVkSmoke]::AvxVkAbi() -ne 6 -or
-              [KeryxVkSmoke]::NoAvxAbi() -ne 2 -or [KeryxVkSmoke]::NoAvxVkAbi() -ne 6) {
+              [KeryxVkSmoke]::NoAvxAbi() -ne 2 -or [KeryxVkSmoke]::NoAvxVkAbi() -ne 6 -or
+              [KeryxVkSmoke]::AvxTraceAbi() -ne 1 -or [KeryxVkSmoke]::NoAvxTraceAbi() -ne 1 -or
+              [KeryxVkSmoke]::AvxV5Abi() -ne 1 -or [KeryxVkSmoke]::NoAvxV5Abi() -ne 1) {
             throw "Vulkan sidecar ABI smoke test failed"
           }
-          Write-Host "Both Vulkan sidecars load and report core ABI 2 / Vulkan ABI 6"
+          Write-Host "Both Vulkan sidecars load: core 2 / Vulkan 6 / trace 1 / PoM v5 1"
 
       - name: Stage artifact
         shell: pwsh
@@ -253,9 +261,9 @@ jobs:
           @"
           keryx-miner-supr — Windows AMD (OpenCL mining + Vulkan GPU inference)
 
-          H15 status: this AMD build cannot produce the required inference traces.
-          Mining remains paused even when the model loads successfully. A Vulkan
-          trace engine is required before this package can mine after H15.
+          H15 mining and verifiable inference use Vulkan on the same AMD card.
+          The miner pauses mining for an inference request or audit replay, then resumes.
+          A separate GPU does not need to be reserved for inference.
 
           Files:
             keryx-miner-supr.exe  - the miner

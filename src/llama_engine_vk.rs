@@ -18,6 +18,10 @@ use libloading::Library;
 #[path = "llama_engine_vk_trace.rs"]
 pub mod tracing;
 
+#[path = "llama_engine_vk_pom_v5.rs"]
+mod pom_v5;
+pub use pom_v5::mine as pom_mine_v5;
+
 type AbiFn = unsafe extern "C" fn() -> c_int;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
 type Load2Fn = unsafe extern "C" fn(*const c_char, c_int, *const c_int, c_int, c_int) -> *mut c_void;
@@ -77,6 +81,7 @@ struct Engine {
     n_ctx: c_int,
     prompt_guard: bool,
     trace: Option<tracing::State>,
+    v5: Option<pom_v5::Api>,
 }
 // The wrapper serializes generation + walk dispatches internally (gen_lock / walk_lock).
 unsafe impl Send for Engine {}
@@ -475,6 +480,7 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
             n_ctx,
             prompt_guard: sym::<AbiFn>(lib, "keryx_llama_prompt_guard").map_or(false, |f| f() == 1),
             trace: tracing::State::load(lib),
+            v5: pom_v5::Api::load(lib),
         });
         dedication_attempt.armed = false;
         true
@@ -762,6 +768,7 @@ pub struct MiningWalk {
     free: FreeFn,
     fetch: FetchFn,
     mine: MineFn,
+    v5: Option<pom_v5::Api>,
     cap: u64,
     healthy: bool,
 }
@@ -838,7 +845,7 @@ impl MiningWalk {
                     MiningLoadError::Unavailable("resident Vulkan allocation/upload unavailable".into())
                 });
             }
-            let mut walk = Self { model, free, fetch, mine, cap: cap(model) as u64, healthy: true };
+            let mut walk = Self { model, free, fetch, mine, v5: pom_v5::Api::load(lib), cap: cap(model) as u64, healthy: true };
             let (mut domain, mut bus, mut device, mut function) = (0, 0, 0, 0);
             if !pci(model, &mut domain, &mut bus, &mut device, &mut function)
                 || (domain, bus, device, function) != wanted_pci
@@ -869,6 +876,14 @@ impl MiningWalk {
             );
             Ok(walk)
         }
+    }
+
+    pub fn mine_v5(&mut self, p: [u64; 4], s: [u64; 4], time: u64, t: [u64; 4], base: u64, batch: u64, seed: &[u64; 4], tiles: u64, stop: &dyn Fn() -> bool) -> Result<(Option<u64>, u64), String> {
+        if !self.healthy { return Err("resident Vulkan device previously failed".into()); }
+        let api = self.v5.ok_or("Vulkan sidecar lacks PoM v5 ABI 1")?;
+        let result = api.run(self.model, p, s, time, t, base, batch, seed, tiles, stop);
+        if result.as_ref().is_err_and(|e| e.contains("dispatch failed")) { self.healthy = false; }
+        result
     }
 
     pub fn mine_v4(
@@ -967,7 +982,7 @@ mod resident_dispatch_tests {
         let freed = Arc::new(AtomicUsize::new(0));
         let driver =
             Box::new(Driver { replies: replies.iter().copied().collect(), calls: vec![], freed: freed.clone() });
-        (MiningWalk { model: Box::into_raw(driver).cast(), free, fetch, mine, cap: 4, healthy: true }, freed)
+        (MiningWalk { model: Box::into_raw(driver).cast(), free, fetch, mine, v5: None, cap: 4, healthy: true }, freed)
     }
     fn run(
         walk: &mut MiningWalk,
@@ -1051,6 +1066,7 @@ pub fn pom_mine_v4(
     let (model, mine, cap) = {
         let g = engine().lock().map_err(|_| "engine mutex poisoned".to_string())?;
         let e = g.as_ref().ok_or_else(|| "no engine loaded".to_string())?;
+        if stop() { return Ok((None, 0)); }
         // Counted under the lock: `unload` takes the same lock, then waits for zero.
         WALK_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let cap = e.batch_max.map_or(0, |f| unsafe { f(e.model) }) as u64;
@@ -1088,6 +1104,19 @@ pub fn pom_mine_v4(
         done += sub as u64;
     }
     Ok((None, done))
+}
+
+/// Called after the OpenCL coordinator raises its inference pause. Taking the
+/// engine lock closes the check/claim race for the shared Vulkan walk, which is
+/// not in OpenCL's per-device resident-miner map.
+pub fn drain_shared_walk() -> Result<(), crate::inference_coord::DeferredReason> {
+    let _owner = engine().lock().map_err(|_| crate::inference_coord::DeferredReason::WalkBusy)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while WALK_INFLIGHT.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        if std::time::Instant::now() >= deadline { return Err(crate::inference_coord::DeferredReason::WalkBusy); }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    Ok(())
 }
 
 /// GPU byte-exactness gate for the zero-dup v4 walk (ignored: needs an AMD/Vulkan GPU, the

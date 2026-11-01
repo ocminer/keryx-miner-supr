@@ -1,0 +1,232 @@
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -272,6 +272,7 @@
+     int  form;   // 0 none, 1 split GLU, 2 GLU gate, 3 GLU up
+     int  bias;   // manifest index of the bias, -1 none
+     bool head;   // ROLE_OUTPUT: rows only at the output positions
++    uint32_t role;   // ROLE_HEADS groups head rows per token
+     uint32_t wtype;  // ggml type of the weights: picks the MMQ layout of a batched input
+ };
+ 
+@@ -3308,7 +3309,7 @@
+     }
+ 
+     // One workgroup per row.
+-    ggml_vk_create_pipeline(device, device->pipeline_keryx_trace, "keryx_trace", keryx_trace_len, keryx_trace_data, "main", 3, sizeof(vk_keryx_trace_push_constants), {1, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_keryx_trace, "keryx_trace", keryx_trace_len, keryx_trace_data, "main", 4, sizeof(vk_keryx_trace_push_constants), {1, 1, 1}, {}, 1);
+     // One workgroup per (query row, head).
+     ggml_vk_create_pipeline(device, device->pipeline_keryx_lse, "keryx_lse", keryx_lse_len, keryx_lse_data, "main", 4, sizeof(vk_keryx_lse_push_constants), {1, 1, 1}, {}, 1);
+     // One workgroup per (head, token).
+@@ -7916,6 +7917,11 @@
+         }
+     }
+ 
++    if (quantize_y) {
++        ctx->keryx_q8_node = dst;
++        ctx->keryx_q8_rows = ne11 * ne12;
++        ctx->keryx_q8_k = ne10;
++    }
+     uint32_t stride_batch_x = qx_needs_dequant ? ne00*ne01 : ggml_vk_batch_stride(src0);
+     uint32_t stride_batch_y = (qy_needs_dequant || quantize_y) ? ne10*ne11 : ggml_vk_batch_stride(src1);
+ 
+@@ -7934,6 +7940,9 @@
+     }
+ 
+     uint32_t fusion_flags = 0;
++    if (quantize_y && ggml_vk_keryx_mmq_tiles(ctx->device, src0)) {
++        fusion_flags |= MAT_VEC_FUSION_FLAGS_KERYX_DS4;
++    }
+ 
+     if (ctx->num_additional_fused_ops > 0) {
+         const ggml_tensor * bias = cgraph->nodes[node_idx + 1]->src[1];
+@@ -12281,7 +12290,9 @@
+ // previous dispatch, and later nodes may reuse their memory.
+ static void ggml_vk_keryx_rows(ggml_backend_vk_context * ctx, vk_context & subctx, vk_keryx_trace & t, const vk_subbuffer & src,
+                                uint32_t src_off, uint32_t row_stride, uint64_t row_bytes, uint32_t kind, uint32_t k_blocks,
+-                               uint64_t nrows, uint64_t first_pos, int leaf_a, int leaf_b, const char * what) {
++                               uint64_t nrows, uint64_t first_pos, int leaf_a, int leaf_b, const char * what,
++                               uint32_t input_slots = 1, const vk_subbuffer * ids = nullptr,
++                               uint32_t ids_off = 0, uint32_t ids_stride = 0, uint32_t body_words = 0) {
+     if (nrows == 0) {
+         return;
+     }
+@@ -12313,15 +12324,15 @@
+     ggml_vk_sync_buffers(ctx, subctx);
+     vk_keryx_trace_push_constants pc = {
+         src_off, row_stride, (uint32_t) row_bytes, kind, k_blocks, (uint32_t) first_pos, t.nl,
+-        leaf_a < 0 ? VK_KERYX_NO_LEAF : (uint32_t) leaf_a, leaf_b < 0 ? VK_KERYX_NO_LEAF : (uint32_t) leaf_b, 0, 0,
++        leaf_a < 0 ? VK_KERYX_NO_LEAF : (uint32_t) leaf_a, leaf_b < 0 ? VK_KERYX_NO_LEAF : (uint32_t) leaf_b, 0, 0, input_slots, ids_off, ids_stride, body_words,
+     };
+-    ggml_vk_dispatch_pipeline(ctx, subctx, pipe, { src, leaves, caps }, pc, { (uint32_t) nrows, 1, 1 });
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipe, { src, leaves, caps, ids ? *ids : src }, pc, { (uint32_t) nrows, 1, 1 });
+     for (const auto & c : copies) {
+         vk_keryx_trace_push_constants cp = pc;
+         cp.kind = kind | VK_KERYX_COPY;
+         cp.cap_row = c.first;
+         cp.cap_off = c.second * (t.cap_slot / 4);
+-        ggml_vk_dispatch_pipeline(ctx, subctx, pipe, { src, leaves, caps }, cp, { 1, 1, 1 });
++        ggml_vk_dispatch_pipeline(ctx, subctx, pipe, { src, leaves, caps, ids ? *ids : src }, cp, { 1, 1, 1 });
+         t.cap_len[c.second] = (uint32_t) row_bytes;
+     }
+     ggml_vk_sync_buffers(ctx, subctx);
+@@ -12338,6 +12349,34 @@
+     const uint64_t misalign = ggml_vk_tensor_buffer_offset(ctx, x) - sb.offset;
+     ggml_vk_keryx_rows(ctx, subctx, t, sb, (uint32_t) (misalign / 4), (uint32_t) x->ne[0], (uint64_t) x->ne[0] * 4, VK_KERYX_KIND_ROWS, 0,
+                        (uint64_t) ggml_nrows(x), first_pos, leaf, -1, x->name);
++}
++
++// One canonical output row per token, including every selected expert and its
++// ID. Head-slice products have the same grouped layout without the ID suffix.
++static void ggml_vk_keryx_grouped_output(ggml_backend_vk_context * ctx, vk_context & subctx,
++                                        vk_keryx_trace & t, const ggml_tensor * x,
++                                        const ggml_tensor * ids, uint32_t slots, int leaf) {
++    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !slots ||
++        (uint64_t)ggml_nrows(x) != (uint64_t)t.n_tokens * slots) {
++        ggml_vk_keryx_fail(t, std::string("unsupported grouped output ") + x->name); return;
++    }
++    const vk_subbuffer sb = ggml_vk_tensor_subbuffer(ctx, x, true);
++    const uint64_t mis = ggml_vk_tensor_buffer_offset(ctx, x) - sb.offset;
++    const uint64_t body = (uint64_t)x->ne[0] * slots;
++    if (mis % 4 || body > UINT32_MAX) { ggml_vk_keryx_fail(t, "grouped output overflow"); return; }
++    vk_subbuffer ib = sb; uint32_t io = 0, stride = 0;
++    if (ids) {
++        if (ids->type != GGML_TYPE_I32 || ids->ne[0] != slots || ids->ne[1] != t.n_tokens || ids->nb[0] != 4 || ids->nb[1] % 4) {
++            ggml_vk_keryx_fail(t, "unsupported expert ID layout"); return;
++        }
++        ib = ggml_vk_tensor_subbuffer(ctx, ids, true);
++        const uint64_t imis = ggml_vk_tensor_buffer_offset(ctx, ids) - ib.offset;
++        if (imis % 4) { ggml_vk_keryx_fail(t, "misaligned expert IDs"); return; }
++        io = (uint32_t)(imis / 4); stride = (uint32_t)(ids->nb[1] / 4);
++    }
++    ggml_vk_keryx_rows(ctx, subctx, t, sb, (uint32_t)(mis / 4), (uint32_t)body,
++        4 * (body + (ids ? slots : 0)), ids ? 4u : VK_KERYX_KIND_ROWS, 0,
++        t.n_tokens, t.pos_base, leaf, -1, x->name, 1, ids ? &ib : nullptr, io, stride, (uint32_t)body);
+ }
+ 
+ // Rows of a traced tensor sit at the last positions of the batch when it holds fewer rows (the
+@@ -12521,7 +12560,7 @@
+ // the bias add of a biased one, carries that product's output; a residual node carries its rows.
+ static void ggml_vk_keryx_on_node(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * node) {
+     vk_keryx_trace & t = vk_keryx_traces[ctx->device->idx];
+-    if (node->op == GGML_OP_MUL_MAT) {
++    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+         // Consumed here, so a later evaluation of the same graph cannot mistake it for its own.
+         const bool q8 = ctx->keryx_q8_node == node;
+         ctx->keryx_q8_node = nullptr;
+@@ -12532,7 +12571,14 @@
+                 ggml_vk_keryx_fail(t, std::string("product ") + node->src[0]->name + " did not take the q8_1 mat-vec path");
+                 return;
+             }
+-            const uint64_t k = ctx->keryx_q8_k, rows = ctx->keryx_q8_rows;
++            const bool experts = node->op == GGML_OP_MUL_MAT_ID;
++            const bool heads = p.role == 7;
++            const uint64_t k = ctx->keryx_q8_k, flat_rows = ctx->keryx_q8_rows;
++            const uint32_t slots = experts ? (uint32_t)node->src[1]->ne[1] : heads ? (uint32_t)node->src[0]->ne[2] : 1u;
++            if (!slots || flat_rows % slots || (heads && t.n_tokens != 1)) {
++                ggml_vk_keryx_fail(t, "unsupported grouped product shape"); return;
++            }
++            const uint64_t rows = flat_rows / slots;
+             const uint64_t kp = (k + 511) / 512 * 512;
+             const uint64_t first = p.head ? ggml_vk_keryx_first_pos(t, rows) : t.pos_base;
+             const vk_subbuffer y = { ctx->prealloc_y, 0, ctx->prealloc_y->size };
+@@ -12545,21 +12591,24 @@
+                                  p.wtype == GGML_TYPE_Q4_K || p.wtype == GGML_TYPE_Q5_K;
+                 kind = ds4 ? VK_KERYX_KIND_Q8_DS4 : VK_KERYX_KIND_Q8_D4;
+             }
+-            ggml_vk_keryx_rows(ctx, subctx, t, y, 0, 0, kp / 32 * 36, kind, (uint32_t) (k / 32), rows, first, 2 * r, -1,
+-                               node->src[0]->name);
++            ggml_vk_keryx_rows(ctx, subctx, t, y, 0, 0, kp / 32 * 36 * slots, kind, (uint32_t) (k / 32), rows, first, 2 * r, -1,
++                               node->src[0]->name, slots);
+             if (p.form == 0 && p.bias < 0) {
+-                ggml_vk_keryx_tensor_rows(ctx, subctx, t, node, 2 * r + 1, p.head ? ggml_vk_keryx_first_pos(t, ggml_nrows(node)) : t.pos_base);
++                if (experts || heads) ggml_vk_keryx_grouped_output(ctx, subctx, t, node, experts ? node->src[2] : nullptr,
++                    experts ? (uint32_t)node->src[2]->ne[0] : slots, 2 * r + 1);
++                else ggml_vk_keryx_tensor_rows(ctx, subctx, t, node, 2 * r + 1, p.head ? ggml_vk_keryx_first_pos(t, ggml_nrows(node)) : t.pos_base);
+             }
+         }
+     } else if (node->op == GGML_OP_GLU) {
+         for (int s = 0; s < 2; s++) {
+             const ggml_tensor * mm = node->src[s];
+-            if (!mm || mm->op != GGML_OP_MUL_MAT) {
++            if (!mm || (mm->op != GGML_OP_MUL_MAT && mm->op != GGML_OP_MUL_MAT_ID)) {
+                 continue;
+             }
+             const int r = ggml_vk_keryx_rank(t, mm->src[0]);
+             if (r >= 0 && (t.prod[r].form == 1 || t.prod[r].form == 2)) {
+-                ggml_vk_keryx_tensor_rows(ctx, subctx, t, node, 2 * r + 1,
++                if (mm->op == GGML_OP_MUL_MAT_ID) ggml_vk_keryx_grouped_output(ctx, subctx, t, node, mm->src[2], (uint32_t)mm->src[2]->ne[0], 2 * r + 1);
++                else ggml_vk_keryx_tensor_rows(ctx, subctx, t, node, 2 * r + 1,
+                                           t.prod[r].head ? ggml_vk_keryx_first_pos(t, ggml_nrows(node)) : t.pos_base);
+                 break;
+             }
+@@ -15704,7 +15753,7 @@
+         memcpy(&wtype, &r[0], 4);
+         if (i < n_products) {
+             s.rank[name] = (int) i;
+-            s.prod.push_back({ form, bias == 0xFFFFFFFFu ? -1 : (int) bias, role == 2, wtype });
++            s.prod.push_back({ form, bias == 0xFFFFFFFFu ? -1 : (int) bias, role == 2, role, wtype });
+         }
+         o += 2 + nl + 55;
+         if (chain) {
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/keryx_trace.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/keryx_trace.comp
+@@ -21,6 +21,7 @@
+ layout(binding = 0) readonly buffer Src { uint src[]; };
+ layout(binding = 1) buffer Leaves { uint leaves[]; };
+ layout(binding = 2) writeonly buffer Cap { uint cap[]; };
++layout(binding = 3) readonly buffer Ids { uint ids[]; };
+ 
+ layout(push_constant) uniform parameter {
+     uint src_off;     // word offset of row 0 in src
+@@ -34,6 +35,10 @@
+     uint leaf_b;
+     uint cap_row;     // COPY_MODE: the row copied
+     uint cap_off;     // COPY_MODE: word offset in cap
++    uint input_slots;
++    uint ids_off;
++    uint ids_stride;
++    uint body_words;
+ } p;
+ 
+ #define KIND_ROWS 0u
+@@ -109,9 +114,16 @@
+ uint word(uint row, uint w) {
+     const uint base = p.src_off + row * p.row_stride;
+     const uint kind = p.kind & 0xFFu;
++    if (kind == 4u) { // grouped expert output, followed by IDs
++        return w < p.body_words ? src[base + w] : ids[p.ids_off + row * p.ids_stride + w - p.body_words];
++    }
+     if (kind == KIND_ROWS) {
+         return src[base + w];
+     }
++    const uint one_words = ((p.k_blocks + 15u) / 16u) * 16u * 9u;
++    const uint slot = w / one_words;
++    w %= one_words;
++    row = row * p.input_slots + slot;
+     if (kind == KIND_Q8_D4 || kind == KIND_Q8_DS4) {
+         // CUDA's MMQ layouts: 144-byte groups of four blocks, their four scales first (f32 d, or
+         // the f16 pair d and s), then the 128 values.
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+@@ -873,6 +873,10 @@
+     uint32_t leaf_b;
+     uint32_t cap_row;
+     uint32_t cap_off;
++    uint32_t input_slots;
++    uint32_t ids_off;
++    uint32_t ids_stride;
++    uint32_t body_words;
+ };
+ 
+ // Must match the push constant block of keryx_rec.comp.
+--- a/src/models/kimi-linear.cpp
++++ b/src/models/kimi-linear.cpp
+@@ -425,7 +425,7 @@
+                 cb(q_nope, "q_nope_perm", il);
+ 
+                 // {n_embd_head_qk_nope, kv_lora_rank, n_head} x {n_embd_head_qk_nope, n_tokens, n_head}
+-                ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
++                ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, layer.wk_b, ggml_cont(ctx0, q_nope));
+                 cb(q_nope_absorbed, "q_nope_absorbed", il);
+ 
+                 // {kv_lora_rank, n_head, n_tokens}

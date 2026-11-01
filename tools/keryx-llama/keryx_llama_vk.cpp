@@ -55,6 +55,15 @@ static const uint32_t WALK_DOT_SPV[] =
 static const uint32_t WALK_SCALAR_SPV[] =
 #include "pom_walk_vk.spv.inc"
 ;
+static const uint32_t WALK_V5_DOT_SPV[] =
+#include "pom_walk_v5_dot_vk.spv.inc"
+;
+static const uint32_t WALK_V5_SCALAR_SPV[] =
+#include "pom_walk_v5_vk.spv.inc"
+;
+static const uint32_t PAD_V5_FILL_SPV[] =
+#include "pom_v5_pad_fill_vk.spv.inc"
+;
 // Two-phase variants of the same source: the offset chase (phase 1) and the pipelined walk.
 static const uint32_t CHASE_SPV[] =
 #include "pom_chase_vk.spv.inc"
@@ -137,6 +146,7 @@ struct PushFetch {
 static constexpr uint32_t FETCH_WINDOW_CHUNKS = 131072;
 
 struct KeryxVkTrace;
+struct KeryxVkPad;
 struct KeryxLlama {
     llama_model*   model = nullptr;
     llama_context* ctx   = nullptr;
@@ -145,6 +155,8 @@ struct KeryxLlama {
     std::string gguf_path;          // supplements pread their bytes straight from the file
     std::mutex gen_lock;
     KeryxVkTrace* trace = nullptr;
+    KeryxVkPad* pad = nullptr;
+    uint32_t loaded_context = 0;
 
     // ── zero-dup walk state (all on ggml's own VkDevice) ──
     size_t   gpu = 0;
@@ -725,11 +737,17 @@ static bool walk_init(KeryxLlama* h) {
 // Record + run one compute dispatch (pipe/ds/push already chosen). Fills `fill_buf` with
 // 0xFFFFFFFF words first when given (the winner reset).
 static bool run_dispatch(KeryxLlama* h, VkPipeline pipe, VkPipelineLayout pl, VkDescriptorSet ds,
-                         const void* push, uint32_t push_bytes, uint32_t groups, VkBuffer fill_buf) {
+                         const void* push, uint32_t push_bytes, uint32_t groups, VkBuffer fill_buf,
+                         bool read_prior_compute = false) {
     vkResetCommandBuffer(h->cmd, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(h->cmd, &bi);
+    if (read_prior_compute) {
+        VkMemoryBarrier ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+        vkCmdPipelineBarrier(h->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &ready, 0, nullptr, 0, nullptr);
+    }
     if (fill_buf) {
         vkCmdFillBuffer(h->cmd, fill_buf, 0, VK_WHOLE_SIZE, NO_WINNER);
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
@@ -814,6 +832,8 @@ static bool run_two_phase(KeryxLlama* h, PushWalk pw, uint32_t total) {
 
 // ── exported ABI ───────────────────────────────────────────────────────────────────────────────
 
+
+#include "keryx_vk_pom_v5.inc.cpp"
 
 // Shared system prompt set by the miner (keryx_llama_set_system_prompt); empty = none.
 static std::mutex g_sys_mu;
@@ -963,6 +983,9 @@ static KeryxLlama* keryx_load_impl(const char* gguf_path, int gpu, const int* la
     mp.split_mode   = LLAMA_SPLIT_MODE_NONE; // ONE GPU — never layer-split across mining cards
     mp.main_gpu     = main_gpu;
     mp.load_mode    = LLAMA_LOAD_MODE_MMAP;
+    // PoM covers every GGUF tensor, including the next-token prediction weights
+    // that newer llama.cpp otherwise skips by default (Qwen tier 3).
+    mp.load_mtp     = true;
     llama_model_kv_override overrides[2] = {};               // zeroed tail terminates the list
     if (keryx_needs_glm4_rope_fix(gguf_path)) {
         overrides[0].tag = LLAMA_KV_OVERRIDE_TYPE_INT;
@@ -1001,6 +1024,7 @@ static KeryxLlama* keryx_load_impl(const char* gguf_path, int gpu, const int* la
 
     auto* h = new KeryxLlama();
     h->model = model; h->ctx = ctx; h->smpl = smpl;
+    h->loaded_context = llama_n_ctx(ctx);
     h->gguf_path = gguf_path;
     h->ctx_info = "n_ctx=" + std::to_string(llama_n_ctx(ctx)) + " kv=" + kv +
                   " flash_attn=" + llama_flash_attn_type_name(cp.flash_attn_type) +
@@ -1125,6 +1149,13 @@ int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char
     if (prompt_len == 0) return -1;
     if (prompt_len > kMaxPromptBytes) return -2;
     std::lock_guard<std::mutex> g(h->gen_lock);
+    keryx_llama_pom_release_pad(h);
+    if (!h->ctx) {
+        const char* kv = nullptr;
+        llama_context_params cp{};
+        h->ctx = keryx_make_ctx(h->model, h->loaded_context, &kv, &cp);
+        if (!h->ctx) return -2;
+    }
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
 
     // Chat template + shared system prompt (same as keryx_llama.cpp): a raw prompt never reaches a
@@ -1242,6 +1273,7 @@ void keryx_llama_free(KeryxLlama* h) {
             if (b) vkDestroyBuffer(h->dev, b, nullptr);
             if (m) vkFreeMemory(h->dev, m, nullptr);
         };
+        keryx_vk_pad_free(h);
         dbuf(h->winner_buf, h->winner_mem);
         dbuf(h->out32_buf, h->out32_mem);
         dbuf(h->prefix_buf, h->prefix_mem);

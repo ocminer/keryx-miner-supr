@@ -1,0 +1,49 @@
+#version 460
+// Adapted from shmutalov/keryx-miner-rdna3 under Apache-2.0; see LICENSE-APACHE.
+// Keryx PoM v5 context pad fill — Vulkan port of the CUDA `pom_v5_pad_fill` kernel. BYTE-IDENTICAL to
+// `src/pom_v5.rs::pad_entry_into` and the node's `consensus/core/src/pom_v5.rs`: entry e of the pad
+// is (a, b, c, d) = (w0, w1 ^ e, w2, w3) after `rounds` ARX rounds, stored as four little-endian u64
+// words. The seed words `w` already have the pad IV folded in (`pom_v5::v5_pad_seed_words`).
+//
+// One invocation per entry. Entries [first, first + count) are written to `base`, the address of
+// entry `first` (the host walks the pad shard by shard and slice by slice).
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 64) in;
+
+layout(std430, buffer_reference, buffer_reference_align = 8) writeonly buffer Entries {
+    uint64_t w[];
+};
+
+layout(push_constant) uniform Push {
+    uint64_t base;   // device address of entry `first`
+    uint64_t first;  // pad index of the first entry of this dispatch
+    uint64_t w0, w1, w2, w3;
+    uint count;      // entries in this dispatch
+    uint rounds;     // POM_V5_P_ROUNDS
+} pc;                // 48 + 8 = 56 B
+
+uint64_t rotl(uint64_t x, uint n) {
+    return (x << n) | (x >> (64u - n));
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) {
+        return;
+    }
+    uint64_t a = pc.w0, b = pc.w1 ^ (pc.first + uint64_t(i)), c = pc.w2, d = pc.w3;
+    // The round count is a push constant: an unrolled 1920-round body would only bloat the shader.
+    for (uint r = 0u; r < pc.rounds; r++) {
+        a += b; d ^= a; d = rotl(d, 32u);
+        c += d; b ^= c; b = rotl(b, 24u);
+        a += b; d ^= a; d = rotl(d, 16u);
+        c += d; b ^= c; b = rotl(b, 63u);
+    }
+    Entries e = Entries(pc.base + uint64_t(i) * 32UL);
+    e.w[0] = a;
+    e.w[1] = b;
+    e.w[2] = c;
+    e.w[3] = d;
+}

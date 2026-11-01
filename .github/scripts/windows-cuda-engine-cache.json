@@ -4,16 +4,11 @@
     "tools/keryx-llama/CMakeLists.txt": "093672f7124c106f5d22e11fe9d25ec48c6182c729442f803bd9ca62458610a5",
     "tools/keryx-llama/keryx_llama.cpp": "69c3e8341d121d1580dd92c0db20b2fb402f70134c729384b130f70c72d22b45",
     "tools/keryx-llama/keryx_llama.def": "22ce13df417328fd5371902596ccbae493fd8e7f73bdcd072e9a62fb74dc1d43",
-    "tools/keryx-llama/keryx_llama_vk.cpp": "e9c6700a308a0f1bf110fffb3f9ec944bebde2d002072680f33bab382fdde232",
-    "tools/keryx-llama/keryx_vk_exports.inc.cpp": "347e83c37fb286751b3ad9fead412061fa5595ad8deb9391db23c8391be6c584",
     "tools/keryx-llama/patches/0001-canonical-trace.patch": "3799b9dd13f7d462c28529c8a11aef65ab1792fefcf34977d1904c5e6da66d1b",
     "tools/keryx-llama/patches/0002-sequence-leaves.patch": "ced1056558237d20050224c843f8e4008f833f759890b164e28e726f71017718",
     "tools/keryx-llama/patches/0003-fattn-tile-f32.patch": "b5a8f5ff9951972be10e1d4971f9507a0640e85333bb2b1ab3694b86250f72b7",
     "tools/keryx-llama/patches/0004-rope-f64-angle.patch": "b15e92b242adc94fb1076932c284414906140fc6bbd7866e0c09fce95739eb4c",
-    "tools/keryx-llama/patches/0005-attn-lse-capture.patch": "4e4f99e79d9da5cd29af1ed018434d18befe93b19f6932980aa5d6a3a20bb913",
-    "tools/keryx-llama/pom_fetch_vk.comp": "e41ded4aa1b1634c6761d2d8f0f42794ec37d058285c1d0b62f1c9eaeb6c6486",
-    "tools/keryx-llama/pom_walk_vk.comp": "3bc1168bd5fcec77930ee7581fd2fbbcfb4dd5865dd315220a9e168f8a32a4a4",
-    "tools/keryx-llama/spike_vk.cpp": "cf28139c5b6798b4c02daf8d7b19930b0e255aebdfd19eec50d633fcd481b66c"
+    "tools/keryx-llama/patches/0005-attn-lse-capture.patch": "4e4f99e79d9da5cd29af1ed018434d18befe93b19f6932980aa5d6a3a20bb913"
   },
   "recipe_sha256": {
     "Build keryx-llama.dll (in-process llama.cpp engine)": "d1f8c8bc110d6b0a4ef47d905cf9e8ca66ab4d0a71b414bf961560cfa2ce7545",

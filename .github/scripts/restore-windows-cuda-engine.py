@@ -16,9 +16,11 @@ def output(hit):
 def main():
  cache=json.loads(MANIFEST.read_text(encoding='utf-8'));workflow=(ROOT/'.github/workflows/windows.yml').read_text(encoding='utf-8')
  mismatches=[]
- # A newly added patch can change the engine without changing any previously
- # recorded file. Bind the complete tracked engine tree, including its file list.
- sources=set(subprocess.check_output(['git','ls-files','--','tools/keryx-llama'],cwd=ROOT,text=True).splitlines())
+ # Bind every CUDA build input, including the complete patch inventory. Vulkan
+ # sources have a separate engine/pin and must not invalidate unchanged CUDA DLLs.
+ sources=set(subprocess.check_output(['git','ls-files','--',
+  'tools/keryx-llama/CMakeLists.txt','tools/keryx-llama/keryx_llama.cpp',
+  'tools/keryx-llama/keryx_llama.def','tools/keryx-llama/patches/*.patch'],cwd=ROOT,text=True).splitlines())
  if sources!=set(cache['source_sha256']):mismatches.append('engine source file inventory')
  for path,expected in cache['source_sha256'].items():
   if not (ROOT/path).is_file() or digest((ROOT/path).read_text(encoding='utf-8').encode())!=expected:mismatches.append(path)

@@ -17,13 +17,14 @@ type SeqState = unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> usize;
 type Lse = unsafe extern "C" fn(*mut c_void, *mut f32, usize, u32) -> c_int;
 type SeqReplay = unsafe extern "C" fn(*mut c_void, *const i32, c_int, c_int) -> c_int;
 type Error = unsafe extern "C" fn() -> *const c_char;
+type Identity = unsafe extern "C" fn(*mut c_void, *mut c_char, usize, *mut c_char, usize) -> c_int;
 const CAPTURE_CAP: usize = 4 << 20;
 
 #[derive(Clone, Copy)]
 struct Api {
     configure: Configure, count: Count, read: Read, generate: Generate, replay: Replay,
     sequence: SeqConfigure, callback: Callback, recurrent: Recurrent,
-    state: SeqState, lse: Lse, seq_replay: SeqReplay, error: Error,
+    state: SeqState, lse: Lse, seq_replay: SeqReplay, error: Error, identity: Identity,
 }
 
 pub(super) struct State {
@@ -45,10 +46,25 @@ impl State {
                 callback: sym(lib, "keryx_llama_vk_batch_callback")?, recurrent: sym(lib, "keryx_llama_vk_recurrent_read")?,
                 state: sym(lib, "keryx_llama_vk_sequence_state")?, lse: sym(lib, "keryx_llama_vk_lse_read")?,
                 seq_replay: sym(lib, "keryx_llama_vk_replay_sequence")?, error: sym(lib, "keryx_llama_last_error")?,
+                identity: sym(lib, "keryx_llama_vk_trace_identity")?,
             },
             manifest: Vec::new(), leaves: 0, sequence: None,
         })
     }
+}
+
+/// Physical Vulkan device and driver of the resident model. Never claim replay
+/// compatibility from a different API's ordinal or an unknown (empty) identity.
+pub fn gpu_identity() -> (String, u32, String) {
+    let unknown = || (String::new(), 0, String::new());
+    let Ok(g) = engine().lock() else { return unknown() };
+    let Some(e) = g.as_ref() else { return unknown() };
+    let Some(s) = e.trace.as_ref() else { return unknown() };
+    let (mut name, mut driver) = ([0u8; 512], [0u8; 1024]);
+    let rc = unsafe { (s.api.identity)(e.model, name.as_mut_ptr().cast(), name.len(), driver.as_mut_ptr().cast(), driver.len()) };
+    if rc != 0 { return unknown(); }
+    let text = |b: &[u8]| String::from_utf8_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]).into_owned();
+    (text(&name), 0, text(&driver))
 }
 
 fn detail(api: Api, context: &str) -> String {
@@ -86,14 +102,14 @@ fn sequence_spec(manifest: &[u8], layers: &[SeqLayer], n_attn: u32, n_recur: u32
     for (entry, _) in entries {
         let Chain::Layer(layer) = entry.chain else { continue };
         if let Some(a) = layer.attn {
-            if a.mla_rank > 0 || a.swa_window > 0 || a.v_norm > 0 || a.softcap != 0 {
+            if a.softcap != 0 {
                 return Err(format!("Vulkan attention layer {} needs additional trace support", layer.layer));
             }
-            attn.push(SeqAttn { layer: layer.layer, slot: a.slot, n_head: a.n_head, n_head_kv: a.n_head_kv, head_dim: a.head_dim });
+            attn.push(SeqAttn { swa: a.swa_window > 0, mla: a.mla_rank > 0, layer: layer.layer, slot: a.slot, n_head: a.n_head, n_head_kv: a.n_head_kv, head_dim: a.head_dim });
         }
         if let Some(r) = layer.recur {
-            if r.kind != manifest::RECUR_GDA { return Err(format!("unsupported Vulkan recurrent layer {}", layer.layer)); }
-            recur.push(SeqRecur { layer: layer.layer, slot: r.slot, kind: 3, n_v_heads: r.n_v_heads, head_dim: r.head_dim });
+            if !matches!(r.kind, manifest::RECUR_GDA | manifest::RECUR_KDA) { return Err(format!("unsupported Vulkan recurrent layer {}", layer.layer)); }
+            recur.push(SeqRecur { layer: layer.layer, slot: r.slot, kind: if r.kind == manifest::RECUR_GDA { 3 } else { 4 }, n_v_heads: r.n_v_heads, head_dim: r.head_dim });
         }
     }
     attn.sort_by_key(|a| a.slot);
@@ -101,7 +117,7 @@ fn sequence_spec(manifest: &[u8], layers: &[SeqLayer], n_attn: u32, n_recur: u32
     let spec = SeqSpec { n_attn, n_recur, heads, attn, recur, interval };
     spec.check().map_err(|e| e.to_string())?;
     // Bind the independently supplied node layout to the native manifest we actually armed.
-    let mut expected: Vec<SeqLayer> = spec.attn.iter().map(|a| [a.layer, 1, a.slot, a.n_head_kv, a.head_dim]).chain(spec.recur_rows()).collect();
+    let mut expected: Vec<SeqLayer> = spec.attn.iter().map(|a| [a.layer, if a.mla { 2 } else { 1 }, a.slot, a.n_head_kv, a.head_dim]).chain(spec.recur_rows()).collect();
     let mut actual = layers.to_vec();
     expected.sort_unstable(); actual.sort_unstable();
     if expected != actual { return Err("sequence layout differs from armed manifest".into()); }
@@ -174,7 +190,7 @@ fn read_sequence(e: &Engine, s: &State, n_pos: usize) -> Result<Vec<Vec<u8>>, St
     state.try_reserve_exact(size).map_err(|e| format!("Vulkan cache readback allocation: {e}"))?;
     state.resize(size, 0u8);
     if unsafe { (s.api.state)(e.model, state.as_mut_ptr(), state.len()) } != size { return Err("Vulkan cache readback incomplete".into()); }
-    let cache = parse_kv_state(&state, n_pos, spec.n_recur > 0).map_err(|e| e.to_string())?;
+    let cache = parse_kv_state(&state, n_pos, spec).map_err(|e| e.to_string())?;
     let (layers, heads) = spec.lse_shape();
     let n_lse = (layers as usize).checked_mul(n_pos).and_then(|n| n.checked_mul(heads as usize)).ok_or("Vulkan sequence size overflow")?;
     let mut lse = vec![0.0f32; n_lse];

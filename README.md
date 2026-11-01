@@ -2,11 +2,11 @@
 
 Suprnova fork of the [keryx-labs/keryx-miner](https://github.com/keryx-labs/keryx-miner) GPU miner.
 
-**AMD status since H15:** the current AMD/Vulkan build cannot produce the required
-inference traces, so it keeps mining paused on Windows, Linux and HiveOS. Loading a model
-successfully does not clear this check. AMD support needs a Vulkan trace engine; changing
-the launcher, reinstalling the driver or enabling CPU inference does not supply it.
-The AMD performance figures below describe earlier, pre-H15 releases.
+**AMD H15 support:** Vulkan provides mining, verifiable inference and audit replay on
+one card. Mining pauses while that card answers an inference request or audit, then
+resumes; no dedicated inference card is required. Use the complete AMD package so
+its Vulkan engine and miner stay matched. The AMD performance figures below are
+historical, pre-H15 measurements and do not describe the new context-pad workload.
 
 ## What's different from upstream
 

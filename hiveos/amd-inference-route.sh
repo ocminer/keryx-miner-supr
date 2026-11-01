@@ -24,6 +24,8 @@ _keryx_engine_sources() {
     printf '%s\n' \
         "tools/keryx-llama/keryx_llama_vk.cpp" \
         "tools/keryx-llama/keryx_vk_trace.inc.cpp" \
+        "tools/keryx-llama/keryx_vk_pom_v5.inc.cpp" \
+        "tools/keryx-llama/pom_v5_pad_fill_vk.comp" \
         "tools/keryx-llama/keryx_vk_exports.inc.cpp" \
         "tools/keryx-llama/pom_walk_vk.comp" \
         "tools/keryx-llama/pom_fetch_vk.comp" \
@@ -140,7 +142,8 @@ keryx_validate_amd_engine() {
         keryx_llama_generate keryx_llama_pom_ready keryx_llama_pom_n_chunks \
         keryx_llama_pom_supl_bytes keryx_llama_pom_fetch keryx_llama_pom_mine \
         keryx_llama_pom_pci keryx_vk_picker_abi keryx_vk_pick_discrete_device \
-        keryx_vk_device_pci keryx_llama_vk_trace_abi keryx_llama_trace_configure \
+        keryx_llama_pom_v5_abi keryx_llama_pom_mine_v5 keryx_llama_pom_release_pad keryx_llama_pom_pad_read \
+        keryx_vk_device_pci keryx_llama_vk_trace_abi keryx_llama_vk_trace_identity keryx_llama_trace_configure \
         keryx_llama_trace_leaf_count keryx_llama_trace_read keryx_llama_generate_traced \
         keryx_llama_replay_multi keryx_llama_vk_sequence_configure keryx_llama_vk_sequence_state \
         keryx_llama_vk_replay_sequence keryx_llama_vk_lse_read keryx_llama_vk_recurrent_read \

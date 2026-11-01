@@ -748,6 +748,18 @@ enum ResidentMiner {
 }
 
 impl ResidentMiner {
+    fn mine_v5(&mut self, p: [u64; 4], s: [u64; 4], time: u64, t: [u64; 4], base: u64, batch: u64, seed: &[u64; 4], tiles: u64) -> Result<crate::pom::GrindCompleted, String> {
+        match self {
+            Self::OpenCl(_) => Err("PoM v5 requires the bundled Vulkan mining backend on this device".into()),
+            #[cfg(any(unix, windows))]
+            Self::Vulkan(miner) => {
+                let stop = || INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0;
+                let (winner, hashes_done) = miner.mine_v5(p, s, time, t, base, batch, seed, tiles, &stop)?;
+                Ok(crate::pom::GrindCompleted { winner, hashes_done })
+            }
+        }
+    }
+
     fn mine_v4(
         &mut self,
         p: [u64; 4],
@@ -781,7 +793,11 @@ fn prefer_resident_vulkan(name: &str, requested: Option<&str>) -> bool {
     match requested {
         Some("opencl") => false,
         Some("vulkan") => true,
-        _ => device_arch_is(&name, "gfx906"),
+        _ => device_arch_is(&name, "gfx906") || name.split(|c: char| !c.is_ascii_alphanumeric()).any(|token| {
+            let Some(arch) = token.strip_prefix("gfx") else { return false; };
+            arch.len() == 4 && arch.bytes().all(|c| c.is_ascii_hexdigit())
+                && (arch.starts_with("103") || arch.starts_with("11") || arch.starts_with("12"))
+        }),
     }
 }
 
@@ -961,6 +977,7 @@ pub fn pause_and_drain_for_inference(
             }
         }
     }
+    crate::llama_engine_vk::drain_shared_walk()?;
     Ok(guard)
 }
 
@@ -1511,20 +1528,13 @@ fn device_is_rdna1(device_id: usize) -> bool {
     device_gfx_name(device_id).contains("gfx101")
 }
 
-/// Zero-dup policy for `device_id`. `reserved` = the card is the inference reservation (model +
-/// OpenCL blob do not fit together, so without zero-dup it would not mine at all).
-/// `KERYX_ZERO_DUP` = `force` (claim any engine-hosted card, even where the blob would fit) /
-/// `off` (never — a reserved card then stays inference-only) / unset (default): claim exactly the
-/// reserved card, on every architecture except RDNA1 (the BDA hang above). Cards where model and
-/// blob coexist keep the OpenCL blob walk, whose RDNA3 WMMA / dp4a kernels are the measured
-/// fastest; the Vulkan walk there is an explicit opt-in until it is benchmarked faster.
+/// Share the inference model by default. H15 needs a context pad in addition
+/// to the weights: a second resident copy wastes the headroom needed to switch
+/// between mining and traced inference. Keep the known RDNA1 BDA exclusion and
+/// the explicit off override; every claim still passes the device/byte gate.
 #[cfg(any(unix, windows))]
-fn zero_dup_policy(device_id: usize, reserved: bool) -> bool {
-    match std::env::var("KERYX_ZERO_DUP").ok().as_deref() {
-        Some("force") => !device_is_rdna1(device_id),
-        Some("off") => false,
-        _ => reserved && !device_is_rdna1(device_id),
-    }
+fn zero_dup_policy(device_id: usize, _reserved: bool) -> bool {
+    std::env::var("KERYX_ZERO_DUP").ok().as_deref() != Some("off") && !device_is_rdna1(device_id)
 }
 
 /// `KERYX_ZERO_DUP=force`: prefer the engine walk on every engine-hosted card.
@@ -1586,7 +1596,7 @@ fn try_claim_shared(device_id: usize) -> bool {
     }
     *SHARED_DEV.lock().unwrap() = Some(device_id);
     log::info!(
-        "PoM: card {device_id:#x} ({}) mines the v4 walk over the inference engine's resident model \
+        "PoM: card {device_id:#x} ({}) mines over the inference engine's resident model \
          (zero-dup, {}) — one VRAM copy serves inference AND mining.",
         device_gfx_name(device_id),
         crate::llama_engine_vk::pom_walk_kernel()
@@ -2047,13 +2057,34 @@ pub fn mine_v4(
             return Err(crate::pom::GrindError::Paused("tier model retired at the H14 gate — restart required"));
         }
     }
+    // A memory-reserved worker has no standalone install to build the host
+    // index. Claim its shared model (and build that index) before deriving the
+    // v5 seed; otherwise an absent index would keep this card paused forever.
+    if dedicated_device() == Some(id) && !is_shared_dev(id) && !try_claim_reserved(id) {
+        return Err(crate::pom::GrindError::Paused("shared Vulkan model/index not ready"));
+    }
+    let v5 = if crate::pom::is_pom_v5_era(daa) {
+        let idx = crate::pom::active_index().ok_or(crate::pom::GrindError::Paused("PoM v5 index not ready"))?;
+        let (model, _, tier) = TIER.lock().ok().and_then(|t| t.clone()).ok_or(crate::pom::GrindError::Paused("PoM v5 model not ready"))?;
+        if crate::models::pom_tier_index(&model, daa) != Some(tier) || idx.1 != tier {
+            return Err(crate::pom::GrindError::Paused("PoM v5 tier/index mismatch"));
+        }
+        let tiles = crate::pom_v5::POM_V5_PAD_TILES_H14.get(tier as usize).copied().filter(|n| *n > 0)
+            .ok_or(crate::pom::GrindError::Paused("PoM v5 tier has no pad"))?;
+        let seed = crate::pom_v5::v5_pad_seed(tier, &model, &idx.0.r_t);
+        Some((crate::pom_v5::v5_pad_seed_words(&seed), tiles))
+    } else { None };
     let t = words(target_le);
     // Zero-dup: the card hosting the inference model walks that single resident copy through the
     // engine. The reserved card keeps trying to claim it while the engine loads (its loop polls
     // here every 100 ms); until then it is inference-only by design.
     if is_shared_dev(id) || (dedicated_device() == Some(id) && try_claim_reserved(id)) {
         let stop = || INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0;
-        return match crate::llama_engine_vk::pom_mine_v4(p, s, time, t, nonce_base, batch, h10_era, &stop) {
+        let result = match &v5 {
+            Some((seed, tiles)) => crate::llama_engine_vk::pom_mine_v5(p, s, time, t, nonce_base, batch, seed, *tiles, &stop),
+            None => crate::llama_engine_vk::pom_mine_v4(p, s, time, t, nonce_base, batch, h10_era, &stop),
+        };
+        return match result {
             Ok((winner, hashes_done)) if hashes_done > 0 => Ok(crate::pom::GrindCompleted { winner, hashes_done }),
             Ok(_) => Err(crate::pom::GrindError::Paused("zero-dup walk paused for GPU inference")),
             Err(e) => {
@@ -2074,7 +2105,11 @@ pub fn mine_v4(
     if INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0 {
         return Err(crate::pom::GrindError::Paused("OpenCL walk paused for GPU inference"));
     }
-    match g.mine_v4(p, s, time, t, nonce_base, batch, if h10_era { 1 } else { 0 }) {
+    let result = match &v5 {
+        Some((seed, tiles)) => g.mine_v5(p, s, time, t, nonce_base, batch, seed, *tiles),
+        None => g.mine_v4(p, s, time, t, nonce_base, batch, if h10_era { 1 } else { 0 }),
+    };
+    match result {
         Ok(completed) if completed.hashes_done > 0 => Ok(completed),
         Ok(_) => Err(crate::pom::GrindError::Paused("resident walk paused for GPU inference")),
         Err(e) => {
@@ -2125,8 +2160,11 @@ mod v4_wmma1_tests {
         use super::prefer_resident_vulkan;
         assert!(prefer_resident_vulkan("gfx906:sramecc+:xnack-", None));
         assert!(!prefer_resident_vulkan("gfx9060", None));
-        assert!(!prefer_resident_vulkan("gfx1100", None));
-        assert!(!prefer_resident_vulkan("gfx1102", None));
+        assert!(!prefer_resident_vulkan("gfx11000", None));
+        assert!(!prefer_resident_vulkan("notgfx1100", None));
+        assert!(prefer_resident_vulkan("AMD (gfx1030:xnack-)", None));
+        assert!(prefer_resident_vulkan("gfx1100", None));
+        assert!(prefer_resident_vulkan("gfx1102", None));
         assert!(!prefer_resident_vulkan("gfx906", Some("opencl")));
         assert!(prefer_resident_vulkan("gfx1100", Some("vulkan")));
         assert!(!prefer_resident_vulkan("gfx1010", Some("vulkan")));

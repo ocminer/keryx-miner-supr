@@ -102,6 +102,13 @@ layout(push_constant) uniform Push {
     uint64_t chase_start_nonce;
     uint     chase_batch;
     uint     pad0;
+#ifdef POM_V5
+    uint64_t pad_addr;
+    uint64_t n_pad;
+    uint64_t pad_inv;
+    uint     k_pad;
+    uint     pad1;
+#endif
 } pc;
 
 layout(constant_id = 0) const uint SPEC_TENSORS = 0u;
@@ -161,6 +168,11 @@ shared uint scratch[V4_NPG * V4_SP_STRIP_U32];   // 12 KB
 // larger than this stay in global memory (every current tier has < 1024 tensors).
 const uint PREFIX_LDS_MAX = 1024u;
 shared uint64_t prefix_lds[PREFIX_LDS_MAX];
+#ifdef POM_V5
+// One contribution per state row, partitioned into each nonce's 32-row group.
+// Shared memory keeps this valid on both wave32 and wave64 devices.
+shared uint64_t v5_state_rows[256];
+#endif
 
 // x mod n_tiles, exact, without a 64-bit division: the compiler lowers `%` on uint64_t to a
 // ~400-instruction restoring loop that cost more than the whole int8 matmul per step. With
@@ -366,6 +378,10 @@ uint locate_chunk(uint64_t c, bool lds_table, out uint64_t base) {
     return lo;
 }
 uint64_t chunk_addr(uint64_t c, bool lds_table) {
+#ifdef POM_V5
+    const uint64_t weights_end = pc.n_tiles * uint64_t(V4_TILE_CHUNKS);
+    if (c >= weights_end) return pc.pad_addr + (c - weights_end) * 32UL;
+#endif
     uint64_t base;
     uint lo = locate_chunk(c, lds_table, base);
     return ADDRS.addr[lo] + (c - base) * 32UL;
@@ -884,6 +900,9 @@ void main() {
     for (uint step = 1u; step <= pc.k; ++step) {
         // Load this sub-nonce's 1 KB tile: lane loads canonical chunk (tile*32 + lane). Chunks are
         // located individually, so a tile that straddles two tensors is gathered exactly.
+#ifdef POM_V5
+        v5_state_rows[lid] = mix64((uint64_t(row4[0]) | (uint64_t(row4[1]) << 32u)) ^ uint64_t(lane));
+#endif
         load_chunk(off * uint64_t(V4_TILE_CHUNKS) + uint64_t(lane), strip + lane * V4_D4, lds_table);
         memoryBarrierShared();
         barrier();
@@ -892,7 +911,16 @@ void main() {
         if (step < pc.k) {
             uint64_t sf = 0UL;
             [[unroll]] for (uint w = 0u; w < 8u; ++w) sf = mix64(sf ^ uint64_t(scratch[strip + w]));
+#ifdef POM_V5
+            uint64_t state_fold = 0UL;
+            [[unroll]] for (uint r = 0u; r < 32u; ++r) state_fold ^= v5_state_rows[sub * 32u + r];
+            const uint64_t raw = mix64(seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf ^ state_fold);
+            const bool pad_step = ((step + 1u) * pc.k_pad) / 256u != (step * pc.k_pad) / 256u;
+            const uint64_t pr = raw - mulhi64(raw, pc.pad_inv) * pc.n_pad;
+            off = pad_step ? pc.n_tiles + (pr >= pc.n_pad ? pr - pc.n_pad : pr) : mod_tiles(raw);
+#else
             off = mod_tiles(mix64(seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf));
+#endif
         }
 
         transition(row4, strip, step, lane);

@@ -96,6 +96,8 @@ pub fn patch_set_hash() -> [u8; 32] {
     for p in [
         &include_bytes!("../tools/keryx-llama/vulkan-patches/0001-h15-vulkan-trace.patch")[..],
         &include_bytes!("../tools/keryx-llama/vulkan-patches/0002-trace-device-identity.patch")[..],
+        &include_bytes!("../tools/keryx-llama/vulkan-patches/0003-full-swa-trace-state.patch")[..],
+        &include_bytes!("../tools/keryx-llama/vulkan-patches/0004-grouped-product-traces.patch")[..],
         &include_bytes!("../tools/keryx-llama/keryx_vk_trace.inc.cpp")[..],
         &include_bytes!("vulkan_trace_seq.rs")[..],
     ] {
@@ -180,7 +182,12 @@ pub fn gpu_identity(gpu: usize) -> (String, u32, String) {
         let driver = nvml_wrapper::Nvml::init().ok().and_then(|n| n.sys_driver_version().ok()).unwrap_or_default();
         (name, sm, driver)
     }
-    #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"), not(target_os = "macos"))))]
+    #[cfg(feature = "pom-opencl")]
+    {
+        let _ = gpu; // AMD leases the singleton owner; identity follows its actual physical device.
+        crate::llama_engine_vk::tracing::gpu_identity()
+    }
+    #[cfg(all(not(feature = "pom-opencl"), not(all(feature = "pom-cuda", not(target_os = "macos")))))]
     {
         let _ = gpu;
         (String::new(), 0, String::new())
