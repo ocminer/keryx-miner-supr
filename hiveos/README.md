@@ -1,5 +1,9 @@
 # HiveOS custom miner — keryx-miner-supr
 
+The current AMD package cannot mine after H15: its Vulkan inference engine lacks the
+required trace support, and the miner keeps mining paused. This applies to standalone
+Linux and Windows AMD packages too. Correct installation does not remove this limitation.
+
 HiveOS rigs run an **older glibc** (Ubuntu 20.04 = glibc 2.31) than the dev rig
 (Ubuntu 24.04 = glibc 2.39). A binary built natively on the dev rig needs up to
 `GLIBC_2.39` and fails on HiveOS with `version 'GLIBC_2.3x' not found`. This

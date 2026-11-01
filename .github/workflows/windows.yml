@@ -268,6 +268,10 @@ jobs:
           @"
           keryx-miner-supr — Windows AMD (OpenCL mining + Vulkan GPU inference)
 
+          H15 status: this AMD build cannot produce the required inference traces.
+          Mining remains paused even when the model loads successfully. A Vulkan
+          trace engine is required before this package can mine after H15.
+
           Files:
             keryx-miner-supr.exe  - the miner
             keryxopencl.dll       - OpenCL worker (auto-loaded; mines on AMD GPUs)
@@ -288,6 +292,8 @@ jobs:
           @echo off
           setlocal
           title Keryx Miner - AMD
+          cd /d "%~dp0"
+          if errorlevel 1 exit /b 1
 
           REM Replace REPLACE_ME with YOUR keryx wallet and optionally rename rig1.
           set WALLET=keryx:REPLACE_ME.rig1
@@ -296,11 +302,13 @@ jobs:
           echo Starting keryx-miner-supr as %WALLET%
           echo Pool: %POOL%
           echo.
-          keryx-miner-supr.exe -a %WALLET% -s %POOL% --tier auto
+          "%~dp0keryx-miner-supr.exe" -a %WALLET% -s %POOL% --tier auto
+          set "MINER_EXIT=%ERRORLEVEL%"
 
           echo.
           echo The miner stopped. Read the messages above, then press any key to close.
           pause
+          exit /b %MINER_EXIT%
           '@ | Out-File -FilePath "$out\start.bat" -Encoding ascii
           $requiredFiles = @(
             "keryx-miner-supr.exe", "keryxopencl.dll", "keryx-llama-vk.dll",

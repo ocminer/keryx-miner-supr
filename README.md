@@ -2,6 +2,12 @@
 
 Suprnova fork of the [keryx-labs/keryx-miner](https://github.com/keryx-labs/keryx-miner) GPU miner.
 
+**AMD status since H15:** the current AMD/Vulkan build cannot produce the required
+inference traces, so it keeps mining paused on Windows, Linux and HiveOS. Loading a model
+successfully does not clear this check. AMD support needs a Vulkan trace engine; changing
+the launcher, reinstalling the driver or enabling CPU inference does not supply it.
+The AMD performance figures below describe earlier, pre-H15 releases.
+
 ## What's different from upstream
 
 | Area | Upstream | `-supr` |

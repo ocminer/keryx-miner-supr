@@ -54,6 +54,10 @@ chmod +x "$DEST/$NAME" "$DEST/run.sh"
 cat > "$DEST/RUN.txt" <<TXT
 keryx-miner-supr — AMD/OpenCL package (v${VERSION})
 
+H15 status: this AMD build cannot produce the required inference traces.
+Mining remains paused even when the model loads successfully. A Vulkan trace
+engine is required before this package can mine after H15.
+
 A KeryxHash miner for AMD GPUs (OpenCL). The binary dlopens libkeryxopencl.so
 for mining and the bundled libkeryx-llama-vk.so for required OPoI GPU inference.
 The portable Vulkan loader is included; the AMD driver must still provide both
@@ -73,7 +77,7 @@ Useful flags:
                           gfx1102/RDNA3 -> 4096). Override only to tune.
   --enable-cpu-inference  deprecated emergency-only inference fallback; normally omit.
 
-PoM v4 reference pool measurements (tier-0 model): RX 7900 XTX gfx1100
+Historical pre-H15 PoM v4 pool measurements (tier-0 model): RX 7900 XTX gfx1100
 ~1.781 MH/s with its exact-tested one-state WMMA path; MI50 gfx906 ~0.521 MH/s
 with DP4A. gfx1102/gfx12 retain the exact-tested multi-state WMMA path.
 TXT
