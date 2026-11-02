@@ -1,0 +1,66 @@
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index d1741cc..c867346 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -531,8 +531,10 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
+     const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
+     const uint8_t * __restrict__ m, const half2 & dm4, const half2 * __restrict__ ds8) {
+ 
+-    float sumf_d = 0.0f;
+-    float sumf_m = 0.0f;
++    // keryx: round the per-sub-block scale and min to half precision exactly like the MMA tile
++    // loader (x_dm = dm*make_half2(sc, m)), so DP4A cards (Pascal/Volta) produce the products the
++    // verifier recomputes; float d*sc here deviated from the canonical value by ~2^-11 relative.
++    float sumf = 0.0f;
+ 
+ #pragma unroll
+     for (int i = 0; i < QR4_K*VDR_Q4_K_Q8_1_MMQ/QI8_1; ++i) {
+@@ -544,14 +546,12 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
+         }
+ 
+         const float2 ds8f = __half22float2(ds8[i]);
++        const float2 smf  = __half22float2(dm4*make_half2(sc[i], m[i]));
+ 
+-        sumf_d += ds8f.x * (sc[i] * sumi_d);
+-        sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
++        sumf += smf.x * (ds8f.x * sumi_d) - smf.y * ds8f.y;
+     }
+ 
+-    const float2 dm4f = __half22float2(dm4);
+-
+-    return dm4f.x*sumf_d - dm4f.y*sumf_m;
++    return sumf;
+ }
+ 
+ #define VDR_Q5_K_Q8_1_MMVQ 2
+@@ -594,8 +594,10 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+     const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
+     const uint8_t * __restrict__ m, const half2 & dm4, const half2 * __restrict__ ds8) {
+ 
+-    float sumf_d = 0.0f;
+-    float sumf_m = 0.0f;
++    // keryx: round the per-sub-block scale and min to half precision exactly like the MMA tile
++    // loader (x_dm = dm*make_half2(sc, m)), so DP4A cards (Pascal/Volta) produce the products the
++    // verifier recomputes; float d*sc here deviated from the canonical value by ~2^-11 relative.
++    float sumf = 0.0f;
+ 
+ #pragma unroll
+     for (int i = 0; i < QR5_K*VDR_Q5_K_Q8_1_MMQ/QI8_1; ++i) {
+@@ -607,14 +609,12 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+         }
+ 
+         const float2 ds8f = __half22float2(ds8[i]);
++        const float2 smf  = __half22float2(dm4*make_half2(sc[i], m[i]));
+ 
+-        sumf_d += ds8f.x * (sc[i] * sumi_d);
+-        sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
++        sumf += smf.x * (ds8f.x * sumi_d) - smf.y * ds8f.y;
+     }
+ 
+-    const float2 dm4f = __half22float2(dm4);
+-
+-    return dm4f.x*sumf_d - dm4f.y*sumf_m;
++    return sumf;
+ }
+ 
+ #define VDR_Q6_K_Q8_1_MMVQ 1

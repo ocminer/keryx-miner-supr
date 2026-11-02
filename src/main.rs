@@ -527,11 +527,11 @@ fn select_tier_auto() -> keryx_miner::models::Tier {
 fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
     use keryx_miner::models::Tier;
     match s.trim().to_ascii_lowercase().as_str() {
-        "very-light" | "verylight" | "very_light" => Some(Tier::VeryLight),
-        "light" => Some(Tier::Light),
-        "default" => Some(Tier::Default),
-        "high" => Some(Tier::High),
-        "very-high" | "veryhigh" | "very_high" => Some(Tier::VeryHigh),
+        "very-light" | "verylight" | "very_light" | "t0" | "tier0" | "0" => Some(Tier::VeryLight),
+        "light" | "t1" | "tier1" | "1" => Some(Tier::Light),
+        "default" | "t2" | "tier2" | "2" => Some(Tier::Default),
+        "high" | "t3" | "tier3" | "3" => Some(Tier::High),
+        "very-high" | "veryhigh" | "very_high" | "t4" | "tier4" | "4" => Some(Tier::VeryHigh),
         _ => None,
     }
 }
@@ -584,6 +584,14 @@ fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier, 
         };
     }
     vrams.sort_by_key(|(id, _)| *id);
+    // `--cuda-device` restricts this process to the listed cards: resolve tiers ONLY for those, and
+    // map the `--force-model` list onto them IN THAT ORDER (`--cuda-device 3 --force-model t3` pins
+    // t3 on GPU 3). Without `--cuda-device` the list maps onto every card in CUDA order.
+    let selected = keryx_miner::slm::cli_cuda_devices();
+    if !selected.is_empty() {
+        vrams.retain(|(id, _)| selected.contains(&(*id as usize)));
+        vrams.sort_by_key(|(id, _)| selected.iter().position(|&d| d == *id as usize).unwrap_or(usize::MAX));
+    }
     if opt.force_model.is_some() {
         // Forced models load verbatim: no VRAM pre-check ("we simply load it, regardless of
         // what the card says — that is the reason we have it").
@@ -602,8 +610,8 @@ fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier, 
     }
     let pinned = pinned_tier(opt);
     let mut out = Vec::with_capacity(vrams.len());
-    for (dev, vram) in &vrams {
-        let (tier, is_forced) = match forced.get(*dev as usize).copied().flatten() {
+    for (slot, (dev, vram)) in vrams.iter().enumerate() {
+        let (tier, is_forced) = match forced.get(slot).copied().flatten() {
             Some(t) => {
                 // --force-model means FORCE: honor the operator's choice with NO VRAM check. If it
                 // does not fit the card it will OOM — that is the user's explicit call. (Only AUTO
@@ -617,8 +625,8 @@ fn resolve_device_tiers(opt: &cli::Opt) -> Vec<(u32, keryx_miner::models::Tier, 
                 (t, true)
             }
             None => {
-                if forced.get(*dev as usize).is_some() {
-                    warn!("GPU {}: --force-model entry unrecognised — using auto (names: very-light|light|default|high|very-high).", dev);
+                if forced.get(slot).is_some() {
+                    warn!("GPU {}: --force-model entry unrecognised — using auto (names: t0..t4 or very-light|light|default|high|very-high).", dev);
                 }
                 if let Some(t) = pinned {
                     (t, false)

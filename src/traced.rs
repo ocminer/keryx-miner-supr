@@ -290,9 +290,15 @@ mod engine {
     }
 
     fn weight_index(spec: &ModelSpec, gguf: &str, gpu: usize) -> Option<IndexRef> {
-        if crate::pom::mining_model_id(gpu as u32) == Some(spec.model_id) {
+        // Reuse the card's mining index ONLY when the per-device registry holds it for exactly this
+        // model. `mining_model_id`/`active_index_for` fall back to process-wide globals that
+        // concurrent installs on OTHER cards rewrite independently; on a mixed rig that handed an
+        // opening another model's index (garbage rows → NaN → "point 0: Mismatch" on a healthy card).
+        if crate::pom::device_index_matches(gpu as u32, &spec.model_id) {
             if let Some(idx) = crate::pom::active_index_for(gpu as u32) {
-                return Some(IndexRef::Device(idx));
+                if crate::pom::device_index_matches(gpu as u32, &spec.model_id) {
+                    return Some(IndexRef::Device(idx));
+                }
             }
         }
         if let Some(i) = built_indices().lock().ok().and_then(|m| m.get(&spec.model_id).cloned()) {

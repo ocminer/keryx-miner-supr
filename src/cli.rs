@@ -14,7 +14,7 @@ pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
     #[clap(
         long = "very-light",
-        help = "Model tier: Qwen3-8B-abliterated (Q4_K_S) — 6 GB+ GPU, smallest tier (PoM tier 0, post-H5; EXAONE-4.0-1.2B in the H4→H5 window)",
+        help = "Tier 0 (t0): Qwen3.5-9B-abliterated — smallest tier",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["light", "high", "very-high", "tier"]
     )]
@@ -22,7 +22,7 @@ pub struct Opt {
 
     #[clap(
         long = "light",
-        help = "Model tier: Gemma-3-4B — any GPU (6 GB+ VRAM)",
+        help = "Tier 1 (t1): GLM-4-9B-0414",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very-light", "high", "very-high"]
     )]
@@ -30,7 +30,7 @@ pub struct Opt {
 
     #[clap(
         long = "high",
-        help = "Model tier: Qwen3-32B — RTX 3090 / 4090 (24 GB+ VRAM) + ~60 GB free disk (model + possession tree)",
+        help = "Tier 3 (t3): Qwen3.8-27B — 24 GB+ VRAM",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very-light", "light", "very-high"]
     )]
@@ -38,7 +38,7 @@ pub struct Opt {
 
     #[clap(
         long = "very-high",
-        help = "Model tier: Llama-3.3-70B (Q2_K_L post-H2) — RTX 5090 / 32 GB+ VRAM + ~85 GB free disk (model + possession tree)",
+        help = "Tier 4 (t4): Kimi-Linear-48B — 32 GB+ VRAM",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very-light", "light", "high", "tier"]
     )]
@@ -47,7 +47,7 @@ pub struct Opt {
     #[clap(
         long = "tier",
         value_name = "TIER",
-        help = "Model tier: auto | very-light | light | default | high | very-high. DEFAULT (no flag) is 'auto' — picks the LARGEST tier that fits the GPU's VRAM (per-process) AND is downloaded = highest tier reward. Pass a name to pin a tier; overrides --very-light/--light/--high/--very-high.",
+        help = "Model tier: auto | t0 (very-light, Qwen3.5-9B) | t1 (light, GLM-4-9B) | t2 (default, Gemma-4-12B) | t3 (high, Qwen3.8-27B) | t4 (very-high, Kimi-Linear-48B). DEFAULT (no flag) is 'auto' — picks the LARGEST tier that fits the GPU's VRAM (per-process) AND is downloaded = highest tier reward. Pass a name to pin a tier; overrides --very-light/--light/--high/--very-high.",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very-light", "light", "high", "very-high"]
     )]
@@ -56,12 +56,14 @@ pub struct Opt {
     #[clap(
         long = "force-model",
         value_name = "MODELS",
-        help = "PER-DEVICE model override, comma-separated, mapped to CUDA device order: \
-                --force-model light,very-light,high → GPU0=light, GPU1=very-light, GPU2=high. \
-                FORCES the model regardless of VRAM fit (a card too small OOMs — power-user knob) and \
-                bypasses the download-availability check. Fewer entries than GPUs → the remaining cards \
-                use normal per-card AUTO best-fit. Overrides --tier / --light / etc. Names: \
-                very-light | light | default | high | very-high. \
+        help = "PER-DEVICE model override, comma-separated, one entry per card: \
+                --force-model t0,t1,t2,t3,t4 → GPU0=tier 0, GPU1=tier 1, … GPU4=tier 4. With \
+                --cuda-device the entries map onto the listed cards in that order (--cuda-device 3 \
+                --force-model t3 → tier 3 on GPU3). FORCES the model regardless of VRAM fit (a card \
+                too small OOMs — power-user knob) and bypasses the download-availability check. Fewer \
+                entries than cards → the remaining cards use per-card AUTO best-fit. Overrides --tier / \
+                --light / etc. Names: t0 | very-light = Qwen3.5-9B, t1 | light = GLM-4-9B, \
+                t2 | default = Gemma-4-12B, t3 | high = Qwen3.8-27B, t4 | very-high = Kimi-Linear-48B. \
                 AMD/OpenCL: PROCESS-WIDE (one resident model per process) — the FIRST entry applies to \
                 ALL cards.",
         help_heading = "OPoI / Inference"

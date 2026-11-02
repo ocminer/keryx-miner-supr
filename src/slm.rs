@@ -2739,7 +2739,21 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> SelfTestOutco
     // PCI-order vs CUDA-ordinal mismatch under CUDA_VISIBLE_DEVICES). Skipped when the operator
     // pinned a host (KERYX_INFERENCE_GPU / --no-shared-inference: per-card processes have no
     // alternate card anyway) and on CPU-inference builds.
+    // A card pinned with `--force-model` keeps its tier: the operator chose one tier per card, so a
+    // failed probe is retried on THAT card (recovery backoff) instead of moving the tier onto another
+    // card's model, where it would swap models per request and leave the pinned card idle.
+    #[cfg(feature = "pom-cuda")]
+    let pinned_card = crate::pom_gpu::is_device_forced(gpu as u32);
+    #[cfg(not(feature = "pom-cuda"))]
+    let pinned_card = false;
+    if pinned_card && !passed {
+        log::warn!(
+            "OPoI self-test: '{}' failed on GPU {} — the card is pinned by --force-model, so the tier stays there and is re-probed on the same card.",
+            name, gpu
+        );
+    }
     if !passed
+        && !pinned_card
         && std::env::var("KERYX_INFERENCE_GPU").is_err()
         && !NO_SHARED_INFERENCE.load(std::sync::atomic::Ordering::Relaxed)
         && !cpu_inference_enabled()

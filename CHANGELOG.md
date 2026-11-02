@@ -5,6 +5,10 @@
   The inference engine now always uses the quantized matrix kernels that record the trace; before,
   Volta handed prompts of 64 tokens or more to cuBLAS, so the prompt was never traced. Turing and
   newer cards already used these kernels, so their inference path is unchanged.
+- **Tesla V100 / GTX 10xx (Pascal): Q4_K/Q5_K models pass the H15 self-check.** Cards without integer tensor cores rounded two K-quant scale products differently from the verifier, so models such as Qwen3.5-9B failed with `point 0: Mismatch` on prompts. The engine now rounds them the same way (llama patch 0006). Verified on a Tesla V100: tier 0 and tier 1 pass and mine with 0 rejected shares.
+- **Multi-card rigs: no more false `point 0: Mismatch`.** When several cards loaded different models in one process, a card's self-check could read another model's possession index while the other cards were starting up, fail, and withdraw a healthy tier. Each opening now uses the index of its own model.
+- **`--force-model` pins one tier per card.** Use `t0`–`t4` (or the old names): `--force-model t0,t1,t2,t3,t4` loads tier 0 on GPU0, tier 1 on GPU1 and so on. With `--cuda-device` the list maps onto the selected cards in that order. A pinned card keeps its tier: a failed self-check is retried on that card instead of moving the tier onto another card.
+- `--help` shows the current model for every tier name.
 - `KERYX_LLAMA_CTX` is capped at the largest context a trace can cover.
 - With the interactive dashboard the miner now writes a plain log file, `keryx-miner.log` (rotated
   at 64 MiB). `--plain-log-file <path>` or `KERYX_PLAIN_LOG_FILE` choose another file, an empty
