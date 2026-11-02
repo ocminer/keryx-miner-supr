@@ -11,6 +11,7 @@
   path disables it; classic mode (HiveOS, mmpOS, `--no-tui`) writes a file only when asked.
 - When the miner stops itself, the reason is printed on the console after the dashboard closes.
 - The dashboard no longer highlights healthy `error: false` status text as an alert.
+- Stale analysis: a stale, duplicate or low-difficulty share is logged with the age of its job at submit time and the pool's reply time, and every 200 answered shares the miner logs a summary (job age p50/p90/p99 for accepted and stale shares, pool reply time).
 
 # keryx-miner-supr 0.15.6 — AMD H15 mining and verifiable inference
 

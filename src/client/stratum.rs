@@ -313,6 +313,127 @@ mod inference_coordination_tests {
     }
 }
 
+
+/// Share timing for stale analysis: when each job arrived, how old its job was when a share was
+/// submitted, and how long the pool took to answer. Logged per stale share and summarized every
+/// `SHARE_TIMING_SUMMARY_EVERY` answered shares.
+mod share_timing {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    const MAX_JOBS: usize = 512;
+    const MAX_PENDING: usize = 4096;
+    pub const SHARE_TIMING_SUMMARY_EVERY: usize = 200;
+
+    #[derive(Default)]
+    struct State {
+        job_seen: HashMap<String, Instant>,
+        job_order: VecDeque<String>,
+        /// msg id -> (job age at submit in ms, submit time)
+        pending: HashMap<u32, (Option<u64>, Instant)>,
+        accepted_age: Vec<u64>,
+        stale_age: Vec<u64>,
+        reply_ms: Vec<u64>,
+        answered: usize,
+    }
+
+    fn state() -> &'static Mutex<State> {
+        static S: OnceLock<Mutex<State>> = OnceLock::new();
+        S.get_or_init(|| Mutex::new(State::default()))
+    }
+
+    pub fn note_job(job_id: &str) {
+        let Ok(mut s) = state().lock() else { return };
+        if s.job_seen.contains_key(job_id) {
+            return;
+        }
+        if s.job_order.len() >= MAX_JOBS {
+            if let Some(old) = s.job_order.pop_front() {
+                s.job_seen.remove(&old);
+            }
+        }
+        s.job_seen.insert(job_id.to_string(), Instant::now());
+        s.job_order.push_back(job_id.to_string());
+    }
+
+    pub fn note_submit(msg_id: u32, job_id: &str) {
+        let Ok(mut s) = state().lock() else { return };
+        let age = s.job_seen.get(job_id).map(|t| t.elapsed().as_millis() as u64);
+        if s.pending.len() >= MAX_PENDING {
+            s.pending.clear();
+        }
+        s.pending.insert(msg_id, (age, Instant::now()));
+    }
+
+    fn pct(v: &mut [u64], p: usize) -> u64 {
+        if v.is_empty() {
+            return 0;
+        }
+        v.sort_unstable();
+        v[((v.len() - 1) * p) / 100]
+    }
+
+    /// Records the pool's answer for `msg_id`; returns (job age at submit ms, pool reply ms) and,
+    /// every `SHARE_TIMING_SUMMARY_EVERY` answers, a summary line to log.
+    pub fn note_reply(msg_id: u32, accepted: bool, stale: bool) -> (Option<(Option<u64>, u64)>, Option<String>) {
+        let Ok(mut s) = state().lock() else { return (None, None) };
+        let Some((age, at)) = s.pending.remove(&msg_id) else { return (None, None) };
+        let reply = at.elapsed().as_millis() as u64;
+        s.reply_ms.push(reply);
+        if let Some(a) = age {
+            if accepted {
+                s.accepted_age.push(a);
+            } else if stale {
+                s.stale_age.push(a);
+            }
+        }
+        s.answered += 1;
+        let mut summary = None;
+        if s.answered >= SHARE_TIMING_SUMMARY_EVERY {
+            let (na, ns) = (s.accepted_age.len(), s.stale_age.len());
+            let mut acc = std::mem::take(&mut s.accepted_age);
+            let mut st = std::mem::take(&mut s.stale_age);
+            let mut rp = std::mem::take(&mut s.reply_ms);
+            summary = Some(format!(
+                "Share timing (last {} answers): job age at submit — accepted n={} p50={}ms p90={}ms p99={}ms, \
+                 stale n={} p50={}ms p90={}ms; pool reply p50={}ms p90={}ms p99={}ms",
+                s.answered,
+                na,
+                pct(&mut acc, 50),
+                pct(&mut acc, 90),
+                pct(&mut acc, 99),
+                ns,
+                pct(&mut st, 50),
+                pct(&mut st, 90),
+                pct(&mut rp, 50),
+                pct(&mut rp, 90),
+                pct(&mut rp, 99),
+            ));
+            s.answered = 0;
+        }
+        (Some((age, reply)), summary)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ages_are_tracked_per_job_and_reply() {
+            note_job("tjob_1");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            note_submit(900_001, "tjob_1");
+            let (t, _) = note_reply(900_001, false, true);
+            let (age, _reply) = t.expect("pending share");
+            assert!(age.expect("job seen") >= 5);
+            assert!(note_reply(900_001, true, false).0.is_none(), "answered once");
+            note_submit(900_002, "never_seen");
+            assert_eq!(note_reply(900_002, true, false).0.unwrap().0, None);
+        }
+    }
+}
+
 type BlockHandle = JoinHandle<()>;
 
 #[derive(Default)]
@@ -1026,6 +1147,7 @@ impl StratumHandler {
                 // Store the finding GPU alongside the job id so the accept/reject response (matched by
                 // msg_id) can be attributed per-card.
                 share_stats.shares_pending.lock().await.insert(msg_id, (job_id.clone(), device_id));
+                share_timing::note_submit(msg_id, &job_id);
                 keryx_miner::runtime_stats::record_share_submitted();
                 let nonce_hex = format!("{:016x}", nonce);
                 let opoi_tag = keryx_inference::tag_fixed(nonce);
@@ -1305,6 +1427,19 @@ impl StratumHandler {
 
                                 self.proof_encoding.answered(rid);
                                 let pending = self.shares_stats.shares_pending.lock().await.remove(&rid);
+                                if pending.is_some() {
+                                    let (timing, summary) = share_timing::note_reply(rid, true, false);
+                                    if let Some((age, reply)) = timing {
+                                        log::debug!(
+                                            "Share accepted: job age at submit {}, pool reply {} ms",
+                                            age.map_or_else(|| "unknown".to_string(), |a| format!("{} ms", a)),
+                                            reply
+                                        );
+                                    }
+                                    if let Some(line) = summary {
+                                        info!("{}", line);
+                                    }
+                                }
                                 if let Some((_jobid, device_id)) = pending {
                                     let delivered_inference = if let Some(req_id) =
                                         self.shares_stats.ai_responses_pending.lock().await.remove(&rid)
@@ -1376,7 +1511,11 @@ impl StratumHandler {
                             }
                         }
                     }
-                    StratumLinePayload::StratumCommand(command) => match command {
+                    StratumLinePayload::StratumCommand(command) => {
+                        if let StratumCommand::MiningNotify(ref notify) = command {
+                            share_timing::note_job(notify.job_id());
+                        }
+                        match command {
                         StratumCommand::SetExtranonce(SetExtranonce::SetExtranoncePlain((
                             ref extranonce,
                             ref nonce_size,
@@ -1761,7 +1900,8 @@ impl StratumHandler {
                             Ok(())
                         }
                         _ => Err(format!("Unexpected stratum message: {:?}", msg).into()),
-                    },
+                        }
+                    }
                     // A result without an id (some pools answer our id-less notifications such as
                     // mining.declare_capabilities with `{"id":null,"result":true}`). It answers
                     // nothing we wait for; ignoring it keeps the connection — and mining — alive.
@@ -1824,6 +1964,21 @@ impl StratumHandler {
                 let was_share = pending.is_some();
                 let device_id = pending.as_ref().and_then(|(_, device_id)| *device_id);
                 let jobid = pending.map(|(j, _)| j);
+                let (timing, summary) = if was_share {
+                    share_timing::note_reply(id, false, matches!(code, ErrorCode::JobNotFound))
+                } else {
+                    (None, None)
+                };
+                if let Some(line) = summary {
+                    info!("{}", line);
+                }
+                let timing_note = timing.map_or_else(String::new, |(age, reply)| {
+                    format!(
+                        ", job age at submit {}, pool reply {} ms",
+                        age.map_or_else(|| "unknown".to_string(), |a| format!("{} ms", a)),
+                        reply
+                    )
+                });
                 match code {
                     ErrorCode::Unknown => {
                         // Match solo-mining behaviour (grpc.rs SubmitBlockResponse): a rejected
@@ -1847,7 +2002,7 @@ impl StratumHandler {
                                 device_id,
                             );
                         }
-                        warn!("Stale share (Job id: {:?})", jobid);
+                        warn!("Stale share (Job id: {:?}{})", jobid, timing_note);
                         Ok(())
                     }
                     ErrorCode::DuplicateShare => {
@@ -1858,7 +2013,7 @@ impl StratumHandler {
                                 device_id,
                             );
                         }
-                        warn!("Duplicate share (Job id: {:?})", jobid);
+                        warn!("Duplicate share (Job id: {:?}{})", jobid, timing_note);
                         Ok(())
                     }
                     ErrorCode::LowDifficultyShare => {
@@ -1869,7 +2024,7 @@ impl StratumHandler {
                                 device_id,
                             );
                         }
-                        warn!("Low difficulty share (Job id: {:?})", jobid);
+                        warn!("Low difficulty share (Job id: {:?}{})", jobid, timing_note);
                         Ok(())
                     }
                     ErrorCode::Unauthorized => {

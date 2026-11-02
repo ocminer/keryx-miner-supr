@@ -118,6 +118,21 @@ pub(crate) enum MiningNotify {
     MiningNotifyLong((String, String, String, String, Vec<String>, String, String, String, bool)),
 }
 
+impl MiningNotify {
+    /// The pool's job id of any notify shape.
+    pub(crate) fn job_id(&self) -> &str {
+        match self {
+            MiningNotify::MiningNotifyV4((id, ..))
+            | MiningNotify::MiningNotifyWithTaskV3((id, ..))
+            | MiningNotify::MiningNotifyShortV3((id, ..))
+            | MiningNotify::MiningNotifyWithTask((id, ..))
+            | MiningNotify::MiningNotifyShortV2((id, ..))
+            | MiningNotify::MiningNotifyShort((id, ..))
+            | MiningNotify::MiningNotifyLong((id, ..)) => id,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum MiningSubmit {
