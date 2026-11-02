@@ -176,6 +176,77 @@ fn set_runtime_tui_active(active: bool) {
 
 struct MinerLogger {
     inner: env_logger::Logger,
+    plain: Option<Mutex<PlainLogFile>>,
+}
+
+/// Plain log file used under the dashboard when no path is given (upstream v0.5.9 d1692ef): the
+/// dashboard keeps only its last lines in memory, so without a file the history of a stopped
+/// miner is gone. Classic mode already writes every line to stdout and gets no default file.
+pub const DEFAULT_PLAIN_LOG_FILE: &str = "keryx-miner.log";
+/// Size at which the plain log file is moved to `<path>.1` and started again.
+const PLAIN_LOG_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Append-only plain log file, rotated once it reaches `PLAIN_LOG_ROTATE_BYTES`.
+pub struct PlainLogFile {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    written: u64,
+}
+
+impl PlainLogFile {
+    pub fn open(path: impl Into<std::path::PathBuf>) -> io::Result<Self> {
+        let path = path.into();
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut log = Self { path, file, written };
+        if log.written >= PLAIN_LOG_ROTATE_BYTES {
+            log.rotate();
+        }
+        Ok(log)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn rotate(&mut self) {
+        let mut old = self.path.clone().into_os_string();
+        old.push(".1");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&self.path, &old);
+        if let Ok(file) = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&self.path) {
+            self.file = file;
+        }
+        self.written = 0;
+    }
+
+    fn write_line(&mut self, line: &str) {
+        if self.written >= PLAIN_LOG_ROTATE_BYTES {
+            self.rotate();
+        }
+        if writeln!(self.file, "{}", line).is_ok() {
+            self.written += line.len() as u64 + 1;
+        }
+    }
+}
+
+/// Resolves the plain log file: `--plain-log-file`, else `KERYX_PLAIN_LOG_FILE`, else the default
+/// only when the dashboard runs. An empty path turns the file off.
+pub fn open_plain_log_file(cli: Option<&str>, dashboard: bool) -> Option<PlainLogFile> {
+    let path = cli
+        .map(str::to_string)
+        .or_else(|| std::env::var("KERYX_PLAIN_LOG_FILE").ok())
+        .or_else(|| dashboard.then(|| DEFAULT_PLAIN_LOG_FILE.to_string()))?;
+    if path.is_empty() {
+        return None;
+    }
+    match PlainLogFile::open(&path) {
+        Ok(file) => Some(file),
+        Err(e) => {
+            eprintln!("Failed to open plain log file '{}': {}", path, e);
+            None
+        }
+    }
 }
 
 impl Log for MinerLogger {
@@ -187,6 +258,15 @@ impl Log for MinerLogger {
         if !self.inner.matches(record) {
             return;
         }
+        if let Some(file) = &self.plain {
+            if let Ok(mut f) = file.lock() {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                f.write_line(&format!("{} [{}] {}", ts, record.level(), record.args()));
+            }
+        }
         if DASHBOARD_ACTIVE.load(Ordering::Acquire) {
             push_log(record.level(), record.target(), &record.args().to_string());
         } else {
@@ -196,21 +276,27 @@ impl Log for MinerLogger {
 
     fn flush(&self) {
         self.inner.flush();
+        if let Some(file) = &self.plain {
+            if let Ok(mut f) = file.lock() {
+                let _ = f.file.flush();
+            }
+        }
     }
 }
 
 /// Install the switchable logger used while the TUI owns the terminal. Classic mode continues to
 /// use the existing env_logger setup and therefore preserves its line format exactly.
-pub fn install_dashboard_logger(level: LevelFilter) -> Result<(), SetLoggerError> {
+pub fn install_dashboard_logger(level: LevelFilter, plain: Option<PlainLogFile>) -> Result<(), SetLoggerError> {
     let mut builder = env_logger::Builder::new();
     builder.filter_level(level).parse_default_env();
     let inner = builder.build();
     let max_level = inner.filter();
+    let plain = plain.map(Mutex::new);
     // Keep logging in classic mode until the alternate-screen thread is actually started. This
     // matters because plugin option processing and `Opt::process` can return actionable startup
     // errors before `start_dashboard`; buffering those messages here would make them disappear.
     DASHBOARD_ACTIVE.store(false, Ordering::Release);
-    match log::set_boxed_logger(Box::new(MinerLogger { inner })) {
+    match log::set_boxed_logger(Box::new(MinerLogger { inner, plain })) {
         Ok(()) => {
             log::set_max_level(max_level);
             LOGGER_INSTALLED.store(true, Ordering::Release);
@@ -222,6 +308,22 @@ pub fn install_dashboard_logger(level: LevelFilter) -> Result<(), SetLoggerError
             LOGGER_INSTALLED.store(false, Ordering::Release);
             Err(error)
         }
+    }
+}
+
+/// Classic line logging plus an explicitly requested plain log file. Returns false when another
+/// logger was already installed (static-cuda builds), which then keeps logging to stdout only.
+pub fn install_classic_logger_with_file(level: LevelFilter, plain: PlainLogFile) -> bool {
+    let mut builder = env_logger::Builder::new();
+    builder.filter_level(level).parse_default_env();
+    let inner = builder.build();
+    let max_level = inner.filter();
+    DASHBOARD_ACTIVE.store(false, Ordering::Release);
+    if log::set_boxed_logger(Box::new(MinerLogger { inner, plain: Some(Mutex::new(plain)) })).is_ok() {
+        log::set_max_level(max_level);
+        true
+    } else {
+        false
     }
 }
 
@@ -524,6 +626,16 @@ fn restore_terminal_for_exit_unlocked() {
 /// Hard-exit restoration must not wait forever behind a blocked terminal write. Stop future frames,
 /// give an in-flight draw a short opportunity to finish, then fall back to idempotent nonblocking
 /// terminal recovery. The caller invokes `process::exit` immediately after this returns.
+/// Logs `msg`, leaves the dashboard and prints `msg` on the restored console (upstream v0.5.9
+/// d1692ef): under the dashboard an error line only lives in its in-memory log pane.
+pub fn report_exit_reason(msg: &str) {
+    log::error!("{}", msg);
+    log::logger().flush();
+    restore_terminal_for_exit();
+    let _ = writeln!(io::stderr(), "\nkeryx-miner-supr stopped: {}", msg);
+    let _ = io::stderr().flush();
+}
+
 pub fn restore_terminal_for_exit() {
     const LOCK_GRACE: Duration = Duration::from_millis(250);
 

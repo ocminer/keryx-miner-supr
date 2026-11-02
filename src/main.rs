@@ -59,6 +59,12 @@ fn exit_process(code: i32) -> ! {
     std::process::exit(code)
 }
 
+/// Hard exit whose reason stays visible after the dashboard closes and lands in the plain log.
+fn exit_with_reason(code: i32, msg: &str) -> ! {
+    tui_driver::report_exit_reason(msg);
+    std::process::exit(code)
+}
+
 /// Attempt to install the CUDA runtime libraries candle needs, on a Debian/Ubuntu host (HiveOS).
 ///
 /// OPoI GPU inference needs cuBLAS, cuBLASLt and cuRAND — candle creates handles for all three
@@ -869,7 +875,8 @@ async fn run() -> Result<(), Error> {
         );
     }
     if tui_enabled {
-        if let Err(error) = tui_driver::install_dashboard_logger(opt.log_level()) {
+        let plain = tui_driver::open_plain_log_file(opt.plain_log_file.as_deref(), true);
+        if let Err(error) = tui_driver::install_dashboard_logger(opt.log_level(), plain) {
             tui_enabled = false;
             tui_driver::mark_requested(false);
             eprintln!("WARNING: interactive dashboard logger could not start ({error}); using classic logs.");
@@ -891,7 +898,11 @@ async fn run() -> Result<(), Error> {
     // try_init: in the static-cuda build CudaPlugin::new already set a logger;
     // init() would panic on the second call.
     if !tui_enabled {
-        let _ = env_logger::builder().filter_level(opt.log_level()).parse_default_env().try_init();
+        let installed = tui_driver::open_plain_log_file(opt.plain_log_file.as_deref(), false)
+            .is_some_and(|plain| tui_driver::install_classic_logger_with_file(opt.log_level(), plain));
+        if !installed {
+            let _ = env_logger::builder().filter_level(opt.log_level()).parse_default_env().try_init();
+        }
     }
     opt.process()?;
     #[cfg(feature = "pom-cuda")]
@@ -1976,12 +1987,14 @@ async fn run() -> Result<(), Error> {
                     last_change = Instant::now();
                     armed = true;
                 } else if armed && stall_armed && last_change.elapsed() >= Duration::from_secs(stall_secs) {
-                    error!(
-                        "WEDGE SUPERVISOR: no accepted share for {}s while mining — the miner is stuck; \
-                         exiting (code 75) so the wrapper relaunches it and resets stuck workers.",
-                        stall_secs
+                    exit_with_reason(
+                        75,
+                        &format!(
+                            "WEDGE SUPERVISOR: no accepted share for {}s while mining — the miner is stuck; \
+                             exiting (code 75) so the wrapper relaunches it and resets stuck workers.",
+                            stall_secs
+                        ),
                     );
-                    exit_process(75);
                 }
             }
         });

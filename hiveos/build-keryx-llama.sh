@@ -66,7 +66,7 @@ docker run --rm --network host \
     /tmp/cmk/bin/cmake -S /llama -B $B -DGGML_CUDA=ON \
       -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DBUILD_SHARED_LIBS=OFF \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-      -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DGGML_CUDA_NCCL=OFF -DCMAKE_BUILD_TYPE=Release \
+      -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FORCE_MMQ=ON -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_COMPILER=$KCUDA/bin/nvcc $SIMD_FLAGS
     /tmp/cmk/bin/cmake --build $B --target llama -j "$JOBS"
     MINCC="${ARCHS%%;*}"

@@ -1,3 +1,17 @@
+# keryx-miner-supr 0.15.7 — Tesla V100 (Volta) H15 traces
+
+- **Tesla V100 / Volta (legacy package): H15 traced self-test fixed.** On Volta every tier failed with
+  `trace read failed (-5), N positions traced for M fed`, the card was withdrawn and mined 0 H/s.
+  The inference engine now always uses the quantized matrix kernels that record the trace; before,
+  Volta handed prompts of 64 tokens or more to cuBLAS, so the prompt was never traced. Turing and
+  newer cards already used these kernels, so their inference path is unchanged.
+- `KERYX_LLAMA_CTX` is capped at the largest context a trace can cover.
+- With the interactive dashboard the miner now writes a plain log file, `keryx-miner.log` (rotated
+  at 64 MiB). `--plain-log-file <path>` or `KERYX_PLAIN_LOG_FILE` choose another file, an empty
+  path disables it; classic mode (HiveOS, mmpOS, `--no-tui`) writes a file only when asked.
+- When the miner stops itself, the reason is printed on the console after the dashboard closes.
+- The dashboard no longer highlights healthy `error: false` status text as an alert.
+
 # keryx-miner-supr 0.15.6 — AMD H15 mining and verifiable inference
 
 - AMD now supports H15 context-pad mining, traced inference and multi-phase audits through the bundled Vulkan engine.

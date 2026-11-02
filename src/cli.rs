@@ -241,6 +241,13 @@ pub struct Opt {
     pub debug: bool,
 
     #[clap(
+        long = "plain-log-file",
+        help = "Write plain text logs to this file path (also KERYX_PLAIN_LOG_FILE). With the interactive dashboard the default is keryx-miner.log, rotated at 64 MiB; give an empty path to disable it. Classic mode writes no file unless one is given.",
+        help_heading = "Monitoring"
+    )]
+    pub plain_log_file: Option<String>,
+
+    #[clap(
         long = "no-tui",
         help = "Disable the interactive terminal dashboard and retain the classic line-oriented logs. The dashboard is selected automatically only on an interactive terminal; use this flag for HiveOS, mmpOS, log collectors and supervisors.",
         help_heading = "Mining"

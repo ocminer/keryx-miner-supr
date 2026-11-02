@@ -1175,8 +1175,39 @@ fn matrix_body_label(label: &'static str, salt: u64, state: &TuiState, palette: 
 }
 
 fn is_warning_text(value: &str) -> bool {
-    let upper = value.to_ascii_uppercase();
+    let upper = strip_error_false(&value.to_ascii_uppercase());
     ["WARN", "ALERT", "ERROR", "FAILED", "REJECT"].iter().any(|needle| upper.contains(needle))
+}
+
+/// Removes "error false" style phrases (`error false`, `error=false`, `"error": false`, `errors = false`)
+/// from an upper-cased line so a healthy status field is not shown as an alert (upstream v0.5.9 5fb606f).
+fn strip_error_false(upper: &str) -> String {
+    let bytes = upper.as_bytes();
+    let mut out = String::with_capacity(upper.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if upper[i..].starts_with("ERROR") {
+            let mut j = i + "ERROR".len();
+            if upper[j..].starts_with('S') {
+                j += 1;
+            }
+            let sep_start = j;
+            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b':' | b'=' | b'"' | b'\'' | b'`') {
+                j += 1;
+            }
+            let end = j + "FALSE".len();
+            let word_ends = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+            if j > sep_start && upper[j..].starts_with("FALSE") && word_ends {
+                out.push(' ');
+                i = end;
+                continue;
+            }
+        }
+        let ch = upper[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn matrix_glyph(state: &TuiState, seed: u64) -> char {
@@ -2720,6 +2751,16 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn error_false_is_not_an_alert() {
+        for l in ["status error false done", "got error=false ok", "{\"error\": false}", "Error: FALSE x", "errors = false"] {
+            assert!(!is_warning_text(l), "{l}");
+        }
+        for l in ["[ERROR] boom", "an error occurred", "error=false but FAILED", "error true then error x", "error falsehood"] {
+            assert!(is_warning_text(l), "{l}");
+        }
+    }
+
     use super::*;
     use crossterm::event::KeyEvent;
     use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};

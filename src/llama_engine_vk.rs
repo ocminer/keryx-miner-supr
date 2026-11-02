@@ -418,7 +418,11 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
             if main_gpu < 0 { "auto-discrete".to_string() } else { main_gpu.to_string() },
             so.display()
         );
-        let configured_ctx: Option<c_int> = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok());
+        // Capped to the largest traceable context (upstream v0.5.8 7adb54c): a larger override would
+        // build a context no trace shape accepts.
+        let max_ctx = keryx_verifiable_inference::shape::MAX_TRACE_POSITIONS.min(c_int::MAX as u32) as c_int;
+        let configured_ctx: Option<c_int> =
+            std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse::<c_int>().ok()).map(|c| c.clamp(1, max_ctx));
         let mut n_ctx: c_int = configured_ctx.unwrap_or(4096);
         // Context ladder + walk reserve (upstream d5ccad3, same as the CUDA engine): the library
         // keeps a context only if the reserve stays free for the zero-dup walk it builds next.

@@ -35,6 +35,9 @@ set(LLAMA_BUILD_SERVER  OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA           ON  CACHE BOOL "" FORCE)
 set(GGML_NATIVE         OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA_NCCL      OFF CACHE BOOL "" FORCE)
+# Traces are captured in the quantized kernels: without this, Volta (sm_70) sends prompt batches of
+# 64+ tokens to cuBLAS and no prefill position is traced. Turing and newer already always use MMQ.
+set(GGML_CUDA_FORCE_MMQ  ON  CACHE BOOL "" FORCE)
 
 # H15 canonical trace: keryx_llama.cpp links against the q8canon leaves added to ggml-cuda by
 # patches/*.patch. Apply them to the (pristine, pinned b10015) checkout at configure time; a tree
