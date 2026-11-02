@@ -1,4 +1,6 @@
-# keryx-miner-supr 0.15.7 — Tesla V100 (Volta) H15 traces
+# keryx-miner-supr 0.15.8 — Tesla V100 / Pascal H15 traces and per-card tier pinning
+
+(0.15.7 was an internal build and was not released.)
 
 - **Tesla V100 / Volta (legacy package): H15 traced self-test fixed.** On Volta every tier failed with
   `trace read failed (-5), N positions traced for M fed`, the card was withdrawn and mined 0 H/s.
