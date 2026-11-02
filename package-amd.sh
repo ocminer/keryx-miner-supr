@@ -54,9 +54,10 @@ chmod +x "$DEST/$NAME" "$DEST/run.sh"
 cat > "$DEST/RUN.txt" <<TXT
 keryx-miner-supr — AMD/OpenCL package (v${VERSION})
 
-H15 status: this AMD build cannot produce the required inference traces.
-Mining remains paused even when the model loads successfully. A Vulkan trace
-engine is required before this package can mine after H15.
+H15: this AMD build mines and answers traced (verifiable) inference through
+the bundled Vulkan engine. Mining and inference share one resident model on the
+same card; mining pauses during a request and resumes afterward. RDNA1 cards
+are not supported for H15.
 
 A KeryxHash miner for AMD GPUs (OpenCL). The binary dlopens libkeryxopencl.so
 for mining and the bundled libkeryx-llama-vk.so for required OPoI GPU inference.
