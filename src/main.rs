@@ -712,11 +712,10 @@ async fn client_main(
     escrow_privkey: Option<String>,
     escrow_cert: Option<String>,
 ) -> Result<(), Error> {
-    // IPFS/kubo setup runs in the BACKGROUND (fire-and-forget) — it's only for optional inference-
-    // reward uploads and must never gate mining. Previously this was `.await`ed, so a slow kubo
-    // download (e.g. first run on macOS) stalled the miner from connecting to the pool for a minute+.
-    let ipfs_url = opt.ipfs_url.clone();
-    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url));
+    // H14+ private answers carry their sealed body inline and need no IPFS daemon. Starting Kubo
+    // here on every connection burns CPU/network resources even when no upload will ever occur.
+    // Legacy uploads retain upload_with_recovery(), which starts a missing local daemon on demand;
+    // explicitly configured remote endpoints and already-running local nodes are left untouched.
 
     let mut client = get_client(
         pool_address,
