@@ -7,6 +7,8 @@
   preceding development session, plus cached SM80/SM86 tile loads.
 - Adds a finite staging-gate override and a CUDA transition regression covering
   pad replacement, reuse and rollback. No model or inference-engine change.
+- Persists node-updated opening deadlines and retains accepted traces during
+  restart recovery, so H16 audit extensions are not lost with the old deadline.
 - **Activation is not yet scheduled upstream.** Mainnet and testnet defaults
   remain disabled until an authoritative activation value is published. This
   preparation must not be advertised as a scheduled, automatic mainnet upgrade.

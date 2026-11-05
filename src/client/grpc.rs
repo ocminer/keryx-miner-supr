@@ -1904,6 +1904,32 @@ const AWAITED_POLL_MAX: usize = 1_024;
 /// How long an opening replay waits for its card to be free.
 const REPLAY_CARD_DEADLINE_MS: u64 = 120_000;
 
+/// An accepted trace restored after a restart has no reconstructed draw yet. H16
+/// can extend its audit beyond the ordinary undrawn horizon while the miner was
+/// offline. Keep it until the node/chain state is recovered, bounded by the latest
+/// possible acceptance plus the node's audit span. A saved phase/opening deadline
+/// also remains authoritative while its chain position is being restored.
+fn keep_undrawn_trace(submitted: u64, now: u64, accepted: bool, node_awaits: Option<bool>, saved_deadline: Option<u64>) -> bool {
+    now < submitted.saturating_add(TRACE_UNDRAWN_LIMIT_DAA)
+        || saved_deadline.is_some_and(|d| now <= d.saturating_add(keryx_miner::trace::OPENING_BACKLOG_CAP_DAA))
+        || (accepted && node_awaits != Some(false)
+            && now <= submitted.saturating_add(TRACE_UNDRAWN_LIMIT_DAA).saturating_add(AUDIT_SPAN_DAA))
+}
+
+/// Persist the node's current deadline with the already-built opening. The bytes
+/// and seed binding are unchanged; both deadline extensions and reorg reductions
+/// must survive restart instead of reverting to the original submission window.
+fn refresh_stored_opening_deadline(
+    opening: &mut Option<keryx_miner::trace_store::StoredOpening>, seed_hash: &str, deadline: u64,
+) -> bool {
+    if let Some(o) = opening.as_mut().filter(|o| o.seed_hash == seed_hash && o.deadline_daa != deadline) {
+        o.deadline_daa = deadline;
+        true
+    } else {
+        false
+    }
+}
+
 /// Earliest retry of a replay that failed `failures` times.
 fn replay_backoff(failures: u32) -> std::time::Instant {
     std::time::Instant::now() + REPLAY_RETRY_BASE.saturating_mul(1 << failures.saturating_sub(1).min(5)).min(REPLAY_RETRY_MAX)
@@ -3109,6 +3135,9 @@ impl KeryxdHandler {
                     info!("Trace: response {} — audit seeded by the node at block {}, opening due by DAA {}", o.response_txid, seed_hash, o.deadline_daa);
                 }
                 let kept = p.opening.as_ref().is_some_and(|op| op.seed_hash == seed_hash);
+                if kept {
+                    refresh_stored_opening_deadline(&mut p.opening, &seed_hash, o.deadline_daa);
+                }
                 p.draw = Some(TraceDraw {
                     seed_hash,
                     seed_daa,
@@ -3137,6 +3166,9 @@ impl KeryxdHandler {
             if !d.audited || (!in_phases && d.deadline_daa != o.deadline_daa) {
                 d.audited = true;
                 d.deadline_daa = o.deadline_daa;
+                changed.push(o.response_txid.clone());
+            }
+            if !in_phases && refresh_stored_opening_deadline(&mut p.opening, &d.seed_hash, o.deadline_daa) {
                 changed.push(o.response_txid.clone());
             }
             if d.opened && idle && !in_phases && p.attn.is_none() {
@@ -3192,7 +3224,11 @@ impl KeryxdHandler {
         let before: Vec<String> = self.pending_traces.keys().cloned().collect();
         let inflight: HashSet<String> = self.opening_inflight.values().map(|o| o.response_txid.clone()).collect();
         self.pending_traces.retain(|txid, p| match p.draw.as_ref() {
-            None => p.submitted_daa + TRACE_UNDRAWN_LIMIT_DAA > daa,
+            None => keep_undrawn_trace(
+                p.submitted_daa, daa, p.accepted_hash.is_some(), p.node_awaits,
+                p.opening.as_ref().map(|o| o.deadline_daa).into_iter()
+                    .chain(p.attn.as_ref().map(|a| a.deadline_daa)).max(),
+            ),
             Some(d) if !d.audited => d.seed_daa + TRACE_UNAUDITED_GRACE_DAA > daa,
             Some(d) => {
                 let deadline = d.deadline_daa.max(p.attn.as_ref().map_or(0, |a| a.deadline_daa));
@@ -3539,6 +3575,49 @@ mod grpc_tests {
     use super::{
         version_lt, AiRequestKey, BoundedAiRequestQueue, BoundedAiSeen, ChallengeInference, QueuedAiRequest, SeenInsert,
     };
+
+    #[test]
+    fn extended_audit_deadline_survives_opening_serialization_and_reorg() {
+        use borsh::BorshDeserialize;
+        use keryx_miner::trace_store::StoredOpening;
+        let mut opening = Some(StoredOpening {
+            seed_hash: "seed-a".into(), deadline_daa: 10_000,
+            payload: "signed-first-piece".into(), extra: vec!["signed-second-piece".into()],
+        });
+        assert!(super::refresh_stored_opening_deadline(&mut opening, "seed-a", 90_000));
+        let restored = StoredOpening::try_from_slice(&borsh::to_vec(opening.as_ref().unwrap()).unwrap()).unwrap();
+        assert_eq!(restored.deadline_daa, 90_000);
+        assert_eq!(restored.payload, "signed-first-piece");
+        assert_eq!(restored.extra, vec!["signed-second-piece"]);
+        assert!(!super::refresh_stored_opening_deadline(&mut opening, "seed-b", 120_000));
+        assert_eq!(opening.as_ref().unwrap().deadline_daa, 90_000, "different seed must not rewrite this opening");
+        assert!(super::refresh_stored_opening_deadline(&mut opening, "seed-a", 20_000));
+        assert_eq!(opening.as_ref().unwrap().deadline_daa, 20_000, "authoritative reorg reduction must apply too");
+        assert!(!super::refresh_stored_opening_deadline(&mut opening, "seed-a", 20_000));
+        assert!(!super::refresh_stored_opening_deadline(&mut None, "seed-a", 20_000));
+    }
+
+    #[test]
+    fn restored_extended_audit_waits_for_node_with_a_bounded_retention_window() {
+        use super::{keep_undrawn_trace, AUDIT_SPAN_DAA, TRACE_UNDRAWN_LIMIT_DAA};
+        let submitted = 1_000;
+        let ordinary_end = submitted + TRACE_UNDRAWN_LIMIT_DAA;
+        assert!(keep_undrawn_trace(submitted, ordinary_end - 1, false, None, None));
+        assert!(!keep_undrawn_trace(submitted, ordinary_end, false, None, None));
+        // The node extended this accepted response while the miner was offline.
+        // Its restored trace must survive the first tick, before the RPC reply.
+        assert!(keep_undrawn_trace(submitted, ordinary_end + 1, true, None, None));
+        assert!(keep_undrawn_trace(submitted, ordinary_end + 1, true, Some(true), None));
+        assert!(!keep_undrawn_trace(submitted, ordinary_end + 1, true, Some(false), None));
+        assert!(keep_undrawn_trace(submitted, ordinary_end + AUDIT_SPAN_DAA, true, None, None));
+        assert!(!keep_undrawn_trace(submitted, ordinary_end + AUDIT_SPAN_DAA + 1, true, None, None));
+        // An already persisted opening/attention deadline remains valid while
+        // its acceptance or next phase is reconstructed, even if not owed now.
+        let saved = ordinary_end + 50_000;
+        assert!(keep_undrawn_trace(submitted, saved, true, Some(false), Some(saved)));
+        assert!(!keep_undrawn_trace(submitted,
+            saved + keryx_miner::trace::OPENING_BACKLOG_CAP_DAA + 1, true, Some(false), Some(saved)));
+    }
 
     fn key(byte: u8) -> AiRequestKey {
         AiRequestKey([byte; 32])
