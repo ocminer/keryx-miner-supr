@@ -29,7 +29,7 @@ pub const POW_SALT_V4_ACTIVATION_DAA: u64 = 21_932_751;
 /// Must mirror `active_salt_version` in `consensus/pow/src/lib.rs` (compared with `>=`).
 #[inline(always)]
 pub fn active_salt_version(daa_score: u64) -> u8 {
-    if crate::pom::testnet_gates() || daa_score >= POW_SALT_V4_ACTIVATION_DAA {
+    if keryx_miner::pom::testnet_gates() || daa_score >= POW_SALT_V4_ACTIVATION_DAA {
         4
     } else if daa_score >= POW_SALT_V2_ACTIVATION_DAA {
         2
