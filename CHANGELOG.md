@@ -1,3 +1,16 @@
+# keryx-miner-supr 0.16.0 — H16 preparation (unreleased)
+
+- Mirrors the upstream H16 context-pad table: 200 MiB less per tier after the
+  node's `pad_margin_activation` gate. Mining and CPU proofs select the table
+  from each job's DAA score, including jobs across a reorganisation.
+- Includes the qualified CPU/IPFS and exact CUDA solver improvements from the
+  preceding development session, plus cached SM80/SM86 tile loads.
+- Adds a finite staging-gate override and a CUDA transition regression covering
+  pad replacement, reuse and rollback. No model or inference-engine change.
+- **Activation is not yet scheduled upstream.** Mainnet and testnet defaults
+  remain disabled until an authoritative activation value is published. This
+  preparation must not be advertised as a scheduled, automatic mainnet upgrade.
+
 # keryx-miner-supr 0.15.8 — Tesla V100 / Pascal H15 traces and per-card tier pinning
 
 (0.15.7 was an internal build and was not released.)

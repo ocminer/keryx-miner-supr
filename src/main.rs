@@ -1419,6 +1419,15 @@ async fn run() -> Result<(), Error> {
             keryx_miner::pom::private_inference_activation_daa()
         );
     }
+    let h16_gate = keryx_miner::pom::pad_margin_activation_daa();
+    if std::env::var_os("KERYX_PAD_MARGIN_ACTIVATION_DAA").is_some() {
+        warn!("PoM: H16 pad gate override resolves to DAA {} — must match the connected node's consensus parameters.", h16_gate);
+    }
+    if h16_gate == u64::MAX {
+        info!("H16: upstream activation is unscheduled; current context-pad rules remain in use.");
+    } else {
+        info!("H16: context-pad rules follow each job's DAA; switching at DAA {} (200 MiB less per tier).", h16_gate);
+    }
     let specs_all = keryx_miner::models::specs_for(lineup_daa, tier);
     let specs_v2 = if tier_forced {
         info!("--force-model: VRAM capability gate skipped for the forced model — it will load regardless of fit (may OOM an undersized card).");

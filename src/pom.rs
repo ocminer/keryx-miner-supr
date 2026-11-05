@@ -526,10 +526,19 @@ pub fn pom_v5_activation_daa() -> u64 {
     })
 }
 
-/// Node `pad_margin_activation`: switch to the H16 context-pad sizes.
-/// Upstream has not scheduled this gate on any public network yet.
+/// H16 mainnet gate. MUST match the node's `pad_margin_activation`.
+/// Upstream miner 7dc10a7 / node b02f409e still leave this unscheduled.
+pub const POM_H16_ACTIVATION_DAA: u64 = u64::MAX;
+/// H16 testnet gate; upstream currently leaves this unscheduled too.
+pub const TESTNET_H16_ACTIVATION_DAA: u64 = u64::MAX;
+
+/// Node `pad_margin_activation`: switch to the H16 context-pad sizes using each
+/// job's DAA, not wall time or a one-way process-wide activation flag. An explicit
+/// override is for matching a separately configured staging node; it does not
+/// discover or announce a network fork. Defaults remain upstream's unscheduled gates.
 pub fn pad_margin_activation_daa() -> u64 {
-    u64::MAX
+    static G: OnceLock<u64> = OnceLock::new();
+    *G.get_or_init(|| gate("KERYX_PAD_MARGIN_ACTIVATION_DAA", POM_H16_ACTIVATION_DAA, TESTNET_H16_ACTIVATION_DAA))
 }
 
 /// Block-task gate: headers carry `task_root`. MUST equal the node's `block_task_activation`.

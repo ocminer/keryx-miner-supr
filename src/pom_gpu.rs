@@ -6036,6 +6036,48 @@ mod v4_kernel_tests {
         if let Some(v) = saved { std::env::set_var("KERYX_POM_V5_FAST", v); } else { std::env::remove_var("KERYX_POM_V5_FAST"); }
     }
 
+    /// Exercise one live CUDA context across a finite staged H16 gate and a reorg.
+    /// Run in its own process with KERYX_PAD_MARGIN_ACTIVATION_DAA set above H15.
+    /// The pad cache must release/rebuild on size changes and reuse an unchanged pad.
+    #[test]
+    #[ignore]
+    fn v5_h16_gate_transition_exactness() {
+        let gate = crate::pom::pad_margin_activation_daa();
+        assert!(gate > crate::pom::pom_v5_activation_daa() && gate < u64::MAX - 1,
+            "set a finite staged KERYX_PAD_MARGIN_ACTIVATION_DAA after H15");
+        let data = blob(65);
+        let index = crate::pom::index_from_ram(data.clone());
+        let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
+        let n_tiles = index.n_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        let pad_seed = crate::pom_v5::v5_pad_seed(0, &[7u8; 32], &index.r_t);
+        let mut old_pad: Option<std::sync::Weak<V5Pad>> = None;
+        let mut old_size = 0;
+        for daa in [gate - 1, gate, gate + 1, gate - 1, gate] {
+            let n_pad = crate::pom_v5::pom_v5_pad_tiles(0, daa);
+            let k_pad = crate::pom_v5::v5_pad_steps(n_tiles, n_pad) as u32;
+            let pad = miner.v5_pad(&pad_seed, n_pad, k_pad).unwrap();
+            if let Some(old) = old_pad.take() {
+                if old_size == n_pad {
+                    assert!(Arc::ptr_eq(&old.upgrade().unwrap(), &pad), "unchanged pad was rebuilt");
+                } else {
+                    assert!(old.upgrade().is_none(), "old pad survives the fork/reorg replacement");
+                }
+            }
+            assert_eq!(pad.n_pad, n_pad);
+            for nonce in 1000..1003 {
+                let seed = crate::pom::pom_block_seed_h14(&PPH, TS, nonce);
+                let (proof, fs) = crate::pom_v5::build_proof_v5(0, seed, &index, &pad_seed, n_pad).unwrap();
+                assert_eq!(crate::pom_v5::verify_proof_v5(seed, &proof, &index.r_t, index.n_chunks, &pad_seed, n_pad).unwrap(), fs);
+                let pow = crate::pom::pom_pow_value(fs, &PPH, true);
+                assert_eq!(miner.mine_v4_impl(&PPH, TS, &pow, nonce, 1, true, true, Some(&*pad)).unwrap(), Some(nonce));
+                assert_eq!(miner.mine_v4_impl(&PPH, TS, &dec_le(pow), nonce, 1, true, true, Some(&*pad)).unwrap(), None);
+            }
+            println!("H16 transition exact: daa={daa} tiles={n_pad} pad_steps={k_pad}");
+            old_size = n_pad;
+            old_pad = Some(Arc::downgrade(&pad));
+        }
+    }
+
     /// Little-endian 256-bit compare, matching the kernel's `pom_le_leq` ordering.
     fn le_cmp(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
         for i in (0..32).rev() {

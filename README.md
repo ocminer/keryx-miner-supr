@@ -2,6 +2,12 @@
 
 Suprnova fork of the [keryx-labs/keryx-miner](https://github.com/keryx-labs/keryx-miner) GPU miner.
 
+**v0.16.0 H16 preparation:** the reduced context-pad tables and job-DAA transition
+logic are integrated. Upstream has not yet scheduled the activation score, so
+mainnet and testnet retain their current rules by default. See [H16 status and
+transition details](docs/H16.md) before treating this development build as a
+scheduled hard-fork upgrade.
+
 **AMD H15 support:** Vulkan provides mining, verifiable inference and audit replay on
 one card. Mining pauses while that card answers an inference request or audit, then
 resumes; no dedicated inference card is required. Use the complete AMD package so
@@ -19,8 +25,15 @@ historical, pre-H15 measurements and do not describe the new context-pad workloa
 
 ## Performance
 
-The PoW is **Proof-of-Model** — a data-dependent walk over the model weights — so hashrates are in
-**MH/s** and follow memory bandwidth far more than core clock.
+The PoW is **Proof-of-Model**, a data-dependent walk over model weights and, from
+H15, a context pad. Hashrates are in **MH/s**. Performance depends on the model
+tier, memory access, tensor/integer throughput and power settings.
+
+Recent H15 development measurements include the exact fast solver on Ampere and
+Blackwell and cached tile loads on Ampere. The matched CMP/RTX 3070 measurements,
+their control builds and qualification limits are recorded in
+[the 2026-11-05 benchmark notes](docs/benchmarks/2026-11-05-h15-cmp-cache.md).
+The older figures below retain their original version and workload labels.
 
 Measured **2026-08-25 on v0.11.13**, one card at a time on an otherwise idle rig (every other miner
 stopped and verified stopped), stock clocks unless noted, each row pool-verified with **0 rejects**:

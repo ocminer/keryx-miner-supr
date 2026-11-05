@@ -256,5 +256,13 @@ mod tests {
         assert_eq!(pom_v5_pad_tiles(5, gate - 1), 0);
         assert_eq!(pom_v5_pad_tiles(5, gate), 0);
         assert_eq!(pom_v5_pad_tiles(u8::MAX, gate), 0);
+        // Reorgs and interleaved old/new jobs must use their own DAA. Crossing
+        // the gate once must never latch the H16 table for a pre-gate job.
+        for daa in [gate - 1, gate, gate.saturating_add(1), gate - 1, gate] {
+            for tier in 0..POM_V5_PAD_TILES_H14.len() {
+                let expected = if daa < gate { POM_V5_PAD_TILES_H14[tier] } else { POM_V5_PAD_TILES_H16[tier] };
+                assert_eq!(pom_v5_pad_tiles(tier as u8, daa), expected);
+            }
+        }
     }
 }
