@@ -1228,10 +1228,10 @@ extern "C" __global__ void pom_mine_v4_ncf_seeded(
 // XOR is associative over the independent halves; SM80+ warp reductions replace
 // ten 32-bit shuffle operations without changing any state bit or memory barrier.
 #if __CUDA_ARCH__ >= 800
-// Cache the H15/H16 tile loads on SM86. Measured on the RTX 3070; other
-// architectures retain the established L1-bypassing copy and shared-memory policy.
+// Cache H15/H16 tile loads on SM80/86, measured on CMP 170HX and RTX 3070.
+// Other architectures retain the established copy and shared-memory policy.
 __device__ __forceinline__ void v5_fast_cp_async16(void* dst, const void* src) {
-#if __CUDA_ARCH__ == 860
+#if __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 860
     unsigned long long sm = __cvta_generic_to_shared(dst);
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "l"(sm), "l"(src));
 #else

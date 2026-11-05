@@ -16,10 +16,10 @@ Unreleased H16 network behavior and other GPU architectures were not runtime-tes
 
 - Compiler: NVIDIA CUDA 13.4, `nvcc V13.4.92`
 - Source: `src/pom_mine.cu`
-- Source SHA-256: `f7ddd414e51d7ce98cda206cb0ce01b2d21e4a9e612be608457bf0623853fe29`
+- Source SHA-256: `5749b15a1757c1a3fa98abf60d6e3f0c29bb5ee122eb4b51aaa6cfde397120da`
 - Artifact: `cuda/pom_mine.fatbin`
-- Artifact SHA-256: `c099b3c3ef6334499502b24d1d9ad99f2d1d42f956dfc53f8903bf4a2f3d5f28`
-- Artifact size: 5097208 bytes
+- Artifact SHA-256: `531312107190013edff37d28564d2bd5d5c53ff740cf96c6bf89d4c67c395e82`
+- Artifact size: 5097224 bytes
 - Native SASS: sm_75, sm_80, sm_86, sm_87, sm_88, sm_89, sm_90, sm_100, sm_103, sm_110,
   sm_120, sm_121
 - Forward-compatible PTX: compute_75 and compute_80
@@ -31,7 +31,7 @@ Other architectures and pre-H15 jobs retain the established solver. Setting
 Rebuild with `cuda/regenerate-pom-fatbin.sh OUTPUT BASELINE`; retain the baseline
 for the established-kernel SASS comparison. H16 activation remains unscheduled.
 
-CMP 170HX qualification extends the exact fast solver to SM80. SM86 tile copies
-use L1-cached asynchronous loads; the SM80/SM120 fast kernels and all established
+CMP 170HX qualification extends the exact fast solver to SM80. SM80/86 tile copies
+use L1-cached asynchronous loads; the SM120 fast kernel and all established
 entry points above remain instruction-identical. Full-miner validation receipts
 are recorded separately; this is a local optimization candidate.
