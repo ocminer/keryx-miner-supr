@@ -1,18 +1,27 @@
 # PoM CUDA fatbin manifest
 
-H15/H16 solver candidate: the new `pom_mine_v5_ncf_fast_seeded` uses exact warp XOR
+H15/H16 solver candidate: `pom_mine_v5_ncf_fast_seeded` uses exact warp XOR
 reductions and a division-free pad-step calculation for the consensus K=256.
-Established entry points are retained. The rebuild compared all five established
-sm_80 kernels against the previously committed image and found identical SASS.
-GPU exactness passed on a physical RTX 3070, RTX 5080, RTX 5070 Ti and two RTX 5090s.
-Each card passed 700 individual exact-target/one-below checks and 20 batch-target
-checks against independently built and verified CPU proofs across five pad extents,
-including current and H16 tier-0 sizes. The H16 gate remains disabled.
+SM80 and SM86 now use L1-cached asynchronous tile loads. All five established
+entry points on each of SM80, SM86 and SM120 retain instruction-identical SASS,
+as does the SM120 fast kernel. The selected SM80/SM86 fast kernels match the
+measured cache prototypes; SM86 also matches the independently benchmarked
+embedded build.
 
-The established sm_86 and sm_120 kernels also retain instruction-identical SASS
-(all five entry points on each architecture). Matched current-era A/B/B/A mining
-runs and the traced-answer/audit/custody/restart/mining-resume check passed.
-Unreleased H16 network behavior and other GPU architectures were not runtime-tested.
+The preceding solver qualification covered a physical RTX 3070, RTX 5080,
+RTX 5070 Ti and two RTX 5090s. The cache extension adds physical CMP 170HX
+and RTX 3070 qualification: each passed 700 individual exact-target/one-below
+checks and 20 batch-target checks against independent CPU proofs over five
+pad extents, including current and H16 tier-0 sizes. The H16 gate remains
+disabled; unreleased H16 network behavior was not tested.
+
+Matched H15 mining comparisons passed on CMP 170HX and RTX 3070. The final
+Linux binary passed traced-answer/proof/audit/custody/restart/mining-resume
+validation on an RTX 5090. The equivalent CMP workflow remains incomplete:
+the power guard stopped replay after custody upload and fetch after restart.
+Do not interpret CMP hashing qualification as full CMP workflow qualification.
+These are local fixtures, not new production-pool acceptance measurements.
+See `docs/benchmarks/2026-11-05-h15-cmp-cache.md` for measured gains and limits.
 
 - Compiler: NVIDIA CUDA 13.4, `nvcc V13.4.92`
 - Source: `src/pom_mine.cu`
