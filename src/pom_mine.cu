@@ -1222,3 +1222,130 @@ extern "C" __global__ void pom_mine_v4_ncf_seeded(
     const unsigned long long*, unsigned int, unsigned long long*,
     unsigned long long, unsigned long long, unsigned int) {}
 #endif
+
+// H15/H16 state-carrying walk. Keep the established ncf entry point unchanged so
+// unqualified architectures and the explicit fallback retain their original SASS.
+// XOR is associative over the independent halves; SM80+ warp reductions replace
+// ten 32-bit shuffle operations without changing any state bit or memory barrier.
+#if __CUDA_ARCH__ >= 800
+__device__ __forceinline__ unsigned long long v5_fast_state_fold(
+    unsigned int w0, unsigned int w1, unsigned int lane) {
+    const unsigned long long h = mix64((((unsigned long long)w1 << 32) | w0) ^ (unsigned long long)lane);
+    const unsigned int lo = __reduce_xor_sync(0xffffffffu, (unsigned int)h);
+    const unsigned int hi = __reduce_xor_sync(0xffffffffu, (unsigned int)(h >> 32));
+    return ((unsigned long long)hi << 32) | lo;
+}
+
+__device__ __forceinline__ bool v5_fast_is_pad_step(
+    unsigned int step, unsigned int K, unsigned int k_pad) {
+    // Consensus uses 256 steps. Keep the generic division for a different K.
+    return K == 256u
+        ? ((step * k_pad) >> 8) != (((step - 1u) * k_pad) >> 8)
+        : v5_is_pad_step(step, K, k_pad);
+}
+
+extern "C" __global__ void pom_mine_v5_ncf_fast_seeded(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long n_tiles, unsigned int K,
+    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
+    unsigned long long time_,
+    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
+    unsigned long long nonce_base, unsigned long long n_nonces,
+    const unsigned short* lut, unsigned int lut_sh, unsigned long long inv_n,
+    const unsigned long long* h10_seeds, unsigned int h10, unsigned long long* winner,
+    unsigned long long n_pad, unsigned long long inv_p, unsigned int k_pad) {
+    // PoM v5 (H15): k_pad != 0 => the offset folds the walk state and routes k_pad of the K steps to
+    // the context pad, addressed as tiles [n_tiles, n_tiles+n_pad) through the SAME lut/prefix (the
+    // host appends the pad as one extra gather segment and rebuilds the LUT over it). inv_p =
+    // Barrett reciprocal of n_pad. k_pad == 0 keeps the byte-exact v4 walk. State-carrying by
+    // construction (s_state), so this fast chaseless kernel stays the v5 production path.
+    extern __shared__ unsigned int s_shared[];
+    const unsigned int w = threadIdx.x >> 5;
+    const unsigned int x = threadIdx.x & 31u;
+    const unsigned long long i = (unsigned long long)blockIdx.x * V4_NCF_WARPS + w;
+    if (i >= n_nonces) return;
+    // per-warp smem: [state 1 KB][2 alternating tile buffers 2 KB]
+    unsigned int* s_warp = s_shared + w * (3u * 256u);
+    unsigned int* s_state = s_warp;
+    unsigned int* s_tiles = s_warp + 256u;
+
+    const unsigned long long nonce = nonce_base + i;
+    // Select/load the already-produced H10 seed on lane 0 and broadcast; pre-H10 retains the cheap
+    // reversible fold on lane 0. Every lane then starts from the identical consensus seed.
+    unsigned long long seed = ((threadIdx.x & 31u) == 0u)
+        ? pom_seed_fold_era(h10, h10_seeds, i, nonce, time_, s0, s1, s2, s3) : 0ULL;
+    seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
+    unsigned long long off = v4_barrett_mod(mix64(seed ^ V4_OFFSET_FIRST_SALT), n_tiles, inv_n);
+    // Issue the first dependent tile before generating S_0, hiding part of its cold latency.
+    {
+        const ulonglong2* q = v4_chunk_addr_lut(bases, prefix, T, lut, lut_sh, off, x);
+        ulonglong2* dst = (ulonglong2*)(s_tiles + 256u + x * 8);   // tile 1 -> buffer (1&1)=1
+        v4_cp_async16(dst, q); v4_cp_async16(dst + 1, q + 1);
+        asm volatile("cp.async.commit_group;");
+    }
+    { unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)x));
+      #pragma unroll
+      for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); s_state[x * 8u + k4] = (unsigned int)h; } }
+    __syncwarp();
+
+    for (unsigned int step = 1; step <= K; step++) {
+        unsigned int* cur = s_tiles + (step & 1u) * 256u;
+        asm volatile("cp.async.wait_group 0;");
+        __syncwarp();
+        if (step < K) {
+            unsigned long long sf = 0;
+            #pragma unroll
+            for (int wd = 0; wd < 8; wd++) sf = mix64(sf ^ (unsigned long long)cur[wd]);
+            // PoM v5: fold S_{step-1} (first two words of every lane's row, warp-reduced) into the
+            // offset and route pad steps into the pad range. s_state still holds S_{step-1} here —
+            // v4_imma_step(step) runs below — matching pom_v5::v5_next_offset exactly.
+            const unsigned long long hs = k_pad != 0u ? v5_fast_state_fold(s_state[x * 8u], s_state[x * 8u + 1u], x) : 0ULL;
+            const unsigned long long raw = mix64(seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf ^ hs);
+            off = v5_fast_is_pad_step(step + 1u, K, k_pad)
+                ? n_tiles + v4_barrett_mod(raw, n_pad, inv_p)
+                : v4_barrett_mod(raw, n_tiles, inv_n);
+            const ulonglong2* q = v4_chunk_addr_lut(bases, prefix, T, lut, lut_sh, off, x);
+            ulonglong2* dst = (ulonglong2*)(s_tiles + ((step + 1u) & 1u) * 256u + x * 8);
+            v4_cp_async16(dst, q); v4_cp_async16(dst + 1, q + 1);
+        }
+        asm volatile("cp.async.commit_group;");
+        v4_imma_step(s_state, cur, step, x);
+    }
+    asm volatile("cp.async.wait_group 0;");
+    __syncwarp();
+
+    // root_K + fold, verbatim reference tail.
+    unsigned int row4[V4_D4];
+    #pragma unroll
+    for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = s_state[x * 8u + k4];
+    unsigned int* s_tile = s_tiles;
+    b3_hash_row32(row4, s_tile + x * 8);
+    __syncwarp();
+    unsigned int* src = s_tile; unsigned int* dst = s_tile + V4_D * 8;
+    for (unsigned int n = V4_D; n > 1; n >>= 1) {
+        if (x < n / 2) b3_hash_pair(src + x * 16, dst + x * 8);
+        __syncwarp();
+        unsigned int* tmp = src; src = dst; dst = tmp;
+    }
+    if (x == 0) {
+        const unsigned long long fin = (unsigned long long)src[0] | ((unsigned long long)src[1] << 32);
+        unsigned long long pv[4];
+        pom_pow_fold(fin, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, i);
+    }
+}
+
+#else
+extern "C" __global__ void pom_mine_v5_ncf_fast_seeded(
+    const unsigned long long*, const unsigned long long*, unsigned int,
+    unsigned long long, unsigned int,
+    unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long,
+    const unsigned short*, unsigned int, unsigned long long,
+    const unsigned long long*, unsigned int, unsigned long long*,
+    unsigned long long, unsigned long long, unsigned int) {}
+#endif

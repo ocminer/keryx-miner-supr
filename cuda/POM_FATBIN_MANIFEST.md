@@ -1,38 +1,24 @@
 # PoM CUDA fatbin manifest
 
-This manifest identifies the modern walk image committed for the v0.13.0 optimization work. Build
-it with `cuda/regenerate-pom-fatbin.sh`; the script refuses incomplete architecture coverage and can
-compare all established GA100 entry points against a baseline before an artifact is installed.
+H15/H16 solver candidate: the new `pom_mine_v5_ncf_fast_seeded` uses exact warp XOR
+reductions and a division-free pad-step calculation for the consensus K=256.
+Established entry points are retained. The rebuild compared all five established
+sm_80 kernels against the previously committed image and found identical SASS.
+GPU qualification is recorded separately before this candidate is promoted.
 
-- Compiler: NVIDIA CUDA 13.4, `nvcc V13.4.92` (PoM v5: `pom_v5_pad_fill`; `n_pad,inv_p,k_pad` appended to `pom_mine_v4_seeded` AND the chaseless `pom_mine_v4_ncf_seeded` [state-fold + Barrett pad routing]; dev build, SASS baseline gate not run)
+- Compiler: NVIDIA CUDA 13.4, `nvcc V13.4.92`
 - Source: `src/pom_mine.cu`
-- Source SHA-256: `6af7350d55c728306bcec9d21b2f7486c26593ec4cb52ac6eaec102756e0eeef`
+- Source SHA-256: `d6d41e16f60c0f660a2f7636117a32b1ab9bdc4f8adb9df601aff5574a39de5b`
 - Artifact: `cuda/pom_mine.fatbin`
-- Artifact SHA-256: `0a16f82a472ce70388ee89e45793193c1586607b19d64534eef45f960f98275e`
-- Artifact size: 4506920 bytes
+- Artifact SHA-256: `e0d40f6c09d6d638a602c0db5f31db41e4b23b0863f3e62531472790153378a7`
+- Artifact size: 5097208 bytes
 - Native SASS: sm_75, sm_80, sm_86, sm_87, sm_88, sm_89, sm_90, sm_100, sm_103, sm_110,
   sm_120, sm_121
 - Forward-compatible PTX: compute_75 and compute_80
 
-The candidate passed the ignored `v4_sidecar_folds_offsets_and_winners_match_host` test on a
-physical sm_80 CMP170HX: all 2,048 model folds; pre-H10 and H10 offset chains at batches
-1/31/32/33/255/256/257; and winners from established TC plus both sidecar combinations matched the
-host oracle.
+The host selects the new entry point only for context-pad jobs on sm_86 and sm_120.
+Other architectures and pre-H15 jobs retain the established solver. Setting
+`KERYX_POM_V5_FAST=0` selects the established path for diagnosis.
 
-The five established sm_80 kernels were instruction-identical to the previous committed image:
-
-| Entry point | SASS SHA-256 |
-| --- | --- |
-| `pom_mine_v4_seeded` | `05afd978713adcc08bf9adeca20be4a64668441e921a28b68c93c96ddc03e9b6` |
-| `pom_mine_v4_chase_seeded` | `9d4febe977dec3fda13306b3f085434c16ec545d62ffffcd4d89f3f2d8219029` |
-| `pom_mine_v4_tc_seeded` | `fa79e2e2ed39e913acc998a313fef698b7f9caa10beb7eb68e018e57354c7410` |
-| `pom_mine_v4_ncf_seeded` | `7d973862f65dd331e132998ee365d37992fa60c023b6fbbcaae0a34970b6257e` |
-| `pom_seed_h10_batch` | `16456c3fa441368cfeaf684efa2b93e1026cb69a9f60e9ad85b7c82f96497758` |
-
-Example protected rebuild:
-
-```console
-cuda/regenerate-pom-fatbin.sh /tmp/pom-all.fatbin cuda/pom_mine.fatbin
-```
-
-Only replace `cuda/pom_mine.fatbin` after the SASS gate and GPU exactness test pass.
+Rebuild with `cuda/regenerate-pom-fatbin.sh OUTPUT BASELINE`; retain the baseline
+for the established-kernel SASS comparison. H16 activation remains unscheduled.

@@ -1191,7 +1191,15 @@ impl PomGpuMiner {
             // batch and its duplicate snippet reads disappear. Measured +7-8% on a 5090 at a 64K
             // batch and +24% at 8K (byte-exact, see pom_mine_v4_ncf). KERYX_POM_V4_NCF=0 falls
             // back to the chase+tc pipeline below.
-            let walk = load_walk_func(&self.cuda, "pom_mine_v4_ncf_seeded")?;
+            // Qualified on Ampere GDDR and Blackwell consumer cards. Other architectures,
+            // pre-H15 jobs and KERYX_POM_V5_FAST=0 retain the established solver.
+            let fast_v5 = v5.is_some()
+                && std::env::var("KERYX_POM_V5_FAST").as_deref() != Ok("0")
+                && matches!(self.stream.context().compute_capability(), Ok((8, 6) | (12, 0)));
+            let walk = load_walk_func(
+                &self.cuda,
+                if fast_v5 { "pom_mine_v5_ncf_fast_seeded" } else { "pom_mine_v4_ncf_seeded" },
+            )?;
             // v5: gather map + LUT over the padded layout and the real pad params; pre-gate: the
             // base map, base LUT and pad disabled (n_pad = inv_p = k_pad = 0 => byte-exact v4).
             let (wbases, wprefix, wt_count, lut, lut_sh, v5_n_pad, v5_inv_p, v5_k_pad): (&CudaSlice<u64>, &CudaSlice<u64>, u32, Arc<CudaSlice<u16>>, u32, u64, u64, u32) =
@@ -5975,6 +5983,55 @@ mod v4_kernel_tests {
             "GPU v5 pad walk found the nonce below the host pow — divergence"
         );
         println!("PoM v5 BIT-EXACT OK (GPU pad walk == host; n_tiles={n_tiles} n_pad={N_PAD} k_pad={k_pad})");
+    }
+
+    /// H15 and H16 retain the same state transition but use different pad extents. Check
+    /// every nonce against the CPU oracle at its exact target and one below, then check
+    /// the unique minimum of a batch with a partial final workgroup.
+    #[test]
+    #[ignore]
+    fn v5_h15_h16_fast_walk_exactness() {
+        let saved = std::env::var("KERYX_POM_V5_FAST").ok();
+        let data = blob(65);
+        let index = crate::pom::index_from_ram(data.clone());
+        let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
+        let n_tiles = index.n_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        let pad_seed = crate::pom_v5::v5_pad_seed(0, &[7u8; 32], &index.r_t);
+        assert!(matches!(miner.stream.context().compute_capability(), Ok((8, 6) | (12, 0))), "fast-path qualification requires sm86 or sm120 hardware");
+        assert_eq!(miner.v4_walk_kind(), "chaseless");
+        let pads = [1, 200, 1023, crate::pom_v5::POM_V5_PAD_TILES_H14[0], crate::pom_v5::POM_V5_PAD_TILES_H16[0]];
+        for n_pad in pads {
+            let k_pad = crate::pom_v5::v5_pad_steps(n_tiles, n_pad) as u32;
+            let pad = miner.v5_pad(&pad_seed, n_pad, k_pad).unwrap();
+            const BASE: u64 = 1000;
+            const BATCH: u64 = 35; // includes a partial last warp group
+            let mut pows = Vec::new();
+            for nonce in BASE..BASE + BATCH {
+                let seed = crate::pom::pom_block_seed_h14(&PPH, TS, nonce);
+                let (proof, fs) = crate::pom_v5::build_proof_v5(0, seed, &index, &pad_seed, n_pad).unwrap();
+                assert_eq!(crate::pom_v5::verify_proof_v5(seed, &proof, &index.r_t, index.n_chunks, &pad_seed, n_pad).unwrap(), fs);
+                pows.push(crate::pom::pom_pow_value(fs, &PPH, true));
+            }
+            for fast in ["0", "1"] {
+                std::env::set_var("KERYX_POM_V5_FAST", fast);
+                for (i, pow) in pows.iter().enumerate() {
+                    let nonce = BASE + i as u64;
+                    assert_eq!(miner.mine_v4_impl(&PPH, TS, pow, nonce, 1, true, true, Some(&*pad)).unwrap(), Some(nonce), "exact target: fast={fast} pad={n_pad} nonce={nonce}");
+                    assert_eq!(miner.mine_v4_impl(&PPH, TS, &dec_le(*pow), nonce, 1, true, true, Some(&*pad)).unwrap(), None, "below target: fast={fast} pad={n_pad} nonce={nonce}");
+                }
+                // Select a range whose unique best nonce is off lane zero, so a wrong
+                // warp broadcast cannot accidentally satisfy this single-winner target.
+                let (begin, best) = (0..BATCH as usize - 1).find_map(|begin| {
+                    let best = (begin..BATCH as usize).min_by(|&a, &b| le_cmp(&pows[a], &pows[b])).unwrap();
+                    ((best - begin) % 32 != 0).then_some((begin, best))
+                }).expect("test vector must put the winner off lane zero");
+                let expected = Some(BASE + best as u64);
+                assert_eq!(miner.mine_v4_impl(&PPH, TS, &pows[best], BASE + begin as u64, BATCH - begin as u64, true, true, Some(&*pad)).unwrap(), expected);
+                assert_eq!(miner.mine_v4_impl(&PPH, TS, &dec_le(pows[best]), BASE + begin as u64, BATCH - begin as u64, true, true, Some(&*pad)).unwrap(), None);
+                println!("v5 exact: fast={fast} pad={n_pad} k_pad={k_pad} nonces={BATCH} winner={}", expected.unwrap());
+            }
+        }
+        if let Some(v) = saved { std::env::set_var("KERYX_POM_V5_FAST", v); } else { std::env::remove_var("KERYX_POM_V5_FAST"); }
     }
 
     /// Little-endian 256-bit compare, matching the kernel's `pom_le_leq` ordering.
