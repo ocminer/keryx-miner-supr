@@ -2,11 +2,12 @@
 
 Suprnova fork of the [keryx-labs/keryx-miner](https://github.com/keryx-labs/keryx-miner) GPU miner.
 
-**v0.16.0 H16 preparation:** the reduced context-pad tables and job-DAA transition
-logic are integrated. Upstream has not yet scheduled the activation score, so
-mainnet and testnet retain their current rules by default. See [H16 status and
-transition details](docs/H16.md) before treating this development build as a
-scheduled hard-fork upgrade.
+**v0.16.0 H16 upgrade:** compatible with keryx-node **v1.6.7**. Normal mining
+continues until mainnet DAA **147,000,000**, then the miner automatically switches
+to the H16 rules (testnet: **180,000**). Every tier uses 200 MiB less context-pad
+memory after activation. Solo mode includes the new awaited-request RPC,
+coordination between rigs sharing an address, and reconnect recovery.
+[H16 compatibility and transition details](docs/H16.md).
 
 **AMD H15 support:** Vulkan provides mining, verifiable inference and audit replay on
 one card. Mining pauses while that card answers an inference request or audit, then

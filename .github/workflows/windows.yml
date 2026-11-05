@@ -119,11 +119,13 @@ jobs:
           $ErrorActionPreference = "Stop"
           $env:PATH = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin;$env:PATH"
           cargo test --locked --release --target $env:TARGET --features pom-opencl -p keryx-miner-supr pad_tables_and_gate_match_h16_node -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "unscheduled H16 gate regression failed" }
+          if ($LASTEXITCODE -ne 0) { throw "default H16 gate regression failed" }
           $env:KERYX_PAD_MARGIN_ACTIVATION_DAA = "160000000"
           cargo test --locked --release --target $env:TARGET --features pom-opencl -p keryx-miner-supr pad_tables_and_gate_match_h16_node -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "finite H16 gate regression failed" }
-          Remove-Item Env:KERYX_PAD_MARGIN_ACTIVATION_DAA
+          Remove-Item Env:KERYX_PAD_MARGIN_ACTIVATION_DAA -ErrorAction SilentlyContinue
+          cargo test --locked --release --target $env:TARGET --features pom-opencl -p keryx-miner-supr h16_ -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "H16 request scheduling regression failed" }
           cargo test --locked --release --target $env:TARGET --features pom-opencl -p keryx-miner-supr extended_audit -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "extended audit restart regression failed" }
 

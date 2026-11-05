@@ -64,6 +64,8 @@ jobs:
             -p keryx-miner-supr --features pom-metal pad_tables_and_gate_match_h16_node -- --test-threads=1
           cargo test --locked --release -p keryx-miner-supr --features pom-metal \
             extended_audit -- --test-threads=1
+          cargo test --locked --release -p keryx-miner-supr --features pom-metal \
+            h16_ -- --test-threads=1
 
       # Byte-exact gate: the Metal walk winner MUST equal the pom.rs CPU reference over a synthetic
       # blob. NON-BLOCKING (continue-on-error): GitHub's macOS runners have a PARAVIRTUALIZED Metal

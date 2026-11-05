@@ -243,6 +243,8 @@ mod tests {
 
     #[test]
     fn pad_tables_and_gate_match_h16_node() {
+        assert_eq!(crate::pom::POM_H16_ACTIVATION_DAA, 147_000_000);
+        assert_eq!(crate::pom::TESTNET_H16_ACTIVATION_DAA, 180_000);
         assert_eq!(POM_V5_PAD_TILES_H14, [638_976, 3_213_312, 4_804_608, 6_471_680, 2_450_432]);
         assert_eq!(POM_V5_PAD_TILES_H16, [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632]);
         let gate = crate::pom::pad_margin_activation_daa();

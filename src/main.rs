@@ -1375,6 +1375,16 @@ async fn run() -> Result<(), Error> {
     // the PRIMARY = biggest tier across cards: it drives the inference lineup (OPoI runs on the
     // largest card), the prefetch, and the power-limit check. Per-card overrides for smaller cards
     // are registered after the primary model is set up (search: set_device_model).
+    #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+    {
+        let selected = keryx_miner::slm::cli_cuda_devices();
+        if !selected.is_empty() {
+            let present = keryx_miner::pom_gpu::query_all_gpus_vram();
+            if let Some(id) = selected.iter().find(|&&id| !present.iter().any(|(gpu, _)| *gpu as usize == id)) {
+                return Err(format!("--cuda-device {}: no such CUDA device on this machine", id).into());
+            }
+        }
+    }
     #[cfg(not(feature = "pom-opencl"))]
     let device_tiers = resolve_device_tiers(&opt);
     #[cfg(not(feature = "pom-opencl"))]

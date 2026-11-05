@@ -125,6 +125,8 @@ struct Engine {
     gguf: String,
     /// Context the model was loaded with (tokens) — bounds the prompt an unguarded library can take.
     n_ctx: c_int,
+    /// Largest restored context that fitted with compute-buffer headroom.
+    ctx_fit: c_int,
     /// `keryx_llama_prompt_guard() == 1`: the library chunks the prompt by n_batch and refuses (-2)
     /// one that does not fit the context. Older libraries feed the whole prompt as ONE batch and
     /// llama.cpp GGML_ASSERTs `n_tokens <= n_batch` — aborting the whole miner on one request.
@@ -387,6 +389,7 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             tensor_device,
             gguf: gguf.to_string(),
             n_ctx,
+            ctx_fit: n_ctx,
             prompt_guard,
             ctx_acquire,
             trace_configure,
@@ -779,7 +782,7 @@ pub fn generate_on(gpu: usize, prompt: &str, max_tokens: usize) -> Option<String
     let e = g.as_mut()?;
     // H15: a post-gate grind may have shrunk this context to the block-task size; inference needs
     // the full one (this also releases the device's PoM v5 pad).
-    if let Err(err) = ensure_full_context(e, gpu) {
+    if let Err(err) = ensure_full_context(e, gpu, 0) {
         log::warn!("llama engine: cannot restore the inference context on GPU {}: {}", gpu, err);
         return None;
     }
@@ -800,7 +803,7 @@ pub fn generate_for(gpu: usize, gguf: &str, prompt: &str, max_tokens: usize) -> 
         log::warn!("llama engine: refusing generation on GPU {}: requested model is not resident", gpu);
         return Err(GenerateError::Failed);
     }
-    if let Err(err) = ensure_full_context(e, gpu) {
+    if let Err(err) = ensure_full_context(e, gpu, 0) {
         log::warn!("llama engine: cannot restore the inference context on GPU {}: {}", gpu, err);
         return Err(GenerateError::Failed);
     }
@@ -941,24 +944,48 @@ fn engine_error(e: &Engine, fallback: &str) -> String {
 
 /// Brings back the load-size context (after a block-task context). Falls back to the model's
 /// context floor when the full size no longer fits next to the pad.
-fn ensure_full_context(e: &mut Engine, gpu: usize) -> Result<(), String> {
-    if e.ctx_full && e.ctx_now > 0 {
+fn ensure_full_context(e: &mut Engine, gpu: usize, need: usize) -> Result<(), String> {
+    if e.ctx_full && e.ctx_now > 0 && e.ctx_now as usize >= need {
         return Ok(());
     }
     // The PoM v5 pad sits in the space the full KV cache needs — give it back first.
     #[cfg(feature = "pom-cuda")]
     crate::pom_gpu::release_pad(gpu as u32);
-    let mut got = unsafe { (e.ctx_acquire)(e.model, e.n_ctx) };
+    let floor = crate::models::spec_for_gguf(&e.gguf).map_or(e.n_ctx, |m| (m.ctx_floor as c_int).min(e.n_ctx));
+    let minimum = floor.max(need.min(c_int::MAX as usize) as c_int).min(e.n_ctx);
+    let start = if minimum > e.ctx_fit { e.n_ctx } else { e.ctx_fit.max(minimum) };
+    let mut got = -1;
+    let mut fitted = None;
+    for n in crate::models::context_ladder(start, minimum) {
+        got = unsafe { (e.ctx_acquire)(e.model, n) };
+        if got < 0 {
+            continue;
+        }
+        #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
+        let free = crate::pom_gpu::query_device_free_vram_mib(gpu);
+        #[cfg(not(all(feature = "pom-cuda", not(feature = "pom-opencl"))))]
+        let free: Option<u64> = None;
+        if n == minimum || free.is_none_or(|mib| mib >= 1024) {
+            break;
+        }
+        fitted.get_or_insert(n);
+    }
     if got < 0 {
-        if let Some(floor) = crate::models::spec_for_gguf(&e.gguf).map(|m| m.ctx_floor as c_int).filter(|f| *f < e.n_ctx) {
-            log::warn!("llama engine: {}-token context did not fit on GPU {} — retrying at the {}-token floor", e.n_ctx, gpu, floor);
-            got = unsafe { (e.ctx_acquire)(e.model, floor) };
+        if let Some(n) = fitted {
+            got = unsafe { (e.ctx_acquire)(e.model, n) };
         }
     }
     e.ctx_now = got.max(0);
     e.ctx_full = got >= 0;
     if got < 0 {
         return Err(engine_error(e, "context allocation failed"));
+    }
+    if got < e.n_ctx && got < e.ctx_fit {
+        log::warn!("llama engine: {}-token context too large for GPU {} — using {} tokens", e.n_ctx, gpu, got);
+    }
+    e.ctx_fit = got;
+    if (got as usize) < need {
+        return Err(format!("llama engine: {}-token context cannot hold {} positions on GPU {}", got, need, gpu));
     }
     log::info!("llama engine: {}-token context restored on GPU {}", got, gpu);
     Ok(())
@@ -977,7 +1004,7 @@ fn ensure_context_for(e: &mut Engine, gpu: usize, n_pos: usize) -> Result<(), St
             return Ok(());
         }
     }
-    ensure_full_context(e, gpu)
+    ensure_full_context(e, gpu, n_pos)
 }
 
 /// Shrinks the engine context of `gpu` to the block-task size (frees the big KV cache so the PoM
@@ -1004,7 +1031,7 @@ pub fn use_full_context(gpu: usize) -> Result<(), String> {
     let slot = slot_for(gpu);
     let mut g = slot.inner.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().ok_or_else(|| "no engine on this GPU".to_string())?;
-    ensure_full_context(e, gpu)
+    ensure_full_context(e, gpu, 0)
 }
 
 /// Arms the canonical trace on the engine hosting `gguf` on `gpu`; returns the leaves per position.
@@ -1014,7 +1041,7 @@ pub fn trace_configure(gguf: &str, gpu: usize, manifest: &[u8]) -> Result<usize,
     let e = g.as_mut().filter(|e| e.gguf == gguf).ok_or_else(|| "no engine hosts this model".to_string())?;
     // max_pos = 0 sizes the pinned leaf buffer from the CURRENT context: arm with the full one
     // resident, never with the 64-token block-task context a previous grind may have left.
-    ensure_full_context(e, gpu)?;
+    ensure_full_context(e, gpu, 0)?;
     let rc = unsafe { (e.trace_configure)(e.model, manifest.as_ptr() as *const c_void, manifest.len(), 0) };
     if rc != 0 {
         return Err(engine_error(e, &format!("trace configuration failed ({rc})")));
@@ -1068,7 +1095,7 @@ pub fn replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, pos: u32, l
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
     // 0.15.3: always the load-size context, like the traced run (n_batch, hence the ubatch
     // boundaries the trace commits, follow the context size). Upstream v0.5.8.
-    ensure_full_context(e, gpu)?;
+    ensure_full_context(e, gpu, 0)?;
     let e = &*e;
     let mut x = vec![0u8; CAPTURE_CAP];
     let mut y = vec![0u8; CAPTURE_CAP];
@@ -1136,7 +1163,7 @@ pub fn generate_traced(
     let slot = slot_for(gpu);
     let mut g = slot.inner.lock().map_err(|_| GenError::Unavailable)?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or(GenError::Unavailable)?;
-    ensure_full_context(e, gpu).map_err(GenError::Failed)?;
+    ensure_full_context(e, gpu, 0).map_err(GenError::Failed)?;
     let e = &*e;
     let cp = CString::new(prompt).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
     let rest = CString::new(prefix.as_ref().map_or("", |p| p.rest)).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
@@ -1221,7 +1248,7 @@ pub fn seq_configure(gguf: &str, gpu: usize, layers: &[SeqLayer], n_attn: u32, n
     if e.seq_layout == key && e.seq_leaves == n_leaves {
         return Ok(n_leaves);
     }
-    ensure_full_context(e, gpu)?;
+    ensure_full_context(e, gpu, 0)?;
     let rc = unsafe { (e.seq_configure)(e.model, layers.as_ptr() as *const u32, layers.len() as u32, n_attn, n_recur, seq_heads, interval) };
     if rc != 0 {
         e.seq_leaves = 0;
@@ -1241,7 +1268,7 @@ pub fn seq_replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, spans: 
         .as_mut()
         .filter(|e| e.gguf == gguf && e.trace_leaves > 0 && e.seq_leaves > 0)
         .ok_or_else(|| "no sequenced engine hosts this model".to_string())?;
-    ensure_full_context(e, gpu)?;
+    ensure_full_context(e, gpu, tokens.len())?;
     let stream: Vec<u32> = spans.iter().map(|s| s.0).collect();
     let lo: Vec<u64> = spans.iter().map(|s| s.1).collect();
     let hi: Vec<u64> = spans.iter().map(|s| s.2).collect();
@@ -1304,7 +1331,7 @@ pub fn replay_multi(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, caps:
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
     // 0.15.3: always the load-size context, like the traced run (n_batch, hence the ubatch
     // boundaries the trace commits, follow the context size). Upstream v0.5.8.
-    ensure_full_context(e, gpu)?;
+    ensure_full_context(e, gpu, tokens.len())?;
     let e = &*e;
     let pos: Vec<u32> = caps.iter().map(|c| c.0).collect();
     let leaf: Vec<u32> = caps.iter().map(|c| c.1).collect();

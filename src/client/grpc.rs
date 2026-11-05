@@ -11,6 +11,9 @@ use crate::proto::{
 use crate::{miner::MinerManager, Error};
 use keryx_miner::slm::InferenceError;
 
+mod request_schedule;
+use request_schedule::Schedule;
+
 fn account_inference_result(
     result: std::result::Result<String, InferenceError>,
     attempt: &mut keryx_miner::runtime_stats::InferenceAttempt,
@@ -189,6 +192,14 @@ impl BoundedAiRequestQueue {
         self.entries.front()
     }
 
+    fn get(&self, index: usize) -> Option<&QueuedAiRequest> {
+        self.entries.get(index)
+    }
+
+    fn remove(&mut self, index: usize) -> Option<QueuedAiRequest> {
+        self.entries.remove(index)
+    }
+
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -365,6 +376,12 @@ pub struct KeryxdHandler {
     node_awaited_openings: bool,
     last_awaited_poll: std::time::Instant,
     awaited_polled: Vec<String>,
+    request_schedule: Schedule,
+    awaited_requests_polled: Vec<(AiRequestKey, [u8; 32])>,
+    awaited_poll_pending: bool,
+    awaited_poll_sent: std::time::Instant,
+    force_awaited_poll: bool,
+    last_providers_poll: std::time::Instant,
 
     /// Request identities (`request_hash`) this escrow key has already answered on-chain. Such a
     /// request is never served again: the node rejects the duplicate and the inference would be
@@ -451,6 +468,7 @@ impl Client for KeryxdHandler {
                     // GetBlockTemplate RPC is emitted by any 200 ms tick.
                     let regular_finished = self.inference_rx.is_some() && self.poll_inference().await;
                     self.trace_tick().await?;
+                    self.try_start_inference();
                     let challenge_finished = !regular_finished && self.challenge_inference_ready();
                     let models_now_ready =
                         self.template_deferred_for_models && keryx_miner::slm::has_proven_serveable_model();
@@ -567,7 +585,7 @@ impl KeryxdHandler {
         let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone());
         let trace_store = keryx_miner::trace_store::TraceStore::new(&trace_state_file);
         let (restored_traces, restored_openings) = Self::restore_traces(&trace_store);
-        Ok(Box::new(Self {
+        let mut handler = Box::new(Self {
             client,
             stream,
             send_channel,
@@ -599,6 +617,12 @@ impl KeryxdHandler {
             node_awaited_openings: false,
             last_awaited_poll: std::time::Instant::now(),
             awaited_polled: Vec::new(),
+            request_schedule: Schedule::default(),
+            awaited_requests_polled: Vec::new(),
+            awaited_poll_pending: false,
+            awaited_poll_sent: std::time::Instant::now(),
+            force_awaited_poll: false,
+            last_providers_poll: std::time::Instant::now() - std::time::Duration::from_secs(60),
             ai_answered_by_me: HashSet::new(),
             template_deferred_for_models: false,
             challenge_inference: None,
@@ -613,7 +637,35 @@ impl KeryxdHandler {
             last_strike_poll: std::time::Instant::now() - std::time::Duration::from_secs(55),
             strike_status: None,
             runtime_generation,
-        }))
+        });
+        handler.restore_parked_requests();
+        Ok(handler)
+    }
+
+    fn restore_parked_requests(&mut self) {
+        let Some(parked) = PARKED_AI.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
+        if parked.address != self.miner_address || parked.escrow != self.escrow_pubkey {
+            keryx_miner::runtime_stats::record_inference_abandoned_requests(
+                keryx_miner::runtime_stats::InferenceKind::SoloRequest, parked.queue.len());
+            return;
+        }
+        self.ai_request_queue = parked.queue;
+        self.ai_seen_keys = parked.seen;
+        self.ai_request_txids = parked.txids;
+        self.inference_rx = parked.inference;
+        self.replay_rx = parked.replay;
+        self.persisting = parked.persisting;
+        self.ai_response_inflight = parked.responses;
+        self.response_resend = parked.resend;
+        self.ai_answered_by_me = parked.answered;
+        self.request_schedule = parked.schedule;
+        // Poll again after reconnect; stale sibling/closed checks cannot decide new-chain work.
+        self.request_schedule.checks.clear();
+        self.request_schedule.siblings.clear();
+        self.force_awaited_poll = true;
+        keryx_miner::runtime_stats::set_connection_inference_queue(
+            self.runtime_generation, self.ai_request_queue.len(), AI_REQUEST_QUEUE_CAPACITY);
+        info!("Inference: restored {} queued request(s) after node reconnect", self.ai_request_queue.len());
     }
 
     fn create_block_channel(send_channel: Sender<KaspadMessage>) -> (Sender<BlockSeed>, BlockHandle) {
@@ -733,6 +785,7 @@ impl KeryxdHandler {
     /// Central terminal cleanup. Metadata is removed on every outcome; retryable failures also
     /// remove the replay marker so a later block/template observation can queue the request again.
     fn finish_ai_request(&mut self, key: AiRequestKey, keep_seen: bool) -> Option<(String, u64)> {
+        self.request_schedule.remove(&key);
         let escrow = self.ai_request_txids.remove(&key);
         if !keep_seen {
             self.ai_seen_keys.remove(&key);
@@ -767,6 +820,9 @@ impl KeryxdHandler {
             }
         }
 
+        self.drop_unawaited_requests();
+        self.request_schedule.queued_at.insert(key, std::time::Instant::now());
+        self.force_awaited_poll = true;
         if let Some(evicted) = self.ai_request_queue.push_back(request) {
             warn!(
                 "OPoI: AiRequest queue full ({}); evicting oldest queued id={}",
@@ -1070,14 +1126,17 @@ impl KeryxdHandler {
     /// Starts SLM inference for the next queued AiRequest, if no inference or opening replay is
     /// in flight and no audit replay is due before it (upstream v0.5.8 `urgent_replay`).
     fn try_start_inference(&mut self) -> bool {
-        if self.inference_busy() {
+        if self.inference_busy() || self.last_known_daa == 0 {
             return false;
         }
-        if !self.ai_request_queue.is_empty() && !self.pending_traces.is_empty() && self.urgent_replay(self.next_request_work()) {
+        self.drop_unawaited_requests();
+        if self.own_request().is_some() && !self.pending_traces.is_empty() && self.urgent_replay(self.next_request_work()) {
             log::debug!("Trace: an audit replay is due before the next request — the request waits");
             return false;
         }
-        while let Some(request) = self.ai_request_queue.pop_front() {
+        while let Some(index) = self.startable_request() {
+            let request = self.ai_request_queue.remove(index).expect("startable request is queued");
+            self.request_schedule.remove(&request.key);
             keryx_miner::runtime_stats::set_connection_inference_queue(
                 self.runtime_generation,
                 self.ai_request_queue.len(),
@@ -1820,8 +1879,18 @@ impl KeryxdHandler {
                 Some(e) => error!("Failed registering for virtual chain notifications: {:?}", e),
             },
             Payload::GetAwaitedOpeningsResponse(resp) => match resp.error.as_ref() {
-                Some(e) => log::debug!("Trace: awaited openings unavailable: {}", e.message),
+                Some(e) => {
+                    self.awaited_poll_pending = false;
+                    log::debug!("Trace: awaited openings unavailable: {}", e.message);
+                }
                 None => self.apply_awaited_openings(&resp),
+            },
+            Payload::GetServiceProvidersResponse(resp) => {
+                if resp.error.is_none() {
+                    if let Some(own) = self.escrow_pubkey.as_deref() {
+                        self.request_schedule.providers(own, &resp);
+                    }
+                }
             },
             Payload::GetVirtualSelectedParentChainFromBlockResponse(msg) => {
                 let Some(start) = self.chain_restore_starts.pop_front() else { return Ok(()) };
@@ -2202,8 +2271,49 @@ impl KeryxdHandler {
         self.inference_rx.is_some() || self.replay_rx.is_some()
     }
 
+    fn request_rank(&self, index: usize) -> usize {
+        let Some(q) = self.ai_request_queue.get(index) else { return 0 };
+        let own = self.escrow_pubkey.as_deref().and_then(hash32);
+        keryx_miner::models::pom_tier_index(&q.model_id, self.last_known_daa)
+            .and_then(|tier| self.request_schedule.siblings.get(&(tier as u32)))
+            .zip(own).map_or(0, |(siblings, own)| request_schedule::sibling_rank(&q.request_hash, &own, siblings))
+    }
+
+    fn request_startable(&self, index: usize, now: std::time::Instant) -> bool {
+        let Some(q) = self.ai_request_queue.get(index) else { return false };
+        self.request_schedule.startable(&q.key, self.request_rank(index), now, self.last_known_daa,
+            self.request_work_daa(q), speeds::generation_daa(&q.model_id, q.max_tokens as u32))
+    }
+
+    fn startable_request(&self) -> Option<usize> {
+        let now = std::time::Instant::now();
+        (0..self.ai_request_queue.len()).find(|&i| self.request_startable(i, now))
+    }
+
+    fn own_request(&self) -> Option<usize> {
+        let now = std::time::Instant::now();
+        (0..self.ai_request_queue.len()).find(|&i| {
+            self.ai_request_queue.get(i).is_some_and(|q| !self.request_schedule.closed(&q.key, self.last_known_daa))
+                && (self.request_rank(i) == 0 || self.request_startable(i, now))
+        })
+    }
+
+    fn drop_unawaited_requests(&mut self) {
+        let mut i = 0;
+        while i < self.ai_request_queue.len() {
+            if self.ai_request_queue.get(i).is_some_and(|q| self.request_schedule.closed(&q.key, self.last_known_daa)) {
+                let q = self.ai_request_queue.remove(i).unwrap();
+                info!("Inference: request id={} no longer awaited from this address — skipped", Self::request_log_id(&q.request_hash));
+                self.finish_ai_request(q.key, true);
+            } else {
+                i += 1;
+            }
+        }
+        keryx_miner::runtime_stats::set_connection_inference_queue(self.runtime_generation, self.ai_request_queue.len(), AI_REQUEST_QUEUE_CAPACITY);
+    }
+
     fn next_request_span_cost(&self) -> u64 {
-        let Some(q) = self.ai_request_queue.front() else { return 0 };
+        let Some(q) = self.own_request().and_then(|i| self.ai_request_queue.get(i)) else { return 0 };
         let tier = keryx_miner::models::pom_tier_index(&q.model_id, self.last_known_daa).unwrap_or(u8::MAX);
         let (n_prompt, max_tokens) = (q.prompt_len, q.max_tokens as u32);
         let work = keryx_miner::trace::OPEN_AUDIT_WORK_PASSES * keryx_miner::trace::service_work_daa(tier, n_prompt, max_tokens);
@@ -2215,7 +2325,10 @@ impl KeryxdHandler {
     }
 
     fn next_request_work(&self) -> u64 {
-        let Some(q) = self.ai_request_queue.front() else { return 0 };
+        self.own_request().and_then(|i| self.ai_request_queue.get(i)).map_or(0, |q| self.request_work_daa(q))
+    }
+
+    fn request_work_daa(&self, q: &QueuedAiRequest) -> u64 {
         let tier = keryx_miner::models::pom_tier_index(&q.model_id, self.last_known_daa).unwrap_or(u8::MAX);
         match speeds::generation_daa(&q.model_id, q.max_tokens as u32) {
             Some(gen) => gen + keryx_miner::trace::work_daa(tier, q.prompt_len, 0, 1),
@@ -2326,7 +2439,7 @@ impl KeryxdHandler {
             info!("Trace: response {} audited at chain block {} — opening already built", txid, seed_hash);
             self.submit_opening(&txid, &seed_hash, body).await;
         }
-        if self.inference_busy() || (!self.ai_request_queue.is_empty() && !self.urgent_replay(self.next_request_work())) {
+        if self.inference_busy() || (self.own_request().is_some() && !self.urgent_replay(self.next_request_work())) {
             return;
         }
         let now = self.last_known_daa;
@@ -2344,7 +2457,7 @@ impl KeryxdHandler {
         let Some((deadline, txid, path)) = first.chain(phases).min_by_key(|(deadline, _, _)| (*deadline <= now, *deadline)) else {
             return;
         };
-        if deadline <= now && !self.ai_request_queue.is_empty() {
+        if deadline <= now && self.own_request().is_some() {
             return;
         }
         if let Some(path) = path {
@@ -3085,15 +3198,27 @@ impl KeryxdHandler {
             .collect();
         due.sort_unstable();
         let response_txids: Vec<String> = due.into_iter().take(AWAITED_POLL_MAX).map(|(_, t)| t.clone()).collect();
-        self.awaited_polled = response_txids.clone();
-        if !response_txids.is_empty() {
-            self.client_send(crate::proto::GetAwaitedOpeningsRequestMessage { response_txids }).await?;
+        let escrow_pubkey = self.escrow_pubkey.clone().unwrap_or_default();
+        let requests: Vec<_> = if escrow_pubkey.is_empty() { Vec::new() } else {
+            self.ai_request_queue.iter().take(AWAITED_POLL_MAX).map(|q| (q.key, q.request_hash)).collect()
+        };
+        if response_txids.is_empty() && requests.is_empty() {
+            return Ok(());
         }
+        self.awaited_polled = response_txids.clone();
+        let request_hashes = requests.iter().map(|(_, hash)| hex::encode(hash)).collect();
+        self.awaited_requests_polled = requests;
+        self.awaited_poll_pending = true;
+        self.awaited_poll_sent = std::time::Instant::now();
+        self.client_send(crate::proto::GetAwaitedOpeningsRequestMessage { response_txids, escrow_pubkey, request_hashes }).await?;
         Ok(())
     }
 
     /// Takes the node's seed and deadline for each opening it awaits.
     fn apply_awaited_openings(&mut self, resp: &crate::proto::GetAwaitedOpeningsResponseMessage) {
+        self.awaited_poll_pending = false;
+        self.request_schedule.apply(std::mem::take(&mut self.awaited_requests_polled), resp, std::time::Instant::now());
+        self.drop_unawaited_requests();
         let mut changed: Vec<String> = Vec::new();
         let mut resend: Vec<(String, keryx_miner::trace_store::StoredOpening, u64)> = Vec::new();
         let listed: HashSet<&str> = resp.openings.iter().map(|o| o.response_txid.as_str()).collect();
@@ -3295,7 +3420,18 @@ impl KeryxdHandler {
     /// The periodic trace work of the 200 ms tick.
     async fn trace_tick(&mut self) -> Result<(), Error> {
         self.poll_replay().await;
-        if self.node_awaited_openings && self.last_awaited_poll.elapsed().as_secs() >= AWAITED_POLL_SECS {
+        if self.node_awaited_openings && self.escrow_pubkey.is_some() && self.last_providers_poll.elapsed().as_secs() >= 60 {
+            self.last_providers_poll = std::time::Instant::now();
+            self.client_send(crate::proto::GetServiceProvidersRequestMessage { window_daa: 0 }).await?;
+        }
+        let unchecked = self.request_schedule.node_checks && self.ai_request_queue.iter().any(|q| {
+            !self.request_schedule.checks.contains_key(&q.key)
+                && self.request_schedule.queued_at.get(&q.key).is_some_and(|at| at.elapsed().as_secs() < request_schedule::CHECK_WAIT_SECS)
+        });
+        let poll_due = self.last_awaited_poll.elapsed().as_secs() >= if unchecked { 2 } else { AWAITED_POLL_SECS };
+        let poll_free = !self.awaited_poll_pending || self.awaited_poll_sent.elapsed().as_secs() >= AWAITED_POLL_SECS;
+        if self.node_awaited_openings && poll_free && (poll_due || self.force_awaited_poll) {
+            self.force_awaited_poll = false;
             self.last_awaited_poll = std::time::Instant::now();
             self.poll_awaited_openings().await?;
         }
@@ -3539,19 +3675,41 @@ mod speeds {
 
 impl Drop for KeryxdHandler {
     fn drop(&mut self) {
-        keryx_miner::runtime_stats::record_inference_abandoned_requests(
-            keryx_miner::runtime_stats::InferenceKind::SoloRequest,
-            self.ai_request_queue.len(),
-        );
         keryx_miner::runtime_stats::connection_lost(self.runtime_generation, "Solo node connection closed");
         self.block_handle.abort();
         // Every queued trace write reaches the disk: the next connection restores from it.
         self.trace_store.flush();
-        if !self.persisting.is_empty() {
-            warn!("Trace: {} traced response(s) were not sent before the connection closed", self.persisting.len());
-        }
+        // In-flight GPU work keeps its card lease and oneshot receiver across a transient
+        // gRPC reconnect. Pending requests and response retries remain owned by this wallet.
+        let parked = ParkedAi {
+            address: self.miner_address.clone(), escrow: self.escrow_pubkey.clone(),
+            queue: std::mem::replace(&mut self.ai_request_queue, BoundedAiRequestQueue::new(AI_REQUEST_QUEUE_CAPACITY)),
+            seen: std::mem::replace(&mut self.ai_seen_keys, BoundedAiSeen::new(AI_SEEN_CAPACITY)),
+            txids: std::mem::take(&mut self.ai_request_txids), inference: self.inference_rx.take(),
+            replay: self.replay_rx.take(), persisting: std::mem::take(&mut self.persisting),
+            responses: std::mem::take(&mut self.ai_response_inflight), resend: std::mem::take(&mut self.response_resend),
+            answered: std::mem::take(&mut self.ai_answered_by_me), schedule: std::mem::take(&mut self.request_schedule),
+        };
+        *PARKED_AI.lock().unwrap_or_else(|p| p.into_inner()) = Some(parked);
     }
 }
+
+struct ParkedAi {
+    address: String,
+    escrow: Option<String>,
+    queue: BoundedAiRequestQueue,
+    seen: BoundedAiSeen,
+    txids: HashMap<AiRequestKey, (String, u64)>,
+    inference: Option<InferenceJob>,
+    replay: Option<ReplayJob>,
+    persisting: Vec<(std::sync::mpsc::Receiver<()>, String, crate::proto::RpcTransaction)>,
+    responses: HashMap<String, (crate::proto::RpcTransaction, u32, std::time::Instant)>,
+    resend: Vec<(std::time::Instant, String, u32)>,
+    answered: HashSet<[u8; 32]>,
+    schedule: Schedule,
+}
+
+static PARKED_AI: std::sync::Mutex<Option<ParkedAi>> = std::sync::Mutex::new(None);
 
 /// True when a keryxd `server_version` string (e.g. "1.4.3", "v1.4.3-OPoI/...") is older than
 /// `min` (major, minor, patch). Unparseable versions return FALSE (fail-open: never hold claims

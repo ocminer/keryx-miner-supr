@@ -4597,6 +4597,29 @@ fn has_device_override(device_id: u32) -> bool {
 /// and the miner's worker ids use) — sourced from the CUDA driver, NOT nvidia-smi line order (which
 /// can map to the wrong card). Empty vec if no CUDA driver (CPU-only / AMD). Never panics.
 /// (upstream Keryx-Labs/keryx-miner@cb7f81c)
+/// Free MiB on one selected device, preserving the caller's current CUDA context.
+pub fn query_device_free_vram_mib(ordinal: usize) -> Option<u64> {
+    use candle_core::cuda_backend::cudarc::driver::{result, sys};
+    std::panic::catch_unwind(|| {
+        result::init().ok()?;
+        let device = result::device::get(i32::try_from(ordinal).ok()?).ok()?;
+        struct Restore(Option<sys::CUcontext>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = unsafe { result::ctx::set_current(self.0.unwrap_or(std::ptr::null_mut())) };
+            }
+        }
+        let _restore = Restore(result::ctx::get_current().ok()?);
+        // Inspect only the selected card, retaining its existing primary context.
+        unsafe {
+            let ctx = result::primary_ctx::retain(device).ok()?;
+            let free = result::ctx::set_current(ctx).ok().and_then(|_| result::mem_get_info().ok());
+            let _ = result::primary_ctx::release(device);
+            free.map(|(bytes, _)| bytes as u64 >> 20)
+        }
+    }).ok().flatten()
+}
+
 /// Per-GPU (ordinal, FREE MiB, TOTAL MiB) via the driver API. FREE is what a tier pick can
 /// actually allocate: budgeting against TOTAL (the old behavior) chose tiers that cudaMalloc'd
 /// straight into an OOM whenever anything else was resident on the card (another miner, a leaked
