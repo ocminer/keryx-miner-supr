@@ -1,14 +1,15 @@
 {
-  "source_commit": "762ae578b27ffcd9623ad91e4cb4157ce4bf562a",
+  "source_commit": "73a035564a7ca7225699c2478029b4c5a0403b3a",
   "source_sha256": {
-    "tools/keryx-llama/CMakeLists.txt": "093672f7124c106f5d22e11fe9d25ec48c6182c729442f803bd9ca62458610a5",
+    "tools/keryx-llama/CMakeLists.txt": "40df80418eee297145caa600bb66a256fbde8a7f56a40d751c4404708c123184",
     "tools/keryx-llama/keryx_llama.cpp": "69c3e8341d121d1580dd92c0db20b2fb402f70134c729384b130f70c72d22b45",
     "tools/keryx-llama/keryx_llama.def": "22ce13df417328fd5371902596ccbae493fd8e7f73bdcd072e9a62fb74dc1d43",
     "tools/keryx-llama/patches/0001-canonical-trace.patch": "3799b9dd13f7d462c28529c8a11aef65ab1792fefcf34977d1904c5e6da66d1b",
     "tools/keryx-llama/patches/0002-sequence-leaves.patch": "ced1056558237d20050224c843f8e4008f833f759890b164e28e726f71017718",
     "tools/keryx-llama/patches/0003-fattn-tile-f32.patch": "b5a8f5ff9951972be10e1d4971f9507a0640e85333bb2b1ab3694b86250f72b7",
     "tools/keryx-llama/patches/0004-rope-f64-angle.patch": "b15e92b242adc94fb1076932c284414906140fc6bbd7866e0c09fce95739eb4c",
-    "tools/keryx-llama/patches/0005-attn-lse-capture.patch": "4e4f99e79d9da5cd29af1ed018434d18befe93b19f6932980aa5d6a3a20bb913"
+    "tools/keryx-llama/patches/0005-attn-lse-capture.patch": "4e4f99e79d9da5cd29af1ed018434d18befe93b19f6932980aa5d6a3a20bb913",
+    "tools/keryx-llama/patches/0006-dp4a-kquant-tile-scales.patch": "39ddcd86b51927fc2cb9258a89862208de3c8f90dec46a70308a22f8d2e4e18a"
   },
   "recipe_sha256": {
     "Build keryx-llama.dll (in-process llama.cpp engine)": "d1f8c8bc110d6b0a4ef47d905cf9e8ca66ab4d0a71b414bf961560cfa2ce7545",
@@ -19,10 +20,10 @@
     "cuda: '12.8.1'",
     "      - name: Install CUDA toolkit (full)\n        id: cuda\n        uses: Jimver/cuda-toolkit@v0.2.24   # settled action version; has CUDA 12.8.1 (first with sm_120)\n        with:\n          cuda: '12.8.1'\n          method: 'network'\n          # Newer CUDA network installs reject a bare \"full\" fetch \u2014 pin the components candle-CUDA\n          # (cudart/cublas/curand/nvrtc + dev import libs) and the llama.cpp nvcc build need.\n          sub-packages: '[\"nvcc\", \"cudart\", \"cublas\", \"cublas_dev\", \"curand\", \"curand_dev\", \"nvrtc\", \"nvrtc_dev\", \"thrust\", \"visual_studio_integration\"]'\n\n      # nvcc (candle-kernels) needs the MSVC host compiler cl.exe on PATH.\n"
   ],
-  "archive_url": "https://github.com/ocminer/keryx-miner-supr/releases/download/v0.15.5/keryx-miner-supr-windows-nvidia-pom.zip",
-  "archive_sha256": "72b386a171e5f6c7aa42682f7ddc6ede1189ee9c017da4d6d7ddf46f8e7d5c87",
+  "archive_url": "https://github.com/ocminer/keryx-miner-supr/releases/download/v0.15.8/keryx-miner-supr-windows-nvidia-pom.zip",
+  "archive_sha256": "771fea5dd7f2000b75d9983b8ba9451415fc350d2bfb5e033b86dbd541aff9d6",
   "dll_sha256": {
-    "keryx-llama.dll": "3b36f7afb6ff01448bdbe998adcfa77a2d1ab0b2dfb67c1bd03493eb8b9f875d",
-    "keryx-llama-noavx.dll": "0c6452152ad6482d74084d1e6f38913810aa15f4fa27e5a97ce9d1c8f3b005d5"
+    "keryx-llama.dll": "ccbd3e9d547b8c7a3623896089b1bbf4280bfa097299fd96fbb998c7c88214cb",
+    "keryx-llama-noavx.dll": "846af8176bbdeb4a2d66b86db1f7b8a59a97398f1bca7f8b2557a4212ff740dd"
   }
 }

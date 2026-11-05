@@ -29,10 +29,25 @@ The PoW is **Proof-of-Model**, a data-dependent walk over model weights and, fro
 H15, a context pad. Hashrates are in **MH/s**. Performance depends on the model
 tier, memory access, tensor/integer throughput and power settings.
 
-Recent H15 development measurements include the exact fast solver on Ampere and
-Blackwell and cached tile loads on Ampere. The matched CMP/RTX 3070 measurements,
-their control builds and qualification limits are recorded in
-[the 2026-11-05 benchmark notes](docs/benchmarks/2026-11-05-h15-cmp-cache.md).
+The solver improvements included in v0.16.0 were measured on 2026-11-05 with
+H15 jobs. These matched A/B/B/A runs compare development build `2139c28`
+(CPU/IPFS fix already applied) with `ca3bc3c` (exact fast solver), on the same card
+and settings. They are development measurements, not a new H16 network benchmark.
+
+| GPU | Tier | Power limit | Before, MH/s | After, MH/s | Gain |
+|---|---:|---:|---:|---:|---:|
+| RTX 5090 | 3 | 600 W | 5.1816 | 5.3779 | +3.79% |
+| RTX 5090 | 3 | 420 W | 3.7606 | 3.8975 | +3.64% |
+| RTX 5080 | 2 | 360 W | 3.3023 | 3.3236 | +0.64% |
+| RTX 5070 Ti | 2 | 300 W | 2.7874 | 2.8426 | +1.98% |
+| RTX 3070 | 0 | 240 W | 1.2191 | 1.2744 | +4.54% |
+
+Each arm ran for 120 seconds after readiness, excluding its first 40 seconds.
+The jobs used a loopback test pool; the rates do not establish real pool acceptance.
+Different tiers perform different work. Later matched development measurements
+added +5.15% on CMP 170HX at 200 W and +0.70% on RTX 3070 at 240 W relative to
+the preceding solver candidate; see [the separate cache measurements and their
+qualification limits](docs/benchmarks/2026-11-05-h15-cmp-cache.md).
 The older figures below retain their original version and workload labels.
 
 Measured **2026-08-25 on v0.11.13**, one card at a time on an otherwise idle rig (every other miner
