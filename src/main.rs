@@ -869,6 +869,11 @@ async fn run() -> Result<(), Error> {
     let matches = app.get_matches();
 
     let mut opt: Opt = Opt::from_arg_matches(&matches)?;
+    // Select the complete consensus gate table before any model or mining state is built.
+    // Keep the existing environment selector for scripted staging runs.
+    if opt.testnet {
+        keryx_miner::native_env::set("KERYX_TESTNET", "1");
+    }
     let mut tui_enabled = tui_requested && !opt.no_tui;
     // Plugin constructors are asked to stay quiet until the host knows whether it can own the
     // terminal. Switch current plugins back to classic logging for option validation, then require

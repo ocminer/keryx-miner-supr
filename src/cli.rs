@@ -287,7 +287,7 @@ pub struct Opt {
     pub pool_password: String,
 
     #[clap(long, help = "Use testnet instead of mainnet [default: false]")]
-    testnet: bool,
+    pub testnet: bool,
 
     #[clap(short = 't', long = "threads", help = "Amount of CPU miner threads to launch [default: 0]")]
     pub num_threads: Option<u16>,

@@ -15,7 +15,7 @@ const KERYX_MATRIX_SALT_V4: [u8; 32] = *b"KERYX:KeryxHash-v4:2026-06-07:xx";
 /// blocks will be rejected after activation — that is the forced-update mechanism.
 ///
 /// Mainnet: 17_275_000 (2026-05-30 ~15:00 UTC emergency activation)
-/// Testnet: 6_000
+/// Testnet: active from genesis (node v1.6.7).
 pub const POW_SALT_V2_ACTIVATION_DAA: u64 = 17_275_000;
 
 /// DAA score at which the miner switches to SALT v4 (chain relaunch on stock difficulty) —
@@ -29,7 +29,7 @@ pub const POW_SALT_V4_ACTIVATION_DAA: u64 = 21_932_751;
 /// Must mirror `active_salt_version` in `consensus/pow/src/lib.rs` (compared with `>=`).
 #[inline(always)]
 pub fn active_salt_version(daa_score: u64) -> u8 {
-    if daa_score >= POW_SALT_V4_ACTIVATION_DAA {
+    if crate::pom::testnet_gates() || daa_score >= POW_SALT_V4_ACTIVATION_DAA {
         4
     } else if daa_score >= POW_SALT_V2_ACTIVATION_DAA {
         2
