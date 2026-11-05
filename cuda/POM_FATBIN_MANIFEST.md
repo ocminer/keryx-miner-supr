@@ -4,7 +4,15 @@ H15/H16 solver candidate: the new `pom_mine_v5_ncf_fast_seeded` uses exact warp 
 reductions and a division-free pad-step calculation for the consensus K=256.
 Established entry points are retained. The rebuild compared all five established
 sm_80 kernels against the previously committed image and found identical SASS.
-GPU qualification is recorded separately before this candidate is promoted.
+GPU exactness passed on a physical RTX 3070, RTX 5080, RTX 5070 Ti and two RTX 5090s.
+Each card passed 700 individual exact-target/one-below checks and 20 batch-target
+checks against independently built and verified CPU proofs across five pad extents,
+including current and H16 tier-0 sizes. The H16 gate remains disabled.
+
+The established sm_86 and sm_120 kernels also retain instruction-identical SASS
+(all five entry points on each architecture). Matched current-era A/B/B/A mining
+runs and the traced-answer/audit/custody/restart/mining-resume check passed.
+Unreleased H16 network behavior and other GPU architectures were not runtime-tested.
 
 - Compiler: NVIDIA CUDA 13.4, `nvcc V13.4.92`
 - Source: `src/pom_mine.cu`
