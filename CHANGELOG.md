@@ -1,17 +1,22 @@
-# keryx-miner-supr 0.16.0 — H16 preparation (unreleased)
+# keryx-miner-supr 0.16.0 — H16 and node 1.6.7
 
-- Mirrors the upstream H16 context-pad table: 200 MiB less per tier after the
-  node's `pad_margin_activation` gate. Mining and CPU proofs select the table
-  from each job's DAA score, including jobs across a reorganisation.
-- Includes the qualified CPU/IPFS and exact CUDA solver improvements from the
-  preceding development session, plus cached SM80/SM86 tile loads.
-- Adds a finite staging-gate override and a CUDA transition regression covering
-  pad replacement, reuse and rollback. No model or inference-engine change.
-- Persists node-updated opening deadlines and retains accepted traces during
-  restart recovery, so H16 audit extensions are not lost with the old deadline.
-- **Activation is not yet scheduled upstream.** Mainnet and testnet defaults
-  remain disabled until an authoritative activation value is published. This
-  preparation must not be advertised as a scheduled, automatic mainnet upgrade.
+- Matches the official H16 gates: mainnet DAA **147,000,000**, testnet **180,000**.
+  Mining continues with the existing rules below the gate and automatically uses
+  the 200 MiB smaller context pad per tier at activation. Jobs below the gate,
+  including after a reorganisation, still use the original pad.
+- Solo mode supports node 1.6.7's awaited-request RPC and coordinated serving by
+  multiple rigs of one address. Unknown requests stay queued; the node decides
+  when a request is closed. Queues, in-flight work and response retries survive
+  transient node reconnects.
+- Node-extended audit deadlines are persisted and recovered after restart.
+- `--testnet` selects the complete testnet consensus gate table, including H16.
+- Inference uses the selected GPU and fits its context with compute-buffer
+  headroom, while requiring enough positions to replay an existing trace.
+- Includes the CPU/IPFS activity reduction and qualified exact CUDA solver/cache
+  improvements. Same-card development measurements and their limits are in the
+  README; these are H15 measurements, not H16 network benchmarks.
+- Complete Linux, HiveOS, mmpOS, SMOS, Windows and Docker distributions. The
+  macOS package retains its existing Metal H15/H16 limitation.
 
 # keryx-miner-supr 0.15.8 — Tesla V100 / Pascal H15 traces and per-card tier pinning
 
