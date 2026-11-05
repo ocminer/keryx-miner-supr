@@ -340,7 +340,7 @@ impl State {
                 info!("PoM v5: no mining model id for device {device_id}; cannot seed the context pad");
                 None
             })?;
-            let n = pom_v5::POM_V5_PAD_TILES_H14.get(tier as usize).copied().filter(|n| *n > 0).or_else(|| {
+            let n = Some(pom_v5::pom_v5_pad_tiles(tier, self.daa_score)).filter(|n| *n > 0).or_else(|| {
                 info!("PoM v5: tier {tier} has no context pad size");
                 None
             })?;

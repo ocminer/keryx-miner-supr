@@ -2093,7 +2093,7 @@ pub fn mine_v4(
         if crate::models::pom_tier_index(&model, daa) != Some(tier) || idx.1 != tier {
             return Err(crate::pom::GrindError::Paused("PoM v5 tier/index mismatch"));
         }
-        let tiles = crate::pom_v5::POM_V5_PAD_TILES_H14.get(tier as usize).copied().filter(|n| *n > 0)
+        let tiles = Some(crate::pom_v5::pom_v5_pad_tiles(tier, daa)).filter(|n| *n > 0)
             .ok_or(crate::pom::GrindError::Paused("PoM v5 tier has no pad"))?;
         let seed = crate::pom_v5::v5_pad_seed(tier, &model, &idx.0.r_t);
         Some((crate::pom_v5::v5_pad_seed_words(&seed), tiles))

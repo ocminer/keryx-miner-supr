@@ -526,6 +526,12 @@ pub fn pom_v5_activation_daa() -> u64 {
     })
 }
 
+/// Node `pad_margin_activation`: switch to the H16 context-pad sizes.
+/// Upstream has not scheduled this gate on any public network yet.
+pub fn pad_margin_activation_daa() -> u64 {
+    u64::MAX
+}
+
 /// Block-task gate: headers carry `task_root`. MUST equal the node's `block_task_activation`.
 ///
 /// keryx-node v1.6.6 retired the block task before it ever activated: `block_task_activation =

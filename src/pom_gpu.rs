@@ -4305,9 +4305,7 @@ pub fn mine_v4(
         // pad fits in the freed KV-cache space (no-op when already shrunk). An inference restores
         // the full context and releases the pad (`release_pad`); the next grind refills it.
         crate::llama_engine::use_task_context(device_id as usize);
-        let n_pad = crate::pom_v5::POM_V5_PAD_TILES_H14
-            .get(tier as usize)
-            .copied()
+        let n_pad = Some(crate::pom_v5::pom_v5_pad_tiles(tier, daa))
             .filter(|n| *n > 0)
             .ok_or(crate::pom::GrindError::Paused("PoM v5: tier has no context pad"))?;
         let n_tiles = miner.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
