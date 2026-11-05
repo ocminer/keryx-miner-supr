@@ -1191,11 +1191,11 @@ impl PomGpuMiner {
             // batch and its duplicate snippet reads disappear. Measured +7-8% on a 5090 at a 64K
             // batch and +24% at 8K (byte-exact, see pom_mine_v4_ncf). KERYX_POM_V4_NCF=0 falls
             // back to the chase+tc pipeline below.
-            // Qualified on Ampere GDDR and Blackwell consumer cards. Other architectures,
+            // Qualified on Ampere HBM/GDDR and Blackwell consumer cards. Other architectures,
             // pre-H15 jobs and KERYX_POM_V5_FAST=0 retain the established solver.
             let fast_v5 = v5.is_some()
                 && std::env::var("KERYX_POM_V5_FAST").as_deref() != Ok("0")
-                && matches!(self.stream.context().compute_capability(), Ok((8, 6) | (12, 0)));
+                && matches!(self.stream.context().compute_capability(), Ok((8, 0) | (8, 6) | (12, 0)));
             let walk = load_walk_func(
                 &self.cuda,
                 if fast_v5 { "pom_mine_v5_ncf_fast_seeded" } else { "pom_mine_v4_ncf_seeded" },
@@ -5997,8 +5997,10 @@ mod v4_kernel_tests {
         let miner = PomGpuMiner::load_test_segments(0, vec![data]).unwrap();
         let n_tiles = index.n_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
         let pad_seed = crate::pom_v5::v5_pad_seed(0, &[7u8; 32], &index.r_t);
-        assert!(matches!(miner.stream.context().compute_capability(), Ok((8, 6) | (12, 0))), "fast-path qualification requires sm86 or sm120 hardware");
-        assert_eq!(miner.v4_walk_kind(), "chaseless");
+        assert!(matches!(miner.stream.context().compute_capability(), Ok((8, 0) | (8, 6) | (12, 0))), "fast-path qualification requires sm80, sm86 or sm120 hardware");
+        // H15 selects the state-carrying solver independently of the pre-H15
+        // tuning default, which deliberately remains chase+TC on HBM cards.
+        assert!(miner.v4_ncf_usable(n_tiles, crate::pom_v4::POM_V4_K as u32, &[0; 4], &[0; 4], TS));
         let pads = [1, 200, 1023, crate::pom_v5::POM_V5_PAD_TILES_H14[0], crate::pom_v5::POM_V5_PAD_TILES_H16[0]];
         for n_pad in pads {
             let k_pad = crate::pom_v5::v5_pad_steps(n_tiles, n_pad) as u32;

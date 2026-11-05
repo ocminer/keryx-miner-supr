@@ -16,17 +16,22 @@ Unreleased H16 network behavior and other GPU architectures were not runtime-tes
 
 - Compiler: NVIDIA CUDA 13.4, `nvcc V13.4.92`
 - Source: `src/pom_mine.cu`
-- Source SHA-256: `d6d41e16f60c0f660a2f7636117a32b1ab9bdc4f8adb9df601aff5574a39de5b`
+- Source SHA-256: `f7ddd414e51d7ce98cda206cb0ce01b2d21e4a9e612be608457bf0623853fe29`
 - Artifact: `cuda/pom_mine.fatbin`
-- Artifact SHA-256: `e0d40f6c09d6d638a602c0db5f31db41e4b23b0863f3e62531472790153378a7`
+- Artifact SHA-256: `c099b3c3ef6334499502b24d1d9ad99f2d1d42f956dfc53f8903bf4a2f3d5f28`
 - Artifact size: 5097208 bytes
 - Native SASS: sm_75, sm_80, sm_86, sm_87, sm_88, sm_89, sm_90, sm_100, sm_103, sm_110,
   sm_120, sm_121
 - Forward-compatible PTX: compute_75 and compute_80
 
-The host selects the new entry point only for context-pad jobs on sm_86 and sm_120.
+The host selects the new entry point only for context-pad jobs on sm_80, sm_86 and sm_120.
 Other architectures and pre-H15 jobs retain the established solver. Setting
 `KERYX_POM_V5_FAST=0` selects the established path for diagnosis.
 
 Rebuild with `cuda/regenerate-pom-fatbin.sh OUTPUT BASELINE`; retain the baseline
 for the established-kernel SASS comparison. H16 activation remains unscheduled.
+
+CMP 170HX qualification extends the exact fast solver to SM80. SM86 tile copies
+use L1-cached asynchronous loads; the SM80/SM120 fast kernels and all established
+entry points above remain instruction-identical. Full-miner validation receipts
+are recorded separately; this is a local optimization candidate.

@@ -1228,6 +1228,17 @@ extern "C" __global__ void pom_mine_v4_ncf_seeded(
 // XOR is associative over the independent halves; SM80+ warp reductions replace
 // ten 32-bit shuffle operations without changing any state bit or memory barrier.
 #if __CUDA_ARCH__ >= 800
+// Cache the H15/H16 tile loads on SM86. Measured on the RTX 3070; other
+// architectures retain the established L1-bypassing copy and shared-memory policy.
+__device__ __forceinline__ void v5_fast_cp_async16(void* dst, const void* src) {
+#if __CUDA_ARCH__ == 860
+    unsigned long long sm = __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "l"(sm), "l"(src));
+#else
+    v4_cp_async16(dst, src);
+#endif
+}
+
 __device__ __forceinline__ unsigned long long v5_fast_state_fold(
     unsigned int w0, unsigned int w1, unsigned int lane) {
     const unsigned long long h = mix64((((unsigned long long)w1 << 32) | w0) ^ (unsigned long long)lane);
@@ -1281,7 +1292,7 @@ extern "C" __global__ void pom_mine_v5_ncf_fast_seeded(
     {
         const ulonglong2* q = v4_chunk_addr_lut(bases, prefix, T, lut, lut_sh, off, x);
         ulonglong2* dst = (ulonglong2*)(s_tiles + 256u + x * 8);   // tile 1 -> buffer (1&1)=1
-        v4_cp_async16(dst, q); v4_cp_async16(dst + 1, q + 1);
+        v5_fast_cp_async16(dst, q); v5_fast_cp_async16(dst + 1, q + 1);
         asm volatile("cp.async.commit_group;");
     }
     { unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)x));
@@ -1307,7 +1318,7 @@ extern "C" __global__ void pom_mine_v5_ncf_fast_seeded(
                 : v4_barrett_mod(raw, n_tiles, inv_n);
             const ulonglong2* q = v4_chunk_addr_lut(bases, prefix, T, lut, lut_sh, off, x);
             ulonglong2* dst = (ulonglong2*)(s_tiles + ((step + 1u) & 1u) * 256u + x * 8);
-            v4_cp_async16(dst, q); v4_cp_async16(dst + 1, q + 1);
+            v5_fast_cp_async16(dst, q); v5_fast_cp_async16(dst + 1, q + 1);
         }
         asm volatile("cp.async.commit_group;");
         v4_imma_step(s_state, cur, step, x);
