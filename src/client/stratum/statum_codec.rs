@@ -65,6 +65,9 @@ pub enum ErrorCode {
     LowDifficultyShare = 23,
     Unauthorized = 24,
     NotSubscribed = 25,
+    /// miner → pool reply to a `mining.ai_request`: every card that serves the requested model is
+    /// already running an inference, so this rig will not answer it. The pool should re-dispatch.
+    Busy = 46,
 }
 
 impl Display for ErrorCode {
@@ -76,6 +79,7 @@ impl Display for ErrorCode {
             ErrorCode::LowDifficultyShare => write!(f, "LowDifficultyShare"),
             ErrorCode::Unauthorized => write!(f, "Unauthorized"),
             ErrorCode::NotSubscribed => write!(f, "NotSubscribed"),
+            ErrorCode::Busy => write!(f, "Busy"),
         }
     }
 }
@@ -301,6 +305,18 @@ pub(crate) struct StratumLine {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) jsonrpc: Option<String>,
     pub(crate) error: Option<StratumError>,
+}
+
+impl StratumLine {
+    /// Error reply to the pool's command `id` (`{"id":id,"result":null,"error":[code,msg,null]}`).
+    pub(crate) fn error_reply(id: u32, code: ErrorCode, message: &str) -> Self {
+        Self {
+            id: Some(id),
+            payload: StratumLinePayload::StratumResult { result: StratumResult::Plain(None) },
+            jsonrpc: Some("2.0".into()),
+            error: Some(StratumError(code, message.into(), None)),
+        }
+    }
 }
 
 /// An error occurred while encoding or decoding a line.
@@ -663,5 +679,28 @@ mod tests {
             }
             other => panic!("7-tuple submit must be WithPomTask, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod busy_reply_tests {
+    use super::*;
+
+    #[test]
+    fn busy_reply_wire_format() {
+        let line = StratumLine::error_reply(17, ErrorCode::Busy, "busy: all eligible GPUs are running inference");
+        let json = serde_json::to_value(&line).unwrap();
+        assert_eq!(json["id"], 17);
+        assert!(json["result"].is_null());
+        assert_eq!(json["error"][0], 46);
+        assert_eq!(json["error"][1], "busy: all eligible GPUs are running inference");
+        assert!(json["error"][2].is_null());
+        assert!(json.get("method").is_none());
+    }
+
+    #[test]
+    fn pool_reply_with_code_46_parses() {
+        let line: StratumLine = serde_json::from_str(r#"{"id":5,"result":null,"error":[46,"busy",null]}"#).unwrap();
+        assert!(matches!(line.error, Some(StratumError(ErrorCode::Busy, _, _))));
     }
 }

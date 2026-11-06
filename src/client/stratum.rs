@@ -1882,7 +1882,7 @@ impl StratumHandler {
                                 .await
                         }
                         StratumCommand::MiningAiRequest(params) => {
-                            self.handle_ai_request(params.fields, params.ext).await;
+                            self.handle_ai_request(id, params.fields, params.ext).await;
                             Ok(())
                         }
                         StratumCommand::MiningAiOpening(params) => {
@@ -1980,7 +1980,7 @@ impl StratumHandler {
                     )
                 });
                 match code {
-                    ErrorCode::Unknown => {
+                    ErrorCode::Unknown | ErrorCode::Busy => {
                         // Match solo-mining behaviour (grpc.rs SubmitBlockResponse): a rejected
                         // share/block is logged but never fatal. Returning Err here tore down the
                         // whole connection and caused an infinite reconnect loop on every share.
@@ -2190,7 +2190,18 @@ impl StratumHandler {
     /// (only that card's walk pauses, like the challenge path) and return the answer inline as
     /// `mining.ai_response`. The pool seals and signs it. Failures send nothing: an empty answer
     /// is never a valid response and the pool re-dispatches.
-    async fn handle_ai_request(&mut self, fields: (String, String, String, String, String, u32, String), ext: Option<serde_json::Value>) {
+    ///
+    /// Busy (0.16.1): when the pool gave the request an `id` and every card that serves the model
+    /// is still running another inference after `ai_busy_wait_ms()`, the rig replies
+    /// `{"id":id,"result":null,"error":[46,"busy: …",null]}` so the pool can re-dispatch at once
+    /// instead of waiting out its deadline. Only this case is answered with an error; every other
+    /// refusal (model not served, invalid request, failed generation) stays silent as before.
+    async fn handle_ai_request(
+        &mut self,
+        pool_id: Option<u32>,
+        fields: (String, String, String, String, String, u32, String),
+        ext: Option<serde_json::Value>,
+    ) {
         let request = match ai::AiRequest::parse_ext(fields, ext.as_ref()) {
             Ok(request) => request,
             Err(error) => {
@@ -2245,14 +2256,30 @@ impl StratumHandler {
             Some(&request.model_id),
         );
         tokio::spawn(async move {
-            let Some(lease) = keryx_miner::slm::acquire_inference_card_async(
-                &request.model_id,
-                keryx_miner::slm::DEFAULT_INFERENCE_DEADLINE_MS,
-            )
-            .await
+            let Some(lease) = keryx_miner::slm::acquire_inference_card_async(&request.model_id, ai_busy_wait_ms()).await
             else {
-                warn!("AI request {:.16}: all eligible cards busy — not answered", request.task_id);
                 runtime_attempt.busy();
+                // Busy only when cards for this model exist and all of them hold an inference
+                // lease. No eligible card at all is not "busy" and stays silent.
+                if keryx_miner::slm::has_inference_cards(&request.model_id) {
+                    match pool_id {
+                        Some(pid) => {
+                            warn!(
+                                "AI request {:.16}: all eligible cards busy with inference — replied busy (46) to pool",
+                                request.task_id
+                            );
+                            let _ = send_channel
+                                .send(StratumLine::error_reply(pid, ErrorCode::Busy, "busy: all eligible GPUs are running inference"))
+                                .await;
+                        }
+                        None => warn!(
+                            "AI request {:.16}: all eligible cards busy — not answered (request had no id, busy reply impossible)",
+                            request.task_id
+                        ),
+                    }
+                } else {
+                    warn!("AI request {:.16}: no card serves this model any more — not answered", request.task_id);
+                }
                 return;
             };
             let gpu = lease.gpu();
@@ -3164,6 +3191,17 @@ mod job_id_daa_tests {
         assert_eq!(job_id_daa("abcd_xyz"), None); // non-numeric daa field
         assert_eq!(job_id_daa("abcd__1"), None); // empty daa field
     }
+}
+
+/// How long a pool `mining.ai_request` waits for a free card before the rig replies busy (46).
+/// `KERYX_AI_BUSY_WAIT_MS` (1..=30000), default 5000 ms: long enough for a short answer already
+/// running on the card to finish, short enough that the pool can still re-dispatch in time.
+fn ai_busy_wait_ms() -> u64 {
+    std::env::var("KERYX_AI_BUSY_WAIT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&ms| (1..=keryx_miner::slm::DEFAULT_INFERENCE_DEADLINE_MS).contains(&ms))
+        .unwrap_or(5_000)
 }
 
 #[cfg(test)]

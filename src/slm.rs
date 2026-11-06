@@ -1642,6 +1642,12 @@ pub fn acquire_inference_card_on(gpu: usize, deadline_ms: u64) -> Option<Inferen
     }
 }
 
+/// True when at least one card is eligible to serve `model_id` (busy or not). Lets a caller tell
+/// "all cards busy" apart from "no card serves this model".
+pub fn has_inference_cards(model_id: &[u8; 32]) -> bool {
+    !eligible_cards(model_id).is_empty()
+}
+
 /// Async router used by network handlers. Unlike `acquire_inference_card`, waiting for a busy card
 /// yields the Tokio worker instead of blocking one of the miner's small async-worker pool. Card
 /// ranking is resolved once per request; busy state is still checked atomically on every wake.
