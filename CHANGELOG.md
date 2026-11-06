@@ -1,3 +1,17 @@
+# keryx-miner-supr 0.16.1 — pool `Busy` reply for AI requests
+
+- When the pool sends a `mining.ai_request` and every card that serves the
+  requested model is still running another inference, the miner now answers that
+  request's id with error **46 `busy`** instead of staying silent. The pool can
+  then hand the request to another rig at once. The rig waits
+  `KERYX_AI_BUSY_WAIT_MS` (default 5000, allowed 1–30000) for a card to become
+  free before it replies busy.
+- Every other refusal (model not served, invalid request, failed generation) is
+  unchanged and stays silent. An error 46 reply from the pool to a share is
+  logged and never closes the connection.
+- Mining, H16 handling, GPU kernels and inference engines are unchanged from
+  0.16.0.
+
 # keryx-miner-supr 0.16.0 — H16 and node 1.6.7
 
 - Matches the official H16 gates: mainnet DAA **147,000,000**, testnet **180,000**.

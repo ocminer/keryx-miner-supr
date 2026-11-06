@@ -519,6 +519,7 @@ At startup the miner logs which mode is active: `PoM resident tree: ON` or `PoM 
 
 | Variable | Default | Effect |
 |---|---|---|
+| `KERYX_AI_BUSY_WAIT_MS` | 5000 | Pool AI requests: how long (1–30000 ms) to wait for a free card when every card serving the model is running another inference. After that the miner replies busy (error 46) so the pool can give the request to another rig. |
 | `KERYX_INFERENCE_GPU` | auto | Pin OPoI inference to a specific CUDA ordinal (see note in *Automatic per-card selection*). |
 | `KERYX_ZERO_DUP` | auto | AMD: share the inference model with Vulkan mining by default. `off` disables sharing and may reserve the inference card; `force` explicitly requests sharing. RDNA1 remains excluded. |
 | `KERYX_POM_BACKEND` | auto | AMD mining workers: `opencl` or `vulkan`. Auto selects Vulkan on gfx906 and RDNA2/3/4. H15 requires Vulkan; the inference card's sharing policy remains separate. RDNA1 is excluded. |
