@@ -80,8 +80,15 @@ impl AiRequest {
             return Err("AI prompt is too large".into());
         }
         let prompt = String::from_utf8(BASE64.decode(prompt_b64)?)?;
-        if prompt.len() > MAX_PAYLOAD_BYTES || prompt.contains('\0') {
+        if prompt.len() > MAX_PAYLOAD_BYTES {
             return Err("Invalid AI prompt".into());
+        }
+        // The node accepts NUL bytes in a prompt. A traced (H15 network) answer tokenizes the full
+        // prompt bytes through the length-aware engine entry point, so it is served. An untraced
+        // request (pool chat/probe, pre-H15) goes through llama.cpp's C-string chat template,
+        // which would silently truncate at the NUL: refuse that one explicitly instead.
+        if trace.is_none() && prompt.contains('\0') {
+            return Err("AI prompt contains a NUL byte and the request is untraced (only traced H15 requests can carry one)".into());
         }
         let mut model_id = [0; 32];
         hex::decode_to_slice(&model_hex, &mut model_id)?;
@@ -233,10 +240,20 @@ mod tests {
         let mut f = fields("x");
         f.6 = "-1".into();
         assert!(AiRequest::parse(f).is_err());
-        assert!(AiRequest::parse(fields("nul\0byte")).is_err());
+        assert!(AiRequest::parse(fields("nul\0byte")).is_err(), "untraced: no C-string-safe path");
         let mut f = fields("x");
         f.4 = "%%%".into();
         assert!(AiRequest::parse(f).is_err());
+    }
+
+    #[test]
+    fn traced_request_keeps_nul_bytes_in_the_prompt() {
+        let prompt = "before\0after\0";
+        let ext = serde_json::json!({"trace": {"tier": 0, "prompt_len": prompt.len(), "chain": true, "attention": true}});
+        let req = AiRequest::parse_ext(fields(prompt), Some(&ext)).unwrap();
+        assert_eq!(req.prompt.as_bytes(), prompt.as_bytes(), "never stripped or replaced");
+        assert_eq!(req.prompt.len(), 13);
+        assert!(req.trace.is_some());
     }
 
     #[test]

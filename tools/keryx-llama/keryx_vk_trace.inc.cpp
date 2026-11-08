@@ -248,19 +248,24 @@ int keryx_llama_vk_lse_read(KeryxLlama* h, float* out, size_t cap, uint32_t n_po
     return -5;
 }
 
-int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, const int32_t* prefix, int n_prefix,
-                               int head_tokens, const char* rest, int max_tokens, char* out, int cap,
-                               int32_t* tokens, int tokens_cap, int* n_prompt_out, int* n_fed_out,
-                               int min_prompt, int answer_bytes_per_position) try {
+// 0.16.2: explicit byte lengths, so `prompt`/`rest` may contain NUL bytes (the node accepts such
+// prompts; the FULL bytes are tokenized). keryx_llama_generate_traced below is the strlen() wrapper.
+int keryx_llama_generate_traced_n(KeryxLlama* h, const char* prompt, size_t prompt_len, const int32_t* prefix,
+                                  int n_prefix, int head_tokens, const char* rest, size_t rest_len, int max_tokens,
+                                  char* out, int cap, int32_t* tokens, int tokens_cap, int* n_prompt_out,
+                                  int* n_fed_out, int min_prompt, int answer_bytes_per_position) try {
     if (!h || !h->trace || !h->trace->configured || !prompt || !out || cap < 2 || !tokens ||
         tokens_cap < 1 || !n_prompt_out || !n_fed_out || max_tokens < 0 || max_tokens > 2048 ||
-        n_prefix < 0 || min_prompt < 0 || answer_bytes_per_position < 0 || (n_prefix && (!prefix || !rest))) return -1;
+        n_prefix < 0 || min_prompt < 0 || answer_bytes_per_position < 0 ||
+        (n_prefix && (!prefix || (!rest && rest_len > 0)))) return -1;
+    if (prompt_len > (size_t(1) << 30) || rest_len > (size_t(1) << 30)) return -1;
+    if (!n_prefix) rest_len = 0;
     std::lock_guard<std::mutex> guard(h->gen_lock);
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
     if ((uint32_t)min_prompt > h->trace->max_ctx || (uint32_t)n_prefix > h->trace->max_ctx)
         return keryx_vk_fail(nullptr, "Prefix or padding exceeds the traced context", -2);
-    std::vector<llama_token> prompt_tokens(strlen(prompt) + 16);
-    int n = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt), prompt_tokens.data(), (int32_t)prompt_tokens.size(), true, true);
+    std::vector<llama_token> prompt_tokens(prompt_len + 16);
+    int n = llama_tokenize(vocab, prompt, (int32_t)prompt_len, prompt_tokens.data(), (int32_t)prompt_tokens.size(), true, true);
     if (n <= 0) return -1;
     prompt_tokens.resize(n);
     if (n_prefix) {
@@ -270,10 +275,12 @@ int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, const int32_t
             if (prefix[i] < 0 || prefix[i] >= n_vocab) return -1;
             prompt_tokens.push_back(prefix[i]);
         }
-        std::vector<llama_token> tail(strlen(rest) + 16);
-        const int nr = llama_tokenize(vocab, rest, (int32_t)strlen(rest), tail.data(), (int32_t)tail.size(), false, true);
-        if (nr < 0) return -1;
-        prompt_tokens.insert(prompt_tokens.end(), tail.begin(), tail.begin() + nr);
+        if (rest_len) {
+            std::vector<llama_token> tail(rest_len + 16);
+            const int nr = llama_tokenize(vocab, rest, (int32_t)rest_len, tail.data(), (int32_t)tail.size(), false, true);
+            if (nr < 0) return -1;
+            prompt_tokens.insert(prompt_tokens.end(), tail.begin(), tail.begin() + nr);
+        }
     }
     const llama_token pad = keryx_vk_trace_pad(vocab);
     if ((size_t)min_prompt > prompt_tokens.size()) prompt_tokens.resize(min_prompt, pad);
@@ -324,6 +331,17 @@ int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, const int32_t
 } catch (...) {
     keryx_vk_trace_error = "Vulkan trace operation failed with an unknown native exception";
     return -5;
+}
+
+// Pre-0.16.2 entry point: NUL-terminated `prompt`/`rest` (a NUL byte ends them).
+int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, const int32_t* prefix, int n_prefix,
+                               int head_tokens, const char* rest, int max_tokens, char* out, int cap,
+                               int32_t* tokens, int tokens_cap, int* n_prompt_out, int* n_fed_out,
+                               int min_prompt, int answer_bytes_per_position) {
+    if (!prompt || (n_prefix && !rest)) return -1;
+    return keryx_llama_generate_traced_n(h, prompt, strlen(prompt), prefix, n_prefix, head_tokens, rest,
+                                         (n_prefix && rest) ? strlen(rest) : 0, max_tokens, out, cap, tokens,
+                                         tokens_cap, n_prompt_out, n_fed_out, min_prompt, answer_bytes_per_position);
 }
 
 int keryx_llama_replay_multi(KeryxLlama* h, const int32_t* tokens, int n_tokens, int n_prompt,
