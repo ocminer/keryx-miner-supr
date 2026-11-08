@@ -830,45 +830,61 @@ mod engine {
     mod nul_prompt_gpu_tests {
         use super::*;
 
-        #[test]
-        #[ignore = "requires one CUDA GPU, a libkeryx-llama with keryx_llama_generate_traced_n, and KERYX_TEST_MODEL_GPU0 (a tier GGUF)"]
-        fn nul_prompt_gets_a_traced_answer_that_opens() {
+        /// Traces `prompt` through the network path ([`generate`]) on GPU 0, checks the node's shape
+        /// bound and verifies openings under two seeds; returns the committed prompt tokens.
+        fn traced_round_trip(spec: &'static ModelSpec, gguf: &str, tier: u8, prompt: &str) -> Vec<i32> {
             use crate::trace::{chain_ctx, verify_chain_opening};
+            let rh: [u8; 32] = std::array::from_fn(|i| (i * 5 + 1) as u8);
+            let t = Traced { tier, prompt_len: prompt.len() as u32, request_hash: rh, chain: true, attention: true };
+            let g = generate(spec, gguf, 0, prompt, 16, t).unwrap_or_else(|e| panic!("traced answer to {prompt:?}: {e:?}"));
+            let trace = g.trace.expect("trace");
+            eprintln!("{prompt:?}: answer {:?}, n_prompt {}, n_pos {}", g.text, trace.record.n_prompt, trace.record.n_pos);
+            let min = keryx_verifiable_inference::shape::min_prompt_positions(prompt.len() as u32);
+            assert!(trace.record.n_prompt >= min, "shape: n_prompt {} < {}", trace.record.n_prompt, min);
+            let m = TierManifest::for_attn(tier).expect("attention manifest");
+            let (_, pctx) = chain_ctx(tier).expect("stage-2 context");
+            let ctx = m.chain.expect("stage-2 context");
+            let index = weight_index(spec, gguf, 0).expect("possession index");
+            let tier_ctx = m.tier_ctx(index.get());
+            for seed in [[0x11u8; 32], [0x77u8; 32]] {
+                let bodies = open_pieces(gguf, 0, &m, &pctx, &trace, &seed, &rh, [0u8; 32], index.get()).expect("opening");
+                verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &rh, &bodies[0], bodies.last().unwrap())
+                    .expect("opening verifies");
+            }
+            trace.tokens[..trace.record.n_prompt as usize].to_vec()
+        }
+
+        /// Loads the tier model on GPU 0 under the miner's trace environment.
+        fn setup() -> (&'static ModelSpec, String, u8) {
+            // As main() does before any ggml init: the trace/sequence hooks do not run inside a
+            // replayed CUDA graph, and attention openings expect unrotated KV rows. Without this the
+            // arming self-check fails ("leaf N: 0 chunk values captured for M chunks").
+            crate::native_env::export_trace_env();
             let gguf = std::env::var("KERYX_TEST_MODEL_GPU0").expect("set KERYX_TEST_MODEL_GPU0");
             let spec = crate::models::spec_for_gguf(&gguf).expect("registry model");
             let tier = crate::models::pom_tier_index(&spec.model_id, u64::MAX).expect("tiered model");
             assert!(llama_engine::ensure_loaded_on(&gguf, 0), "model loads on GPU 0");
+            (spec, gguf, tier)
+        }
 
+        #[test]
+        #[ignore = "requires one CUDA GPU, a libkeryx-llama with keryx_llama_generate_traced_n, and KERYX_TEST_MODEL_GPU0 (a tier GGUF)"]
+        fn nul_prompt_gets_a_traced_answer_that_opens() {
+            let (spec, gguf, tier) = setup();
             let prompt = "Reply with one word.\0What colour is the sky on a clear day?\0";
-            let stripped = prompt.replace('\0', "");
-            let rh: [u8; 32] = std::array::from_fn(|i| (i * 5 + 1) as u8);
-            let ask = |p: &str| Traced { tier, prompt_len: p.len() as u32, request_hash: rh, chain: true, attention: true };
-            let g = generate(spec, &gguf, 0, prompt, 16, ask(prompt)).expect("traced answer to a NUL-byte prompt");
-            let trace = g.trace.expect("trace");
-            eprintln!("NUL prompt: answer {:?}, n_prompt {}, n_pos {}", g.text, trace.record.n_prompt, trace.record.n_pos);
-            let min = keryx_verifiable_inference::shape::min_prompt_positions(prompt.len() as u32);
-            assert!(trace.record.n_prompt >= min, "shape: n_prompt {} < {}", trace.record.n_prompt, min);
+            let with_nul = traced_round_trip(spec, &gguf, tier, prompt);
+            // The NUL bytes reached the tokenizer: the committed prompt differs from the stripped one.
+            let stripped = traced_round_trip(spec, &gguf, tier, &prompt.replace('\0', ""));
+            assert_ne!(with_nul, stripped, "the NUL bytes must reach the tokenizer");
+            llama_engine::unload_for_gpu(0);
+        }
 
-            // The NUL bytes were tokenized: the committed prompt differs from the NUL-stripped one.
-            let s = generate(spec, &gguf, 0, &stripped, 16, ask(&stripped)).expect("traced answer to the stripped prompt");
-            let st = s.trace.expect("trace");
-            assert_ne!(
-                &trace.tokens[..trace.record.n_prompt as usize],
-                &st.tokens[..st.record.n_prompt as usize],
-                "the NUL bytes must reach the tokenizer"
-            );
-
-            // Openings of the NUL-prompt trace verify as the node would.
-            let m = TierManifest::for_attn(tier).expect("attention manifest");
-            let (_, pctx) = chain_ctx(tier).expect("stage-2 context");
-            let ctx = m.chain.expect("stage-2 context");
-            let index = weight_index(spec, &gguf, 0).expect("possession index");
-            let tier_ctx = m.tier_ctx(index.get());
-            for seed in [[0x11u8; 32], [0x77u8; 32]] {
-                let bodies = open_pieces(&gguf, 0, &m, &pctx, &trace, &seed, &rh, [0u8; 32], index.get()).expect("opening");
-                verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &rh, &bodies[0], bodies.last().unwrap())
-                    .expect("opening verifies");
-            }
+        /// Control: the same path with a NUL-free prompt.
+        #[test]
+        #[ignore = "requires one CUDA GPU, libkeryx-llama, and KERYX_TEST_MODEL_GPU0 (a tier GGUF)"]
+        fn plain_prompt_gets_a_traced_answer_that_opens() {
+            let (spec, gguf, tier) = setup();
+            traced_round_trip(spec, &gguf, tier, "Reply with one word. What colour is the sky on a clear day?");
             llama_engine::unload_for_gpu(0);
         }
     }
