@@ -807,18 +807,12 @@ impl PomGpuMiner {
         // one buffer. Valid only if it spans exactly this model's chunks and every device tensor sits
         // at its canonical offset; then host/index tensors are written into their holes and the whole
         // gather is one contiguous range (the lock-step v5 walk applies).
-        let canon_blob = crate::llama_engine::canonical_blob_for(device_id).filter(|&(base, len)| {
-            let mut off = 0u64;
-            let mut ok = len == plan.entries.iter().map(|(nb, _)| (*nb / CHUNK_BYTES) as u64 * CHUNK_BYTES as u64).sum::<u64>();
-            for (nb, src) in &plan.entries {
-                // tensors with no whole chunk (e.g. Gemma's 4-byte scalars) are not part of the stream
-                if let (GatherSource::DevicePtr(p), true) = (src, *nb >= CHUNK_BYTES) {
-                    ok &= *p == base + off;
-                }
-                off += (*nb / CHUNK_BYTES) as u64 * CHUNK_BYTES as u64;
-            }
+        // A device tensor the engine placed outside its stream range (a padded tensor whose following
+        // bytes would not be safe padding gets its own copy) is copied into the reserved hole below.
+        let canon_blob = crate::llama_engine::canonical_blob_for(device_id).filter(|&(_, len)| {
+            let ok = len == plan.entries.iter().map(|(nb, _)| (*nb / CHUNK_BYTES) as u64 * CHUNK_BYTES as u64).sum::<u64>();
             if !ok {
-                log::warn!("PoM[gpu{}]: engine canonical layout does not match the gather plan — using the segmented gather", device_id);
+                log::warn!("PoM[gpu{}]: engine canonical stream length does not match the gather plan — using the segmented gather", device_id);
             }
             ok
         });
@@ -832,7 +826,18 @@ impl PomGpuMiner {
                 continue;
             }
             let base = match source {
-                GatherSource::DevicePtr(p) => *p,
+                GatherSource::DevicePtr(p) => match canon_at(*prefix.last().unwrap()) {
+                    Some(at) if at != *p => {
+                        let len = (chunks * CHUNK_BYTES as u64) as usize;
+                        unsafe {
+                            candle_core::cuda_backend::cudarc::driver::result::memcpy_dtod_async(at, *p, len, stream.cu_stream())
+                        }
+                        .map_err(candle_core::Error::wrap)?;
+                        stream.synchronize().map_err(candle_core::Error::wrap)?;
+                        at
+                    }
+                    _ => *p,
+                },
                 GatherSource::HostPtr(p) => {
                     // Host-resident in ggml (CPU buffer): the walk needs device memory — upload our
                     // own copy of the raw bytes (identical to the GGUF bytes, same as the pointer).
