@@ -317,8 +317,8 @@ static KeryxLlama* keryx_load_impl(const char* gguf_path, int gpu, const int* la
     }
     // KERYX_CANONICAL_WEIGHTS=1: place the GPU weights in the PoM walk's canonical layout (patch 0007).
     {
-        const char* cw = std::getenv("KERYX_CANONICAL_WEIGHTS");
-        keryx_llama_canonical_weights = cw && cw[0] == '1';
+        const char* cw = std::getenv("KERYX_CANONICAL_WEIGHTS");   // default on; "0" restores llama's own layout
+        keryx_llama_canonical_weights = !(cw && cw[0] == '0');
         keryx_llama_canonical_base = nullptr;
         keryx_llama_canonical_bytes = 0;
     }

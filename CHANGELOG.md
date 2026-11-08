@@ -1,3 +1,24 @@
+# keryx-miner-supr 0.16.2 — faster PoM walk, NUL-byte prompts, mixed-tier rigs
+
+- **Faster mining on NVIDIA (sm_80 and newer).** A new walk kernel advances two or
+  four nonces per warp in lock-step over one contiguous copy of the model and
+  picks the faster width per card at startup (checked against the previous kernel
+  before it is used). Inference cards keep a single resident model: the inference
+  engine now lays the weights out in the walk's order. Measured on our rigs,
+  same card and power limit, against 0.16.1:
+  RTX 5090 at 450 W +32% (4.31 → 5.70 MH/s, tier 0; tier 4 4.37 → 5.70),
+  RTX 3070 at 240 W +20% (1.31 → 1.57 MH/s), RTX 5080 at 360 W +2–3%
+  (3.28–3.33 → 3.39–3.41 MH/s; this card was already close to its memory limit).
+  `KERYX_POM_V5_LOCKSTEP=0` returns to the previous kernel,
+  `KERYX_CANONICAL_WEIGHTS=0` to the previous weight layout.
+- **Fix: AI requests whose prompt contains a NUL byte** are now answered. The
+  prompt reaches the engine byte for byte with its length; nothing is removed, so
+  the answer matches the prompt the network audits. Before, every miner refused
+  such a request and the node counted a miss for each of them.
+- **Fix: rigs mining different tiers in one process** no longer get every share
+  of the main tier rejected (`v5 verify: BadTilePath`). Each card now builds the
+  context pad from its own model.
+
 # keryx-miner-supr 0.16.1 — pool `Busy` reply for AI requests
 
 - When the pool sends a `mining.ai_request` and every card that serves the
