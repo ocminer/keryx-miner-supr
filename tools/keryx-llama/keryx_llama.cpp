@@ -72,7 +72,12 @@ int  ggml_cuda_q8s_read_captures(int device, uint8_t* bytes, size_t bytes_cap, u
 }
 #endif
 
+// keryx (patch 0007): canonical weight layout switch and the last canonical buffer it produced.
+extern "C" { extern bool keryx_llama_canonical_weights; extern void * keryx_llama_canonical_base; extern size_t keryx_llama_canonical_bytes; }
+
 struct KeryxLlama {
+    void*  canon_base  = nullptr;   // device address of this model's canonical weight stream (or null)
+    size_t canon_bytes = 0;
     llama_model*   model = nullptr;
     llama_context* ctx   = nullptr;
     llama_sampler* smpl  = nullptr;
@@ -310,7 +315,17 @@ static KeryxLlama* keryx_load_impl(const char* gguf_path, int gpu, const int* la
         overrides[0].val_i64 = 64;
         mp.kv_overrides = overrides;
     }
+    // KERYX_CANONICAL_WEIGHTS=1: place the GPU weights in the PoM walk's canonical layout (patch 0007).
+    {
+        const char* cw = std::getenv("KERYX_CANONICAL_WEIGHTS");
+        keryx_llama_canonical_weights = cw && cw[0] == '1';
+        keryx_llama_canonical_base = nullptr;
+        keryx_llama_canonical_bytes = 0;
+    }
     llama_model* model = llama_model_load_from_file(gguf_path, mp);
+    void* const canon_base = keryx_llama_canonical_base;
+    const size_t canon_bytes = keryx_llama_canonical_bytes;
+    keryx_llama_canonical_weights = false;
     if (!model) return nullptr;
 
     llama_context* ctx = nullptr;
@@ -355,6 +370,7 @@ static KeryxLlama* keryx_load_impl(const char* gguf_path, int gpu, const int* la
 
     auto* h = new KeryxLlama();
     h->model = model; h->ctx = ctx; h->smpl = smpl;
+    h->canon_base = canon_base; h->canon_bytes = canon_bytes;
     h->gpu = gpu; h->cparams = cp; h->kv = kv;
     h->ctx_info = keryx_ctx_info(h) + " vram_free_after=" + std::to_string(free_after) + "MiB";
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
@@ -710,6 +726,13 @@ int keryx_llama_seq_replay(KeryxLlama* h, const int32_t* tokens, int n_tokens, i
 }
 
 size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
+// Device address and byte length of the model's canonical weight stream (patch 0007), or 0 when the
+// weights were allocated the ordinary way. Holes (tensors llama keeps elsewhere) are zero until filled.
+size_t keryx_llama_canonical_blob(KeryxLlama* h, void** base) {
+    if (!h || !base) return 0;
+    *base = h->canon_base;
+    return h->canon_base ? h->canon_bytes : 0;
+}
 
 // Tensor i in CANONICAL order. *is_device = the data pointer is CUDA device memory (walkable
 // in-place); 0 = host memory (the caller uploads its own device copy for the walk).

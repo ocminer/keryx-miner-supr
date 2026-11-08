@@ -37,6 +37,7 @@ type FreeFn = unsafe extern "C" fn(*mut c_void);
 // CUDA ordinal owning tensor i's bytes, or -1 (host/unified/unknown). Upstream aa29fd2 — optional
 // symbol (absent on older .so builds → the ownership gate below degrades to a no-op).
 type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
+type CanonBlobFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> usize;
 /// Optional (v0.14.1 engines): reason of the last failed load, "" when none.
 type LastErrorFn = unsafe extern "C" fn() -> *const c_char;
 // ── H15 block task / canonical trace ABI (libkeryx-llama ABI 3; cherry-picked from upstream v0.5.8) ──
@@ -122,6 +123,8 @@ struct Engine {
     free: FreeFn,
     /// Optional: absent on older `libkeryx-llama.so` builds (looked up soft, gate no-ops if None).
     tensor_device: Option<TensorDeviceFn>,
+    /// Optional (patch 0007): device base + length of the model's canonical weight stream.
+    canonical_blob: Option<CanonBlobFn>,
     gguf: String,
     /// Context the model was loaded with (tokens) — bounds the prompt an unguarded library can take.
     n_ctx: c_int,
@@ -257,6 +260,7 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
         let trace_last_error = sym::<LastErrorFn>(lib, b"keryx_llama_last_error\0");
         // Optional (upstream aa29fd2): older builds lack it — the ownership gate then no-ops.
         let tensor_device = sym::<TensorDeviceFn>(lib, b"keryx_llama_tensor_device\0");
+        let canonical_blob = sym::<CanonBlobFn>(lib, b"keryx_llama_canonical_blob\0");
         // --force-model: NO safety check at all — the operator's contract is "load it verbatim,
         // regardless of what the card says". The pre-check below exists to protect AUTO
         // selection from the poisonous failed-load path; a forced rig opts out of that
@@ -387,6 +391,7 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             generate: gen,
             free,
             tensor_device,
+            canonical_blob,
             gguf: gguf.to_string(),
             n_ctx,
             ctx_fit: n_ctx,
@@ -728,6 +733,18 @@ pub fn tensors_for(gpu: usize) -> Option<Vec<(String, u64, usize, bool)>> {
         out.push((nm, data as u64, nbytes, is_dev != 0));
     }
     Some(out)
+}
+
+/// Device base and byte length of the canonical weight stream of the engine on `gpu`, when its
+/// weights were placed in the PoM walk's canonical layout (KERYX_CANONICAL_WEIGHTS=1, patch 0007).
+pub fn canonical_blob_for(gpu: usize) -> Option<(u64, u64)> {
+    let slot = slot_for(gpu);
+    let g = slot.inner.lock().ok()?;
+    let e = g.as_ref()?;
+    let f = e.canonical_blob?;
+    let mut base: *mut c_void = std::ptr::null_mut();
+    let n = unsafe { f(e.model, &mut base) };
+    (n > 0 && !base.is_null()).then_some((base as u64, n as u64))
 }
 
 /// Legacy shim: tensors of the single/first resident engine (used only where exactly one card

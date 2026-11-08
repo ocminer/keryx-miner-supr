@@ -803,6 +803,28 @@ impl PomGpuMiner {
         let mut bases: Vec<u64> = Vec::new();
         let mut prefix: Vec<u64> = vec![0];
         let mut uploads: Vec<CudaSlice<u8>> = Vec::new();
+        // Canonical layout (patch 0007): the engine placed the weights as the walk's canonical stream in
+        // one buffer. Valid only if it spans exactly this model's chunks and every device tensor sits
+        // at its canonical offset; then host/index tensors are written into their holes and the whole
+        // gather is one contiguous range (the lock-step v5 walk applies).
+        let canon_blob = crate::llama_engine::canonical_blob_for(device_id).filter(|&(base, len)| {
+            let mut off = 0u64;
+            let mut ok = len == plan.entries.iter().map(|(nb, _)| (*nb / CHUNK_BYTES) as u64 * CHUNK_BYTES as u64).sum::<u64>();
+            for (nb, src) in &plan.entries {
+                if let GatherSource::DevicePtr(p) = src {
+                    ok &= *p == base + off;
+                }
+                off += (*nb / CHUNK_BYTES) as u64 * CHUNK_BYTES as u64;
+            }
+            if !ok {
+                log::warn!("PoM[gpu{}]: engine canonical layout does not match the gather plan — using the segmented gather", device_id);
+            }
+            ok
+        });
+        let canon_at = |chunk: u64| canon_blob.map(|(base, _)| base + chunk * CHUNK_BYTES as u64);
+        if let Some((base, len)) = canon_blob {
+            info!("PoM[gpu{}]: engine weights in canonical layout ({} MiB at {:#x}) — contiguous zero-dup walk", device_id, len >> 20, base);
+        }
         for (nbytes, source) in &plan.entries {
             let chunks = (nbytes / CHUNK_BYTES) as u64;
             if chunks == 0 {
@@ -814,10 +836,21 @@ impl PomGpuMiner {
                     // Host-resident in ggml (CPU buffer): the walk needs device memory — upload our
                     // own copy of the raw bytes (identical to the GGUF bytes, same as the pointer).
                     let host: &[u8] = unsafe { std::slice::from_raw_parts(*p as *const u8, *nbytes) };
-                    let dev = stream.clone_htod(host).map_err(candle_core::Error::wrap)?;
-                    let ptr = dev.device_ptr(&stream).0 as u64;
-                    uploads.push(dev);
-                    ptr
+                    if let Some(at) = canon_at(*prefix.last().unwrap()) {
+                        // canonical layout (patch 0007): write it into its reserved hole instead
+                        let len = (chunks * CHUNK_BYTES as u64) as usize;
+                        unsafe {
+                            candle_core::cuda_backend::cudarc::driver::result::memcpy_htod_async(at, &host[..len], stream.cu_stream())
+                        }
+                        .map_err(candle_core::Error::wrap)?;
+                        stream.synchronize().map_err(candle_core::Error::wrap)?;
+                        at
+                    } else {
+                        let dev = stream.clone_htod(host).map_err(candle_core::Error::wrap)?;
+                        let ptr = dev.device_ptr(&stream).0 as u64;
+                        uploads.push(dev);
+                        ptr
+                    }
                 }
                 GatherSource::FromIndex => {
                     // llama repacked this tensor — upload its canonical bytes from the possession
@@ -829,10 +862,19 @@ impl PomGpuMiner {
                     for i in 0..chunks as usize {
                         buf[i * CHUNK_BYTES..][..CHUNK_BYTES].copy_from_slice(&idx.read_chunk_bytes(start + i as u64));
                     }
-                    let dev = stream.clone_htod(buf.as_slice()).map_err(candle_core::Error::wrap)?;
-                    let ptr = dev.device_ptr(&stream).0 as u64;
-                    uploads.push(dev);
-                    ptr
+                    if let Some(at) = canon_at(start) {
+                        unsafe {
+                            candle_core::cuda_backend::cudarc::driver::result::memcpy_htod_async(at, buf.as_slice(), stream.cu_stream())
+                        }
+                        .map_err(candle_core::Error::wrap)?;
+                        stream.synchronize().map_err(candle_core::Error::wrap)?;
+                        at
+                    } else {
+                        let dev = stream.clone_htod(buf.as_slice()).map_err(candle_core::Error::wrap)?;
+                        let ptr = dev.device_ptr(&stream).0 as u64;
+                        uploads.push(dev);
+                        ptr
+                    }
                 }
             };
             bases.push(base);
