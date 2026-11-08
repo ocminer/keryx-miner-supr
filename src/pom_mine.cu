@@ -1425,28 +1425,29 @@ __device__ __forceinline__ void v5ls_step(unsigned int* s_state, const unsigned 
     __syncwarp();
 }
 
-extern "C" __global__ void __launch_bounds__(32) pom_mine_v5_lockstep_seeded(
+template <int NL>
+__device__ __forceinline__ void v5ls_walk(
     const unsigned char* wbase, unsigned long long n_tiles, const unsigned char* pbase, unsigned long long n_pad,
     unsigned int K, unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long n_nonces, unsigned long long inv_n, unsigned long long inv_p, unsigned int k_pad,
     const unsigned long long* h10_seeds, unsigned long long* winner) {
     extern __shared__ unsigned int s_shared[];
-    constexpr unsigned int GS = 32u / V5LS_L;
+    constexpr unsigned int GS = 32u / NL;
     const unsigned int x = threadIdx.x & 31u, g = x / GS;
-    const unsigned long long i0 = (unsigned long long)blockIdx.x * V5LS_L;
+    const unsigned long long i0 = (unsigned long long)blockIdx.x * NL;
     if (i0 >= n_nonces) return;
     const unsigned long long my_i = min(i0 + g, n_nonces - 1);
     const unsigned long long my_seed = h10_seeds[my_i];
     unsigned long long my_off = v4_barrett_mod(mix64(my_seed ^ V4_OFFSET_FIRST_SALT), n_tiles, inv_n);
     #pragma unroll
-    for (int l = 0; l < V5LS_L; l++) {
+    for (int l = 0; l < NL; l++) {
         const unsigned long long off = __shfl_sync(0xffffffffu, my_off, l * GS);
         v5ls_load(s_shared + l * 768u + 512u, wbase + off * 1024ULL, x);       // tile 1 -> buffer 1
     }
     asm volatile("cp.async.commit_group;");
     #pragma unroll
-    for (int l = 0; l < V5LS_L; l++) {
+    for (int l = 0; l < NL; l++) {
         unsigned int* st = s_shared + l * 768u;
         const unsigned long long sd = __shfl_sync(0xffffffffu, my_seed, l * GS);
         unsigned long long h = mix64(sd ^ (V4_S0_ROW_SALT + (unsigned long long)x));
@@ -1463,7 +1464,7 @@ extern "C" __global__ void __launch_bounds__(32) pom_mine_v5_lockstep_seeded(
             unsigned long long hs_mine = 0;
             const unsigned int f0 = v5ls_sw(x, 0);
             #pragma unroll
-            for (int l = 0; l < V5LS_L; l++) {
+            for (int l = 0; l < NL; l++) {
                 const unsigned int* st = s_shared + l * 768u;
                 const unsigned long long hs = v5_fast_state_fold(st[f0], st[f0 + 1u], x);
                 if (g == (unsigned)l) hs_mine = hs;
@@ -1476,7 +1477,7 @@ extern "C" __global__ void __launch_bounds__(32) pom_mine_v5_lockstep_seeded(
             const bool pad = v5_fast_is_pad_step(step + 1u, K, k_pad);
             my_off = pad ? n_tiles + v4_barrett_mod(raw, n_pad, inv_p) : v4_barrett_mod(raw, n_tiles, inv_n);
             #pragma unroll
-            for (int l = 0; l < V5LS_L; l++) {
+            for (int l = 0; l < NL; l++) {
                 const unsigned long long off = __shfl_sync(0xffffffffu, my_off, l * GS);
                 const unsigned char* src = off < n_tiles ? wbase + off * 1024ULL : pbase + (off - n_tiles) * 1024ULL;
                 v5ls_load(s_shared + l * 768u + 256u + (cb ^ 256u), src, x);
@@ -1484,12 +1485,12 @@ extern "C" __global__ void __launch_bounds__(32) pom_mine_v5_lockstep_seeded(
         }
         asm volatile("cp.async.commit_group;");
         #pragma unroll
-        for (int l = 0; l < V5LS_L; l++) v5ls_step(s_shared + l * 768u, s_shared + l * 768u + 256u + cb, step, x);
+        for (int l = 0; l < NL; l++) v5ls_step(s_shared + l * 768u, s_shared + l * 768u + 256u + cb, step, x);
     }
     asm volatile("cp.async.wait_group 0;");
     __syncwarp();
     #pragma unroll
-    for (int l = 0; l < V5LS_L; l++) {
+    for (int l = 0; l < NL; l++) {
         unsigned int* st = s_shared + l * 768u;
         unsigned int row4[V4_D4];
         #pragma unroll
@@ -1512,8 +1513,33 @@ extern "C" __global__ void __launch_bounds__(32) pom_mine_v5_lockstep_seeded(
         __syncwarp();
     }
 }
+
+// Four nonces per 32-thread block (best measured on RTX 5090).
+extern "C" __global__ void __launch_bounds__(32) pom_mine_v5_lockstep_seeded(
+    const unsigned char* wbase, unsigned long long n_tiles, const unsigned char* pbase, unsigned long long n_pad,
+    unsigned int K, unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
+    unsigned long long n_nonces, unsigned long long inv_n, unsigned long long inv_p, unsigned int k_pad,
+    const unsigned long long* h10_seeds, unsigned long long* winner) {
+    v5ls_walk<4>(wbase, n_tiles, pbase, n_pad, K, p0, p1, p2, p3, t0, t1, t2, t3, n_nonces, inv_n, inv_p, k_pad, h10_seeds, winner);
+}
+// Two nonces per 32-thread block (best measured on RTX 3070 / RTX 5080); 6 KiB shared memory.
+extern "C" __global__ void __launch_bounds__(32) pom_mine_v5_lockstep2_seeded(
+    const unsigned char* wbase, unsigned long long n_tiles, const unsigned char* pbase, unsigned long long n_pad,
+    unsigned int K, unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
+    unsigned long long n_nonces, unsigned long long inv_n, unsigned long long inv_p, unsigned int k_pad,
+    const unsigned long long* h10_seeds, unsigned long long* winner) {
+    v5ls_walk<2>(wbase, n_tiles, pbase, n_pad, K, p0, p1, p2, p3, t0, t1, t2, t3, n_nonces, inv_n, inv_p, k_pad, h10_seeds, winner);
+}
 #else
 extern "C" __global__ void pom_mine_v5_lockstep_seeded(
+    const unsigned char*, unsigned long long, const unsigned char*, unsigned long long,
+    unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, unsigned int,
+    const unsigned long long*, unsigned long long*) {}
+extern "C" __global__ void pom_mine_v5_lockstep2_seeded(
     const unsigned char*, unsigned long long, const unsigned char*, unsigned long long,
     unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long,
     unsigned long long, unsigned long long, unsigned long long, unsigned long long,

@@ -25,9 +25,9 @@ See `docs/benchmarks/2026-11-05-h15-cmp-cache.md` for measured gains and limits.
 
 - Compiler: NVIDIA CUDA 13.4, `nvcc V13.4.92`
 - Source: `src/pom_mine.cu`
-- Source SHA-256: `126f30375c5d6cd801cc5728b4efa1ee49e8d961fda251219014c5fbe9278861`
+- Source SHA-256: `30c32bf736a666ecdb66663a9f733ce6cf5b0a934962fdb910179e7ea5ab5071`
 - Artifact: `cuda/pom_mine.fatbin`
-- Artifact SHA-256: `1185182be0d68f16b09397e7660a08106fbbf1c90c1ce7ddf26fc95c564c2867`
+- Artifact SHA-256: `7777e6f4f219b4ed6b1487cf20d5c8fb89f022a36b79a8dc2e24c2df62015140`
 - Artifact size: 5097224 bytes
 - Native SASS: sm_75, sm_80, sm_86, sm_87, sm_88, sm_89, sm_90, sm_100, sm_103, sm_110,
   sm_120, sm_121

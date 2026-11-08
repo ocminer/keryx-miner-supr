@@ -329,7 +329,7 @@ pub struct PomGpuMiner {
     v5_contig_base: OnceLock<Option<u64>>,
     /// Outcome of the one-time cross-check of the lock-step walk against the established fast v5
     /// kernel on this card and blob (winners over several easy-target batches must be identical).
-    v5_lockstep_ok: OnceLock<bool>,
+    v5_lockstep_ok: OnceLock<u64>,
 }
 
 /// The device-resident PoM v5 context pad plus the gather map that reaches it. `n_pad` tiles are
@@ -1187,17 +1187,18 @@ impl PomGpuMiner {
         batch: u64,
         h10_seeds: &CudaSlice<u64>,
         winner: &mut CudaSlice<u64>,
+        nl: u64,
     ) -> candle_core::Result<()> {
         use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-        const NONCES_PER_BLOCK: u64 = 4;
-        let walk = load_walk_func(&self.cuda, "pom_mine_v5_lockstep_seeded")?;
+        let nonces_per_block: u64 = if nl == 2 { 2 } else { 4 };
+        let walk = load_walk_func(&self.cuda, if nl == 2 { "pom_mine_v5_lockstep2_seeded" } else { "pom_mine_v5_lockstep_seeded" })?;
         let pbase = pad._pad_buf.device_ptr(&self.stream).0 as u64;
         let k = crate::pom_v4::POM_V4_K as u32;
         let inv_n = u64::MAX / n_tiles;
         let cfg = LaunchConfig {
-            grid_dim: (((batch + NONCES_PER_BLOCK - 1) / NONCES_PER_BLOCK) as u32, 1, 1),
+            grid_dim: (((batch + nonces_per_block - 1) / nonces_per_block) as u32, 1, 1),
             block_dim: (32, 1, 1),
-            shared_mem_bytes: (NONCES_PER_BLOCK as u32) * 3 * 1024,
+            shared_mem_bytes: (nonces_per_block as u32) * 3 * 1024,
         };
         let mut b = walk.builder();
         b.arg(&wbase)
@@ -1223,6 +1224,30 @@ impl PomGpuMiner {
         Ok(())
     }
 
+    /// Wall time of one lock-step batch (after one warm-up launch) with an impossible target.
+    #[allow(clippy::too_many_arguments)]
+    fn time_v5_lockstep(
+        &self,
+        wbase: u64,
+        n_tiles: u64,
+        pad: &V5Pad,
+        p: &[u64; 4],
+        batch: u64,
+        h10_seeds: &CudaSlice<u64>,
+        winner: &mut CudaSlice<u64>,
+        nl: u64,
+    ) -> candle_core::Result<f64> {
+        let none = [0u64; 4];
+        self.launch_v5_lockstep(wbase, n_tiles, pad, p, &none, batch, h10_seeds, winner, nl)?;
+        self.stream.synchronize().map_err(candle_core::Error::wrap)?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..2 {
+            self.launch_v5_lockstep(wbase, n_tiles, pad, p, &none, batch, h10_seeds, winner, nl)?;
+        }
+        self.stream.synchronize().map_err(candle_core::Error::wrap)?;
+        Ok(t0.elapsed().as_secs_f64() / 2.0)
+    }
+
     /// One-time exactness gate for the lock-step walk on this card: for several easy-target batches
     /// the lowest winning index must equal the established fast v5 kernel's. Any mismatch or error
     /// keeps this miner on the established kernel for good.
@@ -1235,6 +1260,7 @@ impl PomGpuMiner {
         p: &[u64; 4],
         s: &[u64; 4],
         timestamp: u64,
+        nl: u64,
     ) -> bool {
         let run = || -> candle_core::Result<bool> {
             const N: u64 = 8192;
@@ -1258,7 +1284,7 @@ impl PomGpuMiner {
                 }
                 self.stream.memcpy_htod(&[u64::MAX], &mut w_new).map_err(candle_core::Error::wrap)?;
                 self.stream.memcpy_htod(&[u64::MAX], &mut w_ref).map_err(candle_core::Error::wrap)?;
-                self.launch_v5_lockstep(wbase, n_tiles, pad, p, &easy, N, &seeds, &mut w_new)?;
+                self.launch_v5_lockstep(wbase, n_tiles, pad, p, &easy, N, &seeds, &mut w_new, nl)?;
                 let warps = v4_ncf_warps();
                 let mut b = fast.builder();
                 b.arg(&pad.bases_dev)
@@ -1402,16 +1428,29 @@ impl PomGpuMiner {
                 && matches!(self.stream.context().compute_capability(), Ok((major, _)) if major >= 8)
             {
                 if let Some(wbase) = self.v5_contiguous_base() {
-                    let ok = *self.v5_lockstep_ok.get_or_init(|| {
-                        let ok = self.v5_lockstep_selfcheck(wbase, n_tiles, pad, &p, &s, timestamp);
-                        log::info!(
-                            "PoM v5[gpu{}]: lock-step contiguous walk {}",
-                            self.stream.context().ordinal(),
-                            if ok { "cross-checked, active" } else { "REJECTED by cross-check, staying on the established kernel" }
-                        );
-                        ok
+                    let nl = *self.v5_lockstep_ok.get_or_init(|| {
+                        // Cross-check both widths, then keep the faster one on this card and blob.
+                        let ord = self.stream.context().ordinal();
+                        let mut best: (u64, f64) = (0, f64::MAX);
+                        let forced = std::env::var("KERYX_POM_V5_LOCKSTEP_NL").ok().and_then(|v| v.parse::<u64>().ok());
+                        for nl in [4u64, 2] {
+                            if forced.is_some_and(|f| f != nl) || !self.v5_lockstep_selfcheck(wbase, n_tiles, pad, &p, &s, timestamp, nl) {
+                                continue;
+                            }
+                            let t = self.time_v5_lockstep(wbase, n_tiles, pad, &p, batch, &h10_seeds, &mut winner, nl).unwrap_or(f64::MAX);
+                            log::info!("PoM v5[gpu{}]: lock-step walk x{} cross-checked, {:.3} ms per batch of {}", ord, nl, t * 1e3, batch);
+                            if t < best.1 {
+                                best = (nl, t);
+                            }
+                        }
+                        if best.0 == 0 {
+                            log::warn!("PoM v5[gpu{}]: lock-step walk REJECTED by cross-check, staying on the established kernel", ord);
+                        } else {
+                            log::info!("PoM v5[gpu{}]: lock-step contiguous walk active ({} nonces per warp)", ord, best.0);
+                        }
+                        best.0
                     });
-                    if ok {
+                    if nl != 0 {
                         // the self-check may have used the stream: reset the winner after it
                         {
                             use candle_core::cuda_backend::cudarc::driver::result;
@@ -1419,7 +1458,7 @@ impl PomGpuMiner {
                             unsafe { result::memset_d8_async(ptr, 0xff, std::mem::size_of::<u64>(), self.stream.cu_stream()) }
                                 .map_err(candle_core::Error::wrap)?;
                         }
-                        self.launch_v5_lockstep(wbase, n_tiles, pad, &p, &t, batch, &h10_seeds, &mut *winner)?;
+                        self.launch_v5_lockstep(wbase, n_tiles, pad, &p, &t, batch, &h10_seeds, &mut *winner, nl)?;
                         self.stream.synchronize().map_err(candle_core::Error::wrap)?;
                         let w = self.stream.clone_dtoh(&*winner).map_err(candle_core::Error::wrap)?[0];
                         return Ok(if w == u64::MAX { None } else { Some(start + w) });
