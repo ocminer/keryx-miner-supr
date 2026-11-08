@@ -322,6 +322,14 @@ pub struct PomGpuMiner {
     /// (an inference needs the VRAM back); keyed by (seed, n_pad, k_pad) so a model/tier/R_T change
     /// on the same miner refills instead of walking a stale pad.
     v5_pad: Mutex<Option<Arc<V5Pad>>>,
+    /// Device address of weight tile 0 when every canonical chunk lies back to back in ONE device
+    /// range (`load_raw` builds this layout); `None` for gathers over separate tensor allocations.
+    /// Computed once from (bases, prefix). Enables the lock-step v5 walk, which addresses tile t at
+    /// base + t KiB with no segment lookup on the dependent chain.
+    v5_contig_base: OnceLock<Option<u64>>,
+    /// Outcome of the one-time cross-check of the lock-step walk against the established fast v5
+    /// kernel on this card and blob (winners over several easy-target batches must be identical).
+    v5_lockstep_ok: OnceLock<bool>,
 }
 
 /// The device-resident PoM v5 context pad plus the gather map that reaches it. `n_pad` tiles are
@@ -577,6 +585,8 @@ impl PomGpuMiner {
             v5_pad: Mutex::new(None),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
+            v5_contig_base: OnceLock::new(),
+            v5_lockstep_ok: OnceLock::new(),
             _tensors: tensors,
             _shared: Vec::new(),
             _uploads: Vec::new(),
@@ -606,7 +616,16 @@ impl PomGpuMiner {
         let names = meta.sorted_names(); // canonical order — matches pom-rt-builder / the node R_T
 
         use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-        let mut uploads: Vec<CudaSlice<u8>> = Vec::new();
+        // ONE device allocation holding the canonical stream: every tensor's whole 32-byte chunks back
+        // to back in name order, exactly the bytes the per-tensor uploads used to hold (same VRAM).
+        // A contiguous blob lets the lock-step v5 walk address tile t directly (no segment lookup).
+        let n_total_chunks: u64 = names.iter().map(|n| meta.tensors[n].nbytes / CHUNK_BYTES as u64).sum();
+        if n_total_chunks == 0 {
+            return Err(candle_core::Error::Msg("PoM GPU: model produced 0 chunks".into()));
+        }
+        let blob = unsafe { stream.alloc::<u8>((n_total_chunks * CHUNK_BYTES as u64) as usize) }
+            .map_err(candle_core::Error::wrap)?;
+        let blob_ptr = blob.device_ptr(&stream).0 as u64;
         let mut bases: Vec<u64> = Vec::new();
         let mut prefix: Vec<u64> = vec![0];
         let mut host_buf: Vec<u8> = Vec::new();
@@ -616,20 +635,22 @@ impl PomGpuMiner {
             if chunks == 0 {
                 continue;
             }
+            let len = (chunks * CHUNK_BYTES as u64) as usize;
             host_buf.resize(t.nbytes as usize, 0);
             crate::pom::read_exact_at(&file, &mut host_buf, meta.tensor_data_offset + t.offset)
                 .map_err(candle_core::Error::wrap)?;
-            let dev = stream.clone_htod(host_buf.as_slice()).map_err(candle_core::Error::wrap)?;
-            bases.push(dev.device_ptr(&stream).0 as u64);
-            uploads.push(dev);
+            let at = blob_ptr + *prefix.last().unwrap() * CHUNK_BYTES as u64;
+            unsafe {
+                candle_core::cuda_backend::cudarc::driver::result::memcpy_htod_async(at, &host_buf[..len], stream.cu_stream())
+            }
+            .map_err(candle_core::Error::wrap)?;
+            stream.synchronize().map_err(candle_core::Error::wrap)?; // host_buf is reused for the next tensor
+            bases.push(at);
             prefix.push(prefix.last().unwrap() + chunks);
         }
-        let n_total_chunks = *prefix.last().unwrap();
-        if n_total_chunks == 0 {
-            return Err(candle_core::Error::Msg("PoM GPU: model produced 0 chunks".into()));
-        }
+        let uploads: Vec<CudaSlice<u8>> = vec![blob];
         info!(
-            "PoM raw gather: {} tensors uploaded, N={} chunks (candle-free, arch-agnostic)",
+            "PoM raw gather: {} tensors uploaded as one contiguous canonical blob, N={} chunks (candle-free, arch-agnostic)",
             bases.len(),
             n_total_chunks
         );
@@ -649,6 +670,8 @@ impl PomGpuMiner {
             v5_pad: Mutex::new(None),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
+            v5_contig_base: OnceLock::new(),
+            v5_lockstep_ok: OnceLock::new(),
             _tensors: Vec::new(),
             _shared: Vec::new(),
             _uploads: uploads,
@@ -734,6 +757,8 @@ impl PomGpuMiner {
             v5_pad: Mutex::new(None),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
+            v5_contig_base: OnceLock::new(),
+            v5_lockstep_ok: OnceLock::new(),
             _tensors: raw,
             _shared: kept_shared,
             _uploads: Vec::new(),
@@ -882,6 +907,8 @@ impl PomGpuMiner {
             v5_pad: Mutex::new(None),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
+            v5_contig_base: OnceLock::new(),
+            v5_lockstep_ok: OnceLock::new(),
             _tensors: Vec::new(),
             _shared: Vec::new(),
             _uploads: uploads,
@@ -1087,6 +1114,160 @@ impl PomGpuMiner {
         self.mine_v4_impl(pre_pow_hash, timestamp, target_le, start, batch, h10_era, h14_era, None)
     }
 
+    /// Base address of weight tile 0 when the gather is one contiguous range (see `v5_contig_base`).
+    fn v5_contiguous_base(&self) -> Option<u64> {
+        *self.v5_contig_base.get_or_init(|| {
+            let bases: Vec<u64> = self.stream.clone_dtoh(&self.bases_dev).ok()?;
+            let prefix: Vec<u64> = self.stream.clone_dtoh(&self.prefix_dev).ok()?;
+            let b0 = *bases.first()?;
+            let contiguous = bases.iter().zip(prefix.iter()).all(|(&b, &p)| b == b0 + p * CHUNK_BYTES as u64);
+            // tile t must be 16-byte aligned for cp.async; the canonical stream keeps 32-byte chunks
+            (contiguous && b0 % 16 == 0).then_some(b0)
+        })
+    }
+
+    /// Launch the lock-step v5 walk (`pom_mine_v5_lockstep_seeded`) over `batch` nonces whose seeds
+    /// are already in `h10_seeds`. `winner` receives the lowest winning batch index.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_v5_lockstep(
+        &self,
+        wbase: u64,
+        n_tiles: u64,
+        pad: &V5Pad,
+        p: &[u64; 4],
+        t: &[u64; 4],
+        batch: u64,
+        h10_seeds: &CudaSlice<u64>,
+        winner: &mut CudaSlice<u64>,
+    ) -> candle_core::Result<()> {
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        const NONCES_PER_BLOCK: u64 = 4;
+        let walk = load_walk_func(&self.cuda, "pom_mine_v5_lockstep_seeded")?;
+        let pbase = pad._pad_buf.device_ptr(&self.stream).0 as u64;
+        let k = crate::pom_v4::POM_V4_K as u32;
+        let inv_n = u64::MAX / n_tiles;
+        let cfg = LaunchConfig {
+            grid_dim: (((batch + NONCES_PER_BLOCK - 1) / NONCES_PER_BLOCK) as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: (NONCES_PER_BLOCK as u32) * 3 * 1024,
+        };
+        let mut b = walk.builder();
+        b.arg(&wbase)
+            .arg(&n_tiles)
+            .arg(&pbase)
+            .arg(&pad.n_pad)
+            .arg(&k)
+            .arg(&p[0])
+            .arg(&p[1])
+            .arg(&p[2])
+            .arg(&p[3])
+            .arg(&t[0])
+            .arg(&t[1])
+            .arg(&t[2])
+            .arg(&t[3])
+            .arg(&batch)
+            .arg(&inv_n)
+            .arg(&pad.inv_p)
+            .arg(&pad.k_pad)
+            .arg(h10_seeds)
+            .arg(winner);
+        unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        Ok(())
+    }
+
+    /// One-time exactness gate for the lock-step walk on this card: for several easy-target batches
+    /// the lowest winning index must equal the established fast v5 kernel's. Any mismatch or error
+    /// keeps this miner on the established kernel for good.
+    #[allow(clippy::too_many_arguments)]
+    fn v5_lockstep_selfcheck(
+        &self,
+        wbase: u64,
+        n_tiles: u64,
+        pad: &V5Pad,
+        p: &[u64; 4],
+        s: &[u64; 4],
+        timestamp: u64,
+    ) -> bool {
+        let run = || -> candle_core::Result<bool> {
+            const N: u64 = 8192;
+            let easy = [u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 9];
+            let seeds = unsafe { self.stream.alloc::<u64>(N as usize) }.map_err(candle_core::Error::wrap)?;
+            let mut w_new = unsafe { self.stream.alloc::<u64>(1) }.map_err(candle_core::Error::wrap)?;
+            let mut w_ref = unsafe { self.stream.alloc::<u64>(1) }.map_err(candle_core::Error::wrap)?;
+            let seed_fn = load_walk_func(&self.cuda, "pom_seed_h10_batch")?;
+            let fast = load_walk_func(&self.cuda, "pom_mine_v5_ncf_fast_seeded")?;
+            let k = crate::pom_v4::POM_V4_K as u32;
+            let inv_n = u64::MAX / n_tiles;
+            let h10: u32 = 1;
+            let zero = 0u64;
+            for round in 0..6u64 {
+                let start = 0x5eed_0000_0000u64 + round * N * 7919;
+                {
+                    let mut b = seed_fn.builder();
+                    b.arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&s[3]).arg(&timestamp).arg(&start).arg(&N).arg(&seeds);
+                    unsafe { b.launch(LaunchConfig { grid_dim: ((N / 128) as u32, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 }) }
+                        .map_err(candle_core::Error::wrap)?;
+                }
+                self.stream.memcpy_htod(&[u64::MAX], &mut w_new).map_err(candle_core::Error::wrap)?;
+                self.stream.memcpy_htod(&[u64::MAX], &mut w_ref).map_err(candle_core::Error::wrap)?;
+                self.launch_v5_lockstep(wbase, n_tiles, pad, p, &easy, N, &seeds, &mut w_new)?;
+                let warps = v4_ncf_warps();
+                let mut b = fast.builder();
+                b.arg(&pad.bases_dev)
+                    .arg(&pad.prefix_dev)
+                    .arg(&pad.t_count)
+                    .arg(&n_tiles)
+                    .arg(&k)
+                    .arg(&p[0])
+                    .arg(&p[1])
+                    .arg(&p[2])
+                    .arg(&p[3])
+                    .arg(&s[0])
+                    .arg(&s[1])
+                    .arg(&s[2])
+                    .arg(&s[3])
+                    .arg(&timestamp)
+                    .arg(&easy[0])
+                    .arg(&easy[1])
+                    .arg(&easy[2])
+                    .arg(&easy[3])
+                    .arg(&zero)
+                    .arg(&N)
+                    .arg(&*pad.lut)
+                    .arg(&pad.lut_sh)
+                    .arg(&inv_n)
+                    .arg(&seeds)
+                    .arg(&h10)
+                    .arg(&mut w_ref)
+                    .arg(&pad.n_pad)
+                    .arg(&pad.inv_p)
+                    .arg(&pad.k_pad);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (((N + warps - 1) / warps) as u32, 1, 1),
+                        block_dim: ((warps * 32) as u32, 1, 1),
+                        shared_mem_bytes: (warps as u32) * 3 * 1024,
+                    })
+                }
+                .map_err(candle_core::Error::wrap)?;
+                let a = self.stream.clone_dtoh(&w_new).map_err(candle_core::Error::wrap)?;
+                let r = self.stream.clone_dtoh(&w_ref).map_err(candle_core::Error::wrap)?;
+                if a != r || r[0] == u64::MAX {
+                    log::warn!("PoM v5: lock-step walk cross-check round {round}: {:?} != {:?}", a, r);
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        match run() {
+            Ok(ok) => ok,
+            Err(e) => {
+                log::warn!("PoM v5: lock-step walk cross-check failed to run: {e}");
+                false
+            }
+        }
+    }
+
     /// The v4/v5 grind. `v5 = Some(pad)` (H15, `daa >= pom_v5` gate) forces the state-carrying CLASSIC
     /// walk and reads the context pad via the appended gather segment; `None` is the pre-gate path
     /// with the autotuned backend (ncf/tc/classic), byte-identical to before this change.
@@ -1166,6 +1347,38 @@ impl PomGpuMiner {
             }
         }
 
+        // H15/H16 lock-step walk over a contiguous blob (mining-only cards' raw upload). One-time
+        // cross-check against the established fast kernel; KERYX_POM_V5_LOCKSTEP=0 disables it.
+        if let (Some(pad), true) = (v5, h10_era) {
+            if std::env::var("KERYX_POM_V5_LOCKSTEP").as_deref() != Ok("0")
+                && matches!(self.stream.context().compute_capability(), Ok((major, _)) if major >= 8)
+            {
+                if let Some(wbase) = self.v5_contiguous_base() {
+                    let ok = *self.v5_lockstep_ok.get_or_init(|| {
+                        let ok = self.v5_lockstep_selfcheck(wbase, n_tiles, pad, &p, &s, timestamp);
+                        log::info!(
+                            "PoM v5[gpu{}]: lock-step contiguous walk {}",
+                            self.stream.context().ordinal(),
+                            if ok { "cross-checked, active" } else { "REJECTED by cross-check, staying on the established kernel" }
+                        );
+                        ok
+                    });
+                    if ok {
+                        // the self-check may have used the stream: reset the winner after it
+                        {
+                            use candle_core::cuda_backend::cudarc::driver::result;
+                            let (ptr, _record) = winner.device_ptr_mut(&self.stream);
+                            unsafe { result::memset_d8_async(ptr, 0xff, std::mem::size_of::<u64>(), self.stream.cu_stream()) }
+                                .map_err(candle_core::Error::wrap)?;
+                        }
+                        self.launch_v5_lockstep(wbase, n_tiles, pad, &p, &t, batch, &h10_seeds, &mut *winner)?;
+                        self.stream.synchronize().map_err(candle_core::Error::wrap)?;
+                        let w = self.stream.clone_dtoh(&*winner).map_err(candle_core::Error::wrap)?[0];
+                        return Ok(if w == u64::MAX { None } else { Some(start + w) });
+                    }
+                }
+            }
+        }
         // A card whose autotune measured the classic walk faster takes it even though the
         // tensor-core kernel is available and correct here.
         // PoM v5 (H15) must run a STATE-carrying walk: the sidecar/LUT/chase-snippet backends derive
@@ -5090,6 +5303,9 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // This is what makes MULTI-GPU H4 mining work: only the single inference GPU can do the
     // llama zero-dup gather; every other card needs its own copy. catch_unwind so a driver-level
     // panic in one card's load doesn't abort the whole miner.
+    // KERYX_POM_RAW_WALK=1: keep llama loaded for serving but walk a separate raw canonical copy
+    // (one contiguous blob, so the lock-step v5 walk applies). Costs one extra resident model copy.
+    let use_llama = use_llama && std::env::var("KERYX_POM_RAW_WALK").as_deref() != Ok("1");
     let m = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if use_llama {
             info!("PoM[gpu{}]: zero-dup — walking the llama.cpp engine's resident weights (candle dormant)", device_id);
@@ -5695,6 +5911,8 @@ impl PomGpuMiner {
             v5_pad: Mutex::new(None),
             v4_snippet_folds: Mutex::new(None),
             v4_tile_addrs: Mutex::new(None),
+            v5_contig_base: OnceLock::new(),
+            v5_lockstep_ok: OnceLock::new(),
             _tensors: Vec::new(),
             _shared: Vec::new(),
             _uploads: uploads,
