@@ -1,0 +1,11 @@
+Keryx Miner Supr
+Original contributions: ocminer / Suprnova
+https://github.com/ocminer/keryx-miner-supr
+
+Includes code and/or GPU kernels from keryx-miner-supr by ocminer / Suprnova.
+https://github.com/ocminer/keryx-miner-supr
+
+This fork contains upstream Keryx Labs and other third-party work. Their
+copyrights, licenses and notices are retained; no ownership of their work is
+claimed. See LICENSE, LICENSING.md, LICENSE-APACHE, LICENSE-MIT and
+THIRD_PARTY_NOTICES.txt. The new terms do not revoke previous license grants.

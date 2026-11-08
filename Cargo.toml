@@ -2,8 +2,8 @@
 name = "keryx-miner-supr"
 version = "0.16.3"
 edition = "2021"
-license = "MIT/Apache-2.0"
-repository = "https://github.com/suprnova/keryx-miner-supr"
+license-file = "LICENSE"
+repository = "https://github.com/ocminer/keryx-miner-supr"
 readme = "README.md"
 description = "Suprnova fork of the Keryx GPU miner — native sm_120, no devfund tax, faster kernels."
 categories = ["command-line-utilities"]
@@ -25,6 +25,10 @@ include = [
     "Cargo.toml",
     "Cargo.lock",
     "build.rs",
+    "LICENSE",
+    "LICENSING.md",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.txt",
     "LICENSE-MIT",
     "LICENSE-APACHE",
     "README.md",

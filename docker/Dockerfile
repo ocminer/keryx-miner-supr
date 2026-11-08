@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub
 
 WORKDIR /app
-COPY LICENSE-APACHE LICENSE-MIT THIRD_PARTY_NOTICES.txt /app/
+COPY LICENSE LICENSING.md NOTICE README.md LICENSE-APACHE LICENSE-MIT THIRD_PARTY_NOTICES.txt /app/
 # NVIDIA-only modern PoM host, matching CUDA plugin and runtime closure. AMD cards need the
 # separate pom-opencl package; loading an OpenCL plugin into this host cannot change its backend.
 COPY hiveos/dist-modern/keryx-miner-supr /app/keryx-miner-supr

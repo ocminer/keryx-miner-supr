@@ -11,6 +11,9 @@ fastest exact implementation on each card. Existing kernels remain available.
 - AMD mining, inference and audit replay continue on the same GPU. Both the
   regular and pre-AVX Vulkan engines are included; use the complete package.
 - H16 activation, consensus rules and model weights are unchanged.
+- Original contributions use the Source-Sharing License 1.0: no closed-source
+  incorporation; source-sharing derivatives must provide credits and a backlink.
+  Upstream licenses and earlier grants are preserved; see LICENSING.md.
 
 Matched H16 tier-0 development measurements against v0.16.2:
 
@@ -37,7 +40,7 @@ remains an experimental Metal package with its existing H15/H16 limitations.
 
 Packages: Linux NVIDIA modern and legacy, Linux AMD, HiveOS, mmpOS, SMOS,
 Windows NVIDIA and AMD, macOS arm64, and Docker
-`ocminersupr/keryx-miner-supr:0.16.3` (`latest`). Existing licenses are unchanged.
+`ocminersupr/keryx-miner-supr:0.16.3` (`latest`). Third-party licenses and previous grants are preserved.
 
 # keryx-miner-supr 0.16.2 — faster PoM walk, NUL-byte prompts, mixed-tier rigs
 

@@ -102,7 +102,8 @@ for runtime in "${LIBS[@]}"; do
 done
 
 bundle_llama(){
-  cp "$REPO/LICENSE-APACHE" "$REPO/LICENSE-MIT" "$REPO/THIRD_PARTY_NOTICES.txt" "$1/"
+  cp "$REPO/LICENSE" "$REPO/LICENSING.md" "$REPO/NOTICE" "$REPO/README.md" \
+     "$REPO/LICENSE-APACHE" "$REPO/LICENSE-MIT" "$REPO/THIRD_PARTY_NOTICES.txt" "$1/"
   cp "$D/libkeryx-llama.so" "$D/libkeryx-llama-noavx.so" "$1/"
   chmod +x "$1/libkeryx-llama.so" "$1/libkeryx-llama-noavx.so"
   # llama-server is only an optional subprocess fallback for the in-process engines.

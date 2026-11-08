@@ -273,7 +273,7 @@ jobs:
           $rel = "target\$env:TARGET\release"
           $out = "dist-win-amd"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-          Copy-Item LICENSE-APACHE, LICENSE-MIT, THIRD_PARTY_NOTICES.txt -Destination $out
+          Copy-Item LICENSE, LICENSING.md, NOTICE, README.md, LICENSE-APACHE, LICENSE-MIT, THIRD_PARTY_NOTICES.txt -Destination $out
           Copy-Item "$rel\keryx-miner-supr.exe" $out\
           Copy-Item "$rel\keryxopencl.dll"      $out\
           Copy-Item "keryx-llama-vk.dll"         $out\
@@ -567,7 +567,7 @@ jobs:
           $rel = "target\$env:TARGET\release"
           $out = "dist-win-cuda-pom"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-          Copy-Item LICENSE-APACHE, LICENSE-MIT, THIRD_PARTY_NOTICES.txt -Destination $out
+          Copy-Item LICENSE, LICENSING.md, NOTICE, README.md, LICENSE-APACHE, LICENSE-MIT, THIRD_PARTY_NOTICES.txt -Destination $out
           Copy-Item "$rel\keryx-miner-supr.exe" $out\
           # In-process llama.cpp engine — REQUIRED to serve H4/H6 models on Windows/NVIDIA.
           if (Test-Path "keryx-llama.dll") {

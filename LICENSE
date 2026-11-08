@@ -1,0 +1,102 @@
+Keryx Miner Supr Source-Sharing License 1.0
+Copyright (c) 2026 ocminer / Suprnova, for their original contributions.
+Project: https://github.com/ocminer/keryx-miner-supr
+
+1. Scope and existing rights
+
+This license governs only copyrightable original code and modifications owned
+by ocminer / Suprnova and offered under this license in this revision of
+keryx-miner-supr (the "Covered Code"). Covered Code includes our original GPU
+kernels, solver implementations, optimizations and host code, in source form
+and in compiled or translated form. Ownership and modification history are
+identified by the repository's version-control history and existing notices.
+It does not claim ownership of upstream or third-party work.
+
+Upstream Keryx, Kaspa, llama.cpp, dependency, model and other third-party
+materials retain their own licenses. Their notices and license texts must be
+preserved. LICENSE-APACHE, LICENSE-MIT, THIRD_PARTY_NOTICES.txt and component
+notices remain applicable to those materials. See LICENSING.md for scope.
+
+This license is a new grant, not a revocation of earlier grants. Rights already
+received for an earlier revision under another license remain governed by that
+license. No term here restricts statutory rights or independently developed
+code that does not incorporate Covered Code.
+
+2. Running and redistributing the original miner
+
+You may run the unmodified miner, including for commercial or for-profit mining.
+You may copy and redistribute its unmodified source and binaries if you retain
+this license, NOTICE, LICENSING.md, all applicable third-party notices, and the
+project credit and link specified in section 4. No mining fee or royalty is
+created by this license.
+
+Merely running this miner, invoking it through its documented process or
+network interfaces, or distributing an unchanged copy alongside independent
+software does not incorporate its code into that independent software.
+
+3. Source-sharing requirement; no closed-source incorporation
+
+You may study, modify, compile and incorporate Covered Code only subject to
+this section and section 4. You may not copy, adapt, translate, link or embed
+Covered Code, including compiled GPU kernels, into a closed-source miner,
+library, application or other program without separate written permission
+from its copyright holder.
+
+A program incorporating Covered Code must make its complete Corresponding
+Source publicly available, without a fee or access restriction, under terms
+that permit recipients to inspect, use, modify and redistribute that source.
+The source-sharing obligation and the attribution requirements of this
+license must continue to apply to the Covered Code and modifications of it.
+You must provide a prominent link to that source wherever the incorporating
+program is distributed or offered for others to use. When supplying binaries,
+provide the source for that exact version, not only an unrelated development
+branch. Offering an incorporating program as a hosted service does not remove
+these obligations.
+
+"Corresponding Source" means the preferred form for modifying the incorporating
+program, including its modifications, GPU kernel sources, and scripts needed
+to build and install it. It excludes private keys, credentials, user data,
+model weights licensed separately, and unmodified general-purpose operating
+systems, GPU drivers, compilers and independently supplied system libraries.
+Their separate licenses remain applicable. Publishing only headers, an API,
+obfuscated code, or precompiled kernels does not satisfy this requirement.
+
+You may not grant downstream recipients permission to incorporate Covered Code
+into a closed-source program. Commercial source-sharing programs are permitted
+if they satisfy these conditions. A separate written license may grant an
+exception; public availability of this repository is not such an exception.
+
+4. Required credits and backlinks
+
+Every incorporating program and its source distribution must retain the
+relevant copyright and modification notices and include this credit:
+
+  Includes code and/or GPU kernels from keryx-miner-supr by ocminer / Suprnova.
+  https://github.com/ocminer/keryx-miner-supr
+
+Place the credit and link prominently in the source repository's main README
+and in the distributed program's accompanying credits or notices. If the
+program provides an About, Credits or legal-notices screen or command, include
+them there as well. Use a clickable backlink where the medium supports links;
+a legible full URL is sufficient in plain text. Preserve this license and
+NOTICE with the Covered Code. Clearly identify your own modifications without
+implying endorsement by ocminer / Suprnova or the upstream authors.
+
+5. Compliance and reservations
+
+Permission under this license depends on compliance with these conditions.
+A use that fails them is not authorized by this license. Rights not expressly
+granted are reserved, subject to third-party licenses, earlier grants and
+applicable law. This license grants no trademark rights beyond the attribution
+needed to identify the source of the Covered Code.
+
+6. Warranty and liability
+
+The Covered Code is provided without warranties, including warranties of
+fitness for a purpose, merchantability, title or non-infringement, to the extent
+permitted by law. You assume responsibility for its use. To the extent the law
+allows, its copyright holders and contributors are not liable for losses or
+damages arising from its use or inability to use it.
+
+This is a custom source-available license. It is not represented as an
+OSI-approved open-source license, MIT, Apache-2.0 or GPL.

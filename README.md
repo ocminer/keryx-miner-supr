@@ -40,10 +40,33 @@ The PoW is **Proof-of-Model**, a data-dependent walk over model weights and, fro
 H15, a context pad. Hashrates are in **MH/s**. Performance depends on the model
 tier, memory access, tensor/integer throughput and power settings.
 
-The [2026-11-08 H16 platform investigation](docs/benchmarks/2026-11-08-h16-platform.md)
-compares a local development candidate with the frozen v0.16.2 build, including
-per-card kernel choices, power, clocks and CPU use. The historical results below
-retain their original workload and version labels.
+The solver included in **v0.16.3** was measured against the frozen **v0.16.2**
+build on 2026-11-08. These matched development runs use **H16 tier 0
+(Qwen3.5-9B)**; the figures are not a new benchmark of every release package.
+
+| Platform | GPU | Power limit | v0.16.2, MH/s | New solver, MH/s | Gain |
+|---|---|---:|---:|---:|---:|
+| NVIDIA Blackwell | RTX 5090 | 420 W | 5.2208 | 5.4771 | **+4.91%** |
+| NVIDIA Blackwell | RTX 5090 | 600 W | 6.2054 | 6.2035 | Neutral |
+| NVIDIA Blackwell | RTX 5080 | 360 W | 3.3953 | 3.3985 | Neutral |
+| NVIDIA Ampere | RTX 3070 | 240 W | 1.5696 | 1.5693 | Neutral |
+| AMD RDNA 3 | RX 7900 XTX | 272 W | 0.6149 | 1.0945 | **+78.00%** |
+| AMD RDNA 3 | RX 7600 XT | 155 W | 0.2874 | 0.4456 | **+55.02%** |
+| AMD Vega 20 | Instinct MI50 | 150 W | 0.2721 | 0.4421 | **+62.48%** |
+
+The full-power 5090, 5080 and 3070 retain their previous fastest CUDA kernel;
+changes below 0.5% are treated as measurement noise. Kernel selection follows a
+correctness check and warmed timing on each card. AMD also tunes the dispatch
+batch for its card and model.
+
+Final Linux package validation passed H16 mining, inference, attention, custody,
+restart and replay on RTX 5090 and RX 7900 XTX. The live post-H16 NVIDIA pool
+check accepted **75 shares with 0 rejects**. This is compatibility validation,
+not an additional matched performance comparison. Windows GPU execution was
+not tested.
+
+[Full methodology, clocks, measured power, CPU use and qualification limits](docs/benchmarks/2026-11-08-h16-platform.md).
+The historical results below retain their original workload and version labels.
 
 The solver improvements included in v0.16.0 were measured on 2026-11-05 with
 H15 jobs. These matched A/B/B/A runs compare development build `2139c28`
@@ -547,4 +570,12 @@ At startup the miner logs which mode is active: `PoM resident tree: ON` or `PoM 
 
 ## Credit
 
-This fork is derived from [keryx-labs/keryx-miner](https://github.com/keryx-labs/keryx-miner) v0.3.2 (commit `317fcab` "New release v0.3.2: SALT v4 + escrow/channel perf"). Original copyright belongs to the Keryx Labs team. License is dual MIT/Apache-2.0, same as upstream.
+This fork is derived from [keryx-labs/keryx-miner](https://github.com/keryx-labs/keryx-miner) v0.3.2 (commit `317fcab` "New release v0.3.2: SALT v4 + escrow/channel perf"). Original upstream copyrights and licenses are retained.
+
+Our original contributions in this revision are offered under the
+[Keryx Miner Supr Source-Sharing License 1.0](LICENSE). Running the original
+miner, including mining for profit, is permitted. Closed-source incorporation
+of our covered code or kernels requires separate written permission.
+Source-sharing derivatives must provide complete corresponding source, credit
+ocminer / Suprnova, and link back to this repository.
+[Scope, upstream licenses, earlier grants and the required credit](LICENSING.md).
