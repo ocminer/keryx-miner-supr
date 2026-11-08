@@ -1,3 +1,44 @@
+# keryx-miner-supr 0.16.3 — per-card H16 solver tuning
+
+This release adds faster NVIDIA and AMD H16 walk implementations and chooses the
+fastest exact implementation on each card. Existing kernels remain available.
+
+- NVIDIA: reuse tile storage and pack Merkle-parent work. Warmed per-card timing
+  selects the new CUDA kernel only when it wins by at least 0.5%.
+- AMD: cooperative INT8 matrices, shared address resolution, and subgroup dot
+  reductions. Per-card/model tuning selects the kernel and a 1,024/4,096/8,192
+  nonce batch while keeping the measured dispatch within 20 ms.
+- AMD mining, inference and audit replay continue on the same GPU. Both the
+  regular and pre-AVX Vulkan engines are included; use the complete package.
+- H16 activation, consensus rules and model weights are unchanged.
+
+Matched H16 tier-0 development measurements against v0.16.2:
+
+| GPU | Power limit | v0.16.2 MH/s | New solver MH/s | Change |
+|---|---:|---:|---:|---:|
+| RTX 5090 | 420 W | 5.2208 | 5.4771 | +4.91% |
+| RTX 5090 | 600 W | 6.2054 | 6.2035 | Neutral |
+| RTX 5080 | 360 W | 3.3953 | 3.3985 | Neutral |
+| RTX 3070 | 240 W | 1.5696 | 1.5693 | Neutral |
+| RX 7900 XTX | 272 W | 0.6149 | 1.0945 | +78.00% |
+| RX 7600 XT | 155 W | 0.2874 | 0.4456 | +55.02% |
+| Radeon Instinct MI50 | 150 W | 0.2721 | 0.4421 | +62.48% |
+
+These are matched development measurements of the solver included here, not a
+fresh benchmark of every packaged platform. Full-power 5090, 5080 and 3070 kept
+the previous two-nonce kernel. See [the benchmark methodology, clocks, measured
+power and CPU use](https://github.com/ocminer/keryx-miner-supr/blob/v0.16.3/docs/benchmarks/2026-11-08-h16-platform.md).
+
+Qualification includes CPU/GPU exactness, 400 captured mining proofs checked by
+the unmodified node 1.6.7 consensus verifier, and full H16 inference, attention,
+custody, restart and mining-resume checks on RTX 5090 and all three AMD models.
+Windows GPU execution and higher-tier performance were not measured. macOS
+remains an experimental Metal package with its existing H15/H16 limitations.
+
+Packages: Linux NVIDIA modern and legacy, Linux AMD, HiveOS, mmpOS, SMOS,
+Windows NVIDIA and AMD, macOS arm64, and Docker
+`ocminersupr/keryx-miner-supr:0.16.3` (`latest`). Existing licenses are unchanged.
+
 # keryx-miner-supr 0.16.2 — faster PoM walk, NUL-byte prompts, mixed-tier rigs
 
 - **Faster mining on NVIDIA (sm_80 and newer).** A new walk kernel advances two or

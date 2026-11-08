@@ -18,6 +18,13 @@ resumes; no dedicated inference card is required. Use the complete AMD package s
 its Vulkan engine and miner stay matched. The AMD performance figures below are
 historical, pre-H15 measurements and do not describe the new context-pad workload.
 
+**v0.16.3 solver tuning:** faster per-card H16 kernels for NVIDIA and AMD.
+Matched tier-0 development runs measured **+4.91%** on RTX 5090 at 420 W,
+**+78.00%** on RX 7900 XTX, **+55.02%** on RX 7600 XT and **+62.48%** on MI50.
+Full-power RTX 5090, RTX 5080 and RTX 3070 retained their previous fastest kernel
+and were within 0.1% of v0.16.2. See the [complete measurements and
+qualification limits](docs/benchmarks/2026-11-08-h16-platform.md).
+
 ## Build coverage
 
 NVIDIA packages include dedicated worker code for Blackwell and datacenter
