@@ -73,7 +73,7 @@ int  ggml_cuda_q8s_read_captures(int device, uint8_t* bytes, size_t bytes_cap, u
 #endif
 
 // keryx (patch 0007): canonical weight layout switch and the last canonical buffer it produced.
-extern "C" { extern bool keryx_llama_canonical_weights; extern void * keryx_llama_canonical_base; extern size_t keryx_llama_canonical_bytes; }
+extern "C" { extern thread_local bool keryx_llama_canonical_weights; extern thread_local void * keryx_llama_canonical_base; extern thread_local size_t keryx_llama_canonical_bytes; }
 
 struct KeryxLlama {
     void*  canon_base  = nullptr;   // device address of this model's canonical weight stream (or null)

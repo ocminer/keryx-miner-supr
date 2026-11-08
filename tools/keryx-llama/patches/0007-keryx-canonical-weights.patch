@@ -1,8 +1,8 @@
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index eaf3f35..8a3f3db 100644
+index eaf3f35..94e4e10 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -36,6 +36,103 @@
+@@ -36,6 +36,104 @@
  #include <string>
  #include <vector>
  
@@ -17,10 +17,11 @@ index eaf3f35..8a3f3db 100644
 +// the host, or in another context) leave a zeroed hole the miner fills; tensors that are not part of
 +// the stream (fewer than 32 bytes, not whole chunks, or a second tensor of the same name) go after it.
 +// A zeroed slack after the stream absorbs the last tensor's row padding.
++// Thread-local: engines for different cards load concurrently, each in its own thread.
 +extern "C" {
-+bool   keryx_llama_canonical_weights = false;
-+void * keryx_llama_canonical_base    = nullptr;  // last canonical buffer's base (device address)
-+size_t keryx_llama_canonical_bytes   = 0;        // bytes of the canonical stream at that base
++thread_local bool   keryx_llama_canonical_weights = false;
++thread_local void * keryx_llama_canonical_base    = nullptr;  // this thread's last canonical buffer base
++thread_local size_t keryx_llama_canonical_bytes   = 0;        // bytes of the canonical stream at that base
 +}
 +
 +static ggml_backend_buffer_t keryx_canonical_alloc(llama_model_loader & ml, ggml_context * ctx, ggml_backend_buffer_type_t buft) {
@@ -106,7 +107,7 @@ index eaf3f35..8a3f3db 100644
  static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
      switch (arch) {
          case LLM_ARCH_LLAMA:
-@@ -1570,7 +1667,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1570,7 +1668,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                      t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                  }
              } else {
