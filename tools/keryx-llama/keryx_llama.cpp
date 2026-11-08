@@ -73,7 +73,15 @@ int  ggml_cuda_q8s_read_captures(int device, uint8_t* bytes, size_t bytes_cap, u
 #endif
 
 // keryx (patch 0007): canonical weight layout switch and the last canonical buffer it produced.
+#ifdef __APPLE__
+// The Metal engine is built from unpatched llama.cpp (no patch 0007): keep the switch local so the
+// weights load the ordinary way and keryx_llama_canonical_blob() reports no canonical buffer.
+static thread_local bool keryx_llama_canonical_weights = false;
+static thread_local void * keryx_llama_canonical_base = nullptr;
+static thread_local size_t keryx_llama_canonical_bytes = 0;
+#else
 extern "C" { extern thread_local bool keryx_llama_canonical_weights; extern thread_local void * keryx_llama_canonical_base; extern thread_local size_t keryx_llama_canonical_bytes; }
+#endif
 
 struct KeryxLlama {
     void*  canon_base  = nullptr;   // device address of this model's canonical weight stream (or null)
