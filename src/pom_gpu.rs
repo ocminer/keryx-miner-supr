@@ -1447,6 +1447,13 @@ impl PomGpuMiner {
                             log::warn!("PoM v5[gpu{}]: lock-step walk REJECTED by cross-check, staying on the established kernel", ord);
                         } else {
                             log::info!("PoM v5[gpu{}]: lock-step contiguous walk active ({} nonces per warp)", ord, best.0);
+                            if best.1 > 0.0 && best.1 < 0.05 && intensity_batch_for(ord as u32).is_none() {
+                                let scaled = ((batch as f64 * 0.05 / best.1) as u64).max(batch).min(1 << 21);
+                                let scaled = (scaled + 255) / 256 * 256;
+                                if let Ok(mut m) = v5_lockstep_batches().lock() {
+                                    m.insert(ord as u32, scaled);
+                                }
+                            }
                         }
                         best.0
                     });
@@ -3135,6 +3142,9 @@ pub fn v4_batch_for_device(device_id: u32) -> u64 {
     if only_inference() {
         return log_batch_once(device_id, POM_V4_BATCH_MIN, "--only-inference (minimum)");
     }
+    if let Some(b) = v5_lockstep_batches().lock().ok().and_then(|m| m.get(&device_id).copied()) {
+        return log_lockstep_batch_once(device_id, cap_v4_batch(device_id, b));
+    }
     let (b, how) = match v4_tune_for(device_id) {
         Some(t) => (t.batch, "autotuned"),
         None => match gpu_sm_count(device_id) {
@@ -3146,6 +3156,23 @@ pub fn v4_batch_for_device(device_id: u32) -> u64 {
         },
     };
     log_batch_once(device_id, cap_v4_batch(device_id, b), how)
+}
+
+/// Per-card grind batch for the lock-step v5 walk: sized from its measured launch time to about
+/// 50 ms per launch (fewer host round trips between batches), never below the tuned batch.
+fn v5_lockstep_batches() -> &'static Mutex<std::collections::HashMap<u32, u64>> {
+    static B: OnceLock<Mutex<std::collections::HashMap<u32, u64>>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn log_lockstep_batch_once(device_id: u32, batch: u64) -> u64 {
+    static LOGGED: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    if let Ok(mut seen) = LOGGED.get_or_init(|| Mutex::new(std::collections::HashSet::new())).lock() {
+        if seen.insert(device_id) {
+            log::info!("PoM[gpu{}]: v4 grind batch = {} nonces (lock-step walk, ~50 ms per launch).", device_id, batch);
+        }
+    }
+    batch
 }
 
 fn log_batch_once(device_id: u32, batch: u64, how: &str) -> u64 {
