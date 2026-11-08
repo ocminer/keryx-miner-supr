@@ -66,6 +66,27 @@ type GenTracedFn = unsafe extern "C" fn(
     c_int,
     c_int,
 ) -> c_int;
+/// 0.16.2 `keryx_llama_generate_traced_n`: as [`GenTracedFn`] with explicit byte lengths for the
+/// prompt and the rest (both may contain NUL bytes). Optional: older libraries lack it.
+type GenTracedNFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_char,
+    usize,
+    *const i32,
+    c_int,
+    c_int,
+    *const c_char,
+    usize,
+    c_int,
+    *mut c_char,
+    c_int,
+    *mut i32,
+    c_int,
+    *mut c_int,
+    *mut c_int,
+    c_int,
+    c_int,
+) -> c_int;
 type SeqConfigureFn = unsafe extern "C" fn(*mut c_void, *const u32, u32, u32, u32, u32, u32) -> c_int;
 type SeqRootsFn = unsafe extern "C" fn(*mut c_void, *mut u8, usize, *mut u32) -> c_int;
 type SeqReplayFn = unsafe extern "C" fn(
@@ -143,6 +164,8 @@ struct Engine {
     replay: ReplayFn,
     replay_multi: ReplayMultiFn,
     generate_traced: GenTracedFn,
+    /// Length-aware traced generation (NUL-safe prompts); `None` on pre-0.16.2 libraries.
+    generate_traced_n: Option<GenTracedNFn>,
     seq_configure: SeqConfigureFn,
     seq_roots: SeqRootsFn,
     seq_replay: SeqReplayFn,
@@ -258,6 +281,8 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             return None;
         };
         let trace_last_error = sym::<LastErrorFn>(lib, b"keryx_llama_last_error\0");
+        // Optional (0.16.2): length-aware traced generation; older builds refuse NUL-byte prompts.
+        let generate_traced_n = sym::<GenTracedNFn>(lib, b"keryx_llama_generate_traced_n\0");
         // Optional (upstream aa29fd2): older builds lack it — the ownership gate then no-ops.
         let tensor_device = sym::<TensorDeviceFn>(lib, b"keryx_llama_tensor_device\0");
         let canonical_blob = sym::<CanonBlobFn>(lib, b"keryx_llama_canonical_blob\0");
@@ -409,6 +434,7 @@ fn load_engine(gguf: &str, gpu: usize) -> Option<Engine> {
             trace_leaves: 0,
             trace_manifest: [0u8; 32],
             generate_traced,
+            generate_traced_n,
             seq_configure,
             seq_roots,
             seq_replay,
@@ -855,7 +881,13 @@ fn generate_locked(e: &Engine, prompt: &str, max_tokens: usize) -> Result<String
         );
         return Err(GenerateError::PromptTooLong);
     }
-    let cp = CString::new(prompt).map_err(|_| GenerateError::Failed)?;
+    // Untraced generation goes through llama.cpp's C-string chat template, which would truncate at
+    // a NUL byte. Network AiRequests past H15 are always traced (generate_traced: NUL-safe), so an
+    // untraced NUL prompt (pool chat/probe, pre-H15) is refused rather than answered truncated.
+    let cp = CString::new(prompt).map_err(|_| {
+        log::warn!("llama engine: untraced prompt contains a NUL byte — refused (only traced H15 requests can carry one)");
+        GenerateError::Failed
+    })?;
     let max_tokens = c_int::try_from(max_tokens).map_err(|_| GenerateError::Failed)?;
     let mut buf = vec![0u8; 64 * 1024];
     let n =
@@ -1182,8 +1214,11 @@ pub fn generate_traced(
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or(GenError::Unavailable)?;
     ensure_full_context(e, gpu, 0).map_err(GenError::Failed)?;
     let e = &*e;
-    let cp = CString::new(prompt).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
-    let rest = CString::new(prefix.as_ref().map_or("", |p| p.rest)).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
+    // The exact prompt bytes (NULs included) through the length-aware entry point when the library
+    // has it; a pre-0.16.2 library refuses a NUL-byte prompt (never stripped: see prompt_ffi).
+    let args = crate::prompt_ffi::TracedPromptArgs::new(prompt, prefix.as_ref().map_or("", |p| p.rest), e.generate_traced_n.is_some())
+        .map_err(GenError::Failed)?;
+    let ((prompt_ptr, prompt_len), (rest_ptr, rest_len)) = (args.prompt(), args.rest());
     let (prefix_ptr, n_prefix, head_tokens) = match &prefix {
         Some(p) => (p.tokens.as_ptr(), p.tokens.len() as c_int, p.head_tokens.min(c_int::MAX as u32) as c_int),
         None => (std::ptr::null(), 0, 0),
@@ -1192,24 +1227,50 @@ pub fn generate_traced(
     let n_ctx = if e.ctx_now > 0 { e.ctx_now } else { e.n_ctx };
     let mut tokens = vec![0i32; n_ctx.max(1) as usize];
     let (mut n_prompt, mut n_fed): (c_int, c_int) = (0, 0);
+    let (max_tokens, min_prompt, per_position) = (
+        max_tokens.min(c_int::MAX as usize) as c_int,
+        min_prompt.min(c_int::MAX as u32) as c_int,
+        answer_bytes_per_position.min(c_int::MAX as u32) as c_int,
+    );
     let n = unsafe {
-        (e.generate_traced)(
-            e.model,
-            cp.as_ptr(),
-            prefix_ptr,
-            n_prefix,
-            head_tokens,
-            rest.as_ptr(),
-            max_tokens.min(c_int::MAX as usize) as c_int,
-            buf.as_mut_ptr() as *mut c_char,
-            buf.len() as c_int,
-            tokens.as_mut_ptr(),
-            tokens.len() as c_int,
-            &mut n_prompt,
-            &mut n_fed,
-            min_prompt.min(c_int::MAX as u32) as c_int,
-            answer_bytes_per_position.min(c_int::MAX as u32) as c_int,
-        )
+        match e.generate_traced_n {
+            Some(generate_n) => generate_n(
+                e.model,
+                prompt_ptr,
+                prompt_len,
+                prefix_ptr,
+                n_prefix,
+                head_tokens,
+                rest_ptr,
+                rest_len,
+                max_tokens,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len() as c_int,
+                tokens.as_mut_ptr(),
+                tokens.len() as c_int,
+                &mut n_prompt,
+                &mut n_fed,
+                min_prompt,
+                per_position,
+            ),
+            None => (e.generate_traced)(
+                e.model,
+                prompt_ptr,
+                prefix_ptr,
+                n_prefix,
+                head_tokens,
+                rest_ptr,
+                max_tokens,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len() as c_int,
+                tokens.as_mut_ptr(),
+                tokens.len() as c_int,
+                &mut n_prompt,
+                &mut n_fed,
+                min_prompt,
+                per_position,
+            ),
+        }
     };
     if n < 0 {
         let detail = engine_error(e, "");

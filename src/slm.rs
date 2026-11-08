@@ -3454,6 +3454,14 @@ pub fn try_load_and_run_inference_on(
         log::warn!("OPoI: rejected inference request for GPU {}: {}", gpu, reason);
         return Err(InferenceError::Failed);
     }
+    // Untraced engines take the prompt as a C string (chat template), which would truncate it at a
+    // NUL byte. Refuse here, before any engine runs, so the request never counts as an engine
+    // failure. Network AiRequests past H15 are traced (try_load_and_run_traced_inference_on, which
+    // passes the full bytes); this path serves pool chat/probes and pre-H15 requests.
+    if prompt.contains('\0') {
+        log::warn!("OPoI: untraced inference request for GPU {} has a NUL byte in its prompt — refused (only traced H15 requests can carry one)", gpu);
+        return Err(InferenceError::Failed);
+    }
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs
         .iter()

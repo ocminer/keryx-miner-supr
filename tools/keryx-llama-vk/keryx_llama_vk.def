@@ -28,6 +28,7 @@ EXPORTS
     keryx_llama_trace_leaf_count
     keryx_llama_trace_read
     keryx_llama_generate_traced
+    keryx_llama_generate_traced_n
     keryx_llama_replay_multi
     keryx_llama_vk_sequence_configure
     keryx_llama_vk_batch_callback

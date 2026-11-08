@@ -3,12 +3,14 @@
 use super::{engine, sym, Engine};
 use crate::trace::{SeqCapture, SeqLayer, REPLAY_MAX_CAPTURES};
 use crate::vulkan_trace_seq::{parse_kv_state, seq_capture, seq_leaf_bytes, RecurSink, SeqAttn, SeqRecur, SeqSpec};
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr};
 
 type Configure = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int;
 type Count = unsafe extern "C" fn(*mut c_void) -> c_int;
 type Read = unsafe extern "C" fn(*mut c_void, *mut u8, usize, *mut u32, usize, *mut u32) -> c_int;
 type Generate = unsafe extern "C" fn(*mut c_void, *const c_char, *const i32, c_int, c_int, *const c_char, c_int, *mut c_char, c_int, *mut i32, c_int, *mut c_int, *mut c_int, c_int, c_int) -> c_int;
+/// 0.16.2 `keryx_llama_generate_traced_n`: explicit prompt/rest byte lengths (NUL-safe).
+type GenerateN = unsafe extern "C" fn(*mut c_void, *const c_char, usize, *const i32, c_int, c_int, *const c_char, usize, c_int, *mut c_char, c_int, *mut i32, c_int, *mut c_int, *mut c_int, c_int, c_int) -> c_int;
 type Replay = unsafe extern "C" fn(*mut c_void, *const i32, c_int, c_int, *const u32, *const u32, u32, u32, *mut u8, usize, *mut u32) -> c_int;
 type SeqConfigure = unsafe extern "C" fn(*mut c_void, u32, u32, *const u32, u32, u32) -> c_int;
 type Callback = unsafe extern "C" fn(*mut c_void, Option<unsafe extern "C" fn(*mut c_void, u32) -> c_int>, *mut c_void) -> c_int;
@@ -23,6 +25,8 @@ const CAPTURE_CAP: usize = 4 << 20;
 #[derive(Clone, Copy)]
 struct Api {
     configure: Configure, count: Count, read: Read, generate: Generate, replay: Replay,
+    /// Length-aware traced generation; `None` on pre-0.16.2 sidecars (NUL prompts refused).
+    generate_n: Option<GenerateN>,
     sequence: SeqConfigure, callback: Callback, recurrent: Recurrent,
     state: SeqState, lse: Lse, seq_replay: SeqReplay, error: Error, identity: Identity,
 }
@@ -47,6 +51,7 @@ impl State {
                 state: sym(lib, "keryx_llama_vk_sequence_state")?, lse: sym(lib, "keryx_llama_vk_lse_read")?,
                 seq_replay: sym(lib, "keryx_llama_vk_replay_sequence")?, error: sym(lib, "keryx_llama_last_error")?,
                 identity: sym(lib, "keryx_llama_vk_trace_identity")?,
+                generate_n: sym(lib, "keryx_llama_generate_traced_n"),
             },
             manifest: Vec::new(), leaves: 0, sequence: None,
         })
@@ -211,8 +216,10 @@ pub fn generate_traced(gguf: &str, _gpu: usize, prompt: &str, prefix: Option<Pro
     let guard = engine().lock().map_err(|_| GenError::Unavailable)?;
     let e = guard.as_ref().filter(|e| e.gguf == gguf).ok_or(GenError::Unavailable)?;
     let s = e.trace.as_ref().filter(|s| s.leaves > 0).ok_or(GenError::Unavailable)?;
-    let cp = CString::new(prompt).map_err(|_| GenError::Failed("prompt contains NUL".into()))?;
-    let rest = CString::new(prefix.as_ref().map_or("", |p| p.rest)).map_err(|_| GenError::Failed("prompt contains NUL".into()))?;
+    // Exact prompt bytes (NULs included) via the length-aware entry point; see crate::prompt_ffi.
+    let args = crate::prompt_ffi::TracedPromptArgs::new(prompt, prefix.as_ref().map_or("", |p| p.rest), s.api.generate_n.is_some())
+        .map_err(GenError::Failed)?;
+    let ((cp, cp_len), (rest, rest_len)) = (args.prompt(), args.rest());
     if max_tokens > 2048 || min_prompt > c_int::MAX as u32 || answer_bytes_per_position > c_int::MAX as u32 { return Err(GenError::Failed("invalid traced generation bounds".into())); }
     let (ptr, np, head) = match prefix {
         Some(p) if p.tokens.len() <= c_int::MAX as usize && p.head_tokens <= c_int::MAX as u32 => (p.tokens.as_ptr(), p.tokens.len() as c_int, p.head_tokens as c_int),
@@ -223,7 +230,12 @@ pub fn generate_traced(gguf: &str, _gpu: usize, prompt: &str, prefix: Option<Pro
     let mut buf = vec![0u8; 64 * 1024];
     let mut tokens = vec![0i32; e.n_ctx.max(1) as usize];
     let (mut n_prompt, mut n_fed) = (0, 0);
-    let n = unsafe { (s.api.generate)(e.model, cp.as_ptr(), ptr, np, head, rest.as_ptr(), max_tokens as c_int, buf.as_mut_ptr().cast(), buf.len() as c_int, tokens.as_mut_ptr(), tokens.len() as c_int, &mut n_prompt, &mut n_fed, min_prompt as c_int, answer_bytes_per_position as c_int) };
+    let n = unsafe {
+        match s.api.generate_n {
+            Some(generate_n) => generate_n(e.model, cp, cp_len, ptr, np, head, rest, rest_len, max_tokens as c_int, buf.as_mut_ptr().cast(), buf.len() as c_int, tokens.as_mut_ptr(), tokens.len() as c_int, &mut n_prompt, &mut n_fed, min_prompt as c_int, answer_bytes_per_position as c_int),
+            None => (s.api.generate)(e.model, cp, ptr, np, head, rest, max_tokens as c_int, buf.as_mut_ptr().cast(), buf.len() as c_int, tokens.as_mut_ptr(), tokens.len() as c_int, &mut n_prompt, &mut n_fed, min_prompt as c_int, answer_bytes_per_position as c_int),
+        }
+    };
     if n < 0 {
         let d = capture.error.clone().unwrap_or_else(|| detail(s.api, "Vulkan traced generation failed"));
         return Err(match n { -2 => GenError::PromptTooLong(d), -8 => GenError::PromptHead(d), _ => GenError::Failed(d) });

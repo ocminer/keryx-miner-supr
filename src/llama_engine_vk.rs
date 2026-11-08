@@ -529,7 +529,10 @@ pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
     if !prompt_allowed(e, prompt) {
         return None;
     }
-    let cp = CString::new(prompt).ok()?;
+    let Ok(cp) = CString::new(prompt) else {
+        log::warn!("llama-vk engine: untraced prompt contains a NUL byte — refused (only traced H15 requests can carry one)");
+        return None;
+    };
     let cap: usize = 65536;
     let mut out = vec![0u8; cap];
     let n = unsafe {
@@ -585,7 +588,10 @@ pub fn generate_for(gguf: &str, prompt: &str, max_tokens: usize) -> Result<Strin
         return Err(GenerateError::PromptTooLong);
     }
     let cp = CString::new(prompt).map_err(|_| {
-        log::warn!("llama-vk engine: prompt contains a NUL byte — generation refused");
+        log::warn!(
+            "llama-vk engine: untraced prompt contains a NUL byte — refused (the C-string chat template would truncate \
+             it; only traced H15 requests can carry one)"
+        );
         GenerateError::Failed
     })?;
     let cap: usize = 65536;
