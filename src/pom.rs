@@ -995,9 +995,11 @@ impl WeightIndex {
     /// bytes — the same the miner serves in VRAM and the builder pinned in `R_T`. The Merkle tree
     /// is streamed to a temp file next to the GGUF (disk, never tmpfs) so big tiers don't OOM.
     pub fn build_from_gguf(path: &str, model_id: [u8; 32]) -> candle_core::Result<Self> {
-        // Record the resident model identity for the PoM v5 pad seed (single-model/global path);
-        // mixed rigs additionally store it per device via `set_index_for`.
-        set_mining_model_id(model_id);
+        // NOTE: building an index must NOT record a process-wide mining model identity. On a mixed
+        // rig several indices are built (per-card tiers, era prebuilds, trace openings); the last
+        // build used to overwrite the PoM v5 pad model of every card on the SHARED index, so all
+        // of their shares were rejected (BadTilePath). The identity is recorded together with the
+        // index it belongs to: `set_index` (shared) / `set_index_for` (per device).
         let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
         let cache_path = dir.join("pom-tree.bin");
         let meta_path = dir.join("pom-tree.meta");
@@ -1734,9 +1736,16 @@ static PASSTHROUGH: OnceLock<bool> = OnceLock::new();
 /// The resident tier weight index + tier id, installed once at startup when PoM is enabled.
 static POM_INDEX: OnceLock<Arc<(WeightIndex, u8)>> = OnceLock::new();
 
-/// Install the possession index (built from the resident model) and its tier. Call once.
-pub fn set_index(index: WeightIndex, tier: u8) {
-    let _ = POM_INDEX.set(Arc::new((index, tier)));
+/// Model identity of the shared [`POM_INDEX`]; set together with it, exactly once.
+static POM_INDEX_MODEL: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// Install the shared possession index (built from the resident model `model_id`) and its tier.
+/// Call once. The model identity is bound to THIS index (PoM v5 pad seed), so a later index build
+/// for another card's model can never change the pad of the cards mining the shared index.
+pub fn set_index(index: WeightIndex, tier: u8, model_id: [u8; 32]) {
+    if POM_INDEX.set(Arc::new((index, tier))).is_ok() {
+        let _ = POM_INDEX_MODEL.set(model_id);
+    }
 }
 
 /// The active possession index + tier, if installed. This is the PROCESS-WIDE SHARED index used by
@@ -1793,45 +1802,31 @@ pub fn device_index_matches(device_id: u32, model_id: &[u8; 32]) -> bool {
     pom_indices().lock().map(|m| m.get(&device_id).map(|v| &v.model_id == model_id).unwrap_or(false)).unwrap_or(false)
 }
 
-/// Process-wide fallback mining model identity, for single-model rigs whose index is installed via
-/// the global [`set_index`] (no per-device entry). Set by [`WeightIndex::build_from_gguf`], which
-/// builds every resident index and holds the model id. Mixed rigs store the id per device in the
-/// device index registry (see [`set_index_for`]), which takes precedence in [`mining_model_id`].
-fn mining_model_id_cell() -> &'static std::sync::Mutex<Option<[u8; 32]>> {
-    static C: OnceLock<std::sync::Mutex<Option<[u8; 32]>>> = OnceLock::new();
-    C.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-/// Builds a possession index for an opening without touching the process-wide mining model
-/// identity (`build_from_gguf` records it; an opening of a model that is not the card's mining
-/// model must not re-seed the PoM v5 pad of a single-model rig).
+/// Builds a possession index for an opening. Index builds never touch the mining model identity
+/// (it is bound to the installed index, see [`set_index`]), so this is a plain build; kept as a
+/// named entry point for the trace-opening path.
 pub fn build_index_preserving_mining_id(path: &str, model_id: [u8; 32]) -> candle_core::Result<WeightIndex> {
-    let prev = mining_model_id_cell().lock().ok().and_then(|g| *g);
-    let out = WeightIndex::build_from_gguf(path, model_id);
-    if let Ok(mut g) = mining_model_id_cell().lock() {
-        *g = prev;
-    }
-    out
-}
-
-/// Record the process-wide mining model identity (the model the resident global index was built
-/// from). Last writer wins; the per-device registry overrides it for mixed rigs.
-pub fn set_mining_model_id(model_id: [u8; 32]) {
-    if let Ok(mut g) = mining_model_id_cell().lock() {
-        *g = Some(model_id);
-    }
+    WeightIndex::build_from_gguf(path, model_id)
 }
 
 /// The model identity to seed the PoM v5 context pad with for `device_id`: the per-device index's
-/// model if one is installed, else the process-wide mining model. MUST match the model the device's
-/// weight index was built from, or the pad diverges from the node's and the proof is invalid.
+/// model if one is installed, else the model of the shared index ([`set_index`]). It is always the
+/// model of the SAME index [`active_index_for`] returns for this device; anything else makes the pad
+/// diverge from the node's and every share is rejected (BadTilePath).
 pub fn mining_model_id(device_id: u32) -> Option<[u8; 32]> {
     if let Ok(m) = pom_indices().lock() {
         if let Some(v) = m.get(&device_id) {
             return Some(v.model_id);
         }
     }
-    mining_model_id_cell().lock().ok().and_then(|g| *g)
+    POM_INDEX_MODEL.get().copied()
+}
+
+/// PoM v5 pad seed for a share/walk of `device_id` at `tier` over the index with root `r_t`:
+/// `v5_pad_seed(tier, mining_model_id(device), R_T)` — the host share-proof rebuild (pow.rs); the
+/// CUDA walk (pom_gpu.rs) seeds its pad from the same `mining_model_id(device)`.
+pub fn v5_pad_seed_for(device_id: u32, tier: u8, r_t: &[u8; 32]) -> Option<[u8; 32]> {
+    mining_model_id(device_id).map(|model_id| crate::pom_v5::v5_pad_seed(tier, &model_id, r_t))
 }
 
 /// Test-only WeightIndex over arbitrary RAM chunks (`data` = chunk-aligned canonical bytes) — real
