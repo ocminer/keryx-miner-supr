@@ -1898,7 +1898,7 @@ fn ensure_index(model_id: [u8; 32], gguf_path: &str, tier: u8) -> Result<(), Str
         index.build_dense();
         log::info!("PoM: resident tree ready in {:.1}s.", t0.elapsed().as_secs_f32());
     }
-    crate::pom::set_index(index, tier);
+    crate::pom::set_index(index, tier, model_id);
     Ok(())
 }
 

@@ -879,7 +879,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             match crate::pom::WeightIndex::build_from_gguf(gguf, *model_id) {
                 Ok(idx) => {
                     info!("PoM Metal: shared host index ready — N={} chunks", idx.n_chunks);
-                    crate::pom::set_index(idx, tier);
+                    crate::pom::set_index(idx, tier, *model_id);
                 }
                 Err(e) => {
                     static LAST_LOG_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

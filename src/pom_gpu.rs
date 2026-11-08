@@ -5128,7 +5128,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                     if per_device {
                         crate::pom::set_index_for(device_id, model_id, idx, tier);
                     } else {
-                        crate::pom::set_index(idx, tier);
+                        crate::pom::set_index(idx, tier, model_id);
                     }
                 }
                 Err(e) => {

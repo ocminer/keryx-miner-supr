@@ -1595,7 +1595,7 @@ async fn run() -> Result<(), Error> {
                 match keryx_miner::pom::WeightIndex::build_from_gguf(&gpath_pt, model_id_pt) {
                     Ok(idx) => {
                         info!("PoM passthrough: index ready — N={} chunks; shares now carry a proof.", idx.n_chunks);
-                        keryx_miner::pom::set_index(idx, tier_idx);
+                        keryx_miner::pom::set_index(idx, tier_idx, model_id_pt);
                     }
                     Err(e) => warn!("PoM passthrough: index build failed ({}) — shares submit without a proof.", e),
                 }
