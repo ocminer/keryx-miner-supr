@@ -4,18 +4,21 @@ use std::ffi::{c_int, c_void};
 type Mine = unsafe extern "C" fn(*mut c_void, *const u64, *const u64, *const u64, u64, u64, u32, *const u64, u64) -> i64;
 type Read = unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> c_int;
 type Release = unsafe extern "C" fn(*mut c_void);
+type PreferredBatch = unsafe extern "C" fn(*mut c_void) -> u32;
 
 #[derive(Clone, Copy)]
-pub(super) struct Api { mine: Mine, read: Read, release: Release }
+pub(super) struct Api { mine: Mine, read: Read, release: Release, preferred_batch: Option<PreferredBatch> }
 impl Api {
     pub(super) unsafe fn load(lib: &'static libloading::Library) -> Option<Self> {
         let abi = sym::<super::AbiFn>(lib, "keryx_llama_pom_v5_abi")?;
         if abi() != 1 { return None; }
-        Some(Self { mine: sym(lib, "keryx_llama_pom_mine_v5")?, read: sym(lib, "keryx_llama_pom_pad_read")?, release: sym(lib, "keryx_llama_pom_release_pad")? })
+        Some(Self { mine: sym(lib, "keryx_llama_pom_mine_v5")?, read: sym(lib, "keryx_llama_pom_pad_read")?, release: sym(lib, "keryx_llama_pom_release_pad")?, preferred_batch: sym(lib, "keryx_llama_pom_v5_batch") })
     }
     pub(super) fn run(self, model: *mut c_void, p: [u64; 4], s: [u64; 4], time: u64, t: [u64; 4], base: u64, batch: u64, seed: &[u64; 4], tiles: u64, stop: &dyn Fn() -> bool) -> Result<(Option<u64>, u64), String> {
         if tiles == 0 { return Err("PoM v5: zero context-pad tiles".into()); }
-        let sub_max = std::env::var("KERYX_VK_V5_SUB_DISPATCH").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1024).clamp(8, 8192);
+        let sub_max = std::env::var("KERYX_VK_V5_SUB_DISPATCH").ok().and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| self.preferred_batch.map_or(1024, |batch| unsafe { batch(model) as u64 }))
+            .clamp(8, 8192);
         let mut done = 0;
         while done < batch {
             if stop() { break; }
@@ -50,6 +53,33 @@ pub fn mine(p: [u64; 4], s: [u64; 4], time: u64, t: [u64; 4], base: u64, batch: 
 mod tests {
     use super::*;
     use crate::{pom, pom_v4 as v4, pom_v5 as v5};
+
+    #[test]
+    fn native_batch_preserves_partial_winner_and_cancel_accounting() {
+        struct Fake { batch: u32, calls: Vec<(u64,u32)> }
+        unsafe extern "C" fn preferred(p: *mut c_void) -> u32 { (*(p as *mut Fake)).batch }
+        unsafe extern "C" fn run(p: *mut c_void, _: *const u64, _: *const u64, target: *const u64,
+                                  _: u64, base: u64, n: u32, _: *const u64, _: u64) -> i64 {
+            (*(p as *mut Fake)).calls.push((base,n));
+            let winner=*target;
+            if (base..base+n as u64).contains(&winner) { (winner-base) as i64 } else { -1 }
+        }
+        unsafe extern "C" fn read(_: *mut c_void, _: u64, _: *mut u8, _: usize) -> c_int { -1 }
+        unsafe extern "C" fn release(_: *mut c_void) {}
+        for preferred_batch in [None,Some(preferred as PreferredBatch)] {
+            let mut fake=Fake{batch:4096,calls:Vec::new()};
+            let api=Api{mine:run,read,release,preferred_batch};
+            let result=api.run(&mut fake as *mut _ as *mut c_void,[0;4],[0;4],0,[9500,0,0,0],1000,9001,&[0;4],1,&||false).unwrap();
+            assert_eq!(result,(Some(9500),9001));
+            assert_eq!(fake.calls.last(),Some(&(9192,809)));
+            assert_eq!(fake.calls.len(),if preferred_batch.is_some(){3}else{9});
+            fake.calls.clear();
+            let checked=std::cell::Cell::new(false);
+            let result=api.run(&mut fake as *mut _ as *mut c_void,[0;4],[0;4],0,[9500,0,0,0],1000,9001,&[0;4],1,&||checked.replace(true)).unwrap();
+            assert_eq!(result,(None,if preferred_batch.is_some(){4096}else{1024}));
+            assert_eq!(fake.calls.len(),1);
+        }
+    }
 
     fn cpu_value(index: &pom::WeightIndex, pad: &[u8], seed: u64, pph: &[u8; 32]) -> [u8; 32] {
         cpu_value_with(index, pad.len() as u64 / 1024, seed, pph, |off| pad[off as usize * 1024..(off + 1) as usize * 1024].to_vec())

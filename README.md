@@ -21,7 +21,7 @@ historical, pre-H15 measurements and do not describe the new context-pad workloa
 ## Build coverage
 
 NVIDIA packages include dedicated worker code for Blackwell and datacenter
-Ampere, plus the modern PoM walk's CUDA 13.3 fatbin with native sm_75–sm_121
+Ampere, plus the modern PoM walk's CUDA 13.4 fatbin with native sm_75–sm_121
 images and compute_75/compute_80 PTX fallbacks. The legacy package uses CUDA
 12.4 for older supported cards. Keep each package's runtime and inference
 libraries beside its executable; the two build lines have different driver
@@ -32,6 +32,11 @@ requirements.
 The PoW is **Proof-of-Model**, a data-dependent walk over model weights and, from
 H15, a context pad. Hashrates are in **MH/s**. Performance depends on the model
 tier, memory access, tensor/integer throughput and power settings.
+
+The [2026-11-08 H16 platform investigation](docs/benchmarks/2026-11-08-h16-platform.md)
+compares a local development candidate with the frozen v0.16.2 build, including
+per-card kernel choices, power, clocks and CPU use. The historical results below
+retain their original workload and version labels.
 
 The solver improvements included in v0.16.0 were measured on 2026-11-05 with
 H15 jobs. These matched A/B/B/A runs compare development build `2139c28`

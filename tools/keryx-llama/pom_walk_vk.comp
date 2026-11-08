@@ -1,4 +1,8 @@
 #version 460
+#ifdef POM_V5_CM
+#define POM_TP_CM 1
+#define POM_TP_CM_SINGLE 1
+#endif
 // Keryx Proof-of-Model v4 walk — Vulkan compute, ZERO-DUP variant: the K data-dependent 1 KB tile
 // reads go DIRECTLY to the inference engine's resident weight tensors (reached by buffer device
 // address through a per-tensor prefix table) instead of a miner-owned OpenCL blob copy. One AMD
@@ -26,6 +30,10 @@
 #extension GL_EXT_integer_dot_product : require
 #endif
 #extension GL_EXT_control_flow_attributes : require
+#if defined(POM_V5_CM) || defined(POM_V5_REDUCE)
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
 #ifdef POM_TP_CM
 // RDNA3+/CDNA matrix cores: the 32x32x32 int8 state transition as 8 cooperative-matrix
 // 16x16x16 products per sub-nonce (VK_KHR_cooperative_matrix, int8 x int8 -> int32, exact).
@@ -634,6 +642,104 @@ void main() {
     chase_nonce(idx, pc.batch, pc.start_nonce, lds_table, false);
 }
 
+#elif defined(POM_V5_CM)
+// H15/H16 has a state-dependent successor and cannot use the v4 chase scratch.
+// Keep the exact int8 matrix products, deriving just one successor
+// from the old state before its matrix transition overwrites that state.
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint gsub = gl_WorkGroupID.x;
+    const bool live = gsub < pc.batch;
+    const uint64_t seed = seed_fold_era(pc.start_nonce + (live ? uint64_t(gsub) : 0UL));
+    const bool lds_table = false;
+    for (uint i = lane; i < 256u; i += 32u) cm_layout[i] = i;
+    barrier();
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> layout_pos;
+    coopMatLoad(layout_pos, cm_layout, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    uint tweak_pos[8], state_pos[8];
+    [[unroll]] for (uint i=0u; i<8u; ++i) {
+        const uint pos=uint(layout_pos[i]), r=pos>>4, c=pos&15u;
+        tweak_pos[i]=r*0xC2B2AE35u+c*0x85EBCA6Bu;
+        state_pos[i]=r*CM_STATE_STRIDE+c;
+    }
+    barrier();
+    uint row4[8]; initial_row(seed,lane,row4);
+    [[unroll]] for(uint w=0u;w<8u;++w) {
+        [[unroll]] for(uint b=0u;b<4u;++b)
+            cm_state[0][lane*CM_STATE_STRIDE+w*4u+b]=int8_t(row4[w]>>(8u*b));
+    }
+    uint64_t off=mod_tiles(mix64(seed^V4_OFFSET_FIRST_SALT));
+    for(uint step=1u;step<=pc.k;++step) {
+#ifdef POM_V5_RESOLVE
+        // A tile normally belongs to one tensor. Resolve it once per nonce,
+        // then broadcast the address; retain exact gathers at tensor boundaries.
+        uint64_t resolved=0UL;
+        if(lane==0u) {
+            if(off>=pc.n_tiles) {
+                const uint64_t byte=(off-pc.n_tiles)*1024UL;
+                resolved=Tensor(pc.pad_addr).words[uint(byte>>30)]+(byte&0x3fffffffUL);
+            } else {
+                uint64_t first;
+                resolved=resolve_tile(off,lds_table,first);
+            }
+        }
+        resolved=uint64_t(subgroupShuffle(uint(resolved),0u)) |
+                 (uint64_t(subgroupShuffle(uint(resolved>>32),0u))<<32);
+#endif
+        // Vector loads cover all lanes' consecutive 16-byte halves.
+        [[unroll]] for(uint part=0u;part<2u;++part) {
+            uint col=(lane>>1)+part*16u, word=(lane&1u)*4u;
+#ifdef POM_V5_RESOLVE
+            Tensor16 tile=Tensor16(lane_chunk_addr(resolved,col,lds_table)+uint64_t(word*4u));
+#else
+            Tensor16 tile=Tensor16(chunk_addr(off*32UL+uint64_t(col),lds_table)+uint64_t(word*4u));
+#endif
+            uvec4 q=tile.q[0];
+            cm_tile[col*CM_TILE_STRIDE+word+0u]=q.x;
+            cm_tile[col*CM_TILE_STRIDE+word+1u]=q.y;
+            cm_tile[col*CM_TILE_STRIDE+word+2u]=q.z;
+            cm_tile[col*CM_TILE_STRIDE+word+3u]=q.w;
+        }
+        barrier();
+        if(step<pc.k) {
+            uint64_t h=0UL;
+            [[unroll]] for(uint b=0u;b<8u;++b)
+                h |= uint64_t(uint8_t(cm_state[0][lane*CM_STATE_STRIDE+b]))<<(8u*b);
+            h=mix64(h^uint64_t(lane));
+            [[unroll]] for(uint mask=16u;mask>0u;mask>>=1u) h ^= uint64_t(subgroupShuffleXor(uint(h),mask)) | (uint64_t(subgroupShuffleXor(uint(h>>32),mask))<<32);
+            uint64_t sf=0UL;
+            [[unroll]] for(uint w=0u;w<8u;++w) sf=mix64(sf^uint64_t(cm_tile[w]));
+            const uint64_t raw=mix64(seed^(uint64_t(step+1u)*V4_OFFSET_STEP_SALT)^sf^h);
+            const bool pad_step=((step+1u)*pc.k_pad)>>8 != (step*pc.k_pad)>>8;
+            const uint64_t pr=raw-mulhi64(raw,pc.pad_inv)*pc.n_pad;
+            off=pad_step?pc.n_tiles+(pr>=pc.n_pad?pr-pc.n_pad:pr):mod_tiles(raw);
+        }
+        coopmat<int8_t,gl_ScopeSubgroup,16,16,gl_MatrixUseA> A[2][2];
+        coopmat<int8_t,gl_ScopeSubgroup,16,16,gl_MatrixUseB> B[2][2];
+        [[unroll]] for(uint rb=0u;rb<2u;++rb) [[unroll]] for(uint kb=0u;kb<2u;++kb)
+            coopMatLoad(A[rb][kb],cm_state[0],rb*16u*CM_STATE_STRIDE+kb*16u,CM_STATE_STRIDE,gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for(uint kb=0u;kb<2u;++kb) [[unroll]] for(uint cb=0u;cb<2u;++cb)
+            coopMatLoad(B[kb][cb],cm_tile,cb*16u*CM_TILE_STRIDE+kb*4u,CM_TILE_STRIDE,gl_CooperativeMatrixLayoutColumnMajor);
+        [[unroll]] for(uint rb=0u;rb<2u;++rb) [[unroll]] for(uint cb=0u;cb<2u;++cb) {
+            coopmat<int32_t,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator> acc=coopmat<int32_t,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator>(0);
+            acc=coopMatMulAdd(A[rb][0],B[0][cb],acc);
+            acc=coopMatMulAdd(A[rb][1],B[1][cb],acc);
+            [[unroll]] for(uint i=0u;i<8u;++i) {
+                uint v=rho8(acc[i],step*0x9E3779B9u+rb*(16u*0xC2B2AE35u)+cb*(16u*0x85EBCA6Bu)+tweak_pos[i]);
+                cm_state[0][rb*16u*CM_STATE_STRIDE+cb*16u+state_pos[i]]=int8_t(v);
+            }
+        }
+        barrier();
+    }
+    [[unroll]] for(uint w=0u;w<8u;++w) {
+        uint v=0u;
+        [[unroll]] for(uint b=0u;b<4u;++b) v|=uint(uint8_t(cm_state[0][lane*CM_STATE_STRIDE+w*4u+b]))<<(8u*b);
+        row4[w]=v;
+    }
+    barrier();
+    finish(row4,0u,lane,gsub,live);
+}
+
 #elif defined(POM_TP_CM)
 // ============================================================================
 // PHASE 2 (matrix cores) — pipelined walk with the state transition on cooperative matrices:
@@ -904,7 +1010,9 @@ void main() {
         // Load this sub-nonce's 1 KB tile: lane loads canonical chunk (tile*32 + lane). Chunks are
         // located individually, so a tile that straddles two tensors is gathered exactly.
 #ifdef POM_V5
+#ifndef POM_V5_REDUCE
         v5_state_rows[lid] = mix64((uint64_t(row4[0]) | (uint64_t(row4[1]) << 32u)) ^ uint64_t(lane));
+#endif
 #endif
         load_chunk(off * uint64_t(V4_TILE_CHUNKS) + uint64_t(lane), strip + lane * V4_D4, lds_table);
         memoryBarrierShared();
@@ -915,8 +1023,17 @@ void main() {
             uint64_t sf = 0UL;
             [[unroll]] for (uint w = 0u; w < 8u; ++w) sf = mix64(sf ^ uint64_t(scratch[strip + w]));
 #ifdef POM_V5
+#ifdef POM_V5_REDUCE
+            // Each nonce owns 32 consecutive lanes, including on wave64. XOR
+            // masks below 32 never mix the two nonces within a wave64.
+            uint64_t state_fold = mix64((uint64_t(row4[0]) | (uint64_t(row4[1]) << 32u)) ^ uint64_t(lane));
+            [[unroll]] for (uint mask=16u; mask>0u; mask>>=1u)
+                state_fold ^= uint64_t(subgroupShuffleXor(uint(state_fold),mask)) |
+                              (uint64_t(subgroupShuffleXor(uint(state_fold>>32),mask))<<32);
+#else
             uint64_t state_fold = 0UL;
             [[unroll]] for (uint r = 0u; r < 32u; ++r) state_fold ^= v5_state_rows[sub * 32u + r];
+#endif
             const uint64_t raw = mix64(seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf ^ state_fold);
             const bool pad_step = ((step + 1u) * pc.k_pad) / 256u != (step * pc.k_pad) / 256u;
             const uint64_t pr = raw - mulhi64(raw, pc.pad_inv) * pc.n_pad;

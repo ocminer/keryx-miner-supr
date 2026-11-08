@@ -50,6 +50,7 @@ EXPORTS
     keryx_vk_integer_dot_product
     keryx_vk_coopmat_int8
     keryx_llama_pom_v5_abi
+    keryx_llama_pom_v5_batch
     keryx_llama_pom_mine_v5
     keryx_llama_pom_release_pad
     keryx_llama_pom_pad_read

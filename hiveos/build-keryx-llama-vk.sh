@@ -55,6 +55,9 @@ docker run --rm --network host \
     glslc --target-env=vulkan1.2 -O -DUSE_DOT=1 -mfmt=c -o $G/pom_walk_dot_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
     glslc --target-env=vulkan1.2 -O -DPOM_V5=1 -mfmt=c -o $G/pom_walk_v5_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
     glslc --target-env=vulkan1.2 -O -DPOM_V5=1 -DUSE_DOT=1 -mfmt=c -o $G/pom_walk_v5_dot_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
+    glslc --target-env=vulkan1.3 -O -DPOM_V5=1 -DPOM_V5_CM=1 -mfmt=c -o $G/pom_walk_v5_cm_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
+    glslc --target-env=vulkan1.3 -O -DPOM_V5=1 -DPOM_V5_CM=1 -DPOM_V5_RESOLVE=1 -mfmt=c -o $G/pom_walk_v5_resolved_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
+    glslc --target-env=vulkan1.2 -O -DPOM_V5=1 -DPOM_V5_REDUCE=1 -DUSE_DOT=1 -mfmt=c -o $G/pom_walk_v5_reduce_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
     glslc --target-env=vulkan1.2 -O -mfmt=c -o $G/pom_v5_pad_fill_vk.spv.inc /repo/tools/keryx-llama/pom_v5_pad_fill_vk.comp
     glslc --target-env=vulkan1.2 -O -DPOM_CHASE=1 -mfmt=c -o $G/pom_chase_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
     glslc --target-env=vulkan1.2 -O -DPOM_TP=1 -mfmt=c -o $G/pom_walk_tp_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp

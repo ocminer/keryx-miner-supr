@@ -1190,15 +1190,23 @@ impl PomGpuMiner {
         nl: u64,
     ) -> candle_core::Result<()> {
         use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-        let nonces_per_block: u64 = if nl == 2 { 2 } else { 4 };
-        let walk = load_walk_func(&self.cuda, if nl == 2 { "pom_mine_v5_lockstep2_seeded" } else { "pom_mine_v5_lockstep_seeded" })?;
+        let nonces_per_block = nl & 15;
+        let inplace = nl & 16 != 0;
+        let kernel = match nl {
+            2 => "pom_mine_v5_lockstep2_seeded",
+            4 => "pom_mine_v5_lockstep_seeded",
+            18 => "pom_mine_v5_inplace2_seeded",
+            20 => "pom_mine_v5_inplace4_seeded",
+            _ => candle_core::bail!("invalid PoM v5 launch variant {nl}"),
+        };
+        let walk = load_walk_func(&self.cuda, kernel)?;
         let pbase = pad._pad_buf.device_ptr(&self.stream).0 as u64;
         let k = crate::pom_v4::POM_V4_K as u32;
         let inv_n = u64::MAX / n_tiles;
         let cfg = LaunchConfig {
             grid_dim: (((batch + nonces_per_block - 1) / nonces_per_block) as u32, 1, 1),
             block_dim: (32, 1, 1),
-            shared_mem_bytes: (nonces_per_block as u32) * 3 * 1024,
+            shared_mem_bytes: (nonces_per_block as u32) * (if inplace { 2 } else { 3 }) * 1024,
         };
         let mut b = walk.builder();
         b.arg(&wbase)
@@ -1429,24 +1437,49 @@ impl PomGpuMiner {
             {
                 if let Some(wbase) = self.v5_contiguous_base() {
                     let nl = *self.v5_lockstep_ok.get_or_init(|| {
-                        // Cross-check both widths, then keep the faster one on this card and blob.
+                        // Exactness comes before timing. Keep the established layouts in the
+                        // same per-card race: a newer layout may be slower on another GPU.
                         let ord = self.stream.context().ordinal();
-                        let mut best: (u64, f64) = (0, f64::MAX);
                         let forced = std::env::var("KERYX_POM_V5_LOCKSTEP_NL").ok().and_then(|v| v.parse::<u64>().ok());
-                        for nl in [4u64, 2] {
-                            if forced.is_some_and(|f| f != nl) || !self.v5_lockstep_selfcheck(wbase, n_tiles, pad, &p, &s, timestamp, nl) {
+                        let inplace = std::env::var("KERYX_POM_V5_INPLACE").unwrap_or_default();
+                        let mut candidates = Vec::new();
+                        for variant in [4u64, 2, 20, 18] {
+                            if forced.is_some_and(|f| f != (variant & 15))
+                                || (variant & 16 != 0 && inplace == "0")
+                                || (variant & 16 == 0 && inplace == "force")
+                                || !self.v5_lockstep_selfcheck(wbase, n_tiles, pad, &p, &s, timestamp, variant) {
                                 continue;
                             }
-                            let t = self.time_v5_lockstep(wbase, n_tiles, pad, &p, batch, &h10_seeds, &mut winner, nl).unwrap_or(f64::MAX);
-                            log::info!("PoM v5[gpu{}]: lock-step walk x{} cross-checked, {:.3} ms per batch of {}", ord, nl, t * 1e3, batch);
-                            if t < best.1 {
-                                best = (nl, t);
+                            candidates.push((variant, 0.0f64));
+                        }
+                        // Let the card reach its working clock before comparing. Reverse the
+                        // order on alternate rounds to avoid favoring a colder/warmer arm.
+                        let warm = std::time::Instant::now();
+                        if let Some(&(variant, _)) = candidates.first() {
+                            while warm.elapsed().as_secs_f64() < 0.25 {
+                                if self.time_v5_lockstep(wbase,n_tiles,pad,&p,batch,&h10_seeds,&mut winner,variant).is_err() { break; }
                             }
+                        }
+                        for round in 0..4 {
+                            let count = candidates.len();
+                            for i in 0..count {
+                                let j = if round & 1 == 0 { i } else { count - 1 - i };
+                                let (variant, sum) = &mut candidates[j];
+                                *sum += self.time_v5_lockstep(wbase,n_tiles,pad,&p,batch,&h10_seeds,&mut winner,*variant).unwrap_or(f64::INFINITY);
+                            }
+                        }
+                        let mut best: (u64, f64) = (0, f64::INFINITY);
+                        for (variant, sum) in candidates {
+                            let t = sum / 4.0;
+                            log::info!("PoM v5[gpu{}]: x{} {} tile layout cross-checked, {:.3} ms per batch of {}",ord,variant & 15,if variant & 16 != 0 {"in-place"} else {"double-buffer"},t*1e3,batch);
+                            // A marginal new-path result is not enough to displace the fallback.
+                            let margin = if variant & 16 != 0 && best.0 & 16 == 0 { 0.995 } else { 1.0 };
+                            if t.is_finite() && t > 0.0 && t < best.1 * margin { best = (variant,t); }
                         }
                         if best.0 == 0 {
                             log::warn!("PoM v5[gpu{}]: lock-step walk REJECTED by cross-check, staying on the established kernel", ord);
                         } else {
-                            log::info!("PoM v5[gpu{}]: lock-step contiguous walk active ({} nonces per warp)", ord, best.0);
+                            log::info!("PoM v5[gpu{}]: lock-step contiguous walk active ({} nonces per warp, {} tile layout)", ord, best.0 & 15, if best.0 & 16 != 0 { "in-place" } else { "double-buffer" });
                             if best.1 > 0.0 && best.1 < 0.05 && intensity_batch_for(ord as u32).is_none() {
                                 let scaled = ((batch as f64 * 0.05 / best.1) as u64).max(batch).min(1 << 21);
                                 let scaled = (scaled + 255) / 256 * 256;
@@ -6389,6 +6422,54 @@ mod v4_kernel_tests {
             }
         }
         if let Some(v) = saved { std::env::set_var("KERYX_POM_V5_FAST", v); } else { std::env::remove_var("KERYX_POM_V5_FAST"); }
+    }
+
+    /// Exact target brackets and partial batches for both in-place layouts.
+    #[test]
+    #[ignore]
+    fn v5_inplace_layouts_match_cpu() {
+        let data = blob(65);
+        let index = crate::pom::index_from_ram(data.clone());
+        let miner = PomGpuMiner::load_test_segments(0, vec![data.clone()]).unwrap();
+        let n_tiles = index.n_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
+        let pad_seed = crate::pom_v5::v5_pad_seed(0, &[7u8; 32], &index.r_t);
+        assert!(matches!(miner.stream.context().compute_capability(), Ok((8, 0) | (8, 6) | (12, 0))), "fast-path qualification requires sm80, sm86 or sm120 hardware");
+        // H15 selects the state-carrying solver independently of the pre-H15
+        // tuning default, which deliberately remains chase+TC on HBM cards.
+        assert!(miner.v4_ncf_usable(n_tiles, crate::pom_v4::POM_V4_K as u32, &[0; 4], &[0; 4], TS));
+        let pads = [1, 200, 1023, crate::pom_v5::POM_V5_PAD_TILES_H14[0], crate::pom_v5::POM_V5_PAD_TILES_H16[0]];
+        for n_pad in pads {
+            let k_pad = crate::pom_v5::v5_pad_steps(n_tiles, n_pad) as u32;
+            const BASE: u64 = 1000;
+            const BATCH: u64 = 35; // includes a partial last warp group
+            let mut pows = Vec::new();
+            for nonce in BASE..BASE + BATCH {
+                let seed = crate::pom::pom_block_seed_h14(&PPH, TS, nonce);
+                let (proof, fs) = crate::pom_v5::build_proof_v5(0, seed, &index, &pad_seed, n_pad).unwrap();
+                assert_eq!(crate::pom_v5::verify_proof_v5(seed, &proof, &index.r_t, index.n_chunks, &pad_seed, n_pad).unwrap(), fs);
+                pows.push(crate::pom::pom_pow_value(fs, &PPH, true));
+            }
+            for fast in [18u64,20u64] {
+                let miner = PomGpuMiner::load_test_segments(0, vec![data.clone()]).unwrap();
+                miner.v5_lockstep_ok.set(fast).unwrap();
+                let pad = miner.v5_pad(&pad_seed,n_pad,k_pad).unwrap();
+                for (i, pow) in pows.iter().enumerate() {
+                    let nonce = BASE + i as u64;
+                    assert_eq!(miner.mine_v4_impl(&PPH, TS, pow, nonce, 1, true, true, Some(&*pad)).unwrap(), Some(nonce), "exact target: fast={fast} pad={n_pad} nonce={nonce}");
+                    assert_eq!(miner.mine_v4_impl(&PPH, TS, &dec_le(*pow), nonce, 1, true, true, Some(&*pad)).unwrap(), None, "below target: fast={fast} pad={n_pad} nonce={nonce}");
+                }
+                // Select a range whose unique best nonce is off lane zero, so a wrong
+                // warp broadcast cannot accidentally satisfy this single-winner target.
+                let (begin, best) = (0..BATCH as usize - 1).find_map(|begin| {
+                    let best = (begin..BATCH as usize).min_by(|&a, &b| le_cmp(&pows[a], &pows[b])).unwrap();
+                    ((best - begin) % 32 != 0).then_some((begin, best))
+                }).expect("test vector must put the winner off lane zero");
+                let expected = Some(BASE + best as u64);
+                assert_eq!(miner.mine_v4_impl(&PPH, TS, &pows[best], BASE + begin as u64, BATCH - begin as u64, true, true, Some(&*pad)).unwrap(), expected);
+                assert_eq!(miner.mine_v4_impl(&PPH, TS, &dec_le(pows[best]), BASE + begin as u64, BATCH - begin as u64, true, true, Some(&*pad)).unwrap(), None);
+                println!("v5 exact: fast={fast} pad={n_pad} k_pad={k_pad} nonces={BATCH} winner={}", expected.unwrap());
+            }
+        }
     }
 
     /// Exercise one live CUDA context across a finite staged H16 gate and a reorg.

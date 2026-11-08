@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -60,6 +61,15 @@ static const uint32_t WALK_V5_DOT_SPV[] =
 ;
 static const uint32_t WALK_V5_SCALAR_SPV[] =
 #include "pom_walk_v5_vk.spv.inc"
+;
+static const uint32_t WALK_V5_CM_SPV[] =
+#include "pom_walk_v5_cm_vk.spv.inc"
+;
+static const uint32_t WALK_V5_RESOLVED_SPV[] =
+#include "pom_walk_v5_resolved_vk.spv.inc"
+;
+static const uint32_t WALK_V5_REDUCE_SPV[] =
+#include "pom_walk_v5_reduce_vk.spv.inc"
 ;
 static const uint32_t PAD_V5_FILL_SPV[] =
 #include "pom_v5_pad_fill_vk.spv.inc"
@@ -341,7 +351,7 @@ static bool prefer_single_nonce_cm(KeryxLlama* h) {
 
 static VkPipeline make_pipeline(KeryxLlama* h, const uint32_t* spv, size_t spv_bytes,
                                 uint32_t push_bytes, VkShaderModule* sm, VkPipelineLayout* pl,
-                                uint32_t wave = 0, bool allow_wave_fallback = true) {
+                                uint32_t wave = 0, bool allow_wave_fallback = true, bool full_subgroups = false) {
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = spv_bytes;
     smi.pCode = spv;
@@ -362,6 +372,7 @@ static VkPipeline make_pipeline(KeryxLlama* h, const uint32_t* spv, size_t spv_b
     rss.requiredSubgroupSize = wave;
     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, wave ? &rss : nullptr, 0,
                  VK_SHADER_STAGE_COMPUTE_BIT, *sm, "main", nullptr};
+    if (full_subgroups) cpi.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     // The standalone resident walk has one contiguous tensor. Specializing the count
     // removes its table search and straddle path; normal zero-dup models retain theirs.
     VkSpecializationMapEntry tensor_entry{0, 0, sizeof(h->n_tensors)};

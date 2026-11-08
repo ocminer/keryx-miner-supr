@@ -10,8 +10,8 @@ mining-only cards the raw weight upload, on inference cards the engine's own
 weights when the engine places them in canonical order (`KERYX_CANONICAL_WEIGHTS`,
 default on).
 
-Before first use on a card, the host cross-checks both widths against the
-established fast kernel on the live job and keeps the faster width that matches;
+Before first use on a card, the host cross-checks both widths and tile layouts
+against the established fast kernel on the live job and times the exact candidates;
 a mismatch leaves the card on the established kernel. The lock-step kernels are
 selected only on compute capability 8.0 and newer. `KERYX_POM_V5_LOCKSTEP=0`
 disables them. All earlier entry points (including `pom_mine_v5_ncf_fast_seeded`
@@ -20,10 +20,10 @@ behavior and remain the fallback.
 
 - Compiler: NVIDIA CUDA 13.4, `nvcc V13.4.92`
 - Source: `src/pom_mine.cu`
-- Source SHA-256: `30c32bf736a666ecdb66663a9f733ce6cf5b0a934962fdb910179e7ea5ab5071`
+- Source SHA-256: `f6deab08bae320390d4cad163eb1f042a4f94a3515d4e91d58e1e8f67c1a8b24`
 - Artifact: `cuda/pom_mine.fatbin`
-- Artifact SHA-256: `7777e6f4f219b4ed6b1487cf20d5c8fb89f022a36b79a8dc2e24c2df62015140`
-- Artifact size: 7989624 bytes
+- Artifact SHA-256: `619177f55e797dcdc835158e73195fb10e49bba4c371a3abee5dd1c041218925`
+- Artifact size: 10166304 bytes
 - Native SASS: sm_75, sm_80, sm_86, sm_87, sm_88, sm_89, sm_90, sm_100, sm_103, sm_110,
   sm_120, sm_121
 - Forward-compatible PTX: compute_75 and compute_80
@@ -35,3 +35,12 @@ diagnosis.
 
 Rebuild with `cuda/regenerate-pom-fatbin.sh OUTPUT BASELINE`; retain the baseline
 for the established-kernel SASS comparison.
+
+The optional `pom_mine_v5_inplace2_seeded` and `pom_mine_v5_inplace4_seeded`
+kernels preload the matrix fragments before reusing one tile buffer, reducing
+shared memory from 3 KiB to 2 KiB per nonce. Merkle parents from independent
+nonces share the finish phase. A warmed, interleaved per-card comparison selects
+the layout; a new layout must beat the established one by at least 0.5%.
+`KERYX_POM_V5_INPLACE=0` excludes the new layouts for diagnosis. All 168
+established native functions across the 12 architectures are instruction-identical
+to the v0.16.2 baseline; the additional layouts have separate entry points.
