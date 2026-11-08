@@ -811,7 +811,8 @@ impl PomGpuMiner {
             let mut off = 0u64;
             let mut ok = len == plan.entries.iter().map(|(nb, _)| (*nb / CHUNK_BYTES) as u64 * CHUNK_BYTES as u64).sum::<u64>();
             for (nb, src) in &plan.entries {
-                if let GatherSource::DevicePtr(p) = src {
+                // tensors with no whole chunk (e.g. Gemma's 4-byte scalars) are not part of the stream
+                if let (GatherSource::DevicePtr(p), true) = (src, *nb >= CHUNK_BYTES) {
                     ok &= *p == base + off;
                 }
                 off += (*nb / CHUNK_BYTES) as u64 * CHUNK_BYTES as u64;
