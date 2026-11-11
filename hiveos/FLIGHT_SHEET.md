@@ -44,7 +44,8 @@ uses the template below), set **Miner = Custom**, then open **Setup Miner Config
 | **Extra config arguments** | *optional* — blank = per-card AUTO; e.g. `--very-high` pins a tier |
 
 Keep the `stratum+tcp://` scheme on the Pool URL — without it the miner falls
-back to gRPC. Apply the Flight Sheet to your rig(s).
+back to gRPC. For an encrypted TLS connection use `stratum+ssl://krx.suprnova.cc:4405`
+instead; the URL is passed to the miner unchanged. Apply the Flight Sheet to your rig(s).
 
 ## 4. Extra config arguments — reference
 
@@ -85,6 +86,6 @@ Expected first-run sequence: model prefetch → GPU inference residency → opti
   downloading, or the rig has no internet / not enough disk. Mining begins once
   the model files are present.
 - **No shares / falls back to gRPC** — make sure the Pool URL keeps the
-  `stratum+tcp://` prefix.
+  `stratum+tcp://` (or `stratum+ssl://`) prefix.
 - **Worker on the wrong difficulty** — krx.suprnova.cc offers several stratum
   ports; pick the one for your difficulty per the pool site.

@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
@@ -701,6 +702,53 @@ fn record_forwarded_pool_candidate<E>(
     }
 }
 
+/// Whether `url` names a stratum pool (`stratum+tcp://`, `stratum+ssl://` or `stratum+tls://`).
+pub fn is_stratum_url(url: &str) -> bool {
+    ["stratum+tcp://", "stratum+ssl://", "stratum+tls://"].iter().any(|p| url.starts_with(p))
+}
+
+/// TLS options of a stratum connection.
+pub struct TlsSettings {
+    /// Extra PEM certificate authority trusted besides the public roots.
+    pub ca_file: Option<String>,
+}
+
+trait PoolIo: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> PoolIo for T {}
+
+/// TLS client session over `socket` (upstream v0.6.2): Mozilla roots bundled in the binary
+/// (webpki-roots, no system OpenSSL) plus an optional extra PEM CA, full certificate and host-name
+/// verification, SNI = the pool host name.
+async fn tls_wrap(socket: TcpStream, address: &str, settings: &TlsSettings) -> Result<Box<dyn PoolIo>, Error> {
+    use tokio_rustls::rustls::{self, pki_types::pem::PemObject, pki_types::CertificateDer, pki_types::ServerName, RootCertStore};
+
+    let mut roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    if let Some(path) = &settings.ca_file {
+        let mut added = 0;
+        for cert in CertificateDer::pem_file_iter(path).map_err(|e| format!("pool CA file {}: {}", path, e))? {
+            roots.add(cert.map_err(|e| format!("pool CA file {}: {}", path, e))?)?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(format!("pool CA file {}: no certificate", path).into());
+        }
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let host = tls_server_name(address);
+    let name = ServerName::try_from(host.to_string()).map_err(|e| format!("pool host {}: {}", host, e))?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let stream = tokio::time::timeout(Duration::from_secs(10), connector.connect(name, socket)).await??;
+    Ok(Box::new(stream))
+}
+
+/// Host part of `host:port` / `[v6]:port`, the TLS server name (SNI and certificate check).
+fn tls_server_name(address: &str) -> &str {
+    address.rsplit_once(':').map_or(address, |(h, _)| h).trim_start_matches('[').trim_end_matches(']')
+}
+
 #[allow(dead_code)]
 pub struct StratumHandler {
     log_handler: JoinHandle<()>,
@@ -989,6 +1037,7 @@ impl StratumHandler {
 
     pub async fn connect(
         address: String,
+        tls: Option<TlsSettings>,
         miner_address: String,
         pool_password: String,
         mine_when_not_synced: bool,
@@ -1003,7 +1052,7 @@ impl StratumHandler {
             ACTIVE_POOL.load(Ordering::Relaxed),
         );
         let connect_started = std::time::Instant::now();
-        let socket = match TcpStream::connect(address).await {
+        let socket = match TcpStream::connect(&address).await {
             Ok(socket) => socket,
             Err(error) => {
                 keryx_miner::runtime_stats::connection_lost(runtime_generation, "Pool connection failed");
@@ -1052,6 +1101,21 @@ impl StratumHandler {
             }
         }
 
+        // stratum+ssl:// / stratum+tls:// (upstream v0.6.2): TLS over the tuned TCP socket; the line
+        // codec runs unchanged on top of either stream.
+        let socket: Box<dyn PoolIo> = match &tls {
+            Some(settings) => match tls_wrap(socket, &address, settings).await {
+                Ok(stream) => {
+                    info!("TLS session established with {}", address);
+                    stream
+                }
+                Err(error) => {
+                    keryx_miner::runtime_stats::connection_lost(runtime_generation, "Pool TLS handshake failed");
+                    return Err(error);
+                }
+            },
+            None => Box::new(socket),
+        };
         let client = Framed::new(socket, NewLineJsonCodec::new());
         let (send_channel, recv) = mpsc::channel::<StratumLine>(3);
         let (sink, stream) = client.split();
@@ -3284,4 +3348,28 @@ mod proof_encoding_tests {
         assert!(line.id.is_none());
         assert!(matches!(line.payload, StratumLinePayload::StratumResult { .. }));
     }
+}
+
+#[cfg(test)]
+mod tls_url_tests {
+    use super::{is_stratum_url, tls_server_name};
+
+    #[test]
+    fn recognises_the_stratum_schemes() {
+        for url in ["stratum+tcp://krx.suprnova.cc:4401", "stratum+ssl://krx.suprnova.cc:4405", "stratum+tls://pool.example:443"] {
+            assert!(is_stratum_url(url), "{url}");
+        }
+        for url in ["grpc://127.0.0.1:22110", "127.0.0.1", "stratum://pool:1", "ssl://pool:1", "STRATUM+SSL://pool:1", "http://pool:1"] {
+            assert!(!is_stratum_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn tls_server_name_is_the_host_part() {
+        assert_eq!(tls_server_name("krx.suprnova.cc:4405"), "krx.suprnova.cc");
+        assert_eq!(tls_server_name("[::1]:4405"), "::1");
+        assert_eq!(tls_server_name("10.0.0.1:4405"), "10.0.0.1");
+        assert_eq!(tls_server_name("pool.example"), "pool.example");
+    }
+
 }

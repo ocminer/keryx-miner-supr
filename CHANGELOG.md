@@ -1,4 +1,4 @@
-# keryx-miner-supr 0.16.4 — compressed private prompts from pools
+# keryx-miner-supr 0.16.4 — compressed private prompts from pools, stratum+ssl
 
 - **Fix: pool-forwarded compressed private prompts are now inflated like the solo
   path.** Since H14 an opened private prompt may be compressed (marker
@@ -11,6 +11,12 @@
   stream that cannot be inflated at all is served as its raw bytes. Prompt bytes
   that are not valid UTF-8 are read with replacement characters instead of
   refusing the request. NUL-byte handling and the size limits are unchanged.
+- **stratum+ssl:// TLS pool connections**, port 4405 on suprnova
+  (`-s stratum+ssl://krx.suprnova.cc:4405`; `stratum+tls://` is accepted too). The
+  pool certificate and host name are verified against public root certificates
+  built into the miner, so no system OpenSSL is needed on mining OS images.
+  `--pool-ca-file <pem>` trusts an extra certificate authority. Backup pools,
+  reconnect and failover work over TLS; `stratum+tcp://` is unchanged.
 - Mining kernels, inference engines, H16 rules and model weights are unchanged
   from v0.16.3.
 

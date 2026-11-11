@@ -3,7 +3,7 @@
 # Sourced by h-run.sh; writes $CUSTOM_CONFIG_FILENAME with the CLI_ARGS string.
 #
 # Flight-sheet mapping:
-#   Pool URL  ($CUSTOM_URL)        -> -s stratum+tcp://host:port  (scheme required)
+#   Pool URL  ($CUSTOM_URL)        -> -s stratum+tcp://host:port or stratum+ssl://host:port (scheme required; passed unchanged)
 #   Wallet    ($CUSTOM_TEMPLATE)   -> -a keryx:addr.worker
 #   Password  ($CUSTOM_PASS)       -> --pool-password (sent in stratum mining.authorize).
 #                                     Most keryx pools ignore it; on suprnova set e.g.

@@ -674,11 +674,14 @@ async fn get_client(
     escrow_state_file: String,
     escrow_cert: Option<String>,
     ipfs_url: String,
+    pool_ca_file: Option<String>,
 ) -> Result<Box<dyn Client + 'static>, Error> {
-    if keryxd_address.starts_with("stratum+tcp://") {
-        let (_schema, address) = keryxd_address.split_once("://").unwrap();
+    if client::stratum::is_stratum_url(&keryxd_address) {
+        let (schema, address) = keryxd_address.split_once("://").unwrap();
+        let tls = (schema != "stratum+tcp").then_some(client::stratum::TlsSettings { ca_file: pool_ca_file });
         Ok(StratumHandler::connect(
             address.to_string().clone(),
+            tls,
             mining_address.clone(),
             pool_password.clone(),
             mine_when_not_synced,
@@ -727,6 +730,7 @@ async fn client_main(
         opt.escrow_state_file.clone(),
         escrow_cert,
         opt.ipfs_url.clone(),
+        opt.pool_ca_file.clone(),
     )
     .await?;
 
@@ -929,7 +933,7 @@ async fn run() -> Result<(), Error> {
         }
     }
 
-    let initial_mode = if opt.keryxd_address.starts_with("stratum+tcp://") {
+    let initial_mode = if client::stratum::is_stratum_url(&opt.keryxd_address) {
         keryx_miner::runtime_stats::MiningMode::Pool
     } else {
         keryx_miner::runtime_stats::MiningMode::Solo
@@ -1189,7 +1193,7 @@ async fn run() -> Result<(), Error> {
     // resolve it only when a configured pool is solo (grpc); pool mining skips it entirely.
     // (Previously this hard-errored at startup for pool miners once H6 was active.)
     let solo_mining =
-        std::iter::once(&opt.keryxd_address).chain(opt.backup_pool.iter()).any(|a| !a.starts_with("stratum+tcp://"));
+        std::iter::once(&opt.keryxd_address).chain(opt.backup_pool.iter()).any(|a| !client::stratum::is_stratum_url(a));
     let escrow_cert: Option<String> = if !solo_mining {
         info!("Pool (stratum) mining — escrow delegation cert not required (the pool signs the coinbase).");
         None
@@ -2192,7 +2196,7 @@ async fn run() -> Result<(), Error> {
     }
 }
 
-/// Best-effort TCP reachability probe of a `stratum+tcp://host:port` (or bare host:port) pool URL —
+/// Best-effort TCP reachability probe of a `stratum+tcp://` / `stratum+ssl://host:port` (or bare host:port) pool URL —
 /// used by the failback prober to decide whether a higher-priority pool has recovered, WITHOUT
 /// touching the active mining connection or its globals. Just a connect within `timeout`.
 async fn tcp_pool_reachable(url: &str, timeout: Duration) -> bool {

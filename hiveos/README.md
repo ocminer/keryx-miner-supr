@@ -91,7 +91,8 @@ keryx-miner-supr/
    - **Miner name**: auto-filled from the archive (`keryx-miner-supr-modern`, `-legacy`, or `-amd`)
    - **Hash algorithm**: `keryxhash`
    - **Wallet and worker template**: `keryx:<addr>.%WORKER_NAME%`
-   - **Pool URL**: `stratum+tcp://krx.suprnova.cc:4401` (the scheme is required)
+   - **Pool URL**: `stratum+tcp://krx.suprnova.cc:4401` (the scheme is required), or
+     `stratum+ssl://krx.suprnova.cc:4405` for an encrypted TLS connection
    - **Pass**: as needed (keryx pools usually ignore)
    - **Extra config arguments**: optional. **Blank = per-card AUTO** (each GPU loads the
      heaviest model its VRAM can hold = max reward). Pass a tier flag like `--very-high`

@@ -266,13 +266,13 @@ pub struct Opt {
     #[clap(short = 'a', long = "mining-address", help = "The Keryx address for the miner reward")]
     pub mining_address: Option<String>,
 
-    #[clap(short = 's', long = "keryxd-address", default_value = "127.0.0.1", help = "The IP of the keryxd instance")]
+    #[clap(short = 's', long = "keryxd-address", default_value = "127.0.0.1", help = "The IP of the keryxd instance, or a pool URL: stratum+tcp://host:port, or stratum+ssl://host:port (also stratum+tls://) for an encrypted TLS pool connection")]
     pub keryxd_address: String,
 
     #[clap(
         long = "backup-pool",
         value_name = "URL",
-        help = "Backup/failover pool as a full URL (stratum+tcp://host:port). Repeatable — pass it multiple times to define a PRIORITY LIST tried in the order given. If the primary (-s) fails hard (no job for ~90s or the connection drops), the miner fails over to the next pool; in the background it keeps probing higher-priority pools and switches back as soon as one recovers. Uses the same wallet/password as -s. OFF entirely unless at least one is set."
+        help = "Backup/failover pool as a full URL (stratum+tcp://host:port or stratum+ssl://host:port). Repeatable — pass it multiple times to define a PRIORITY LIST tried in the order given. If the primary (-s) fails hard (no job for ~90s or the connection drops), the miner fails over to the next pool; in the background it keeps probing higher-priority pools and switches back as soon as one recovers. Uses the same wallet/password as -s. OFF entirely unless at least one is set."
     )]
     pub backup_pool: Vec<String>,
 
@@ -285,6 +285,9 @@ pub struct Opt {
         help = "Stratum pool password (sent in mining.authorize). Most keryx pools ignore it; on suprnova set e.g. 'd=16' for static difficulty 16. Do NOT use -p for this — -p is --port."
     )]
     pub pool_password: String,
+
+    #[clap(long = "pool-ca-file", help = "Extra PEM certificate authority trusted for stratum+ssl:// pools")]
+    pub pool_ca_file: Option<String>,
 
     #[clap(long, help = "Use testnet instead of mainnet [default: false]")]
     pub testnet: bool,
@@ -484,8 +487,11 @@ impl Opt {
         // Name the mode explicitly: `-s` doubles as pool URL and node address, and "keryxd address:
         // stratum+tcp://…" read as a bug to users. This line is the first thing to check when a
         // solo miner cannot reach its node (see README "Solo mining").
-        if self.keryxd_address.starts_with("stratum+tcp://") {
+        if crate::client::stratum::is_stratum_url(&self.keryxd_address) {
             log::info!("pool address: {} (stratum)", self.keryxd_address);
+            if self.keryxd_address.starts_with("stratum+tcp://") {
+                log::warn!("Pool connection is not encrypted; use stratum+ssl:// if the pool offers it.");
+            }
         } else {
             log::info!("keryxd address: {} (solo — mining direct to node)", self.keryxd_address);
         }

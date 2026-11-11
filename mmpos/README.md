@@ -8,6 +8,8 @@ Run the miner with the stats API enabled:
 keryx-miner-supr -a keryx:<addr>.<worker> -s stratum+tcp://krx.suprnova.cc:4401 \
     --tier auto --api-bind 127.0.0.1:4067
 ```
+For an encrypted pool connection use `-s stratum+ssl://krx.suprnova.cc:4405`.
+
 Then point the mmpos agent at the endpoint (mmpos agent v4.0.18+ supports a
 direct HTTP json endpoint):
 ```

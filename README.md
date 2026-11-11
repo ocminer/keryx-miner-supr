@@ -19,8 +19,9 @@ its Vulkan engine and miner stay matched. The AMD performance figures below are
 historical, pre-H15 measurements and do not describe the new context-pad workload.
 
 **v0.16.4:** pool-forwarded compressed private prompts are inflated before
-inference, exactly like the solo path; mining and inference engines are
-unchanged from v0.16.3.
+inference, exactly like the solo path, and `stratum+ssl://` TLS pool connections
+are supported (port 4405 on suprnova). Mining and inference engines are unchanged
+from v0.16.3.
 
 **v0.16.3 solver tuning:** faster per-card H16 kernels for NVIDIA and AMD.
 Matched tier-0 development runs measured **+4.91%** on RTX 5090 at 420 W,
@@ -267,6 +268,12 @@ LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64 \
     -a keryx:<your_mining_address>.<worker_name> \
     -s stratum+tcp://krx.suprnova.cc:4401
 ```
+
+For an encrypted pool connection use `stratum+ssl://` (also accepted: `stratum+tls://`), on
+suprnova port 4405: `-s stratum+ssl://krx.suprnova.cc:4405`. The certificate is checked against
+the public root certificates built into the miner (no system OpenSSL needed); `--pool-ca-file
+<pem>` adds an extra certificate authority for a private pool. `--backup-pool` accepts both
+schemes.
 
 Add `--cuda-device N` to run a single GPU, a tier flag (`--very-high`, …) to pin all cards to one tier, or `--force-model` to set a model per card (see [Model tiers](#model-tiers) below).
 
