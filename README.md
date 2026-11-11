@@ -18,6 +18,10 @@ resumes; no dedicated inference card is required. Use the complete AMD package s
 its Vulkan engine and miner stay matched. The AMD performance figures below are
 historical, pre-H15 measurements and do not describe the new context-pad workload.
 
+**v0.16.4:** pool-forwarded compressed private prompts are inflated before
+inference, exactly like the solo path; mining and inference engines are
+unchanged from v0.16.3.
+
 **v0.16.3 solver tuning:** faster per-card H16 kernels for NVIDIA and AMD.
 Matched tier-0 development runs measured **+4.91%** on RTX 5090 at 420 W,
 **+78.00%** on RX 7900 XTX, **+55.02%** on RX 7600 XT and **+62.48%** on MI50.

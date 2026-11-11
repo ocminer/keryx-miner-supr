@@ -1,3 +1,25 @@
+# keryx-miner-supr 0.16.4 — compressed private prompts from pools
+
+- **Fix: pool-forwarded compressed private prompts are now inflated like the solo
+  path.** Since H14 an opened private prompt may be compressed (marker
+  `00 4B 5A 01` followed by raw DEFLATE). A pool that forwards the opened bytes
+  sent that stream to the model as text, or the request was refused as invalid
+  UTF-8. The stratum path now inflates it before inference (output capped at
+  1 MiB) and the solo and pool paths share one decoder. The traced answer keeps
+  the prompt length the pool sends, the sealed length the network checks.
+- A compressed stream that is cut short is served with the text it yields; a
+  stream that cannot be inflated at all is served as its raw bytes. Prompt bytes
+  that are not valid UTF-8 are read with replacement characters instead of
+  refusing the request. NUL-byte handling and the size limits are unchanged.
+- Mining kernels, inference engines, H16 rules and model weights are unchanged
+  from v0.16.3.
+
+Packages: Linux NVIDIA modern and legacy, Linux AMD, HiveOS, mmpOS, SMOS,
+Windows NVIDIA and AMD, macOS arm64, and Docker
+`ocminersupr/keryx-miner-supr:0.16.4` (`latest`). Licensing is unchanged from
+v0.16.3 (Source-Sharing License 1.0); third-party licenses and previous grants
+are preserved.
+
 # keryx-miner-supr 0.16.3 — per-card H16 solver tuning
 
 This release adds faster NVIDIA and AMD H16 walk implementations and chooses the

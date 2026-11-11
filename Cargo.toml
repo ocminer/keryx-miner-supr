@@ -1,6 +1,6 @@
 [package]
 name = "keryx-miner-supr"
-version = "0.16.3"
+version = "0.16.4"
 edition = "2021"
 license-file = "LICENSE"
 repository = "https://github.com/ocminer/keryx-miner-supr"
