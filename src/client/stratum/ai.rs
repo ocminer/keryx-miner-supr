@@ -79,10 +79,16 @@ impl AiRequest {
         if prompt_b64.len() > MAX_PAYLOAD_BYTES.div_ceil(3) * 4 {
             return Err("AI prompt is too large".into());
         }
-        let prompt = String::from_utf8(BASE64.decode(prompt_b64)?)?;
-        if prompt.len() > MAX_PAYLOAD_BYTES {
+        let raw = BASE64.decode(prompt_b64)?;
+        if raw.len() > MAX_PAYLOAD_BYTES {
             return Err("Invalid AI prompt".into());
         }
+        // Since H14 an opened private prompt may be COMPRESSED (magic 00 4B 5A 01 + raw DEFLATE): a
+        // pool forwards the opened bytes as they are, so inflate them exactly like the solo (gRPC)
+        // path and upstream do (cut at 1 MiB; a broken stream yields its partial output, else the
+        // raw bytes; lossy UTF-8). The trace keeps the pool's `prompt_len`, the sealed length the
+        // node sees, while the engine tokenizes the inflated text.
+        let prompt = crate::client::grpc::decode_private_prompt(&raw);
         // The node accepts NUL bytes in a prompt. A traced (H15 network) answer tokenizes the full
         // prompt bytes through the length-aware engine entry point, so it is served. An untraced
         // request (pool chat/probe, pre-H15) goes through llama.cpp's C-string chat template,
@@ -254,6 +260,67 @@ mod tests {
         assert_eq!(req.prompt.as_bytes(), prompt.as_bytes(), "never stripped or replaced");
         assert_eq!(req.prompt.len(), 13);
         assert!(req.trace.is_some());
+    }
+
+    fn compressed(text: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(text).unwrap();
+        let mut packed = vec![0x00, b'K', b'Z', 0x01];
+        packed.extend(enc.finish().unwrap());
+        packed
+    }
+
+    fn fields_bytes(prompt: &[u8]) -> (String, String, String, String, String, u32, String) {
+        let mut f = fields("x");
+        f.4 = BASE64.encode(prompt);
+        f
+    }
+
+    #[test]
+    fn parse_inflates_a_compressed_private_prompt() {
+        let text = "Entrée 41 — le code est ORCHIDÉE-7319. ".repeat(500);
+        let packed = compressed(text.as_bytes());
+        assert!(packed.len() < text.len() / 10);
+        assert_eq!(AiRequest::parse(fields_bytes(&packed)).unwrap().prompt, text);
+        // Traced: the engine gets the inflated text, the trace keeps the pool's (sealed) length.
+        let ext = serde_json::json!({"trace": {"tier": 0, "prompt_len": packed.len(), "chain": true, "attention": true}});
+        let req = AiRequest::parse_ext(fields_bytes(&packed), Some(&ext)).unwrap();
+        assert_eq!(req.prompt, text);
+        assert_eq!(req.trace.unwrap().prompt_len as usize, packed.len());
+    }
+
+    #[test]
+    fn parse_serves_a_truncated_compressed_prompt_as_its_partial_output() {
+        let ascii: String = (0..4000).map(|i| char::from(b'a' + (i * 7 % 26) as u8)).collect();
+        let mut packed = compressed(ascii.as_bytes());
+        packed.truncate(packed.len() / 2);
+        let prompt = AiRequest::parse(fields_bytes(&packed)).unwrap().prompt;
+        assert!(!prompt.is_empty() && ascii.starts_with(&prompt), "upstream: partial output");
+    }
+
+    #[test]
+    fn parse_serves_a_corrupt_compressed_prompt_as_its_raw_bytes() {
+        let mut corrupt = vec![0x00, b'K', b'Z', 0x01];
+        corrupt.extend([0xFF; 32]);
+        assert_eq!(AiRequest::parse(fields_bytes(&corrupt)).unwrap().prompt, "\u{FFFD}".repeat(32), "upstream: raw bytes, lossy");
+    }
+
+    #[test]
+    fn parse_caps_the_raw_and_the_inflated_prompt() {
+        assert!(AiRequest::parse(fields_bytes(&vec![b'a'; MAX_PAYLOAD_BYTES + 1])).is_err(), "raw length checked");
+        let bomb = compressed(&vec![b'a'; MAX_PAYLOAD_BYTES + 4096]);
+        assert!(bomb.len() < MAX_PAYLOAD_BYTES);
+        assert_eq!(AiRequest::parse(fields_bytes(&bomb)).unwrap().prompt.len(), 1 << 20, "inflated output cut at 1 MiB");
+    }
+
+    #[test]
+    fn parse_reads_invalid_utf8_lossily_and_keeps_nul_rules_after_inflating() {
+        assert_eq!(AiRequest::parse(fields_bytes(&[b'h', b'i', 0xFF])).unwrap().prompt, "hi\u{FFFD}");
+        let nul = compressed(b"before\0after");
+        assert!(AiRequest::parse(fields_bytes(&nul)).is_err(), "untraced NUL refused after inflating too");
+        let ext = serde_json::json!({"trace": {"tier": 0, "prompt_len": nul.len(), "chain": true, "attention": true}});
+        assert_eq!(AiRequest::parse_ext(fields_bytes(&nul), Some(&ext)).unwrap().prompt.as_bytes(), b"before\0after");
     }
 
     #[test]
