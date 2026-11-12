@@ -4,6 +4,7 @@ name: discord-release
 # Optional repository variable DISCORD_ROLE_ID: a role id that is mentioned in the post.
 # The x job posts the same release to X; it needs the secrets X_API_KEY, X_API_SECRET,
 # X_ACCESS_TOKEN and X_ACCESS_SECRET (OAuth 1.0a user context) and is skipped without them.
+# The X post is best effort: if X refuses it, the run logs a warning and still succeeds.
 on:
   release:
     types: [published]
@@ -150,5 +151,8 @@ jobs:
               with urllib.request.urlopen(req, timeout=30) as r:
                   out = json.loads(r.read())
           except urllib.error.HTTPError as e:
-              print("X status", e.code, e.read().decode(errors="replace")[:500]); sys.exit(1)
+              # best effort: X refusing the post (e.g. no API credits) must not fail the release run
+              print(f"::warning::X post not sent (HTTP {e.code}): {e.read().decode(errors='replace')[:300]}"); sys.exit(0)
+          except Exception as e:
+              print(f"::warning::X post not sent: {e}"); sys.exit(0)
           print("X status", r.status, "post id", out.get("data", {}).get("id"))
