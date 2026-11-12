@@ -2,6 +2,8 @@ name: discord-release
 # Posts every published (non-prerelease) GitHub release of this repository to Discord.
 # Needs the repository secret DISCORD_WEBHOOK (a Discord channel webhook URL); without it the job is skipped.
 # Optional repository variable DISCORD_ROLE_ID: a role id that is mentioned in the post.
+# The x job posts the same release to X; it needs the secrets X_API_KEY, X_API_SECRET,
+# X_ACCESS_TOKEN and X_ACCESS_SECRET (OAuth 1.0a user context) and is skipped without them.
 on:
   release:
     types: [published]
@@ -10,6 +12,11 @@ on:
       tag:
         description: release tag to post (e.g. v1.2.3)
         required: true
+      post_to:
+        description: where to post
+        type: choice
+        options: [both, discord, x]
+        default: both
 permissions:
   contents: read
 concurrency:
@@ -17,7 +24,7 @@ concurrency:
 jobs:
   post:
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.run_attempt == 1 && startsWith(github.event.workflow_run.head_branch, 'v')) }}
+    if: ${{ (github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.run_attempt == 1 && startsWith(github.event.workflow_run.head_branch, 'v'))) && (inputs.post_to || 'both') != 'x' }}
     steps:
       - name: Post release to Discord
         env:
@@ -69,3 +76,79 @@ jobs:
                                        headers={"Content-Type": "application/json", "User-Agent": "suprnova-release-bot"})
           with urllib.request.urlopen(req, timeout=30) as r:
               print("Discord status", r.status)
+  x:
+    runs-on: ubuntu-latest
+    if: ${{ (github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.run_attempt == 1 && startsWith(github.event.workflow_run.head_branch, 'v'))) && (inputs.post_to || 'both') != 'discord' }}
+    steps:
+      - name: Post release to X
+        env:
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag || github.event.workflow_run.head_branch }}
+        shell: python
+        run: |
+          import base64, hashlib, hmac, json, os, re, secrets, subprocess, sys, time
+          import urllib.error, urllib.parse, urllib.request
+          keys = [os.environ.get(k, "").strip() for k in ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_SECRET")]
+          if not all(keys):
+              print("X secrets not set - skipping"); sys.exit(0)
+          ckey, csec, tok, tsec = keys
+          repo, tag = os.environ["REPO"], os.environ["TAG"]
+          rel = json.loads(subprocess.run(["gh", "api", f"repos/{repo}/releases/tags/{tag}"],
+                                          capture_output=True, text=True, check=True).stdout)
+          if rel.get("draft") or rel.get("prerelease"):
+              print("draft or prerelease - skipping"); sys.exit(0)
+          name = repo.split("/")[1]
+          rname = (rel.get("name") or "").strip()
+          def plain(t):
+              t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)
+              t = re.sub(r"[*_`]", "", t)
+              return re.sub(r"\s+", " ", t).strip()
+          # summary: the release title's subtitle ("Name vX — subtitle"), else the first prose paragraph
+          summary = ""
+          m = re.search(r"\s[—–-]\s+(.+)$", rname)
+          if m:
+              summary = plain(m.group(1))
+          else:
+              body = re.sub(r"<!--.*?-->", "", rel.get("body") or "", flags=re.S)
+              body = re.sub(r"```.*?```", "", body, flags=re.S)
+              for para in re.split(r"\n\s*\n", body):
+                  p = para.strip()
+                  if not p or re.match(r"(#|>|\||[-*+] |\d+[.)] |!\[)", p):
+                      continue
+                  summary = plain(p); break
+          summary = summary[:1].upper() + summary[1:]
+          url = rel["html_url"]
+          head = f"{name} {tag} is out!"
+          budget = 280 - 23 - len(head) - 4   # X counts every link as 23 characters
+          if len(summary) > budget:
+              cut = summary[:budget]
+              end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+              if end >= 40:
+                  summary = cut[:end + 1]
+              else:
+                  summary = cut[:budget - 1].rsplit(" ", 1)[0].rstrip(" ,;:.—–-") + "…"
+          text = head + (f"\n\n{summary}" if summary else "") + f"\n\n{url}"
+          print(text)
+          endpoint = "https://api.x.com/2/tweets"
+          q = lambda v: urllib.parse.quote(str(v), safe="~-._")
+          oauth = {"oauth_consumer_key": ckey, "oauth_nonce": secrets.token_hex(16),
+                   "oauth_signature_method": "HMAC-SHA1", "oauth_timestamp": str(int(time.time())),
+                   "oauth_token": tok, "oauth_version": "1.0"}
+          base = "&".join(["POST", q(endpoint), q("&".join(f"{q(k)}={q(v)}" for k, v in sorted(oauth.items())))])
+          oauth["oauth_signature"] = base64.b64encode(
+              hmac.new(f"{q(csec)}&{q(tsec)}".encode(), base.encode(), hashlib.sha1).digest()).decode()
+          auth = "OAuth " + ", ".join(f'{q(k)}="{q(v)}"' for k, v in sorted(oauth.items()))
+          req = urllib.request.Request(endpoint, data=json.dumps({"text": text}).encode(), method="POST",
+                                       headers={"Authorization": auth, "Content-Type": "application/json",
+                                                "User-Agent": "suprnova-release-bot"})
+          try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  out = json.loads(r.read())
+          except urllib.error.HTTPError as e:
+              print("X status", e.code, e.read().decode(errors="replace")[:500]); sys.exit(1)
+          print("X status", r.status, "post id", out.get("data", {}).get("id"))
