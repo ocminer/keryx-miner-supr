@@ -333,15 +333,17 @@ extern "C" KERYX_VK_EXPORT void keryx_vk_queue_submit(size_t dev_num, const void
                                       vk::Fence((VkFence) fence));
 }
 
-// True when ggml enabled VK_KHR_shader_integer_dot_product on this device (the walk's packed
-// int8 dot-product kernel declares that SPIR-V capability; it is only legal on such a device).
+// True when ggml enabled VK_KHR_shader_integer_dot_product on this device AND the driver reports the
+// packed int8 dot as hardware-accelerated (the walk's packed dot-product kernel declares that SPIR-V
+// capability; it is only legal on such a device). ggml also enables the extension on cards that
+// emulate it (RDNA1) for the canonical trace; the walk keeps its scalar kernel there, as before.
 extern "C" KERYX_VK_EXPORT bool keryx_vk_integer_dot_product(size_t dev_num) {
     try {
         if (dev_num >= vk_instance.device_indices.size()) {
             return false;
         }
         vk_device dev = ggml_vk_get_device(dev_num);
-        return dev->integer_dot_product;
+        return dev->integer_dot_product && dev->integer_dot_accelerated;
     } catch (...) {
         return false;
     }

@@ -1,0 +1,40 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index ca8e7d8..9b69c9e 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -738,6 +738,7 @@ struct vk_device_struct {
+     bool shader_64b_indexing;
+ 
+     bool integer_dot_product;
++    bool integer_dot_accelerated;  // Keryx: hardware int8 dot (v_dot4); false = driver-emulated
+     // 0: default, 1: force mmvq, -1: disable mmvq
+     int32_t mmvq_mode;
+ 
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 1ead433..c8ada19 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -4103,6 +4103,7 @@ vk_device ggml_vk_get_device(size_t idx) {
+         bool internally_sync_support = false;
+         device->coopmat_support = false;
+         device->integer_dot_product = false;
++        device->integer_dot_accelerated = false;
+         device->shader_64b_indexing = false;
+         bool bfloat16_support = false;
+         bool dot2_f16_support = false;
+@@ -4343,7 +4344,14 @@ vk_device ggml_vk_get_device(size_t idx) {
+             device->coopmat_support = false;
+         }
+ 
+-        device->integer_dot_product = device->integer_dot_product && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated;
++        // Keryx canonical trace: every product takes the q8_1 integer path, so the int8 pipelines are
++        // required, not an optimisation. Keep them wherever the extension exists (its feature is
++        // mandatory then) even if the driver reports the packed dot as not accelerated - e.g. RADV on
++        // RX 5700/5600 (Navi10) and GFX1013, which emulate it with plain integer ALU ops. Integer dot
++        // products are exact either way, so the committed trace is identical.
++        // KERYX_VK_ASSUME_UNACCELERATED_DOT=1 (test only) treats the card like RX 5700 for qualification.
++        device->integer_dot_accelerated = device->integer_dot_product && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated &&
++                                          !getenv("KERYX_VK_ASSUME_UNACCELERATED_DOT");
+ 
+         device->min_imported_host_pointer_alignment = external_memory_host_props.minImportedHostPointerAlignment;
+ 

@@ -45,7 +45,7 @@ if ! ldconfig -p 2>/dev/null | grep -q 'libOpenCL\.so' \
   preflight "       Without it the miner creates no GPU workers and will exit."
 fi
 if command -v clinfo >/dev/null 2>&1; then
-  ndev=$(timeout 15 clinfo 2>/dev/null | grep -c 'Device Name')
+  ndev=$(timeout 15 clinfo 2>/dev/null | grep -cE '^[[:space:]]*Device Type:?[[:space:]]+(CL_DEVICE_TYPE_)?GPU')
   preflight "OpenCL preflight: clinfo reports ${ndev:-0} device(s)."
   if [[ "${ndev:-0}" -eq 0 ]]; then
     preflight "WARNING: no OpenCL devices visible — the miner will exit with 'No workers specified'."
