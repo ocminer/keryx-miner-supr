@@ -1,3 +1,25 @@
+# keryx-miner-supr 0.16.5 — AMD RX 5700 inference fix
+
+- **Fix: GPU inference on AMD cards without hardware int8 dot products.** On
+  RX 5700 / 5600 (RDNA1, Navi10) the Linux AMD Vulkan driver reports int8 dot
+  products as supported but not accelerated. The Vulkan engine then dropped its
+  int8 path, the traced inference self-test failed ("did not take the q8_1
+  mat-vec path"), the model was withdrawn and the whole rig stopped mining. The
+  engine now keeps the int8 path on such cards; integer results are exact, so
+  the traces are unchanged. Cards with hardware int8 dot behave as before.
+- HiveOS AMD: the OpenCL preflight now counts GPUs correctly with ROCm's
+  `clinfo`, which previously produced a false "0 device(s)" warning.
+- The OpenCL in-order queue fallback ("Out-of-order queue unsupported") is now
+  an info line; it was always harmless.
+- NVIDIA packages, mining kernels, H16 rules and model weights are unchanged
+  from v0.16.4.
+
+Packages: Linux NVIDIA modern and legacy, Linux AMD, HiveOS, mmpOS, SMOS,
+Windows NVIDIA and AMD, macOS arm64, and Docker
+`ocminersupr/keryx-miner-supr:0.16.5` (`latest`). Licensing is unchanged from
+v0.16.3 (Source-Sharing License 1.0); third-party licenses and previous grants
+are preserved.
+
 # keryx-miner-supr 0.16.4 — compressed private prompts from pools, stratum+ssl
 
 - **Fix: pool-forwarded compressed private prompts are now inflated like the solo

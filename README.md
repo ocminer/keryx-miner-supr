@@ -18,6 +18,9 @@ resumes; no dedicated inference card is required. Use the complete AMD package s
 its Vulkan engine and miner stay matched. The AMD performance figures below are
 historical, pre-H15 measurements and do not describe the new context-pad workload.
 
+**v0.16.5:** AMD RX 5700 / 5600 (RDNA1) cards can serve traced GPU inference
+again; other cards and all mining kernels are unchanged from v0.16.4.
+
 **v0.16.4:** pool-forwarded compressed private prompts are inflated before
 inference, exactly like the solo path, and `stratum+ssl://` TLS pool connections
 are supported (port 4405 on suprnova). Mining and inference engines are unchanged
