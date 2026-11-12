@@ -1,14 +1,10 @@
 //! In-process llama.cpp engine, AMD/Vulkan flavor (dynamically loaded sidecar) — zero-dup:
-//! llama.cpp hosts the SINGLE resident model copy on the inference GPU, the PoM walk gathers
-//! straight over its VRAM tensors (wrapper exports `keryx_llama_pom_mine`/`_fetch` — byte-exact
-//! per the full-model spike + the startup byte gate below), and OPoI text generation runs
-//! in-process. Absent/failed .so = try the Vulkan llama-server GPU route; candle-CPU is a
-//! deprecated explicit emergency fallback only, and every card keeps its own OpenCL blob.
-//!
-//! Consensus safety: this module only changes WHO HOSTS the model bytes on the inference card and
-//! WHO GENERATES the user-facing OPoI text. The walk math is byte-identical (pom_walk_vk.comp),
-//! and [`pom_byte_gate`] cross-checks the engine's gather against the host possession index at
-//! every startup — any mismatch refuses zero-dup and the OpenCL blob path takes over.
+//! Each selected AMD GPU owns its model, tracing context and outstanding walks.
+//! Inference drains only that card; peers keep mining. The same resident model
+//! supplies canonical PoM bytes, verified against the CPU possession index before
+//! mining. RDNA1 requires the descriptor-memory sidecar capability: the old BDA
+//! gather must never be dispatched there. Production cards with failed inference
+//! or byte gates stay paused instead of falling back to mining-only OpenCL v4.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::{Mutex, OnceLock};
@@ -55,7 +51,6 @@ const VK_ABI: c_int = 6; // 5->6: keryx_llama_pom_mine is the PoM v4 walk (tiles
 
 /// Walk dispatches in flight outside the engine mutex (see `pom_mine_v4`): `unload` must not free
 /// the model while one is running.
-static WALK_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 // The pinned ggml backend initializes its instance/device registry without an internal lock.
 // Independent mining workers may now create devices alongside the inference loader. Serialize
 // setup and enumeration only; established devices still dispatch independently.
@@ -73,6 +68,7 @@ struct Engine {
     pom_pci: PciFn,
     walk_dot: Option<ReadyFn>,
     walk_cm: Option<ReadyFn>,
+    descriptor_memory: Option<ReadyFn>,
     batch_max: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
     gpu: usize,
     gguf: String,
@@ -86,9 +82,40 @@ struct Engine {
 // The wrapper serializes generation + walk dispatches internally (gen_lock / walk_lock).
 unsafe impl Send for Engine {}
 
-fn engine() -> &'static Mutex<Option<Engine>> {
-    static E: OnceLock<Mutex<Option<Engine>>> = OnceLock::new();
-    E.get_or_init(|| Mutex::new(None))
+/// A model and its outstanding walks belong to one selected OpenCL worker.
+/// Slots live for the process, like the native library; unloading one card must
+/// never wait for, free, or invalidate another card's model.
+#[derive(Default)]
+struct EngineSlot {
+    engine: Mutex<Option<Engine>>,
+    walk_inflight: std::sync::atomic::AtomicUsize,
+    evicted: std::sync::atomic::AtomicBool,
+    suspect: std::sync::atomic::AtomicBool,
+}
+
+thread_local! {
+    static CURRENT_GPU: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn slot_for(gpu: usize) -> &'static EngineSlot {
+    static SLOTS: OnceLock<Mutex<std::collections::HashMap<usize, &'static EngineSlot>>> = OnceLock::new();
+    let mut slots = SLOTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock().unwrap_or_else(|p| p.into_inner());
+    *slots.entry(gpu).or_insert_with(|| Box::leak(Box::new(EngineSlot::default())))
+}
+
+fn slot() -> &'static EngineSlot { slot_for(current_gpu()) }
+fn engine() -> &'static Mutex<Option<Engine>> { &slot().engine }
+pub(crate) fn current_gpu() -> usize { CURRENT_GPU.with(|g| g.get()) }
+
+/// Thread-bound, nestable selection for the legacy no-ordinal helper API. Every
+/// inference transaction and mining dispatch holds this scope, including replay.
+pub(crate) struct GpuSelection(usize, std::marker::PhantomData<std::rc::Rc<()>>);
+pub(crate) fn select_gpu(gpu: usize) -> GpuSelection {
+    GpuSelection(CURRENT_GPU.with(|g| g.replace(gpu)), std::marker::PhantomData)
+}
+impl Drop for GpuSelection {
+    fn drop(&mut self) { CURRENT_GPU.with(|g| g.set(self.0)); }
 }
 
 /// A failed model load must not leave the mining worker selected during Vulkan preflight idle.
@@ -308,7 +335,13 @@ pub fn ggml_device_pci(device: i32) -> Option<(u32, u32, u32, u32)> {
 
 /// Load the .so + the model once (idempotent, blocking — a model load takes seconds). Returns
 /// whether the engine is active for `gguf`. Safe to call from multiple threads.
-pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
+pub fn ggml_device_for_pci(wanted: (u32, u32, u32, u32)) -> Option<i32> {
+    // Enumeration only. Never initialize a model on an ordinal guessed from OpenCL.
+    (0..64).find(|&device| ggml_device_pci(device) == Some(wanted))
+}
+
+pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
+    let _selection = select_gpu(gpu);
     let mut g = match engine().lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -324,7 +357,15 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
         .ok()
         .and_then(|s| s.trim().parse::<c_int>().ok())
         .filter(|gpu| *gpu >= 0);
-    let main_gpu: c_int = match explicit_gpu {
+    let main_gpu: c_int = if crate::pom_opencl::per_card_inference() {
+        match crate::pom_opencl::vulkan_device_for_worker(gpu) {
+            Ok(device) => device,
+            Err(reason) => {
+                log::error!("Vulkan inference GPU {gpu}: {reason}; this card cannot mine without its own inference route");
+                return false;
+            }
+        }
+    } else { match explicit_gpu {
         Some(gpu) => gpu,
         None if auto_device_allowlist_active() => match pick_discrete_ggml_device() {
             Some(gpu) => gpu,
@@ -339,7 +380,7 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
             }
         },
         None => -1,
-    };
+    }};
     let mut dedication_attempt = InprocessDedicationAttempt { armed: false };
     if main_gpu >= 0 {
         if !crate::pom_opencl::prepare_inprocess_vulkan_device(main_gpu) {
@@ -478,6 +519,7 @@ pub fn ensure_loaded(gguf: &str, _gpu: usize) -> bool {
             pom_pci: pci,
             walk_dot: sym::<ReadyFn>(lib, "keryx_llama_pom_walk_dot"),
             walk_cm: sym::<ReadyFn>(lib, "keryx_llama_pom_walk_cm"),
+            descriptor_memory: sym::<ReadyFn>(lib, "keryx_llama_pom_descriptor_memory"),
             batch_max: sym::<unsafe extern "C" fn(*mut c_void) -> u32>(lib, "keryx_llama_pom_batch_max"),
             gpu: main_gpu.max(0) as usize, // -1 = auto; the actual device is read via pom_pci
             gguf: gguf.to_string(),
@@ -645,6 +687,11 @@ pub fn pom_pci() -> Option<(u32, u32, u32, u32)> {
 /// canonical chunk count equals the host possession index's, then reads evenly-spaced chunks
 /// through the walk's exact gather path and byte-compares them against the index (GGUF pread).
 /// Any mismatch → refuse zero-dup (caller keeps the OpenCL blob).
+pub fn pom_uses_descriptor_memory() -> bool {
+    engine().lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+        .is_some_and(|e| e.descriptor_memory.is_some_and(|f| unsafe { f(e.model) }))
+}
+
 pub fn pom_byte_gate(index: &crate::pom::WeightIndex) -> bool {
     let g = match engine().lock() {
         Ok(g) => g,
@@ -671,7 +718,7 @@ pub fn pom_byte_gate(index: &crate::pom::WeightIndex) -> bool {
             // A failed fetch DISPATCH means the device may be hung (RDNA1 field logs: this was a
             // hard GPU hang, not a soft error). Mark it so unload() never calls vkDeviceWaitIdle/
             // free on a possibly-dead device — that blocks forever and wedges the whole rig.
-            DEVICE_SUSPECT.store(true, std::sync::atomic::Ordering::Relaxed);
+            slot().suspect.store(true, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         if got != index.read_chunk_bytes(off) {
@@ -698,16 +745,16 @@ pub fn pom_byte_gate(index: &crate::pom::WeightIndex) -> bool {
 /// and re-occupy the VRAM the unload just freed — recreating the small-card squeeze. With the flag
 /// set (and no explicit KERYX_LLAMA_VK_DEVICE), no GPU inference route is advertised: mining wins.
 pub fn evicted_for_vram() -> bool {
-    EVICTED.load(std::sync::atomic::Ordering::Relaxed)
+    slot().evicted.load(std::sync::atomic::Ordering::Relaxed)
 }
-static EVICTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Set when a byte-gate FETCH dispatch fails — the engine's device may be hung; skip free/wait-idle.
-static DEVICE_SUSPECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 
 /// Pre-flight verdict: GPU inference is UNFIT on this rig (no card can hold model + blob) —
 /// set before any engine/server load so neither ever starts. Same flag the try_start guard reads.
 pub fn mark_gpu_inference_unfit() {
-    EVICTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    slot().evicted.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Unload the in-process engine and free all its Vulkan allocations. This is a generic model-swap
@@ -721,8 +768,12 @@ pub fn unload() -> bool {
         Err(p) => p.into_inner(),
     };
     if let Some(e) = g.take() {
-        if DEVICE_SUSPECT.load(std::sync::atomic::Ordering::Relaxed) {
-            EVICTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        if crate::pom_opencl::per_card_inference() {
+            crate::slm::invalidate_inference_routes_on_gpu(current_gpu(), "Vulkan model owner unloaded");
+            crate::pom_opencl::release_inprocess_vulkan_dedication();
+        }
+        if slot().suspect.load(std::sync::atomic::Ordering::Relaxed) {
+            slot().evicted.store(true, std::sync::atomic::Ordering::Relaxed);
             // The device may be hung (failed gate-fetch dispatch): freeing would vkDeviceWaitIdle
             // on it and block forever. Leak the engine's objects instead — the handle is dropped,
             // the flag stays, and the process keeps running (that card is lost until reboot anyway).
@@ -735,7 +786,7 @@ pub fn unload() -> bool {
         // A zero-dup walk dispatch may still be running outside the mutex (it polls the inference
         // pause between sub-dispatches, so this is bounded by one sub-dispatch). Never free under it.
         let wait = std::time::Instant::now();
-        while WALK_INFLIGHT.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        while slot().walk_inflight.load(std::sync::atomic::Ordering::Acquire) != 0 {
             if wait.elapsed() > std::time::Duration::from_secs(60) {
                 log::error!(
                     "llama-vk engine: a zero-dup walk dispatch did not finish within 60 s — NOT freeing \
@@ -1056,10 +1107,10 @@ mod resident_dispatch_tests {
     }
 }
 
-struct InflightGuard;
+struct InflightGuard(usize);
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        WALK_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        slot_for(self.0).walk_inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -1086,11 +1137,11 @@ pub fn pom_mine_v4(
         let e = g.as_ref().ok_or_else(|| "no engine loaded".to_string())?;
         if stop() { return Ok((None, 0)); }
         // Counted under the lock: `unload` takes the same lock, then waits for zero.
-        WALK_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        slot().walk_inflight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let cap = e.batch_max.map_or(0, |f| unsafe { f(e.model) }) as u64;
         (e.model, e.pom_mine, cap)
     };
-    let _inflight = InflightGuard;
+    let _inflight = InflightGuard(current_gpu());
     // Nonces per engine call: the library pipelines up to four two-phase sub-batches per call
     // (chase of the next overlapping the walk of the current), so a call covers 4 x 32768 on
     // Linux (4 x 8192 on Windows, TDR-safe); its reported capacity bounds it. The inference pause
@@ -1130,7 +1181,7 @@ pub fn pom_mine_v4(
 pub fn drain_shared_walk() -> Result<(), crate::inference_coord::DeferredReason> {
     let _owner = engine().lock().map_err(|_| crate::inference_coord::DeferredReason::WalkBusy)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while WALK_INFLIGHT.load(std::sync::atomic::Ordering::Acquire) != 0 {
+    while slot().walk_inflight.load(std::sync::atomic::Ordering::Acquire) != 0 {
         if std::time::Instant::now() >= deadline { return Err(crate::inference_coord::DeferredReason::WalkBusy); }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
@@ -1410,5 +1461,37 @@ mod zero_dup_v4_tests {
         assert_eq!((winner, done), (None, (1 << 16) + 9));
         eprintln!("full grind: {done} nonces");
         gen("after 64k grind");
+    }
+}
+
+#[cfg(test)]
+mod per_card_slot_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    #[test]
+    fn selection_is_nested_thread_local_and_unwind_safe() {
+        let _outer = select_gpu(701);
+        let result = std::panic::catch_unwind(|| {
+            let _inner = select_gpu(702);
+            assert_eq!(current_gpu(), 702);
+            assert_eq!(std::thread::spawn(|| current_gpu()).join().unwrap(), 0);
+            panic!("simulated request failure");
+        });
+        assert!(result.is_err());
+        assert_eq!(current_gpu(), 701);
+    }
+    #[test]
+    fn inflight_guard_remains_bound_to_origin_after_selection_changes() {
+        let _selection = select_gpu(703);
+        slot().walk_inflight.fetch_add(1, Ordering::SeqCst);
+        let walk = InflightGuard(current_gpu());
+        let _other = select_gpu(704);
+        assert_eq!(slot().walk_inflight.load(Ordering::SeqCst), 0);
+        drop(walk);
+        assert_eq!(slot_for(703).walk_inflight.load(Ordering::SeqCst), 0);
+        assert_eq!(slot_for(704).walk_inflight.load(Ordering::SeqCst), 0);
+        slot_for(703).suspect.store(true, Ordering::SeqCst);
+        assert!(!slot_for(704).suspect.load(Ordering::SeqCst));
+        slot_for(703).suspect.store(false, Ordering::SeqCst);
     }
 }

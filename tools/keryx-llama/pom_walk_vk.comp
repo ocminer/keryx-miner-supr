@@ -25,7 +25,11 @@
 // RDNA2+/CDNA). Without it the scalar unpack path is used. Both are bit-identical (the int8 dots
 // cannot overflow i32 at this depth).
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#ifndef KERYX_DESCRIPTOR_MEMORY
 #extension GL_EXT_buffer_reference : require
+#endif
+#extension GL_GOOGLE_include_directive : require
+#include "pom_descriptor_memory.glsl"
 #ifdef USE_DOT
 #extension GL_EXT_integer_dot_product : require
 #endif
@@ -55,6 +59,7 @@ layout(local_size_x = 256) in;
 // A resident weight tensor's bytes as LE u64 words, reached by device address. Canonical chunk
 // c inside tensor j = words [ (c - prefix[j])*4 .. +4 ] at addr[j] (raw GGUF quant bytes,
 // uploaded verbatim by the engine — u64 LE view is exactly pom.rs chunk_to_words).
+#ifndef KERYX_DESCRIPTOR_MEMORY
 layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Tensor {
     uint64_t words[];
 };
@@ -63,6 +68,9 @@ layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Ten
 layout(std430, buffer_reference, buffer_reference_align = 16) readonly buffer Tensor16 {
     uvec4 q[];
 };
+uint64_t page_read64(uint64_t address) { return Tensor(address).words[0]; }
+uvec4 page_read128(uint64_t address) { return Tensor16(address).q[0]; }
+#endif
 
 // Lowest winning batch-relative index per sub-batch of a pipelined dispatch (pc.sub_index).
 layout(std430, binding = 0) buffer Winner { uint offset[]; } OUT;
@@ -390,7 +398,7 @@ uint64_t chunk_addr(uint64_t c, bool lds_table) {
     const uint64_t weights_end = pc.n_tiles * uint64_t(V4_TILE_CHUNKS);
     if (c >= weights_end) {
         const uint64_t byte = (c - weights_end) * 32UL;
-        return Tensor(pc.pad_addr).words[uint(byte >> 30)] + (byte & 0x3fffffffUL);
+        return page_read64(pc.pad_addr + (byte >> 30) * 8UL) + (byte & 0x3fffffffUL);
     }
 #endif
     uint64_t base;
@@ -429,9 +437,9 @@ uint64_t lane_chunk_addr(uint64_t resolved, uint lane, bool lds_table) {
 // The 32 bytes of canonical chunk `c` as 8 LE u32 words (same u32 order as the OpenCL blob's
 // `dst[w] = src[w]`), into registers.
 void load_chunk_regs(uint64_t c, bool lds_table, out uint w[8]) {
-    Tensor16 chunk = Tensor16(chunk_addr(c, lds_table));
-    uvec4 a = chunk.q[0];
-    uvec4 b = chunk.q[1];
+    uint64_t address = chunk_addr(c, lds_table);
+    uvec4 a = page_read128(address);
+    uvec4 b = page_read128(address + 16UL);
     w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
     w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
 }
@@ -539,9 +547,9 @@ void chase_nonce(uint idx, uint batch, uint64_t start_nonce, bool lds_table, boo
         }
         if (step == pc.k) break; // K tiles are consumed; tile K+1 is dead
         // chunk 0 = the snippet.
-        Tensor16 chunk = Tensor16(addr0);
-        uvec4 a = chunk.q[0];
-        uvec4 b = chunk.q[1];
+        uint64_t address = addr0;
+        uvec4 a = page_read128(address);
+        uvec4 b = page_read128(address + 16UL);
         uint64_t sf = 0UL;
         sf = mix64(sf ^ uint64_t(a.x)); sf = mix64(sf ^ uint64_t(a.y)); sf = mix64(sf ^ uint64_t(a.z)); sf = mix64(sf ^ uint64_t(a.w));
         sf = mix64(sf ^ uint64_t(b.x)); sf = mix64(sf ^ uint64_t(b.y)); sf = mix64(sf ^ uint64_t(b.z)); sf = mix64(sf ^ uint64_t(b.w));
@@ -551,9 +559,9 @@ void chase_nonce(uint idx, uint batch, uint64_t start_nonce, bool lds_table, boo
 
 // A lane's chunk of a resolved tile, into registers.
 void load_tile_chunk_regs(uint64_t resolved, uint lane, bool lds_table, out uint w[8]) {
-    Tensor16 chunk = Tensor16(lane_chunk_addr(resolved, lane, lds_table));
-    uvec4 a = chunk.q[0];
-    uvec4 b = chunk.q[1];
+    uint64_t address = lane_chunk_addr(resolved, lane, lds_table);
+    uvec4 a = page_read128(address);
+    uvec4 b = page_read128(address + 16UL);
     w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
     w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
 }
@@ -677,7 +685,7 @@ void main() {
         if(lane==0u) {
             if(off>=pc.n_tiles) {
                 const uint64_t byte=(off-pc.n_tiles)*1024UL;
-                resolved=Tensor(pc.pad_addr).words[uint(byte>>30)]+(byte&0x3fffffffUL);
+                resolved=page_read64(pc.pad_addr + (byte >> 30) * 8UL)+(byte&0x3fffffffUL);
             } else {
                 uint64_t first;
                 resolved=resolve_tile(off,lds_table,first);

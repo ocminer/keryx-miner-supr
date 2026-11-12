@@ -29,6 +29,7 @@ _keryx_engine_sources() {
         "tools/keryx-llama/keryx_vk_exports.inc.cpp" \
         "tools/keryx-llama/pom_walk_vk.comp" \
         "tools/keryx-llama/pom_fetch_vk.comp" \
+        "tools/keryx-llama/pom_descriptor_memory.glsl" \
         "hiveos/build-keryx-llama-vk.sh" \
         "tools/prepare-llama-vulkan.py"
     local patch

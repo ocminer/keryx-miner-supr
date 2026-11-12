@@ -66,6 +66,11 @@ docker run --rm --network host \
     glslc --target-env=vulkan1.3 -O -DPOM_TP_CM=1 -DPOM_TP_CM_SINGLE=1 -mfmt=c -o $G/pom_walk_tp_cm_single_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
     glslc --target-env=vulkan1.2 -O -mfmt=c -o $G/pom_fetch_vk.spv.inc /repo/tools/keryx-llama/pom_fetch_vk.comp
 
+    glslc --target-env=vulkan1.2 -O -DKERYX_DESCRIPTOR_MEMORY=1 -mfmt=c -o $G/pom_walk_descriptor_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
+    glslc --target-env=vulkan1.2 -O -DKERYX_DESCRIPTOR_MEMORY=1 -DPOM_V5=1 -mfmt=c -o $G/pom_walk_v5_descriptor_vk.spv.inc /repo/tools/keryx-llama/pom_walk_vk.comp
+    glslc --target-env=vulkan1.2 -O -DKERYX_DESCRIPTOR_MEMORY=1 -mfmt=c -o $G/pom_fetch_descriptor_vk.spv.inc /repo/tools/keryx-llama/pom_fetch_vk.comp
+    glslc --target-env=vulkan1.2 -O -DKERYX_DESCRIPTOR_MEMORY=1 -mfmt=c -o $G/pom_v5_pad_descriptor_vk.spv.inc /repo/tools/keryx-llama/pom_v5_pad_fill_vk.comp
+
 
     g++ -O2 -std=c++17 -shared -fPIC -fopenmp /repo/tools/keryx-llama/keryx_llama_vk.cpp \
       -I $G -I /llama/include -I /llama/ggml/include -I /llama/src -I /llama/common \

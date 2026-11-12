@@ -95,10 +95,23 @@ static const uint32_t FETCH_SPV[] =
 #include "pom_fetch_vk.spv.inc"
 ;
 
+static const uint32_t WALK_DESCRIPTOR_SPV[] =
+#include "pom_walk_descriptor_vk.spv.inc"
+;
+static const uint32_t WALK_V5_DESCRIPTOR_SPV[] =
+#include "pom_walk_v5_descriptor_vk.spv.inc"
+;
+static const uint32_t FETCH_DESCRIPTOR_SPV[] =
+#include "pom_fetch_descriptor_vk.spv.inc"
+;
+static const uint32_t PAD_DESCRIPTOR_SPV[] =
+#include "pom_v5_pad_descriptor_vk.spv.inc"
+;
 // Exports appended to ggml-vulkan.cpp by the build script.
 extern "C" bool keryx_vk_raw_handles(size_t dev_num, void ** vk_instance, void ** vk_physical_device,
                                      void ** vk_device, uint32_t * compute_queue_family_index);
 extern "C" bool keryx_vk_tensor_addr(const struct ggml_tensor * tensor, uint64_t * gpu_addr, uint64_t * size_bytes);
+extern "C" bool keryx_vk_tensor_buffer(const struct ggml_tensor*, VkBuffer*, uint64_t*, uint64_t*);
 extern "C" void * keryx_vk_tensor_device(const struct ggml_tensor * tensor);
 extern "C" void keryx_vk_queue_submit(size_t dev_num, const void * submit_info, void * fence);
 extern "C" int keryx_vk_pick_discrete_device();
@@ -200,6 +213,11 @@ struct KeryxLlama {
     uint64_t n_chunks = 0;
     uint32_t n_tensors = 0;
     uint64_t supl_bytes = 0;
+    bool descriptor_memory = false;
+    // Slot 0 is a bound dummy; token 0 remains invalid. Each real slot spans at
+    // most 1 GiB. A contiguous native allocation uses consecutive slots.
+    std::vector<VkDescriptorBufferInfo> pages{{VK_NULL_HANDLE, 0, 0}};
+    size_t weight_pages = 1;
     bool walk_ready = false;
     bool device_failed = false;
     bool walk_dot = false;  // packed int8 dot-product kernel selected (else scalar)
@@ -215,6 +233,42 @@ static void keryx_vk_trace_free(KeryxLlama* h);
 // when the card has enough total VRAM. Keep every allocation below 1 GiB;
 // canonical byte offsets are translated through the existing address tables.
 static constexpr uint64_t KERYX_VK_ALLOC_BYTES = 1ull << 30;
+
+// RDNA1's legacy BDA gather hung on NAVI10. The compatibility shader must
+// never contain a PhysicalStorageBuffer pointer, including pad fill/access.
+static bool descriptor_memory_device(const VkPhysicalDeviceProperties& p) {
+    const uint32_t family = p.deviceID & 0xfff0u;
+    return p.vendorID == 0x1002 && (family == 0x7310 || family == 0x7340 || family == 0x7360);
+}
+static uint64_t descriptor_buffer(KeryxLlama* h, VkBuffer buffer, uint64_t bytes) {
+    for (size_t i=1; i<h->pages.size(); ++i)
+        if (h->pages[i].buffer == buffer && h->pages[i].offset == 0) return i * KERYX_VK_ALLOC_BYTES;
+    const uint64_t count = (bytes + KERYX_VK_ALLOC_BYTES - 1) / KERYX_VK_ALLOC_BYTES;
+    if (!bytes || count > 16 - h->pages.size()) {
+        KERYX_LOG_ERROR("keryx-llama-vk: descriptor memory exceeds 15 GiB/page slots; card stays paused\n");
+        return 0;
+    }
+    const uint64_t token = h->pages.size() * KERYX_VK_ALLOC_BYTES;
+    for (uint64_t off=0; off<bytes; off+=KERYX_VK_ALLOC_BYTES)
+        h->pages.push_back({buffer,off,std::min(KERYX_VK_ALLOC_BYTES,bytes-off)});
+    return token;
+}
+static uint64_t walk_buffer_address(KeryxLlama* h, VkBuffer buffer, uint64_t bytes) {
+    if (h->descriptor_memory) return descriptor_buffer(h,buffer,bytes);
+    VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; info.buffer=buffer;
+    return vkGetBufferDeviceAddress(h->dev,&info);
+}
+static void update_descriptor_pages(KeryxLlama* h) {
+    if (!h->descriptor_memory || !h->walk_ds) return;
+    VkDescriptorBufferInfo info[16];
+    for (size_t i=0;i<16;++i) info[i]=(i>0 && i<h->pages.size()) ? h->pages[i] : VkDescriptorBufferInfo{h->winner_buf,0,4};
+    for (auto ds : {h->walk_ds,h->walk_ds2,h->fetch_ds}) {
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet=ds; w.dstBinding=5; w.descriptorCount=16;
+        w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo=info;
+        vkUpdateDescriptorSets(h->dev,1,&w,0,nullptr);
+    }
+}
 
 // ── small Vulkan helpers ────────────────────────────────────────────────────────────────────
 
@@ -463,6 +517,20 @@ static bool walk_init(KeryxLlama* h) {
         return false;
     }
 
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(h->phys,&properties);
+    const char* compatibility=getenv("KERYX_VK_DESCRIPTOR_MEMORY");
+    h->descriptor_memory=descriptor_memory_device(properties) || (compatibility && strcmp(compatibility,"1")==0);
+    if (h->descriptor_memory) {
+        const auto& lim=properties.limits;
+        if (lim.maxStorageBufferRange<KERYX_VK_ALLOC_BYTES || lim.maxPerStageDescriptorStorageBuffers<21 ||
+            lim.maxDescriptorSetStorageBuffers<21 || KERYX_VK_ALLOC_BYTES%lim.minStorageBufferOffsetAlignment!=0) {
+            KERYX_LOG_ERROR("keryx-llama-vk: device limits cannot support the descriptor gather; refusing BDA fallback\n");
+            gguf_free(g); if(meta) ggml_free(meta); return false;
+        }
+        KERYX_LOG_INFO("keryx-llama-vk: descriptor memory selected on device %zu (no BDA gather)\n",h->gpu);
+    }
+
     // Command pool + buffer + fence on ggml's compute queue family (submits go through the
     // guarded hook, so we never race ggml's own queue use).
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -498,6 +566,13 @@ static bool walk_init(KeryxLlama* h) {
         uint64_t addr = 0, sz = 0;
         if (t && keryx_vk_tensor_addr(t, &addr, &sz) && sz == gguf_nbytes
             && keryx_vk_tensor_device(t) == (void*)model_dev) {
+            if (h->descriptor_memory) {
+                VkBuffer buffer; uint64_t offset, bytes;
+                if (!keryx_vk_tensor_buffer(t,&buffer,&offset,&bytes)) { gguf_free(g); if(meta) ggml_free(meta); return false; }
+                addr=descriptor_buffer(h,buffer,bytes);
+                if (!addr) { gguf_free(g); if(meta) ggml_free(meta); return false; }
+                addr+=offset;
+            }
             addrs.push_back(addr);
             n_resident++;
         } else {
@@ -529,7 +604,7 @@ static bool walk_init(KeryxLlama* h) {
             h->supplements.emplace_back(buffer, memory);
             VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             dai.buffer = buffer;
-            const uint64_t address = vkGetBufferDeviceAddress(h->dev, &dai);
+            const uint64_t address = walk_buffer_address(h, buffer, std::min(KERYX_VK_ALLOC_BYTES, supl_total - first));
             if (!address) return false;
             addresses.push_back(address);
         }
@@ -586,6 +661,8 @@ static bool walk_init(KeryxLlama* h) {
         h->n_tensors = (uint32_t)addrs.size();
     }
 
+    h->weight_pages=h->pages.size();
+
     // Table + result buffers. The table is hot (binary-searched every gather) -> device-local.
     if (!make_buffer(h, prefix.size() * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false, &h->prefix_buf, &h->prefix_mem, nullptr)) return false;
@@ -608,7 +685,7 @@ static bool walk_init(KeryxLlama* h) {
         if (const char* e = getenv("KERYX_VK_WALK_BATCH")) { long v = atol(e); if (v >= 64) want = (uint32_t)v; }
         want = (want + V4_NPG - 1) / V4_NPG * V4_NPG;
         const char* mode = getenv("KERYX_VK_WALK_MODE");
-        if (mode && strcmp(mode, "sp") == 0) {
+        if (h->descriptor_memory || (mode && strcmp(mode, "sp") == 0)) {
             KERYX_LOG_WARN("keryx-llama-vk: KERYX_VK_WALK_MODE=sp — single-phase walk\n");
         } else {
             VkDeviceSize bytes = (VkDeviceSize)want * ((VkDeviceSize)V4_K * 8 + 8);  // resolved tiles (u64) + seed
@@ -631,15 +708,16 @@ static bool walk_init(KeryxLlama* h) {
         }
     }
 
-    VkDescriptorSetLayoutBinding b[5]{};
+    VkDescriptorSetLayoutBinding b[6]{};
     for (uint32_t i = 0; i < 5; i++) {
         b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     }
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = 5;
+    b[5]={5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,16,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};
+    dli.bindingCount = h->descriptor_memory ? 6 : 5;
     dli.pBindings = b;
     if (vkCreateDescriptorSetLayout(h->dev, &dli, nullptr, &h->dsl) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 15};
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, h->descriptor_memory ? 63u : 15u};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 3;
     dpi.poolSizeCount = 1;
@@ -677,7 +755,8 @@ static bool walk_init(KeryxLlama* h) {
     // The dot-product variant needs VK_KHR_shader_integer_dot_product ENABLED on ggml's device (a
     // SPIR-V capability the driver must have been asked for), not merely advertised.
     // KERYX_VK_WALK_DOT=0 forces the scalar kernel (A/B + the byte-exactness test runs both).
-    bool want_dot = keryx_vk_integer_dot_product(h->gpu);
+    update_descriptor_pages(h);
+    bool want_dot = !h->descriptor_memory && keryx_vk_integer_dot_product(h->gpu);
     if (const char* e = getenv("KERYX_VK_WALK_DOT")) {
         if (e[0] == '0') want_dot = false;
     }
@@ -707,7 +786,10 @@ static bool walk_init(KeryxLlama* h) {
     bool want_cm = tp && !cm_disabled && (cm_forced || keryx_vk_coopmat_int8(h->gpu));
     const char* npg_env = getenv("KERYX_VK_WALK_NPG");
     if (npg_env) { long v = atol(npg_env); if (v == 1 || v == 2 || v == 8) h->walk_npg = (uint32_t)v; }
-    if (!ext_spv.empty()) {
+    if (h->descriptor_memory) {
+        h->walk_npg=8;
+        h->walk_pipe=make_pipeline(h,WALK_DESCRIPTOR_SPV,sizeof(WALK_DESCRIPTOR_SPV),sizeof(PushWalk),&h->walk_sm,&h->walk_pl);
+    } else if (!ext_spv.empty()) {
         h->walk_pipe = make_pipeline(h, ext_spv.data(), ext_spv.size() * 4, sizeof(PushWalk), &h->walk_sm, &h->walk_pl, wave);
     } else if (want_cm) {
         const bool single = (!wave || wave == 32) &&
@@ -763,7 +845,7 @@ static bool walk_init(KeryxLlama* h) {
             : make_pipeline(h, ext_chase.data(), ext_chase.size() * 4, sizeof(PushWalk), &h->chase_sm, &h->chase_pl, chase_wave);
         if (!h->chase_pipe) return false;
     }
-    h->fetch_pipe = make_pipeline(h, FETCH_SPV, sizeof(FETCH_SPV), sizeof(PushFetch), &h->fetch_sm, &h->fetch_pl);
+    h->fetch_pipe = make_pipeline(h, h->descriptor_memory ? FETCH_DESCRIPTOR_SPV : FETCH_SPV, h->descriptor_memory ? sizeof(FETCH_DESCRIPTOR_SPV) : sizeof(FETCH_SPV), sizeof(PushFetch), &h->fetch_sm, &h->fetch_pl);
     if (!h->walk_pipe || !h->fetch_pipe) return false;
 
     h->walk_ready = true;
@@ -1109,6 +1191,9 @@ uint64_t keryx_llama_pom_supl_bytes(KeryxLlama* h) { return h ? h->supl_bytes : 
 
 // Fetch `count` (≤ FETCH_WINDOW_CHUNKS) canonical chunks starting at `first` through the exact
 // table+BDA path the walk gathers with. `out` receives count*32 bytes.
+// Runtime capability gate: old sidecars must not re-enable the RDNA1 BDA path.
+bool keryx_llama_pom_descriptor_memory(KeryxLlama* h) { return h && h->walk_ready && h->descriptor_memory; }
+
 bool keryx_llama_pom_fetch_range(KeryxLlama* h, uint64_t first, uint32_t count, uint8_t* out) {
     if (!h || !h->walk_ready || count == 0 || count > FETCH_WINDOW_CHUNKS || first + count > h->n_chunks) {
         return false;

@@ -53,6 +53,8 @@ pub enum SelfTestOutcome {
 pub struct HostLoadGate(Mutex<(Option<ThreadId>, usize)>);
 
 impl HostLoadGate {
+    pub const fn new() -> Self { Self(Mutex::new((None, 0))) }
+
     pub fn try_enter(&self) -> Option<HostLoadPermit<'_>> {
         let current = std::thread::current().id();
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());

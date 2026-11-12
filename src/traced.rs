@@ -187,8 +187,7 @@ pub fn gpu_identity(gpu: usize) -> (String, u32, String) {
     }
     #[cfg(feature = "pom-opencl")]
     {
-        let _ = gpu; // AMD leases the singleton owner; identity follows its actual physical device.
-        crate::llama_engine_vk::tracing::gpu_identity()
+        crate::llama_engine_vk::tracing::gpu_identity(gpu)
     }
     #[cfg(all(not(feature = "pom-opencl"), not(all(feature = "pom-cuda", not(target_os = "macos")))))]
     {

@@ -121,7 +121,7 @@ pub struct MiningSnapshot {
     pub sample_sequence: u64,
     pub preparing: bool,
     pub inference_paused: bool,
-    /// Exact CUDA cards paused for inference. `inference_paused` denotes the whole rig.
+    /// Exact worker cards paused for inference. `inference_paused` denotes the whole rig.
     pub inference_paused_gpus: Vec<u32>,
     /// Cards reserved for inference because model and PoM walk cannot share their VRAM (AMD
     /// 16 GB cards on the default tier). They do not mine by design; not counted as AI pause.

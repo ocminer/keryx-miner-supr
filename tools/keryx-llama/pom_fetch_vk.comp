@@ -5,13 +5,19 @@
 // handful of sampled chunks) and the full-model spike sweep both go through here.
 // One invocation = one chunk: out[idx*4 .. idx*4+4] = chunk (first_chunk + idx).
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#ifndef KERYX_DESCRIPTOR_MEMORY
 #extension GL_EXT_buffer_reference : require
+#endif
+#extension GL_GOOGLE_include_directive : require
+#include "pom_descriptor_memory.glsl"
 
 layout(local_size_x = 64) in;
 
+#ifndef KERYX_DESCRIPTOR_MEMORY
 layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Tensor {
     uint64_t words[];
 };
+#endif
 
 layout(std430, binding = 0) writeonly buffer Out { uint64_t w[]; } OUT;
 layout(std430, binding = 1) readonly buffer Table { uint64_t prefix[]; } PREFIX;
@@ -34,9 +40,14 @@ void main() {
         uint mid = (lo + hi) / 2u;
         if (PREFIX.prefix[mid] <= off) { lo = mid; } else { hi = mid; }
     }
+#ifdef KERYX_DESCRIPTOR_MEMORY
+    uint64_t address = ADDRS.addr[lo] + (off - PREFIX.prefix[lo]) * 32UL;
+    for (uint w = 0u; w < 4u; ++w) OUT.w[idx * 4u + w] = page_read64(address + uint64_t(w) * 8UL);
+#else
     Tensor chunk = Tensor(ADDRS.addr[lo] + (off - PREFIX.prefix[lo]) * 32UL);
     OUT.w[idx * 4u]      = chunk.words[0];
     OUT.w[idx * 4u + 1u] = chunk.words[1];
     OUT.w[idx * 4u + 2u] = chunk.words[2];
     OUT.w[idx * 4u + 3u] = chunk.words[3];
+#endif
 }

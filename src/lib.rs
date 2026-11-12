@@ -407,12 +407,17 @@ impl PluginManager {
         // VRAM sizing or inference placement runs. Global OpenCL enumeration is not equivalent on
         // mixed-platform rigs or with `--opencl-device` subsets/reordering.
         #[cfg(feature = "pom-opencl")]
-        crate::pom_opencl::set_selected_worker_devices(
+        crate::pom_opencl::set_selected_worker_routes(
             self.plugins
                 .iter()
                 .filter(|managed| managed.plugin.enabled())
                 .flat_map(|managed| managed.plugin.get_worker_specs())
-                .filter_map(|spec| spec.opencl_device_id())
+                .filter_map(|spec| {
+                    let id = spec.opencl_device_id()?;
+                    let label = spec.id();
+                    let ordinal = label.strip_prefix('#')?.split_whitespace().next()?.parse::<usize>().ok()?;
+                    Some((ordinal, id))
+                })
                 .collect(),
         );
         Ok(count)

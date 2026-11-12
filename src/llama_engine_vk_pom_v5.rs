@@ -1,5 +1,5 @@
 //! Context-pad mining through the same model owner and scoped dispatch lifetime.
-use super::{engine, sym, InflightGuard, WALK_INFLIGHT};
+use super::{engine, sym, slot, current_gpu, InflightGuard};
 use std::ffi::{c_int, c_void};
 type Mine = unsafe extern "C" fn(*mut c_void, *const u64, *const u64, *const u64, u64, u64, u32, *const u64, u64) -> i64;
 type Read = unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> c_int;
@@ -42,10 +42,10 @@ pub fn mine(p: [u64; 4], s: [u64; 4], time: u64, t: [u64; 4], base: u64, batch: 
         let e = guard.as_ref().ok_or("no Vulkan model owner")?;
         let api = e.v5.ok_or("Vulkan sidecar lacks PoM v5 ABI 1")?;
         if stop() { return Ok((None, 0)); }
-        WALK_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        slot().walk_inflight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         (e.model, api)
     };
-    let _flight = InflightGuard;
+    let _flight = InflightGuard(current_gpu());
     api.run(model, p, s, time, t, base, batch, seed, tiles, stop)
 }
 

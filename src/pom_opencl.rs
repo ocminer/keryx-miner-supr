@@ -753,7 +753,7 @@ impl ResidentMiner {
             Self::OpenCl(_) => Err("PoM v5 requires the bundled Vulkan mining backend on this device".into()),
             #[cfg(any(unix, windows))]
             Self::Vulkan(miner) => {
-                let stop = || INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0;
+                let stop = mining_paused;
                 let (winner, hashes_done) = miner.mine_v5(p, s, time, t, base, batch, seed, tiles, &stop)?;
                 Ok(crate::pom::GrindCompleted { winner, hashes_done })
             }
@@ -776,7 +776,7 @@ impl ResidentMiner {
                 .map(|winner| crate::pom::GrindCompleted { winner, hashes_done: batch }),
             #[cfg(any(unix, windows))]
             Self::Vulkan(miner) => {
-                let stop = || INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0;
+                let stop = mining_paused;
                 let (winner, hashes_done) = miner.mine_v4(p, s, time, t, base, batch, h10, &stop)?;
                 Ok(crate::pom::GrindCompleted { winner, hashes_done })
             }
@@ -800,21 +800,22 @@ fn prefer_resident_vulkan(name: &str, gfxip: Option<(u32, u32)>, requested: Opti
     // AMD's Windows driver can expose a marketing name instead of a gfx token.
     // Its architecture properties keep the default and the RDNA1 exclusion
     // independent of that spelling. Unsupported properties retain name matching.
+    if is_rdna1(name, gfxip) { return false; }
     let name = name.to_ascii_lowercase();
-    let radeon = matches!(radeon_rx_model(&name), Some(6000..=7999 | 9000..=9999));
+    let radeon = matches!(radeon_rx_model(&name), Some(5000..=7999 | 9000..=9999));
     let instinct = name.contains("instinct") && name.split(|c: char| !c.is_ascii_alphanumeric())
         .any(|word| matches!(word, "mi50" | "mi60"));
-    if is_rdna1(&name, gfxip) || (!name.contains("gfx") && gfxip.is_none() && !radeon && !instinct) {
+    if !name.contains("gfx") && gfxip.is_none() && !radeon && !instinct {
         return false;
     }
     match requested {
         Some("opencl") => false,
         Some("vulkan") => true,
-        _ => radeon || instinct || matches!(gfxip, Some((10, 3) | (11, _) | (12, _)))
+        _ => radeon || instinct || matches!(gfxip, Some((10, 1 | 3) | (11, _) | (12, _)))
             || device_arch_is(&name, "gfx906") || name.split(|c: char| !c.is_ascii_alphanumeric()).any(|token| {
             let Some(arch) = token.strip_prefix("gfx") else { return false; };
             arch.len() == 4 && arch.bytes().all(|c| c.is_ascii_hexdigit())
-                && (arch.starts_with("103") || arch.starts_with("11") || arch.starts_with("12"))
+                && (arch.starts_with("101") || arch.starts_with("103") || arch.starts_with("11") || arch.starts_with("12"))
         }),
     }
 }
@@ -841,6 +842,60 @@ fn remember_vulkan_failure(device_id: usize, reason: &str) {
 /// inference/VRAM helpers must not accidentally adopt a CUDA card exposed through another OpenCL
 /// platform.
 static SELECTED_WORKER_DEVS: Mutex<Option<Vec<usize>>> = Mutex::new(None);
+static WORKER_LABELS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+static PER_CARD_INFERENCE: AtomicBool = AtomicBool::new(false);
+
+pub fn per_card_inference() -> bool { PER_CARD_INFERENCE.load(Ordering::Acquire) }
+
+/// Public GPU labels are worker ordinals, never ggml's independently ordered indices.
+pub fn worker_gpu_ordinals() -> Vec<usize> {
+    let labels = WORKER_LABELS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    labels.into_iter().filter_map(|(ordinal, id)| device_is_gpu(id).then_some(ordinal)).collect()
+}
+
+pub fn worker_device(gpu: usize) -> Option<usize> {
+    WORKER_LABELS.lock().unwrap_or_else(|p| p.into_inner()).iter()
+        .find_map(|(ordinal, id)| (*ordinal == gpu).then_some(*id)).filter(|id| device_is_gpu(*id))
+}
+
+fn worker_ordinal(device: usize) -> Option<usize> {
+    WORKER_LABELS.lock().unwrap_or_else(|p| p.into_inner()).iter()
+        .find_map(|(ordinal, id)| (*id == device).then_some(*ordinal))
+}
+
+/// Keep the plugin's public ordinal alongside the opaque OpenCL identity. A
+/// reordered/subset selection uses the same public labels as mining and telemetry.
+pub fn set_selected_worker_routes(routes: Vec<(usize, usize)>) {
+    let ids = routes.iter().map(|(_, id)| *id).collect();
+    set_selected_worker_devices(ids);
+    *WORKER_LABELS.lock().unwrap_or_else(|p| p.into_inner()) = routes;
+}
+
+pub fn worker_memory_mib() -> std::collections::HashMap<usize, u64> {
+    worker_gpu_ordinals().into_iter().filter_map(|gpu| {
+        let id = worker_device(gpu)?;
+        let bytes = Device::new(id as opencl3::types::cl_device_id).global_mem_size().ok()?;
+        Some((gpu, bytes / (1024 * 1024)))
+    }).collect()
+}
+
+pub fn vulkan_device_for_worker(gpu: usize) -> Result<i32, String> {
+    let id = worker_device(gpu).ok_or_else(|| format!("no selected OpenCL GPU at worker ordinal {gpu}"))?;
+    let pci = device_pci_full(id).ok_or_else(|| format!("worker {gpu} exposes no PCI identity; refusing ambiguous Vulkan placement"))?;
+    let device = crate::llama_engine_vk::ggml_device_for_pci(pci)
+        .ok_or_else(|| format!("no Vulkan device matches OpenCL worker {gpu} at PCI {}; check Vulkan driver/device visibility", format_pci_location(pci)))?;
+    if let Some(pinned) = explicit_vulkan_device() {
+        if pinned != device {
+            return Err(format!("KERYX_LLAMA_VK_DEVICE={pinned} excludes worker {gpu}'s Vulkan device {device}; remove the single-device pin to serve every selected card"));
+        }
+    }
+    Ok(device)
+}
+
+static HOST_LOAD: crate::inference_coord::HostLoadGate = crate::inference_coord::HostLoadGate::new();
+pub fn try_host_load() -> Result<crate::inference_coord::HostLoadPermit<'static>, crate::inference_coord::DeferredReason> {
+    HOST_LOAD.try_enter().ok_or(crate::inference_coord::DeferredReason::HostLoadBusy)
+}
 
 /// Internal hand-off to the bundled ggml/Vulkan picker. Values are comma-separated PCI
 /// `dddd:bb:dd.f` locations derived from the exact selected OpenCL GPU workers. An explicitly present
@@ -868,6 +923,7 @@ fn format_pci_location((domain, bus, device, function): (u32, u32, u32, u32)) ->
 /// to inference while the actual mining workers were left with an impossible memory plan.
 pub fn set_selected_worker_devices(device_ids: Vec<usize>) {
     let device_ids = normalize_device_ids(device_ids);
+    *WORKER_LABELS.lock().unwrap_or_else(|p| p.into_inner()) = device_ids.iter().copied().enumerate().collect();
     #[cfg(any(unix, windows))]
     {
         let pci_allowlist = device_ids
@@ -884,13 +940,14 @@ pub fn set_selected_worker_devices(device_ids: Vec<usize>) {
         if !device_ids.is_empty() && pci_allowlist.is_empty() {
             log::warn!(
                 "PoM[opencl]: selected workers expose no usable PCI identity; automatic Vulkan \
-                 inference placement cannot enforce the allowlist and will use the bundled \
-                 largest-discrete fallback (KERYX_LLAMA_VK_DEVICE remains available)."
+                 inference placement cannot be verified; these workers remain paused until \
+                 the driver exposes their PCI identity."
             );
         }
     }
     log::info!("PoM[opencl]: device helpers scoped to {} selected OpenCL worker(s).", device_ids.len());
     *SELECTED_WORKER_DEVS.lock().unwrap_or_else(|p| p.into_inner()) = Some(device_ids);
+    PER_CARD_INFERENCE.store(true, Ordering::Release);
 }
 
 fn configured_worker_devices() -> Option<Vec<usize>> {
@@ -930,10 +987,19 @@ fn scoped_gpu_devices() -> Vec<usize> {
     scoped_worker_devices().into_iter().filter(|id| device_is_gpu(*id)).collect()
 }
 
-/// OpenCL's inference server and mining contexts can target the same physical GPU. Pause every AMD
-/// walk while GPU inference runs (the server route is singleton today), and use each miner mutex as
-/// the completion barrier for a command that was already enqueued when the pause began.
+/// Production inference pauses and drains the selected worker only. The global
+/// counter is retained for direct legacy library callers without worker routing.
 static INFERENCE_PAUSE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static CARD_PAUSES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+fn device_paused(device_id: usize) -> bool {
+    INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0 ||
+        CARD_PAUSES.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|(id, count)| *id == device_id && *count != 0)
+}
+
+fn mining_paused() -> bool {
+    target_dev().map_or_else(|| INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0, device_paused)
+}
 
 /// Covers the whole device-facing portion of `ensure_installed` (including any future shared-walk
 /// probe), while `INSTALLING` below covers direct resident uploads. The two registries make an
@@ -945,7 +1011,7 @@ struct GpuSetupGuard(usize);
 impl GpuSetupGuard {
     fn begin(device_id: usize) -> Option<Self> {
         let mut setup = GPU_SETUP.lock().unwrap_or_else(|p| p.into_inner());
-        if INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0 || setup.contains(&device_id) {
+        if device_paused(device_id) || setup.contains(&device_id) {
             return None;
         }
         setup.push(device_id);
@@ -959,25 +1025,43 @@ impl Drop for GpuSetupGuard {
     }
 }
 
-pub struct InferenceDrainGuard;
+pub struct InferenceDrainGuard { device: Option<usize> }
 
 impl Drop for InferenceDrainGuard {
     fn drop(&mut self) {
-        INFERENCE_PAUSE_COUNT.fetch_sub(1, Ordering::AcqRel);
+        if let Some(id) = self.device {
+            let mut pauses = CARD_PAUSES.lock().unwrap_or_else(|p| p.into_inner());
+            let (_, count) = pauses.iter_mut().find(|(d, _)| *d == id).expect("owned pause");
+            *count -= 1;
+        } else {
+            INFERENCE_PAUSE_COUNT.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
+fn begin_device_pause(device: Option<usize>) -> InferenceDrainGuard {
+    if let Some(id) = device {
+        let mut pauses = CARD_PAUSES.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, count)) = pauses.iter_mut().find(|(d, _)| *d == id) { *count += 1; }
+        else { pauses.push((id, 1)); }
+    } else { INFERENCE_PAUSE_COUNT.fetch_add(1, Ordering::AcqRel); }
+    InferenceDrainGuard { device }
+}
+
 pub fn pause_and_drain_for_inference(
-    _gpu: usize,
+    gpu: usize,
 ) -> Result<InferenceDrainGuard, crate::inference_coord::DeferredReason> {
-    INFERENCE_PAUSE_COUNT.fetch_add(1, Ordering::AcqRel);
-    let guard = InferenceDrainGuard;
+    let device = if per_card_inference() {
+        Some(worker_device(gpu).ok_or(crate::inference_coord::DeferredReason::WalkBusy)?)
+    } else { None };
+    let guard = begin_device_pause(device);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         // Taking both coordination locks after publishing the pause closes the check/claim race:
         // an older setup is visible here, while a newer one observes the pause and defers.
-        let setup_busy = !GPU_SETUP.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
-        let upload_busy = !INSTALLING.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
+        let selected_busy = |devices: &Vec<usize>| device.map_or(!devices.is_empty(), |id| devices.contains(&id));
+        let setup_busy = selected_busy(&GPU_SETUP.lock().unwrap_or_else(|p| p.into_inner()));
+        let upload_busy = selected_busy(&INSTALLING.lock().unwrap_or_else(|p| p.into_inner()));
         if !setup_busy && !upload_busy {
             break;
         }
@@ -988,7 +1072,8 @@ pub fn pause_and_drain_for_inference(
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     let residents: Vec<Arc<Mutex<ResidentMiner>>> =
-        POM_BY_DEV.lock().map(|miners| miners.iter().map(|(_, miner)| Arc::clone(miner)).collect()).unwrap_or_default();
+        POM_BY_DEV.lock().map(|miners| miners.iter().filter(|(id, _)| device.map_or(true, |wanted| *id == wanted))
+            .map(|(_, miner)| Arc::clone(miner)).collect()).unwrap_or_default();
     for miner in residents {
         // `PomMiner::mine_v4` finishes/reads its in-order queue before releasing this mutex.
         // Taking it once therefore drains a command submitted just before the pause was raised.
@@ -1000,6 +1085,7 @@ pub fn pause_and_drain_for_inference(
             }
         }
     }
+    let _selection = crate::llama_engine_vk::select_gpu(gpu);
     crate::llama_engine_vk::drain_shared_walk()?;
     Ok(guard)
 }
@@ -1071,7 +1157,7 @@ fn words(b: &[u8; 32]) -> [u64; 4] {
 /// The cl_device_id whose card hosts the in-process llama engine (zero-dup): that card gets NO
 /// OpenCL blob — its mine() routes over the engine's resident weights instead. Claimed once by
 /// the card whose PCI location matches the engine's, after the startup byte gate passes.
-static SHARED_DEV: Mutex<Option<usize>> = Mutex::new(None);
+static SHARED_DEV: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Card DEDICATED to OPoI inference (engine-hosted model; model + blob can't share its VRAM):
 /// it deliberately mines nothing — no blob install, no walk. The other cards mine at full rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1106,7 +1192,7 @@ fn clear_dedication_owned_by(owner: DedicationOwner) {
 
 /// True when `device_id` (a cl_device_id) is the card reserved for GPU inference.
 pub fn is_dedicated_inference_device(device_id: usize) -> bool {
-    dedicated_device() == Some(device_id)
+    !per_card_inference() && dedicated_device() == Some(device_id)
 }
 
 fn dedicated_device() -> Option<usize> {
@@ -1161,7 +1247,7 @@ pub fn require_dedicated_inference_card() {
 /// `DEDICATED_DEV` is not sufficient because an existing GPU allocation would continue
 /// occupying VRAM and make the subsequent llama model load OOM.
 fn evict_resident_for_dedication(device_id: usize) -> Result<(), String> {
-    if INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) == 0 {
+    if !device_paused(device_id) {
         return Err("OpenCL walks are not paused; refusing to evict live mining VRAM".into());
     }
     let resident = {
@@ -1304,6 +1390,20 @@ fn prepare_vulkan_device(device: i32, owner: DedicationOwner, route: &str) -> bo
 /// Resolve and reserve the exact in-process Vulkan target before llama.cpp allocates its model.
 #[cfg(any(unix, windows))]
 pub fn prepare_inprocess_vulkan_device(device: i32) -> bool {
+    if per_card_inference() {
+        let gpu = crate::llama_engine_vk::current_gpu();
+        let Some(id) = worker_device(gpu) else { return false };
+        if vulkan_device_for_worker(gpu).ok() != Some(device) || !device_paused(id) {
+            log::error!("Vulkan inference GPU {gpu}: exact device must be paused before model allocation");
+            return false;
+        }
+        // A legacy standalone walk may still own VRAM. Only this GPU is drained/evicted.
+        if let Err(reason) = evict_resident_for_dedication(id) {
+            log::error!("Vulkan inference GPU {gpu}: cannot release its old mining buffer: {reason}");
+            return false;
+        }
+        return true;
+    }
     prepare_vulkan_device(device, DedicationOwner::InProcess, "in-process Vulkan inference")
 }
 
@@ -1315,6 +1415,12 @@ pub fn prepare_vulkan_server_device(device: i32) -> bool {
 
 #[cfg(any(unix, windows))]
 pub fn release_inprocess_vulkan_dedication() {
+    if per_card_inference() {
+        if let Some(id) = worker_device(crate::llama_engine_vk::current_gpu()) {
+            SHARED_DEV.lock().unwrap_or_else(|p| p.into_inner()).retain(|d| *d != id);
+        }
+        return;
+    }
     clear_dedication_owned_by(DedicationOwner::InProcess);
 }
 
@@ -1332,6 +1438,9 @@ pub fn release_provisional_vulkan_dedication() {
 
 #[cfg(any(unix, windows))]
 pub fn dedicate_loaded_engine_card_if_required() -> bool {
+    if per_card_inference() {
+        return worker_device(crate::llama_engine_vk::current_gpu()).is_some_and(engine_hosts_card);
+    }
     let dedication_required = DEDICATION_REQUIRED.load(Ordering::Acquire);
     let explicit_override = explicit_vulkan_device_override();
     let Some((domain, bus, device, function)) = crate::llama_engine_vk::pom_pci() else {
@@ -1410,7 +1519,7 @@ pub fn dedicate_loaded_engine_card_if_required() -> bool {
 }
 
 fn is_shared_dev(device_id: usize) -> bool {
-    SHARED_DEV.lock().unwrap().map_or(false, |d| d == device_id)
+    SHARED_DEV.lock().unwrap().contains(&device_id)
 }
 
 /// Set once the miner reaches the H6 (PoM v3) gate. In v3 the walk is the OpenCL `pom_mine_v3`
@@ -1558,7 +1667,10 @@ fn device_is_rdna1(device_id: usize) -> bool {
 /// the explicit off override; every claim still passes the device/byte gate.
 #[cfg(any(unix, windows))]
 fn zero_dup_policy(device_id: usize, _reserved: bool) -> bool {
-    std::env::var("KERYX_ZERO_DUP").ok().as_deref() != Some("off") && !device_is_rdna1(device_id)
+    // Old sidecars lack this capability; never re-enable their known-hanging
+    // BDA fetch even with an environment override.
+    if device_is_rdna1(device_id) && !crate::llama_engine_vk::pom_uses_descriptor_memory() { return false; }
+    std::env::var("KERYX_ZERO_DUP").ok().as_deref() != Some("off")
 }
 
 /// `KERYX_ZERO_DUP=force`: prefer the engine walk on every engine-hosted card.
@@ -1588,15 +1700,16 @@ fn try_claim_shared(device_id: usize) -> bool {
     if ZERO_DUP_REFUSED.lock().unwrap_or_else(|p| p.into_inner()).contains(&device_id) {
         return false;
     }
-    // The engine is a singleton: one shared card per process.
-    if SHARED_DEV.lock().unwrap().is_some() {
-        return false;
-    }
     if !engine_hosts_card(device_id) {
         return false; // engine not loaded (yet), walk not ready, or it lives on another card
     }
     let reserved = dedicated_device() == Some(device_id);
     if !zero_dup_policy(device_id, reserved) {
+        if per_card_inference() {
+            log::error!("PoM GPU {:?}: safe shared Vulkan gather unavailable or disabled; this card stays paused. H16 cannot use the legacy OpenCL v4 fallback.", worker_ordinal(device_id));
+            ZERO_DUP_REFUSED.lock().unwrap_or_else(|p| p.into_inner()).push(device_id);
+            return false;
+        }
         log::info!(
             "PoM: card {device_id:#x} ({}) hosts the inference model but the zero-dup policy keeps its own \
              OpenCL blob{} (KERYX_ZERO_DUP=force overrides).",
@@ -1610,6 +1723,11 @@ fn try_claim_shared(device_id: usize) -> bool {
         return false; // the shared possession index is built by ensure_installed / the claim caller
     };
     if !crate::llama_engine_vk::pom_byte_gate(index) {
+        if per_card_inference() {
+            ZERO_DUP_REFUSED.lock().unwrap_or_else(|p| p.into_inner()).push(device_id);
+            log::error!("PoM GPU {:?}: shared model byte gate failed; card stays paused, no alternate mining-only backend.", worker_ordinal(device_id));
+            return false;
+        }
         // Deterministic verdict (or a hung device): never dispatch again in this process.
         ZERO_DUP_REFUSED.lock().unwrap_or_else(|p| p.into_inner()).push(device_id);
         log::warn!(
@@ -1618,7 +1736,7 @@ fn try_claim_shared(device_id: usize) -> bool {
         );
         return false;
     }
-    *SHARED_DEV.lock().unwrap() = Some(device_id);
+    SHARED_DEV.lock().unwrap().push(device_id);
     log::info!(
         "PoM: card {device_id:#x} ({}) mines over the inference engine's resident model \
          (zero-dup, {}) — one VRAM copy serves inference AND mining.",
@@ -1714,7 +1832,7 @@ fn install_resident(device_id: usize) -> Result<(), String> {
         }
         // This read occurs while holding the same registry lock the drain takes after raising its
         // counter, so install and generation have a total order even before a resident exists.
-        if INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0 {
+        if mining_paused() {
             return Err("GPU inference owns the card; resident install deferred".into());
         }
         if !ins.contains(&device_id) {
@@ -1795,6 +1913,14 @@ fn install_resident(device_id: usize) -> Result<(), String> {
 /// True if THIS thread's bound card has the tier resident — either its own OpenCL blob or the
 /// zero-dup engine walk (or, with no binding, any card does).
 pub fn is_installed() -> bool {
+    if per_card_inference() {
+        let Some(id) = target_dev() else { return false };
+        let Some(gpu) = worker_ordinal(id) else { return false };
+        let ready = TIER.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+            .is_some_and(|(model, _, _)| crate::slm::model_serveable_on(model, gpu)) && is_shared_dev(id);
+        if ready { mark_bound_worker_ready(id); }
+        return ready;
+    }
     // A DEDICATED inference card is deliberately not mining — treat it as resolved so the worker
     // doesn't loop ensure_installed/heartbeat on it (its 0 hash is intentional and logged once).
     if let (Some(id), Some(d)) = (bound_dev(), dedicated_device()) {
@@ -1812,7 +1938,7 @@ pub fn is_installed() -> bool {
             }
             ready
         }
-        None => !POM_BY_DEV.lock().unwrap().is_empty() || SHARED_DEV.lock().unwrap().is_some(),
+        None => !POM_BY_DEV.lock().unwrap().is_empty() || !SHARED_DEV.lock().unwrap().is_empty(),
     }
 }
 
@@ -1907,8 +2033,41 @@ fn ensure_index(model_id: [u8; 32], gguf_path: &str, tier: u8) -> Result<(), Str
 /// is built once (first thread under BUILD_LOCK), then each thread streams the GGUF to its OWN card,
 /// so all cards end up resident and mine independently.
 /// (Unlike NVIDIA, the AMD OpenCL buffer is never evicted, so each card does this work once.)
+fn ensure_serving_worker() {
+    let Some(id) = target_dev() else { return };
+    let Some(gpu) = worker_ordinal(id) else { return };
+    if device_paused(id) || is_installed() { return; }
+    let Some((model, path, tier)) = TIER.lock().unwrap_or_else(|p| p.into_inner()).clone() else { return };
+    let _selection = crate::llama_engine_vk::select_gpu(gpu);
+
+    // Proving another card must never open this card's mining gate. The probe owns
+    // the card lease and drains only its walk; low-RAM model staging is serialized.
+    if !crate::slm::model_serveable_on(&model, gpu) {
+        if crate::slm::run_inference_self_test(&model, gpu) != crate::inference_coord::SelfTestOutcome::Passed {
+            return;
+        }
+    }
+    if !crate::slm::model_serveable_on(&model, gpu)
+        || !crate::llama_engine_vk::active_for(&path) || !engine_hosts_card(id) { return; }
+    {
+        let _build = BUILD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(reason) = ensure_index(model, &path, tier) {
+            log::warn!("PoM GPU {gpu}: possession index unavailable: {reason}");
+            return;
+        }
+    }
+    let Some(_setup) = GpuSetupGuard::begin(id) else { return };
+    if try_claim_shared(id) {
+        mark_bound_worker_ready(id);
+    }
+}
+
 pub fn ensure_installed() {
-    if INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0 {
+    if per_card_inference() {
+        ensure_serving_worker();
+        return;
+    }
+    if mining_paused() {
         return;
     }
     if is_installed() {
@@ -1976,7 +2135,7 @@ pub fn ensure_installed() {
             // give it up to 10 minutes before falling back to the blob (which would otherwise
             // occupy the VRAM the forced claim was meant to save).
             #[cfg(any(unix, windows))]
-            if zero_dup_forced() && SHARED_DEV.lock().unwrap().is_none() {
+            if zero_dup_forced() && SHARED_DEV.lock().unwrap().is_empty() {
                 static FORCE_WAIT_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
                 let mut since = FORCE_WAIT_SINCE.lock().unwrap_or_else(|p| p.into_inner());
                 let t0 = *since.get_or_insert_with(std::time::Instant::now);
@@ -2047,12 +2206,17 @@ pub fn mine_v4(
     batch: u64,
     daa: u64,
 ) -> crate::pom::GrindResult {
-    if INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0 {
+    if mining_paused() {
         return Err(crate::pom::GrindError::Paused("OpenCL walk paused for GPU inference"));
     }
     let Some(id) = target_dev() else {
         return Err(crate::pom::GrindError::Paused("no OpenCL GPU bound"));
     };
+    let gpu = worker_ordinal(id).unwrap_or(0);
+    let _selection = crate::llama_engine_vk::select_gpu(gpu);
+    if per_card_inference() && !is_installed() {
+        return Err(crate::pom::GrindError::Paused("this GPU has not proven its own Vulkan inference and mining route"));
+    }
     // H10 hardfork (DAA 87,360,000): at/after the gate the SEED becomes the one-way cSHAKE256
     // PowHash of the RAW pph words; below it, the reversible v4 fold over the v4-salted words.
     // Byte-identical dispatch to pom::pom_block_seed_v4_era. The POW fold (p) is unchanged (H3 words).
@@ -2103,7 +2267,7 @@ pub fn mine_v4(
     // engine. The reserved card keeps trying to claim it while the engine loads (its loop polls
     // here every 100 ms); until then it is inference-only by design.
     if is_shared_dev(id) || (dedicated_device() == Some(id) && try_claim_reserved(id)) {
-        let stop = || INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0;
+        let stop = mining_paused;
         let result = match &v5 {
             Some((seed, tiles)) => crate::llama_engine_vk::pom_mine_v5(p, s, time, t, nonce_base, batch, seed, *tiles, &stop),
             None => crate::llama_engine_vk::pom_mine_v4(p, s, time, t, nonce_base, batch, h10_era, &stop),
@@ -2126,7 +2290,7 @@ pub fn mine_v4(
     };
     // Close the read-flag / lock race with `pause_and_drain_for_inference`: a call that read false
     // just before the pause was raised may acquire this mutex only after the drain did.
-    if INFERENCE_PAUSE_COUNT.load(Ordering::Acquire) != 0 {
+    if mining_paused() {
         return Err(crate::pom::GrindError::Paused("OpenCL walk paused for GPU inference"));
     }
     let result = match &v5 {
@@ -2538,5 +2702,30 @@ mod v4_byte_exact {
         assert_eq!(selected_h10_eras(Some("h10"), false).unwrap(), vec![true]);
         assert_eq!(selected_h10_eras(Some("both"), false).unwrap(), vec![false, true]);
         assert!(selected_h10_eras(Some("yes"), true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod per_card_pause_tests {
+    use super::*;
+    #[test]
+    fn inference_pause_and_unwind_leave_peer_setup_available() {
+        const A: usize = usize::MAX - 71;
+        const B: usize = usize::MAX - 72;
+        let outer = begin_device_pause(Some(A));
+        assert!(device_paused(A));
+        assert!(!device_paused(B));
+        assert!(GpuSetupGuard::begin(A).is_none());
+        let peer_setup = GpuSetupGuard::begin(B).expect("peer keeps setting up/mining");
+        let result = std::panic::catch_unwind(|| {
+            let _inner = begin_device_pause(Some(A));
+            panic!("simulated inference failure");
+        });
+        assert!(result.is_err());
+        assert!(device_paused(A), "outer inference still owns pause");
+        drop(outer);
+        assert!(!device_paused(A), "failed request resumes only its card");
+        assert!(GpuSetupGuard::begin(A).is_some());
+        drop(peer_setup);
     }
 }

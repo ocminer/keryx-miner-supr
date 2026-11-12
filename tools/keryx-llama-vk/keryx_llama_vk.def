@@ -10,6 +10,7 @@ EXPORTS
     keryx_llama_load
     keryx_llama_pom_load
     keryx_llama_tensor_count
+    keryx_llama_pom_descriptor_memory
     keryx_llama_pom_ready
     keryx_llama_pom_n_chunks
     keryx_llama_pom_supl_bytes

@@ -8,13 +8,19 @@
 // One invocation per entry. Entries [first, first + count) are written to `base`, the address of
 // entry `first` (the host walks the pad shard by shard and slice by slice).
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#ifndef KERYX_DESCRIPTOR_MEMORY
 #extension GL_EXT_buffer_reference : require
+#endif
+#extension GL_GOOGLE_include_directive : require
+#include "pom_descriptor_memory.glsl"
 
 layout(local_size_x = 64) in;
 
+#ifndef KERYX_DESCRIPTOR_MEMORY
 layout(std430, buffer_reference, buffer_reference_align = 8) writeonly buffer Entries {
     uint64_t w[];
 };
+#endif
 
 layout(push_constant) uniform Push {
     uint64_t base;   // device address of entry `first`
@@ -41,9 +47,15 @@ void main() {
         a += b; d ^= a; d = rotl(d, 16u);
         c += d; b ^= c; b = rotl(b, 63u);
     }
+#ifdef KERYX_DESCRIPTOR_MEMORY
+    uint64_t address = pc.base + uint64_t(i) * 32UL;
+    page_write64(address, a); page_write64(address + 8UL, b);
+    page_write64(address + 16UL, c); page_write64(address + 24UL, d);
+#else
     Entries e = Entries(pc.base + uint64_t(i) * 32UL);
     e.w[0] = a;
     e.w[1] = b;
     e.w[2] = c;
     e.w[3] = d;
+#endif
 }

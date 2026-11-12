@@ -1456,6 +1456,10 @@ fn card_hashrate_get(gpu: usize) -> Option<f64> {
 /// nvidia-smi row numbers are physical/global and are not the same namespace under
 /// `CUDA_VISIBLE_DEVICES`; using the driver keeps routing aligned with `Device::new_cuda(gpu)`.
 fn gpu_mem_mib(query: &str) -> std::collections::HashMap<usize, u64> {
+    #[cfg(feature = "pom-opencl")]
+    {
+        return if query == "memory.total" { crate::pom_opencl::worker_memory_mib() } else { std::collections::HashMap::new() };
+    }
     #[cfg(feature = "pom-cuda")]
     {
         return match query {
@@ -1469,7 +1473,7 @@ fn gpu_mem_mib(query: &str) -> std::collections::HashMap<usize, u64> {
             _ => std::collections::HashMap::new(),
         };
     }
-    #[cfg(not(feature = "pom-cuda"))]
+    #[cfg(not(any(feature = "pom-cuda", feature = "pom-opencl")))]
     {
         let mut out = std::collections::HashMap::new();
         let Ok(o) = std::process::Command::new("nvidia-smi")
@@ -1507,6 +1511,10 @@ fn card_assigned_model_bytes(gpu: usize) -> u64 {
 ///      is the "fits free VRAM" fallback in practice).
 /// Single-GPU / no-CUDA collapses to `[inference_gpu_ordinal()]` so behavior is unchanged.
 fn eligible_cards(model_id: &[u8; 32]) -> Vec<usize> {
+    #[cfg(feature = "pom-opencl")]
+    {
+        return proven_route_gpus(model_id);
+    }
     #[cfg(feature = "pom-cuda")]
     {
         // A proven inference engine stays eligible while its walk is being rebuilt. Restricting
@@ -1545,7 +1553,7 @@ fn eligible_cards(model_id: &[u8; 32]) -> Vec<usize> {
         }
         cards
     }
-    #[cfg(not(feature = "pom-cuda"))]
+    #[cfg(not(any(feature = "pom-cuda", feature = "pom-opencl")))]
     {
         let _ = model_id;
         vec![inference_gpu_for_model(model_id)]
@@ -1744,12 +1752,11 @@ pub fn inference_gpu_ordinal() -> usize {
             return biggest_cuda_gpu_within(&allowed).unwrap_or(allowed[0]);
         }
     }
-    // OpenCL/Vulkan owns one process-wide inference engine and records it as one logical route;
-    // physical placement is tracked separately by pom_opencl's full-PCI mapping. Never let an
-    // unrelated NVIDIA card discovered via nvidia-smi change this logical key on a mixed host.
+    // AMD uses the selected OpenCL worker labels, with full-PCI Vulkan matching.
+    // Never let unrelated NVIDIA discovery or ggml enumeration relabel the card.
     #[cfg(feature = "pom-opencl")]
     {
-        return restrict_inference_gpu(0);
+        return restrict_inference_gpu(crate::pom_opencl::worker_gpu_ordinals().first().copied().unwrap_or(0));
     }
 
     #[cfg(not(feature = "pom-opencl"))]
@@ -2824,11 +2831,31 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> SelfTestOutco
             secs
         );
     }
-    if passed || model_serveable(model_id) {
-        SelfTestOutcome::Passed
-    } else {
-        SelfTestOutcome::Failed
-    }
+    completed_self_test(model_id, gpu, passed)
+}
+
+fn completed_self_test(model_id: &[u8; 32], gpu: usize, passed: bool) -> SelfTestOutcome {
+    // A peer's success preserves the pool capability, but cannot qualify this
+    // AMD worker or make its warmer report success after its own failed trace.
+    let qualified = if cfg!(feature = "pom-opencl") {
+        model_serveable_on(model_id, gpu)
+    } else { passed || model_serveable(model_id) };
+    if qualified { SelfTestOutcome::Passed } else { SelfTestOutcome::Failed }
+}
+
+#[cfg(all(test, feature = "pom-opencl"))]
+#[test]
+fn amd_failed_route_does_not_borrow_a_peers_self_test() {
+    let model = [0xED; 32];
+    record_serveable_on(&model, 1901);
+    record_unserveable_on(&model, 1902);
+    assert!(model_serveable(&model), "the healthy peer keeps pool capability");
+    assert_eq!(completed_self_test(&model, 1902, false), SelfTestOutcome::Failed);
+    assert_eq!(completed_self_test(&model, 1901, true), SelfTestOutcome::Passed);
+    record_serveable_on(&model, 1902);
+    assert_eq!(completed_self_test(&model, 1902, true), SelfTestOutcome::Passed);
+    self_test_state().write().unwrap().retain(|(m, _), _| *m != model);
+    self_test_failures().write().unwrap().retain(|(m, _), _| *m != model);
 }
 
 /// Durable startup proof coordinator. Capability/job gates intentionally remain closed until a
@@ -2840,7 +2867,7 @@ pub fn run_inference_self_test(model_id: &[u8; 32], gpu: usize) -> SelfTestOutco
 pub fn warm_inference_route(model_id: [u8; 32], initial_gpu: usize) {
     // One durable warmer per model: the era swap starts one for the new model, which must not
     // double up with a startup warmer for the same model.
-    let Some(_registration) = WarmerRegistration::claim(model_id) else { return };
+    let Some(_registration) = WarmerRegistration::claim(model_id, initial_gpu) else { return };
     let mut delay = std::time::Duration::from_secs(30);
     let mut target_gpu = initial_gpu;
     loop {
@@ -2871,7 +2898,8 @@ pub fn warm_inference_route(model_id: [u8; 32], initial_gpu: usize) {
         if outcome != SelfTestOutcome::Passed {
             delay = (delay * 2).min(std::time::Duration::from_secs(300));
         }
-        target_gpu = inference_gpu_for_model(&model_id);
+        #[cfg(not(feature = "pom-opencl"))]
+        { target_gpu = inference_gpu_for_model(&model_id); }
     }
 }
 
@@ -2889,18 +2917,20 @@ pub fn is_era_retired(model_id: &[u8; 32]) -> bool {
     era_retired().read().map(|s| s.contains(model_id)).unwrap_or(false)
 }
 
-fn live_warmers() -> &'static Mutex<std::collections::HashSet<[u8; 32]>> {
-    static SET: OnceLock<Mutex<std::collections::HashSet<[u8; 32]>>> = OnceLock::new();
+type WarmerKey = ([u8; 32], Option<usize>);
+fn live_warmers() -> &'static Mutex<std::collections::HashSet<WarmerKey>> {
+    static SET: OnceLock<Mutex<std::collections::HashSet<WarmerKey>>> = OnceLock::new();
     SET.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 /// RAII claim on "the durable warmer of this model"; dropped when the warmer exits.
-struct WarmerRegistration([u8; 32]);
+struct WarmerRegistration(WarmerKey);
 
 impl WarmerRegistration {
-    fn claim(model_id: [u8; 32]) -> Option<Self> {
+    fn claim(model_id: [u8; 32], gpu: usize) -> Option<Self> {
         let mut g = live_warmers().lock().unwrap_or_else(|p| p.into_inner());
-        g.insert(model_id).then(|| Self(model_id))
+        let key = (model_id, cfg!(feature = "pom-opencl").then_some(gpu));
+        g.insert(key).then(|| Self(key))
     }
 }
 
@@ -3061,11 +3091,11 @@ mod era_swap_tests {
     #[test]
     fn warmer_registration_is_exclusive_per_model() {
         let id = [0xE5u8; 32];
-        let first = WarmerRegistration::claim(id).expect("first claim");
-        assert!(WarmerRegistration::claim(id).is_none(), "second warmer for the same model refused");
-        assert!(WarmerRegistration::claim([0xE6u8; 32]).is_some());
+        let first = WarmerRegistration::claim(id, 0).expect("first claim");
+        assert!(WarmerRegistration::claim(id, 0).is_none(), "second warmer for the same model refused");
+        assert!(WarmerRegistration::claim([0xE6u8; 32], 0).is_some());
         drop(first);
-        assert!(WarmerRegistration::claim(id).is_some(), "claim released on exit");
+        assert!(WarmerRegistration::claim(id, 0).is_some(), "claim released on exit");
     }
 }
 
@@ -3302,7 +3332,9 @@ fn with_traced_engine<R>(gpu: usize, model_id: &[u8; 32], f: impl FnOnce(&'stati
     if !crate::gguf::is_complete_file(&gguf_path_for(spec)) {
         return Err(InferenceError::Deferred(DeferredReason::ModelIncomplete));
     }
-    let _pause_stats = crate::runtime_stats::begin_gpu_inference_pause(None);
+    let _selection = crate::llama_engine_vk::select_gpu(gpu);
+    let _host_load = crate::pom_opencl::try_host_load().map_err(InferenceError::Deferred)?;
+    let _pause_stats = crate::runtime_stats::begin_gpu_inference_pause(Some(gpu));
     let _walk_drain = crate::pom_opencl::pause_and_drain_for_inference(gpu).map_err(InferenceError::Deferred)?;
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
     if !crate::llama_engine_vk::active_for(&gguf) {
@@ -3485,10 +3517,15 @@ pub fn try_load_and_run_inference_on(
     #[cfg(all(feature = "pom-cuda", not(feature = "pom-opencl")))]
     let _host_load = crate::pom_gpu::try_host_load().map_err(InferenceError::Deferred)?;
 
+    #[cfg(feature = "pom-opencl")]
+    let _selection = crate::llama_engine_vk::select_gpu(gpu);
+    #[cfg(feature = "pom-opencl")]
+    let _host_load = crate::pom_opencl::try_host_load().map_err(InferenceError::Deferred)?;
+
     // Include the drain in frontend pause accounting, not just the generation after it succeeds.
     // Busy admission unwinds this guard immediately without reporting a failed inference.
     let _pause_stats = crate::runtime_stats::begin_gpu_inference_pause(
-        if cfg!(all(feature = "pom-cuda", not(feature = "pom-opencl"))) { Some(gpu) } else { None },
+        if cfg!(any(feature = "pom-cuda", feature = "pom-opencl")) { Some(gpu) } else { None },
     );
 
     // GPU inference and the possession walk must never overlap on the serving card. Publishing a
@@ -3641,7 +3678,7 @@ pub fn try_load_and_run_inference_on(
     #[cfg(feature = "pom-opencl")]
     {
         let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
-        if !cpu_inference_enabled() && !crate::llama_vulkan::reuse_exact_or_stop(&gguf, gpu) {
+        if !cpu_inference_enabled() && (crate::pom_opencl::per_card_inference() || !crate::llama_vulkan::reuse_exact_or_stop(&gguf, gpu)) {
             // The lifecycle-locked transition above synchronously stopped/reaped any old server
             // before the higher-priority engine claims dedication. A failed load therefore cannot
             // clear a still-resident subprocess model's reservation.
@@ -3682,6 +3719,12 @@ pub fn try_load_and_run_inference_on(
                 log::warn!("SlmEngine: in-process llama-vk generate failed — trying the next engine.");
             }
         }
+    }
+
+    #[cfg(feature = "pom-opencl")]
+    if crate::pom_opencl::per_card_inference() {
+        // A singleton server/CPU fallback cannot prove this worker's exact GPU route.
+        return Err(InferenceError::Failed);
     }
 
     #[cfg(any(feature = "pom-opencl", feature = "pom-cuda"))]

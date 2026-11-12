@@ -37,6 +37,8 @@ static void keryx_vk_pad_release(KeryxLlama* h) {
         if (b.second) vkFreeMemory(h->dev, b.second, nullptr);
     }
     p.shards.clear();
+    h->pages.resize(h->weight_pages);
+    update_descriptor_pages(h);
     p.buffer = VK_NULL_HANDLE; p.memory = VK_NULL_HANDLE;
     p.address = p.tiles = 0;
 }
@@ -61,12 +63,12 @@ static bool keryx_vk_pad_ensure(KeryxLlama* h, const uint64_t seed[4], uint64_t 
     if (h->pad && h->pad->tiles == tiles && memcmp(h->pad->seed, seed, 32) == 0) return true;
     if (!h->pad) h->pad = new KeryxVkPad();
     auto& p = *h->pad;
-    if (!p.fill_pipe) p.fill_pipe = make_pipeline(h, PAD_V5_FILL_SPV, sizeof(PAD_V5_FILL_SPV), sizeof(PushPadFill), &p.fill_sm, &p.fill_pl);
+    if (!p.fill_pipe) p.fill_pipe = make_pipeline(h, h->descriptor_memory ? PAD_DESCRIPTOR_SPV : PAD_V5_FILL_SPV, h->descriptor_memory ? sizeof(PAD_DESCRIPTOR_SPV) : sizeof(PAD_V5_FILL_SPV), sizeof(PushPadFill), &p.fill_sm, &p.fill_pl);
     if (!p.walk_pipe) {
         const char* selected = getenv("KERYX_VK_V5_DOT");
         const bool dot = keryx_vk_integer_dot_product(h->gpu) && !(selected && strcmp(selected, "0") == 0);
-        p.walk_pipe = make_pipeline(h, dot ? WALK_V5_DOT_SPV : WALK_V5_SCALAR_SPV,
-            dot ? sizeof(WALK_V5_DOT_SPV) : sizeof(WALK_V5_SCALAR_SPV), sizeof(PushWalkV5), &p.walk_sm, &p.walk_pl);
+        p.walk_pipe = make_pipeline(h, h->descriptor_memory ? WALK_V5_DESCRIPTOR_SPV : (dot ? WALK_V5_DOT_SPV : WALK_V5_SCALAR_SPV),
+            h->descriptor_memory ? sizeof(WALK_V5_DESCRIPTOR_SPV) : (dot ? sizeof(WALK_V5_DOT_SPV) : sizeof(WALK_V5_SCALAR_SPV)), sizeof(PushWalkV5), &p.walk_sm, &p.walk_pl);
     }
     if (!p.fill_pipe || !p.walk_pipe) return false;
     keryx_vk_pad_release(h);
@@ -84,7 +86,7 @@ static bool keryx_vk_pad_ensure(KeryxLlama* h, const uint64_t seed[4], uint64_t 
         }
         p.shards.emplace_back(buffer, memory);
         VkBufferDeviceAddressInfo shard{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; shard.buffer = buffer;
-        const uint64_t address = vkGetBufferDeviceAddress(h->dev, &shard);
+        const uint64_t address = walk_buffer_address(h,buffer,std::min(KERYX_VK_ALLOC_BYTES, tiles * 1024 - first));
         if (!address) { keryx_vk_pad_release(h); return false; }
         addresses.push_back(address);
     }
@@ -95,7 +97,8 @@ static bool keryx_vk_pad_ensure(KeryxLlama* h, const uint64_t seed[4], uint64_t 
     }
     VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     dai.buffer = p.buffer;
-    p.address = vkGetBufferDeviceAddress(h->dev, &dai);
+    p.address = walk_buffer_address(h,p.buffer,addresses.size()*sizeof(uint64_t));
+    update_descriptor_pages(h);
     if (!p.address) { keryx_vk_pad_release(h); return false; }
     const uint64_t entries = tiles * 32;
     // Small bounded dispatches keep Windows TDR and older AMD devices responsive.
@@ -121,6 +124,7 @@ static bool keryx_vk_tune_v5(KeryxLlama* h, const PushWalkV5& job) {
     if (h->device_failed) return false;
     auto& pad = *h->pad;
     if (pad.tuned) return !h->device_failed;
+    if (h->descriptor_memory) { pad.tuned=true; return true; } // no BDA/matrix candidates on RDNA1
     const char* mode = getenv("KERYX_VK_V5_MODE");
     const char* dot = getenv("KERYX_VK_V5_DOT");
     if ((mode && (strcmp(mode,"sp")==0 || strcmp(mode,"0")==0)) ||

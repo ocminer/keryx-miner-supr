@@ -1,6 +1,6 @@
 //! H15 tracing on the existing Vulkan model owner. The parent engine mutex keeps
 //! model lifetime, generation and replay serialized; the caller drains mining.
-use super::{engine, sym, Engine};
+use super::{engine, sym, select_gpu, Engine};
 use crate::trace::{SeqCapture, SeqLayer, REPLAY_MAX_CAPTURES};
 use crate::vulkan_trace_seq::{parse_kv_state, seq_capture, seq_leaf_bytes, RecurSink, SeqAttn, SeqRecur, SeqSpec};
 use std::ffi::{c_char, c_int, c_void, CStr};
@@ -60,7 +60,8 @@ impl State {
 
 /// Physical Vulkan device and driver of the resident model. Never claim replay
 /// compatibility from a different API's ordinal or an unknown (empty) identity.
-pub fn gpu_identity() -> (String, u32, String) {
+pub fn gpu_identity(gpu: usize) -> (String, u32, String) {
+    let _selection = select_gpu(gpu);
     let unknown = || (String::new(), 0, String::new());
     let Ok(g) = engine().lock() else { return unknown() };
     let Some(e) = g.as_ref() else { return unknown() };
@@ -78,7 +79,8 @@ fn detail(api: Api, context: &str) -> String {
     format!("{context}: {d}")
 }
 
-pub fn trace_configure(gguf: &str, _gpu: usize, manifest: &[u8]) -> Result<usize, String> {
+pub fn trace_configure(gguf: &str, gpu: usize, manifest: &[u8]) -> Result<usize, String> {
+    let _selection = select_gpu(gpu);
     if crate::trace::TierManifest::parse(manifest).is_none() { return Err("invalid trace manifest".into()); }
     let mut guard = engine().lock().map_err(|_| "Vulkan engine poisoned")?;
     let e = guard.as_mut().filter(|e| e.gguf == gguf).ok_or("no Vulkan engine hosts this model")?;
@@ -96,7 +98,8 @@ pub fn trace_configure(gguf: &str, _gpu: usize, manifest: &[u8]) -> Result<usize
     Ok(s.leaves)
 }
 
-pub fn traced_with(gguf: &str, _gpu: usize, manifest: &[u8]) -> bool {
+pub fn traced_with(gguf: &str, gpu: usize, manifest: &[u8]) -> bool {
+    let _selection = select_gpu(gpu);
     engine().lock().map_or(false, |g| g.as_ref().is_some_and(|e| e.gguf == gguf && e.trace.as_ref().is_some_and(|s| s.leaves > 0 && s.manifest == manifest)))
 }
 
@@ -129,7 +132,8 @@ fn sequence_spec(manifest: &[u8], layers: &[SeqLayer], n_attn: u32, n_recur: u32
     Ok(spec)
 }
 
-pub fn seq_configure(gguf: &str, _gpu: usize, layers: &[SeqLayer], n_attn: u32, n_recur: u32, heads: u32, interval: u32) -> Result<usize, String> {
+pub fn seq_configure(gguf: &str, gpu: usize, layers: &[SeqLayer], n_attn: u32, n_recur: u32, heads: u32, interval: u32) -> Result<usize, String> {
+    let _selection = select_gpu(gpu);
     let mut guard = engine().lock().map_err(|_| "Vulkan engine poisoned")?;
     let e = guard.as_mut().filter(|e| e.gguf == gguf).ok_or("no Vulkan engine hosts this model")?;
     let s = e.trace.as_mut().filter(|s| s.leaves > 0).ok_or("no configured Vulkan trace")?;
@@ -212,7 +216,8 @@ pub struct TracedGeneration {
     pub ubatch: Vec<u32>, pub leaves: Vec<[u8; 32]>, pub seq: Option<Vec<[u8; 32]>>,
 }
 
-pub fn generate_traced(gguf: &str, _gpu: usize, prompt: &str, prefix: Option<PromptPrefix<'_>>, max_tokens: usize, min_prompt: u32, answer_bytes_per_position: u32) -> Result<TracedGeneration, GenError> {
+pub fn generate_traced(gguf: &str, gpu: usize, prompt: &str, prefix: Option<PromptPrefix<'_>>, max_tokens: usize, min_prompt: u32, answer_bytes_per_position: u32) -> Result<TracedGeneration, GenError> {
+    let _selection = select_gpu(gpu);
     let guard = engine().lock().map_err(|_| GenError::Unavailable)?;
     let e = guard.as_ref().filter(|e| e.gguf == gguf).ok_or(GenError::Unavailable)?;
     let s = e.trace.as_ref().filter(|s| s.leaves > 0).ok_or(GenError::Unavailable)?;
@@ -258,7 +263,8 @@ pub fn generate_traced(gguf: &str, _gpu: usize, prompt: &str, prefix: Option<Pro
     Ok(TracedGeneration { text, tokens, n_prompt: n_prompt as u32, n_pos, ubatch, leaves, seq })
 }
 
-pub fn replay_multi(gguf: &str, _gpu: usize, tokens: &[i32], n_prompt: u32, caps: &[(u32, u32)], slot_bytes: usize) -> Result<Vec<Vec<u8>>, String> {
+pub fn replay_multi(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, caps: &[(u32, u32)], slot_bytes: usize) -> Result<Vec<Vec<u8>>, String> {
+    let _selection = select_gpu(gpu);
     if caps.is_empty() || caps.len() > REPLAY_MAX_CAPTURES || slot_bytes == 0 || slot_bytes > CAPTURE_CAP || slot_bytes % 4 != 0 || n_prompt == 0 || n_prompt as usize > tokens.len() || tokens.len() > c_int::MAX as usize { return Err("invalid Vulkan replay request".into()); }
     let guard = engine().lock().map_err(|_| "Vulkan engine poisoned")?;
     let e = guard.as_ref().filter(|e| e.gguf == gguf).ok_or("no Vulkan engine hosts this model")?;
@@ -274,7 +280,8 @@ pub fn replay_multi(gguf: &str, _gpu: usize, tokens: &[i32], n_prompt: u32, caps
     Ok(out.chunks(slot_bytes).zip(lens).map(|(b, n)| b[..n as usize].to_vec()).collect())
 }
 
-pub fn seq_replay(gguf: &str, _gpu: usize, tokens: &[i32], n_prompt: u32, spans: &[(u32, u64, u64)], max_chunks: u32) -> Result<Vec<SeqCapture>, String> {
+pub fn seq_replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, spans: &[(u32, u64, u64)], max_chunks: u32) -> Result<Vec<SeqCapture>, String> {
+    let _selection = select_gpu(gpu);
     if n_prompt == 0 || n_prompt as usize > tokens.len() || tokens.len() > c_int::MAX as usize || spans.len() > REPLAY_MAX_CAPTURES || spans.iter().any(|s| s.2 < s.1) { return Err("invalid Vulkan sequence replay".into()); }
     let guard = engine().lock().map_err(|_| "Vulkan engine poisoned")?;
     let e = guard.as_ref().filter(|e| e.gguf == gguf).ok_or("no Vulkan engine hosts this model")?;

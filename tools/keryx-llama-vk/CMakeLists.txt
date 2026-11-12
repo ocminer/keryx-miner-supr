@@ -114,7 +114,27 @@ add_custom_command(OUTPUT "${KERYX_WALK_V5_DOT_SPV}"
 add_custom_command(OUTPUT "${KERYX_PAD_V5_SPV}"
   COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -mfmt=c -o "${KERYX_PAD_V5_SPV}" "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_v5_pad_fill_vk.comp"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_v5_pad_fill_vk.comp" VERBATIM)
-add_custom_target(keryx-pom-vk-shaders DEPENDS "${KERYX_WALK_V5_RESOLVED_SPV}" "${KERYX_WALK_V5_REDUCE_SPV}" "${KERYX_WALK_V5_CM_SPV}" "${KERYX_WALK_V5_SPV}" "${KERYX_WALK_V5_DOT_SPV}" "${KERYX_PAD_V5_SPV}" "${KERYX_WALK_SPV}" "${KERYX_WALK_DOT_SPV}" "${KERYX_FETCH_SPV}"
+set(KERYX_DESCRIPTOR_0 "${KERYX_SHADER_DIR}/pom_walk_descriptor_vk.spv.inc")
+add_custom_command(OUTPUT "${KERYX_DESCRIPTOR_0}"
+  COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -DKERYX_DESCRIPTOR_MEMORY=1 -mfmt=c
+    -o "${KERYX_DESCRIPTOR_0}" "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_walk_vk.comp"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_walk_vk.comp" "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_descriptor_memory.glsl" VERBATIM)
+set(KERYX_DESCRIPTOR_1 "${KERYX_SHADER_DIR}/pom_walk_v5_descriptor_vk.spv.inc")
+add_custom_command(OUTPUT "${KERYX_DESCRIPTOR_1}"
+  COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -DKERYX_DESCRIPTOR_MEMORY=1 -DPOM_V5=1 -mfmt=c
+    -o "${KERYX_DESCRIPTOR_1}" "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_walk_vk.comp"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_walk_vk.comp" "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_descriptor_memory.glsl" VERBATIM)
+set(KERYX_DESCRIPTOR_2 "${KERYX_SHADER_DIR}/pom_fetch_descriptor_vk.spv.inc")
+add_custom_command(OUTPUT "${KERYX_DESCRIPTOR_2}"
+  COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -DKERYX_DESCRIPTOR_MEMORY=1 -mfmt=c
+    -o "${KERYX_DESCRIPTOR_2}" "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_fetch_vk.comp"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_fetch_vk.comp" "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_descriptor_memory.glsl" VERBATIM)
+set(KERYX_DESCRIPTOR_3 "${KERYX_SHADER_DIR}/pom_v5_pad_descriptor_vk.spv.inc")
+add_custom_command(OUTPUT "${KERYX_DESCRIPTOR_3}"
+  COMMAND "${Vulkan_GLSLC_EXECUTABLE}" --target-env=vulkan1.2 -O -DKERYX_DESCRIPTOR_MEMORY=1 -mfmt=c
+    -o "${KERYX_DESCRIPTOR_3}" "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_v5_pad_fill_vk.comp"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_v5_pad_fill_vk.comp" "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/pom_descriptor_memory.glsl" VERBATIM)
+add_custom_target(keryx-pom-vk-shaders DEPENDS "${KERYX_DESCRIPTOR_0}" "${KERYX_DESCRIPTOR_1}" "${KERYX_DESCRIPTOR_2}" "${KERYX_DESCRIPTOR_3}" "${KERYX_WALK_V5_RESOLVED_SPV}" "${KERYX_WALK_V5_REDUCE_SPV}" "${KERYX_WALK_V5_CM_SPV}" "${KERYX_WALK_V5_SPV}" "${KERYX_WALK_V5_DOT_SPV}" "${KERYX_PAD_V5_SPV}" "${KERYX_WALK_SPV}" "${KERYX_WALK_DOT_SPV}" "${KERYX_FETCH_SPV}"
   "${KERYX_CHASE_SPV}" "${KERYX_WALK_TP_SPV}" "${KERYX_WALK_TP_DOT_SPV}" "${KERYX_WALK_TP_CM_SPV}" "${KERYX_WALK_TP_CM_SINGLE_SPV}")
 
 add_library(keryx-llama-vk SHARED "${CMAKE_CURRENT_SOURCE_DIR}/../keryx-llama/keryx_llama_vk.cpp")

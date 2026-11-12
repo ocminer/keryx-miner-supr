@@ -62,6 +62,20 @@ extern "C" KERYX_VK_EXPORT bool keryx_vk_tensor_addr(const struct ggml_tensor * 
     return true;
 }
 
+// Descriptor-backed gather uses the same allocation and canonical tensor offset,
+// without dereferencing any physical storage buffer pointer in a shader.
+extern "C" KERYX_VK_EXPORT bool keryx_vk_tensor_buffer(const struct ggml_tensor * tensor,
+        VkBuffer * buffer, uint64_t * offset, uint64_t * allocation_bytes) {
+    if (!tensor || !tensor->buffer || !ggml_backend_buffer_is_vk(tensor->buffer)) return false;
+    auto * ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+    const vk_buffer & b = ctx->dev_buffer;
+    if (!b) return false;
+    *buffer = (VkBuffer)b->buffer;
+    *offset = vk_tensor_offset(tensor) + tensor->view_offs;
+    *allocation_bytes = b->size;
+    return *offset <= *allocation_bytes && ggml_nbytes(tensor) <= *allocation_bytes - *offset;
+}
+
 // VkDevice that owns a VK-resident tensor's buffer (nullptr when not VK-resident). BDA values
 // are only dereferenceable on their owning device, so the walk matches this against
 // keryx_vk_raw_handles across dev_num to self-locate the model's device — the loader's main_gpu

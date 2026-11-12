@@ -1632,27 +1632,10 @@ async fn run() -> Result<(), Error> {
                 // Device selection lives INSIDE ensure_loaded/try_start (issue #18: pin to a
                 // discrete GPU, KERYX_LLAMA_VK_DEVICE overrides) — the `0` here is only the
                 // last-resort ggml index when no discrete Vulkan device is found at all.
-                // UP-FRONT plan (field request): compute from VRAM math whether model + possession
-                // blob (≈ gguf + gguf + 1.5 GiB KV/ctx margin) can share one card. If NOT, announce
-                // the plan NOW instead of load→fail→fallback churn: the inference card will be
-                // DEDICATED — it hosts the model and answers OPoI (the 8x-reward path, and fast GPU
-                // answers avoid challenge timeouts), and it simply does not mine; the other cards
-                // mine at full rate. The dedication itself is enforced in pom_opencl (no blob is
-                // installed on the engine's card when both can't fit).
-                let gguf_mb = std::fs::metadata(&gpath_llama).map(|m| m.len() / (1024 * 1024)).unwrap_or(6144);
-                let need_mb = gguf_mb * 2 + 1536;
-                let vram_mb = keryx_miner::pom_opencl::max_gpu_global_mem_mb().unwrap_or(0);
-                if vram_mb > 0 && vram_mb < need_mb {
-                    info!(
-                        "PoM(AMD): model ({gguf_mb} MiB) + possession blob need ~{need_mb} MiB on one card; largest card has \
-                         {vram_mb} MiB — the inference card is RESERVED for the model: it mines over that single \
-                         resident copy (zero-dup v4 walk, after the startup byte gate) instead of its own blob, or \
-                         stays inference-only (INF, 0 H/s) if the gate refuses; all other cards mine at full rate."
-                    );
-                    keryx_miner::pom_opencl::require_dedicated_inference_card();
+                info!("PoM(AMD): every selected GPU must pass its own Vulkan inference self-test; each card shares one resident model between inference and mining.");
+                for gpu in keryx_miner::pom_opencl::worker_gpu_ordinals() {
+                    std::thread::spawn(move || keryx_miner::slm::warm_inference_route(spec.model_id, gpu));
                 }
-                let inf_gpu = keryx_miner::slm::inference_gpu_for_model(&spec.model_id);
-                keryx_miner::slm::warm_inference_route(spec.model_id, inf_gpu);
             });
         }
         // Apple Silicon (Metal) — llama.cpp Metal inference via the in-process engine (Phase 3b of

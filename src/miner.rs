@@ -147,7 +147,7 @@ pub fn inference_pause_active() -> bool {
 /// templates flowing to every worker (also across reconnects); its per-card guard survives the
 /// connection and the paused worker polls the newest job. Other backends retain their global gate.
 pub fn begin_network_inference_pause() -> InferencePauseGuard {
-    begin_network_inference_pause_for(cfg!(all(feature = "pom-cuda", not(feature = "pom-opencl"))))
+    begin_network_inference_pause_for(cfg!(any(feature = "pom-cuda", feature = "pom-opencl")))
 }
 
 fn begin_network_inference_pause_for(per_card_backend: bool) -> InferencePauseGuard {
@@ -159,7 +159,7 @@ fn begin_network_inference_pause_for(per_card_backend: bool) -> InferencePauseGu
 }
 
 pub fn inference_pause_scope() -> &'static str {
-    if cfg!(all(feature = "pom-cuda", not(feature = "pom-opencl"))) {
+    if cfg!(any(feature = "pom-cuda", feature = "pom-opencl")) {
         "serving GPU only; other GPUs continue PoW"
     } else {
         "backend-wide PoW pause"

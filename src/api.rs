@@ -52,6 +52,7 @@ fn generic_json(stats: &Arc<Mutex<MinerStats>>, version: &str, uptime: u64) -> S
         (s.total_hashrate, s.devices.clone(), s.total_power_w, s.total_efficiency_mhs_per_w)
     };
     let (acc, rej) = shares();
+    let runtime = keryx_miner::runtime_stats::snapshot();
     // Per-device health + efficiency (field request): everything the combined log line
     // shows, machine-readable. Fields are null on rigs where NVML is unavailable or the
     // device mapping could not be verified — consumers must treat them as optional.
@@ -78,6 +79,10 @@ fn generic_json(stats: &Arc<Mutex<MinerStats>>, version: &str, uptime: u64) -> S
         "version": version,
         "algo": "keryxhash",
         "uptime_s": uptime,
+        "inference_paused_gpus": runtime.mining.inference_paused_gpus,
+        "inference_paused_all": runtime.mining.inference_paused,
+        "inference_host_gpus": runtime.mining.inference_host_gpus,
+        "hashrate_sample_sequence": runtime.mining.sample_sequence,
         "total_hashrate_hs": total,
         "total_power_w": total_power_w,
         "total_efficiency_mhs_per_w": total_eff,
