@@ -12,14 +12,19 @@ passed node 1.6.7's unmodified consensus verifier across the H16 boundary and
 reorgs. Solo testing accepted 1,016 pre-H16 blocks and recovered after two
 forced connection drops.
 
-**AMD H15 support:** Vulkan provides mining, verifiable inference and audit replay on
-one card. Mining pauses while that card answers an inference request or audit, then
-resumes; no dedicated inference card is required. Use the complete AMD package so
-its Vulkan engine and miner stay matched. The AMD performance figures below are
-historical, pre-H15 measurements and do not describe the new context-pad workload.
+**v0.16.6 AMD H16 repair:** each selected AMD GPU must pass its own Vulkan
+inference self-test before mining. Only the card serving an inference request
+or audit pauses; it resumes afterwards while other cards continue mining. The
+same resident model serves inference and mining on each card. Install the
+complete AMD package with its matching Vulkan engines, including the pre-AVX
+variant for older CPUs.
 
-**v0.16.5:** AMD RX 5700 / 5600 (RDNA1) cards can serve traced GPU inference
-again; other cards and all mining kernels are unchanged from v0.16.4.
+The RX 5600/5700 compatibility path is **experimental pending physical RDNA1
+testing**. Cards missing from Vulkan, or failing their own inference check,
+stay paused with a diagnostic. The v0.16.5 integer-dot inference fix is retained.
+See [AMD Vulkan operation and compatibility](docs/AMD_VULKAN_INFERENCE.md).
+Windows GPU execution and ten-card rigs have not been qualified. Existing
+performance tables below retain their original versions and workloads.
 
 **v0.16.4:** pool-forwarded compressed private prompts are inflated before
 inference, exactly like the solo path, and `stratum+ssl://` TLS pool connections

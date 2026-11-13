@@ -128,6 +128,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "H16 request scheduling regression failed" }
           cargo test --locked --release --target $env:TARGET --features pom-opencl -p keryx-miner-supr extended_audit -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "extended audit restart regression failed" }
+          cargo test --locked --release --target $env:TARGET --features pom-opencl -p keryx-miner-supr per_card_ -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "per-card AMD ownership/pause regression failed" }
+          cargo test --locked --release --target $env:TARGET --features pom-opencl -p keryx-miner-supr amd_failed_route_does_not_borrow_a_peers_self_test -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "exact-card AMD proof regression failed" }
 
       # 0.15.5: the engine DLLs read GGML_CUDA_DISABLE_GRAPHS / LLAMA_ATTN_ROT_DISABLE with the C
       # runtime's getenv. std::env::set_var alone is invisible to it on Windows (0.15.4 field bug:

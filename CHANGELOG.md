@@ -1,3 +1,36 @@
+# Keryx Miner Supr v0.16.6 — AMD Vulkan H16 and per-card inference
+
+- Fix AMD H16 mining after a successful Vulkan inference self-test. Workers no
+  longer fall back to an older mining backend that cannot process H16 jobs.
+- Each selected AMD card now proves and serves its own Vulkan inference route.
+  Only the serving card pauses for inference or an audit, then resumes mining;
+  the other cards keep mining. A failed card cannot qualify through another
+  card's successful self-test.
+- Add a Vulkan mining compatibility path for RX 5600/5700 (RDNA1). This path
+  remains experimental: physical RDNA1 hardware has not yet been tested.
+- Match OpenCL and Vulkan cards by physical device identity. A card missing from
+  Vulkan remains paused with a diagnostic instead of using a different GPU.
+- Serialize AMD model loading to reduce simultaneous host-memory staging.
+- Include matching Vulkan inference engines for modern and pre-AVX CPUs in both
+  Linux and Windows AMD packages. Install the complete package; replacing only
+  the miner executable is insufficient.
+
+H16 consensus rules, activation gates and model weights are unchanged. Existing
+NVIDIA and other AMD solver selections are retained; this is a compatibility and
+inference repair, not a new hashrate-gain claim.
+
+Development validation passed on RX 7900 XTX, RX 7600 XT and MI50, including
+traced H16 inference, audit openings, mining resumption, and both serving
+directions on a mixed two-card rig. Physical RX 5700, ten-card rigs and Windows
+GPU execution remain unqualified. The macOS package retains its existing
+experimental Metal/H15/H16 limitations.
+
+Packages: Linux NVIDIA modern and legacy, Linux AMD, HiveOS, mmpOS, SMOS,
+Windows NVIDIA and AMD, macOS arm64, and Docker
+`ocminersupr/keryx-miner-supr:0.16.6` (`latest`). Licensing is unchanged from
+v0.16.3 (Source-Sharing License 1.0); third-party licenses and previous grants
+are preserved.
+
 # keryx-miner-supr 0.16.5 — AMD RX 5700 inference fix
 
 - **Fix: GPU inference on AMD cards without hardware int8 dot products.** On
