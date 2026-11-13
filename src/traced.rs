@@ -614,31 +614,47 @@ mod engine {
         let min_prompt = keryx_verifiable_inference::shape::min_prompt_positions(prompt_len);
         let per_position = keryx_verifiable_inference::shape::ANSWER_BYTES_PER_POSITION;
         let (_, pctx) = crate::trace::chain_ctx(tier).ok_or_else(|| TracedError::Unsupported("no stage-2 prefix context".into()))?;
-        let (head, rest) = format_prompt_parts(spec.name, prompt)
-            .ok_or_else(|| TracedError::Unsupported(format!("'{}' has no prefix template", spec.name)))?;
         let tokens = crate::trace::prefix_tokens(&pctx, &request_hash);
-        let prefix = PromptPrefix { tokens: &tokens, head_tokens: pctx.offset, rest: &rest };
-        let g = match llama_engine::generate_traced(gguf, gpu, &head, Some(prefix), max_tokens, min_prompt, per_position) {
-            Ok(g) => g,
-            Err(GenError::PromptTooLong(d)) => return Err(TracedError::PromptTooLong(d)),
-            Err(GenError::PromptHead(d)) => return Err(TracedError::Unsupported(format!("prompt head: {d}"))),
-            Err(e) => return Err(TracedError::Failed(format!("{e:?}"))),
+        let attempt = |prompt: &str| -> Result<Generated, TracedError> {
+            let (head, rest) = format_prompt_parts(spec.name, prompt)
+                .ok_or_else(|| TracedError::Unsupported(format!("'{}' has no prefix template", spec.name)))?;
+            let prefix = PromptPrefix { tokens: &tokens, head_tokens: pctx.offset, rest: &rest };
+            let g = match llama_engine::generate_traced(gguf, gpu, &head, Some(prefix), max_tokens, min_prompt, per_position) {
+                Ok(g) => g,
+                Err(GenError::PromptTooLong(d)) => return Err(TracedError::PromptTooLong(d)),
+                Err(GenError::PromptHead(d)) => return Err(TracedError::Unsupported(format!("prompt head: {d}"))),
+                Err(e) => return Err(TracedError::Failed(format!("{e:?}"))),
+            };
+            let (lo, hi) = (pctx.offset as usize, pctx.offset as usize + tokens.len());
+            if g.tokens.get(lo..hi) != Some(tokens.as_slice()) {
+                return Err(TracedError::Failed("the fed prompt does not carry the request prefix".to_string()));
+            }
+            let record = crate::trace::TraceRecord::new_chain(&m, g.n_prompt, g.ubatch, g.leaves, &g.tokens)
+                .ok_or_else(|| TracedError::Failed("incomplete stage-2 trace".to_string()))?;
+            let seq = if attention {
+                Some(g.seq.and_then(crate::trace::SeqTrace::new).ok_or_else(|| TracedError::Failed("no sequence leaves".to_string()))?)
+            } else {
+                None
+            };
+            if g.text.trim().is_empty() {
+                return Err(TracedError::Failed("empty answer".to_string()));
+            }
+            Ok(Generated { text: truncate_answer(g.text, max_tokens), trace: Some(ResponseTrace { record, tokens: g.tokens, seq }) })
         };
-        let (lo, hi) = (pctx.offset as usize, pctx.offset as usize + tokens.len());
-        if g.tokens.get(lo..hi) != Some(tokens.as_slice()) {
-            return Err(TracedError::Failed("the fed prompt does not carry the request prefix".to_string()));
+        let outcome = attempt(prompt);
+        if matches!(&outcome, Err(TracedError::PromptTooLong(_))) {
+            // Upstream v0.6.2: retry only a context overflow, once, and only when the ORIGINAL
+            // opened payload length fits the model budget. The trace still commits that original
+            // length and request prefix. Both CUDA and Vulkan use this same per-card path.
+            if let Some(cut) = crate::prompt_retry::retry_prompt(prompt, spec.ctx_floor, max_tokens, prompt_len) {
+                log::warn!(
+                    "Trace '{}': prompt too long — retrying with {} of its {} bytes on GPU {}",
+                    spec.name, cut.len(), prompt.len(), gpu
+                );
+                return attempt(&cut);
+            }
         }
-        let record = crate::trace::TraceRecord::new_chain(&m, g.n_prompt, g.ubatch, g.leaves, &g.tokens)
-            .ok_or_else(|| TracedError::Failed("incomplete stage-2 trace".to_string()))?;
-        let seq = if attention {
-            Some(g.seq.and_then(crate::trace::SeqTrace::new).ok_or_else(|| TracedError::Failed("no sequence leaves".to_string()))?)
-        } else {
-            None
-        };
-        if g.text.trim().is_empty() {
-            return Err(TracedError::Failed("empty answer".to_string()));
-        }
-        Ok(Generated { text: truncate_answer(g.text, max_tokens), trace: Some(ResponseTrace { record, tokens: g.tokens, seq }) })
+        outcome
     }
 
     /// The opening of an audited response (bundle of its pieces), built on the card `gpu` that

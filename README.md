@@ -12,6 +12,14 @@ passed node 1.6.7's unmodified consensus verifier across the H16 boundary and
 reorgs. Solo testing accepted 1,016 pre-H16 blocks and recovered after two
 forced connection drops.
 
+**v0.16.7 large private prompts:** CUDA and Vulkan now use upstream v0.6.2's
+one-time context-overflow retry for traced requests, preserving the original
+request length and audit identity. Both pool and solo paths retain upstream's
+bounded compressed-prompt decoder. Pools should forward the original opened
+bytes and remove any obsolete 64 KiB limit on *inflated text*. Valid dispatches
+that cannot be served return error 46 when the pool supplies an id.
+[Prompt handling and pool integration](docs/PRIVATE_PROMPTS.md).
+
 **v0.16.6 AMD H16 repair:** each selected AMD GPU must pass its own Vulkan
 inference self-test before mining. Only the card serving an inference request
 or audit pauses; it resumes afterwards while other cards continue mining. The

@@ -4,7 +4,7 @@
 //! the POOL (its escrow key signs the coinbase), so a v3 pool opens the envelope itself, sends the
 //! plaintext prompt here, and seals + signs the answer it gets back. The miner never sees a key
 //! and nothing is published to IPFS.
-use super::statum_codec::{StratumCommand, StratumLine, StratumLinePayload};
+use super::statum_codec::{ErrorCode, StratumCommand, StratumLine, StratumLinePayload};
 use crate::Error;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
@@ -23,13 +23,19 @@ pub(super) struct TraceAsk {
 }
 
 impl TraceAsk {
-    fn parse(ext: &serde_json::Value) -> Result<Option<Self>, Error> {
+    fn parse(ext: &serde_json::Value, sent_len: usize) -> Result<Option<Self>, Error> {
         let Some(t) = ext.get("trace") else { return Ok(None) };
         if t.is_null() {
             return Ok(None);
         }
         let tier = t.get("tier").and_then(|v| v.as_u64()).filter(|v| *v < 16).ok_or("trace.tier missing")? as u8;
-        let prompt_len = t.get("prompt_len").and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok()).ok_or("trace.prompt_len missing")?;
+        // Upstream: omitted metadata defaults to the ORIGINAL opened bytes, never the inflated
+        // text. Clamp both forms to the consensus private-payload bound.
+        let limit = keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN as u32;
+        let prompt_len = match t.get("prompt_len") {
+            None => sent_len.min(limit as usize) as u32,
+            Some(v) => v.as_u64().and_then(|v| u32::try_from(v).ok()).ok_or("Invalid AI trace prompt length")?.min(limit),
+        };
         let chain = t.get("chain").and_then(|v| v.as_bool()).unwrap_or(true);
         let attention = t.get("attention").and_then(|v| v.as_bool()).unwrap_or(true);
         let upload = match t.get("upload").and_then(|v| v.as_str()) {
@@ -37,7 +43,7 @@ impl TraceAsk {
             Some(_) => return Err("trace.upload must be an http(s) URL".into()),
             None => None,
         };
-        Ok(Some(Self { tier, prompt_len, chain, attention, upload }))
+        Ok(Some(Self { tier, prompt_len, chain, attention: chain && attention, upload }))
     }
 }
 
@@ -62,10 +68,6 @@ impl AiRequest {
 
     /// [`parse`] with the optional 0.15.3 extension object.
     pub fn parse_ext(fields: (String, String, String, String, String, u32, String), ext: Option<&serde_json::Value>) -> Result<Self, Error> {
-        let trace = match ext {
-            Some(e) => TraceAsk::parse(e)?,
-            None => None,
-        };
         let (task_id, txid, request_hash, model_hex, prompt_b64, max_tokens, reward) = fields;
         if !task_id.eq_ignore_ascii_case(&request_hash) || max_tokens == 0 || max_tokens > i32::MAX as u32 {
             return Err("Invalid AI task metadata".into());
@@ -83,10 +85,14 @@ impl AiRequest {
         if raw.len() > MAX_PAYLOAD_BYTES {
             return Err("Invalid AI prompt".into());
         }
+        let trace = match ext {
+            Some(e) => TraceAsk::parse(e, raw.len())?,
+            None => None,
+        };
         // Since H14 an opened private prompt may be COMPRESSED (magic 00 4B 5A 01 + raw DEFLATE): a
         // pool forwards the opened bytes as they are, so inflate them exactly like the solo (gRPC)
         // path and upstream do (cut at 1 MiB; a broken stream yields its partial output, else the
-        // raw bytes; lossy UTF-8). The trace keeps the pool's `prompt_len`, the sealed length the
+        // raw bytes; lossy UTF-8). The trace keeps the pool's `prompt_len`, original opened length the
         // node sees, while the engine tokenizes the inflated text.
         let prompt = crate::client::grpc::decode_private_prompt(&raw);
         // The node accepts NUL bytes in a prompt. A traced (H15 network) answer tokenizes the full
@@ -108,8 +114,14 @@ impl AiRequest {
         h
     }
 
+    /// Upstream refuses an unservable dispatch with error 46, if it has an id. The pool can
+    /// immediately re-dispatch; this is not a mining share response or an empty AI answer.
+    pub fn refusal(&self, reply_id: Option<u32>, message: &str) -> Option<StratumLine> {
+        reply_id.map(|id| StratumLine::error_reply(id, ErrorCode::Busy, message))
+    }
+
     /// `mining.ai_response` with `params = [worker, task_id, request_hash, model_id_hex,
-    /// answer_base64]`. An empty answer is never sent (the pool re-dispatches on silence).
+    /// answer_base64]`. An empty answer is never sent; refusals use the original dispatch id.
     pub fn response(&self, id: u32, worker: String, result: &str) -> Result<StratumLine, Error> {
         self.response_traced(id, worker, result, None)
     }
@@ -321,6 +333,67 @@ mod tests {
         assert!(AiRequest::parse(fields_bytes(&nul)).is_err(), "untraced NUL refused after inflating too");
         let ext = serde_json::json!({"trace": {"tier": 0, "prompt_len": nul.len(), "chain": true, "attention": true}});
         assert_eq!(AiRequest::parse_ext(fields_bytes(&nul), Some(&ext)).unwrap().prompt.as_bytes(), b"before\0after");
+    }
+
+    #[test]
+    fn large_compressed_requests_keep_original_trace_length_and_pass_admission() {
+        for size in [74_739, 79_150, 70 * 1024, 100 * 1024, 250 * 1024, 500 * 1024, 1 << 20] {
+            let text = "x".repeat(size);
+            let packed = compressed(text.as_bytes());
+            let ext = serde_json::json!({"trace": {"tier": 3}});
+            let req = AiRequest::parse_ext(fields_bytes(&packed), Some(&ext)).unwrap();
+            assert_eq!(req.prompt, text);
+            assert_eq!(req.trace.unwrap().prompt_len as usize, packed.len(), "default is before inflate");
+            assert!(keryx_miner::slm::validate_private_inference_request(&req.prompt, 128, 0).is_ok());
+            let explicit = serde_json::json!({"trace": {"tier": 3, "prompt_len": 23_000}});
+            let req = AiRequest::parse_ext(fields_bytes(&packed), Some(&explicit)).unwrap();
+            assert_eq!(req.trace.unwrap().prompt_len, 23_000, "explicit node metadata is authoritative");
+        }
+    }
+
+    #[test]
+    fn trace_length_defaults_clamps_and_rejects_bad_metadata_like_upstream() {
+        let ext = serde_json::json!({"trace": {"tier": 0, "chain": false, "attention": true}});
+        let req = AiRequest::parse_ext(fields(&"x".repeat(70_000)), Some(&ext)).unwrap();
+        let trace = req.trace.unwrap();
+        assert_eq!(trace.prompt_len, 65_536);
+        assert!(!trace.attention, "attention requires chain");
+        for length in [0u64, 17, 65_536, 100_000, u32::MAX as u64] {
+            let ext = serde_json::json!({"trace": {"tier": 0, "prompt_len": length}});
+            assert_eq!(AiRequest::parse_ext(fields("small"), Some(&ext)).unwrap().trace.unwrap().prompt_len, length.min(65_536) as u32);
+        }
+        for length in [serde_json::Value::Null, serde_json::json!(-1), serde_json::json!(1u64 << 32), serde_json::json!("7"), serde_json::json!(1.5)] {
+            let ext = serde_json::json!({"trace": {"tier": 0, "prompt_len": length}});
+            assert!(AiRequest::parse_ext(fields("small"), Some(&ext)).is_err());
+        }
+    }
+
+    #[test]
+    fn upstream_byte_cap_precedes_lossy_utf8_expansion() {
+        let ext = serde_json::json!({"trace": {"tier": 0}});
+        let packed = compressed(&vec![0xFF; MAX_PAYLOAD_BYTES + 4096]);
+        let req = AiRequest::parse_ext(fields_bytes(&packed), Some(&ext)).unwrap();
+        assert_eq!(req.prompt, "\u{FFFD}".repeat(MAX_PAYLOAD_BYTES));
+        assert!(keryx_miner::slm::validate_private_inference_request(&req.prompt, 128, 0).is_ok());
+        // A valid multibyte prompt may end in a partial codepoint at the upstream byte cap.
+        let text = format!("xxx{}", "🙂".repeat(MAX_PAYLOAD_BYTES / 4));
+        let packed = compressed(text.as_bytes());
+        let req = AiRequest::parse_ext(fields_bytes(&packed), Some(&ext)).unwrap();
+        assert_eq!(req.prompt.len(), MAX_PAYLOAD_BYTES + 2);
+        assert!(req.prompt.ends_with('\u{FFFD}'));
+        assert!(keryx_miner::slm::validate_private_inference_request(&req.prompt, 128, 0).is_ok());
+    }
+
+    #[test]
+    fn refusal_uses_dispatch_id_and_upstream_busy_error_not_an_answer() {
+        let req = AiRequest::parse(fields("hello")).unwrap();
+        let wire = serde_json::to_value(req.refusal(Some(991), "model not ready").unwrap()).unwrap();
+        assert_eq!(wire["id"], 991);
+        assert!(wire["result"].is_null());
+        assert_eq!(wire["error"][0], 46);
+        assert_eq!(wire["error"][1], "model not ready");
+        assert!(wire.get("method").is_none());
+        assert!(req.refusal(None, "busy").is_none());
     }
 
     #[test]

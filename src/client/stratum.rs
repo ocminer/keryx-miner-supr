@@ -2249,17 +2249,9 @@ impl StratumHandler {
         }
     }
 
-    /// `mining.ai_request` (upstream 2cf7ab5, the H14 pool path): the pool opened the private
-    /// request with ITS escrow key and sends the plaintext prompt; we run it on a leased card
-    /// (only that card's walk pauses, like the challenge path) and return the answer inline as
-    /// `mining.ai_response`. The pool seals and signs it. Failures send nothing: an empty answer
-    /// is never a valid response and the pool re-dispatches.
-    ///
-    /// Busy (0.16.1): when the pool gave the request an `id` and every card that serves the model
-    /// is still running another inference after `ai_busy_wait_ms()`, the rig replies
-    /// `{"id":id,"result":null,"error":[46,"busy: …",null]}` so the pool can re-dispatch at once
-    /// instead of waiting out its deadline. Only this case is answered with an error; every other
-    /// refusal (model not served, invalid request, failed generation) stays silent as before.
+    /// Run the opened private request on a leased card; only that card pauses. As upstream
+    /// v0.6.2 does, valid but unservable dispatches receive error 46 on their original id, and
+    /// malformed requests receive error 20. A refusal is never an empty AI answer or a share ACK.
     async fn handle_ai_request(
         &mut self,
         pool_id: Option<u32>,
@@ -2270,6 +2262,9 @@ impl StratumHandler {
             Ok(request) => request,
             Err(error) => {
                 warn!("Invalid AI request from pool: {}", error);
+                if let Some(id) = pool_id {
+                    let _ = self.send_channel.send(StratumLine::error_reply(id, ErrorCode::Unknown, &error.to_string())).await;
+                }
                 return;
             }
         };
@@ -2278,9 +2273,17 @@ impl StratumHandler {
             keryx_miner::runtime_stats::record_inference_failed_request(
                 keryx_miner::runtime_stats::InferenceKind::PoolTask,
             );
+            if let Some(reply) = request.refusal(pool_id, "model not ready on this rig") {
+                let _ = self.send_channel.send(reply).await;
+            }
             return;
         }
-        if let Err(reason) = keryx_miner::slm::validate_inference_request(
+        let validate = if request.trace.is_some() {
+            keryx_miner::slm::validate_private_inference_request
+        } else {
+            keryx_miner::slm::validate_inference_request
+        };
+        if let Err(reason) = validate(
             &request.prompt,
             request.max_tokens,
             keryx_miner::slm::DEFAULT_INFERENCE_DEADLINE_MS,
@@ -2289,6 +2292,9 @@ impl StratumHandler {
             keryx_miner::runtime_stats::record_inference_failed_request(
                 keryx_miner::runtime_stats::InferenceKind::PoolTask,
             );
+            if let Some(reply) = request.refusal(pool_id, reason) {
+                let _ = self.send_channel.send(reply).await;
+            }
             return;
         }
         // H15 traced answer: the tier must be the model's own (its manifests define the trace).
@@ -2304,6 +2310,9 @@ impl StratumHandler {
                     t.chain
                 );
                 keryx_miner::runtime_stats::record_inference_failed_request(keryx_miner::runtime_stats::InferenceKind::PoolTask);
+                if let Some(reply) = request.refusal(pool_id, "traced request cannot be served on this rig") {
+                    let _ = self.send_channel.send(reply).await;
+                }
                 return;
             }
         }
@@ -2323,26 +2332,14 @@ impl StratumHandler {
             let Some(lease) = keryx_miner::slm::acquire_inference_card_async(&request.model_id, ai_busy_wait_ms()).await
             else {
                 runtime_attempt.busy();
-                // Busy only when cards for this model exist and all of them hold an inference
-                // lease. No eligible card at all is not "busy" and stays silent.
-                if keryx_miner::slm::has_inference_cards(&request.model_id) {
-                    match pool_id {
-                        Some(pid) => {
-                            warn!(
-                                "AI request {:.16}: all eligible cards busy with inference — replied busy (46) to pool",
-                                request.task_id
-                            );
-                            let _ = send_channel
-                                .send(StratumLine::error_reply(pid, ErrorCode::Busy, "busy: all eligible GPUs are running inference"))
-                                .await;
-                        }
-                        None => warn!(
-                            "AI request {:.16}: all eligible cards busy — not answered (request had no id, busy reply impossible)",
-                            request.task_id
-                        ),
-                    }
+                let reason = if keryx_miner::slm::has_inference_cards(&request.model_id) {
+                    "busy: all eligible GPUs are running inference"
                 } else {
-                    warn!("AI request {:.16}: no card serves this model any more — not answered", request.task_id);
+                    "no eligible card serves this model"
+                };
+                warn!("AI request {:.16}: {} (dispatch id {:?})", request.task_id, reason, pool_id);
+                if let Some(reply) = request.refusal(pool_id, reason) {
+                    let _ = send_channel.send(reply).await;
                 }
                 return;
             };
@@ -2382,11 +2379,17 @@ impl StratumHandler {
                 Ok(_) | Err(InferenceError::Failed) => {
                     warn!("AI request {:.16}: inference produced no answer", request.task_id);
                     runtime_attempt.failed();
+                    if let Some(reply) = request.refusal(pool_id, "inference failed to produce a traced answer") {
+                        let _ = send_channel.send(reply).await;
+                    }
                     return;
                 }
                 Err(InferenceError::Deferred(reason)) => {
                     info!("AI request {:.16}: GPU {} deferred ({})", request.task_id, gpu, reason);
                     runtime_attempt.busy();
+                    if let Some(reply) = request.refusal(pool_id, &reason.to_string()) {
+                        let _ = send_channel.send(reply).await;
+                    }
                     return;
                 }
             };
@@ -2455,6 +2458,9 @@ impl StratumHandler {
                 Err(error) => {
                     runtime_attempt.failed();
                     warn!("AI request {:.16}: {}", request.task_id, error);
+                    if let Some(reply) = request.refusal(pool_id, "could not encode inference response") {
+                        let _ = send_channel.send(reply).await;
+                    }
                 }
             }
         });

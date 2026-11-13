@@ -1,3 +1,31 @@
+# Keryx Miner Supr v0.16.7 — large private-prompt compatibility
+
+- Port upstream keryx-miner v0.6.2-PoM's traced context-overflow retry to both
+  CUDA and Vulkan. Try the full decoded prompt first; only a context overflow
+  can trigger one UTF-8-safe head/tail retry within the model's budget. Keep
+  the original prompt length, request prefix, serving card and audit trace.
+- Match upstream's optional `trace.prompt_len` default and consensus clamping:
+  count the original opened bytes before decompression, never inflated text.
+- Preserve upstream's 1 MiB DEFLATE byte cap before lossy UTF-8 conversion;
+  admit its bounded conversion expansion on private traced requests.
+- Reply explicitly to unservable pool dispatches using upstream error 46
+  (malformed requests: 20) when an id is supplied, so pools can redispatch.
+
+Pool operators must also remove obsolete 64 KiB decoded-text routing limits
+and forward the original opened bytes. v0.16.4 already introduced compressed
+pool-prompt decoding; v0.16.7 adds the retry and admission/refusal fixes.
+See [the integration contract](docs/PRIVATE_PROMPTS.md).
+
+H16 consensus, model weights, native engines, GPU mining kernels and per-card
+pause/proof requirements are unchanged. No new hashrate gain is claimed.
+Existing physical RDNA1, Windows GPU and ten-card qualification gaps remain;
+macOS retains its experimental Metal/H15/H16 limitations.
+
+Packages: Linux NVIDIA modern and legacy, Linux AMD, HiveOS, mmpOS, SMOS,
+Windows NVIDIA and AMD, macOS arm64, and Docker
+`ocminersupr/keryx-miner-supr:0.16.7` (`latest`). Licensing remains
+Source-Sharing License 1.0; upstream licenses and previous grants are preserved.
+
 # Keryx Miner Supr v0.16.6 — AMD Vulkan H16 and per-card inference
 
 - Fix AMD H16 mining after a successful Vulkan inference self-test. Workers no

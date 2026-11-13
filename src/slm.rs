@@ -56,8 +56,12 @@ macro_rules! classic_eprintln {
 /// inflates up to `MAX_DECOMPRESSED_PROMPT_LEN` (1 MiB, grpc.rs). A fixed 4 KiB limit refused every
 /// valid larger private prompt (pool field report 2026-10-09: real misses). Whether a prompt can be
 /// served is a property of the CARD (its model context), so the byte limit is now only the 1 MiB
-/// sanity bound and each engine refuses what does not fit its context (`GenerateError::PromptTooLong`).
+/// sanity bound for text RPCs. Private traced requests additionally allow the bounded expansion
+/// of upstream's lossy UTF-8 conversion; their engine applies the upstream context retry.
 pub const MAX_INFERENCE_PROMPT_BYTES: usize = 1 << 20;
+/// Upstream caps DEFLATE bytes BEFORE lossy UTF-8: each invalid byte can become U+FFFD (3 bytes).
+/// This is a post-decoder allocation bound, not a larger wire or decompression limit.
+pub const MAX_PRIVATE_PROMPT_UTF8_BYTES: usize = 3 * MAX_INFERENCE_PROMPT_BYTES;
 /// Prompts above this never reach the deprecated candle engines (their rotary tables stop at 4096
 /// tokens); it is the pre-H14 limit, so their behavior is unchanged.
 pub const LEGACY_ENGINE_PROMPT_BYTES: usize = 4 * 1024;
@@ -84,11 +88,29 @@ pub fn validate_inference_request(
     max_tokens: usize,
     deadline_ms: u64,
 ) -> std::result::Result<u64, &'static str> {
+    validate_inference_with_limit(prompt, max_tokens, deadline_ms, MAX_INFERENCE_PROMPT_BYTES)
+}
+
+/// Admission after the upstream private-prompt decoder, shared by Stratum and solo gRPC.
+pub fn validate_private_inference_request(
+    prompt: &str,
+    max_tokens: usize,
+    deadline_ms: u64,
+) -> std::result::Result<u64, &'static str> {
+    validate_inference_with_limit(prompt, max_tokens, deadline_ms, MAX_PRIVATE_PROMPT_UTF8_BYTES)
+}
+
+fn validate_inference_with_limit(
+    prompt: &str,
+    max_tokens: usize,
+    deadline_ms: u64,
+    byte_limit: usize,
+) -> std::result::Result<u64, &'static str> {
     if prompt.is_empty() {
         return Err("prompt is empty");
     }
-    if prompt.len() > MAX_INFERENCE_PROMPT_BYTES {
-        return Err("prompt exceeds 1 MiB");
+    if prompt.len() > byte_limit {
+        return Err("prompt exceeds its decoded UTF-8 limit");
     }
     if max_tokens == 0 {
         return Err("max_tokens must be at least 1");
@@ -3363,7 +3385,7 @@ pub fn try_load_and_run_traced_inference_on(
     max_tokens: usize,
     traced: crate::traced::Traced,
 ) -> std::result::Result<crate::traced::Generated, InferenceError> {
-    if let Err(reason) = validate_inference_request(prompt, max_tokens, DEFAULT_INFERENCE_DEADLINE_MS) {
+    if let Err(reason) = validate_private_inference_request(prompt, max_tokens, DEFAULT_INFERENCE_DEADLINE_MS) {
         log::warn!("Trace: rejected private request for GPU {}: {}", gpu, reason);
         return Err(InferenceError::Failed);
     }
@@ -4110,6 +4132,17 @@ mod inference_admission_tests {
         assert!(validate_inference_request("x", 0, 1).is_err());
         assert!(validate_inference_request("x", MAX_INFERENCE_TOKENS + 1, 1).is_err());
         assert!(validate_inference_request("x", 1, MAX_INFERENCE_DEADLINE_MS + 1).is_err());
+    }
+
+    #[test]
+    fn private_prompt_admission_allows_bounded_lossy_utf8_not_larger_wire_inputs() {
+        let text = "\u{FFFD}".repeat(MAX_INFERENCE_PROMPT_BYTES);
+        assert_eq!(text.len(), MAX_PRIVATE_PROMPT_UTF8_BYTES);
+        assert!(validate_private_inference_request(&text, 128, 0).is_ok());
+        assert!(validate_inference_request(&text, 128, 0).is_err(), "plain text RPC cap unchanged");
+        assert!(validate_private_inference_request(&(text + "x"), 128, 0).is_err());
+        assert!(validate_private_inference_request("x", MAX_INFERENCE_TOKENS + 1, 0).is_err());
+        assert!(validate_private_inference_request("x", 128, MAX_INFERENCE_DEADLINE_MS + 1).is_err());
     }
 
     #[test]

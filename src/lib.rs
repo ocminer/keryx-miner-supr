@@ -48,6 +48,7 @@ pub(crate) mod vulkan_trace_seq;
 pub mod trace_store;
 /// Prompt bytes for the engines' traced-generation C ABI (NUL-safe, explicit lengths).
 pub mod prompt_ffi;
+pub(crate) mod prompt_retry;
 /// 0.15.3: traced H15 private answers + openings (CUDA in-process engine; refused elsewhere).
 pub mod traced;
 pub mod block_task;
