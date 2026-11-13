@@ -455,13 +455,16 @@ jobs:
       # cuRAND (link import libs + headers). Install everything to be safe.
       - name: Install CUDA toolkit (full)
         id: cuda
+        timeout-minutes: 12
         uses: Jimver/cuda-toolkit@v0.2.24   # settled action version; has CUDA 12.8.1 (first with sm_120)
         with:
           cuda: '12.8.1'
           method: 'network'
           # Newer CUDA network installs reject a bare "full" fetch — pin the components candle-CUDA
           # (cudart/cublas/curand/nvrtc + dev import libs) and the llama.cpp nvcc build need.
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev", "thrust", "visual_studio_integration"]'
+          # nvcc builds the Rust/CUDA frontend directly. IDE registration can hang in
+          # devenv on hosted runners; only a native DLL cache miss needs MSBuild integration.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev", "thrust"]'
 
       # nvcc (candle-kernels) needs the MSVC host compiler cl.exe on PATH.
       - name: Set up MSVC (cl.exe in PATH)
@@ -494,6 +497,15 @@ jobs:
         id: cuda_engine_cache
         shell: pwsh
         run: python .github/scripts/restore-windows-cuda-engine.py
+
+      - name: Install CUDA MSBuild integration only for native DLL rebuild
+        if: steps.cuda_engine_cache.outputs.hit != 'true'
+        timeout-minutes: 12
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.8.1'
+          method: 'network'
+          sub-packages: '["visual_studio_integration"]'
 
       - name: Build keryx-llama.dll (in-process llama.cpp engine)
         if: steps.cuda_engine_cache.outputs.hit != 'true'
