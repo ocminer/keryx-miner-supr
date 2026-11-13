@@ -285,9 +285,11 @@ jobs:
           @"
           keryx-miner-supr — Windows AMD (OpenCL mining + Vulkan GPU inference)
 
-          H15 mining and verifiable inference use Vulkan on the same AMD card.
-          The miner pauses mining for an inference request or audit replay, then resumes.
-          A separate GPU does not need to be reserved for inference.
+          H16 mining and traced inference share a resident model on each AMD card.
+          Only the card serving a request or audit pauses, then resumes mining.
+          Every selected card must pass its own Vulkan inference self-test.
+          RX 5600/5700 compatibility is experimental pending physical RDNA1 tests.
+          Windows GPU execution has not been qualified.
 
           Files:
             keryx-miner-supr.exe  - the miner
@@ -297,7 +299,7 @@ jobs:
 
           Keep every file in the same folder. Install a current AMD graphics driver; it
           provides both OpenCL.dll and the Vulkan loader/ICD. The model remains on the GPU
-          for OPoI inference. Deprecated CPU inference is not enabled automatically.
+          for inference. Each selected card requires its own working Vulkan route.
 
           EASIEST START: open start.bat in Notepad, replace REPLACE_ME with your
           keryx wallet address (and rename rig1 if desired), save, then double-click it.

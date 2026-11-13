@@ -54,10 +54,11 @@ chmod +x "$DEST/$NAME" "$DEST/run.sh"
 cat > "$DEST/RUN.txt" <<TXT
 keryx-miner-supr — AMD/OpenCL package (v${VERSION})
 
-H15: this AMD build mines and answers traced (verifiable) inference through
-the bundled Vulkan engine. Mining and inference share one resident model on the
-same card; mining pauses during a request and resumes afterward. RDNA1 cards
-are not supported for H15.
+H16: each selected AMD card mines and serves traced inference through its own
+bundled Vulkan engine. Only the serving card pauses for a request or audit and
+then resumes; other cards keep mining. Each card must pass its own self-test.
+RX 5600/5700 (RDNA1) uses an experimental compatibility path; physical RDNA1
+hardware has not yet been qualified. Install every file from this package.
 
 A KeryxHash miner for AMD GPUs (OpenCL). The binary dlopens libkeryxopencl.so
 for mining and the bundled libkeryx-llama-vk.so for required OPoI GPU inference.
@@ -76,7 +77,8 @@ Useful flags:
   --opencl-workload N     nonces-per-dispatch ratio. AUTO by default — picks a
                           capability-driven value per arch (gfx906 MI50 -> 2048,
                           gfx1102/RDNA3 -> 4096). Override only to tune.
-  --enable-cpu-inference  deprecated emergency-only inference fallback; normally omit.
+  Each selected card requires its own working Vulkan inference route.
+  Mining-only and CPU-inference substitutes do not qualify an AMD H16 worker.
 
 Historical pre-H15 PoM v4 pool measurements (tier-0 model): RX 7900 XTX gfx1100
 ~1.781 MH/s with its exact-tested one-state WMMA path; MI50 gfx906 ~0.521 MH/s
