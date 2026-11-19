@@ -1,3 +1,38 @@
+# Keryx Miner Supr v0.16.8 — faster AMD H16 mining
+
+- AMD Vulkan walk: each step now finds its 1 KiB tile through a small bucket
+  table (one load and a short scan) instead of a binary search over the
+  tensor table. At start-up every card cross-checks the new lookup against
+  the previous search on its own model and keeps the search if they differ.
+- AMD Vulkan walk: one exact modulo per step (context pad or weights) instead
+  of computing both.
+- Linux AMD: the per-card dispatch tuner also tries 16384 and 32768 nonces per
+  launch, still bounded to 20 ms per launch. Windows keeps its previous bound.
+
+Measured against v0.16.7 on the same card, power limit and tier-0 model,
+matched before/after/after/before runs of 120 s (MH/s):
+
+| GPU | Power limit | v0.16.7 | v0.16.8 | Change |
+|---|---|---:|---:|---:|
+| RX 7900 XTX | 350 W | 1.225 | 1.502 | **+22.6%** |
+| RX 7600 XT | 155 W | 0.442 | 0.506 | **+14.6%** |
+| Instinct MI50 | 150 W | 0.439 | 0.461 | **+5.0%** |
+
+The MI50 runs were shortened to 65-105 s by the test's temperature limit.
+Larger tiers gain similarly on the development build (RX 7900 XTX tiers 1-3,
+RX 7600 XT tiers 1-2). Results depend on cooling, power limit and driver.
+
+`KERYX_VK_V5_BUCKET=0` restores the table search. The RDNA1 descriptor path,
+NVIDIA kernels, H16 consensus, model weights, inference, custody and per-card
+pause/proof requirements are unchanged; NVIDIA native engines are identical to
+v0.16.7. Existing physical RDNA1, Windows GPU and ten-card qualification gaps
+remain; macOS retains its experimental Metal/H15/H16 limitations.
+
+Packages: Linux NVIDIA modern and legacy, Linux AMD, HiveOS, mmpOS, SMOS,
+Windows NVIDIA and AMD, macOS arm64, and Docker
+`ocminersupr/keryx-miner-supr:0.16.8` (`latest`). Licensing remains
+Source-Sharing License 1.0; upstream licenses and previous grants are preserved.
+
 # Keryx Miner Supr v0.16.7 — large private-prompt compatibility
 
 - Port upstream keryx-miner v0.6.2-PoM's traced context-overflow retry to both

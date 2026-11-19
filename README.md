@@ -12,6 +12,14 @@ passed node 1.6.7's unmodified consensus verifier across the H16 boundary and
 reorgs. Solo testing accepted 1,016 pre-H16 blocks and recovered after two
 forced connection drops.
 
+**v0.16.8 faster AMD mining:** the AMD Vulkan H16 walk resolves tile addresses
+through a self-checked bucket table, computes one modulo per step and may use
+larger dispatches on Linux. Measured against v0.16.7 at the same power limit:
+RX 7900 XTX 1.225 → 1.502 MH/s (**+22.6%**, 350 W), RX 7600 XT 0.442 → 0.506
+(**+14.6%**, 155 W), Instinct MI50 0.439 → 0.461 (**+5.0%**, 150 W). NVIDIA
+kernels and all consensus/inference behaviour are unchanged.
+[Details](CHANGELOG.md).
+
 **v0.16.7 large private prompts:** CUDA and Vulkan now use upstream v0.6.2's
 one-time context-overflow retry for traced requests, preserving the original
 request length and audit identity. Both pool and solo paths retain upstream's
