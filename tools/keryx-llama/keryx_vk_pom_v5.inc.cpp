@@ -13,6 +13,7 @@ struct KeryxVkPad {
     uint32_t nonces_per_group = 8;
     uint32_t preferred_batch = 1024;
     bool tuned = false;
+    bool bucket_ok = true; // cleared when the bucket lookup is disabled or fails its exactness gate
 };
 
 struct PushPadFill {
@@ -120,15 +121,16 @@ static bool keryx_vk_pad_ensure(KeryxLlama* h, const uint64_t seed[4], uint64_t 
 
 // Pipelines belong to one model owner/card. Only exact candidates compete with
 // the established kernel, and a small timing difference retains that fallback.
-static bool keryx_vk_tune_v5(KeryxLlama* h, const PushWalkV5& job) {
+static bool keryx_vk_tune_v5(KeryxLlama* h, PushWalkV5& job) {
     if (h->device_failed) return false;
     auto& pad = *h->pad;
     if (pad.tuned) return !h->device_failed;
-    if (h->descriptor_memory) { pad.tuned=true; return true; } // no BDA/matrix candidates on RDNA1
+    { const char* e = getenv("KERYX_VK_V5_BUCKET"); if (e && e[0]=='0') { pad.bucket_ok=false; job.reserved=0; } }
+    if (h->descriptor_memory) { pad.bucket_ok=false; job.reserved=0; pad.tuned=true; return true; } // no BDA/matrix candidates on RDNA1
     const char* mode = getenv("KERYX_VK_V5_MODE");
     const char* dot = getenv("KERYX_VK_V5_DOT");
     if ((mode && (strcmp(mode,"sp")==0 || strcmp(mode,"0")==0)) ||
-        (!mode && dot && strcmp(dot,"0")==0)) { pad.tuned = true; return true; }
+        (!mode && dot && strcmp(dot,"0")==0)) { pad.bucket_ok=false; job.reserved=0; pad.tuned = true; return true; }
     VkPhysicalDeviceSubgroupSizeControlProperties control{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -178,6 +180,23 @@ static bool keryx_vk_tune_v5(KeryxLlama* h, const PushWalkV5& job) {
     bool ok = true;
     PushWalkV5 check=job; check.walk.batch=1027;
     check.walk.t[0]=check.walk.t[1]=check.walk.t[2]=~0ULL; check.walk.t[3]=~0ULL>>9;
+    // The bucket lookup must reproduce the binary search on this card and model
+    // before any kernel uses it; otherwise every kernel keeps the search.
+    if (job.reserved) {
+        PushWalkV5 plain=check; plain.reserved=0;
+        for (unsigned round=0;round<48 && ok && job.reserved;++round) {
+            plain.walk.start_nonce=check.walk.start_nonce=job.walk.start_nonce+0xb0c0000000000ULL+round*1027ULL*104729ULL;
+            if (round>=24) { plain.walk.t[3]=check.walk.t[3]=~0ULL>>(9+(round&3)); }
+            uint32_t want, got;
+            if (!run(choices[0],plain,want) || !run(choices[0],check,got)) { ok=false; break; }
+            if (want!=got) {
+                KERYX_LOG_WARN("keryx-llama-vk: v5 bucket lookup failed exactness on device %zu; retaining the table search\n",h->gpu);
+                pad.bucket_ok=false; job.reserved=0; check.reserved=0;
+            }
+        }
+        check.walk.t[3]=~0ULL>>9;
+        if (ok && job.reserved) KERYX_LOG_INFO("keryx-llama-vk: v5 bucket lookup cross-checked on device %zu (%u tiles/bucket)\n",h->gpu,1u<<(h->bucket_code-1));
+    }
     for (unsigned round=0;round<8 && ok && choices.size()>1;++round) {
         check.walk.start_nonce=job.walk.start_nonce+0x5eed00000000ULL+round*1027ULL*7919ULL;
         uint32_t reference;
@@ -220,10 +239,15 @@ static bool keryx_vk_tune_v5(KeryxLlama* h, const PushWalkV5& job) {
     // batches can leave a large GPU underfilled and spend unnecessary CPU time
     // submitting fences. Keep each selected launch below 20 ms.
     if (ok && usable) {
-        const uint32_t sizes[] = {1024,4096,8192};
-        double seconds[3]{};
-        for (unsigned round=0;round<4 && ok;++round) for (unsigned pos=0;pos<3;++pos) {
-            const unsigned i=(round&1)?2-pos:pos;
+#ifdef _WIN32
+        const unsigned n_sizes = 3; // WDDM: keep the established bound
+#else
+        const unsigned n_sizes = 5;
+#endif
+        const uint32_t sizes[] = {1024,4096,8192,16384,32768};
+        double seconds[5]{};
+        for (unsigned round=0;round<4 && ok;++round) for (unsigned pos=0;pos<n_sizes;++pos) {
+            const unsigned i=(round&1)?n_sizes-1-pos:pos;
             timed.walk.batch=sizes[i]; uint32_t unused;
             if (!run(choices[best],timed,unused)) {ok=false;break;}
             const auto start=std::chrono::steady_clock::now();
@@ -231,8 +255,9 @@ static bool keryx_vk_tune_v5(KeryxLlama* h, const PushWalkV5& job) {
             seconds[i]+=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
         }
         double rate=0;
-        if (ok) for(unsigned i=0;i<3;++i) {
+        if (ok) for(unsigned i=0;i<n_sizes;++i) {
             const double elapsed=seconds[i]/4.0, candidate=sizes[i]/elapsed;
+            KERYX_LOG_INFO("keryx-llama-vk: v5 device %zu dispatch %u: %.3f ms\n",h->gpu,sizes[i],elapsed*1000.0);
             if(elapsed>0 && elapsed<=0.020 && candidate>rate*1.005) {
                 pad.preferred_batch=sizes[i];rate=candidate;
             }
@@ -269,7 +294,7 @@ void keryx_llama_pom_release_pad(KeryxLlama* h) {
 int64_t keryx_llama_pom_mine_v5(KeryxLlama* h, const uint64_t p[4], const uint64_t s[4], const uint64_t t[4],
                                uint64_t timestamp, uint64_t start_nonce, uint32_t batch,
                                const uint64_t pad_seed[4], uint64_t pad_tiles) {
-    if (!h || !h->walk_ready || !p || !s || !t || !pad_seed || !batch || batch > 8192 || !pad_tiles) return -2;
+    if (!h || !h->walk_ready || !p || !s || !t || !pad_seed || !batch || batch > 32768 || !pad_tiles) return -2;
     const uint64_t n_tiles = h->n_chunks / 32;
     if (!n_tiles || pad_tiles > UINT64_MAX / 256 || n_tiles > UINT64_MAX - pad_tiles) return -2;
     std::lock_guard<std::mutex> lock(h->walk_lock);
@@ -284,6 +309,7 @@ int64_t keryx_llama_pom_mine_v5(KeryxLlama* h, const uint64_t p[4], const uint64
         pv.pad_address = h->pad->address; pv.pad_tiles = pad_tiles;
         pv.pad_inverse = (~0ULL / pad_tiles) + (((~0ULL % pad_tiles) + 1 == pad_tiles) ? 1 : 0);
         pv.pad_steps = (uint32_t)std::max<uint64_t>(1, std::min<uint64_t>(255, (256 * pad_tiles + (n_tiles + pad_tiles) / 2) / (n_tiles + pad_tiles)));
+        pv.reserved = h->pad->bucket_ok ? h->bucket_code : 0;
         if (!keryx_vk_tune_v5(h, pv)) return -2;
         const uint32_t npg = h->pad->nonces_per_group;
         if (!run_dispatch(h, h->pad->walk_pipe, h->pad->walk_pl, h->walk_ds, &pv, sizeof(pv), (batch + npg - 1) / npg, h->winner_buf, true)) return -2;

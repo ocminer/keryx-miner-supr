@@ -207,6 +207,7 @@ struct KeryxLlama {
     void *winner_map = nullptr, *out32_map = nullptr;
 
     VkBuffer prefix_buf = VK_NULL_HANDLE, addrs_buf = VK_NULL_HANDLE;
+    uint32_t bucket_code = 0; // v5 tile-bucket table appended to the prefix buffer: shift + 1, 0 = absent
     VkDeviceMemory prefix_mem = VK_NULL_HANDLE, addrs_mem = VK_NULL_HANDLE;
     std::vector<std::pair<VkBuffer, VkDeviceMemory>> supplements;
 
@@ -662,6 +663,27 @@ static bool walk_init(KeryxLlama* h) {
     }
 
     h->weight_pages=h->pages.size();
+
+    // v5 bucket table: for every 2^shift tiles, the table entry (u16, four per u64) whose range
+    // holds the bucket's first chunk. The walk then finds a tile's entry with one table load and
+    // a short forward scan instead of a binary search. Appended after the n_tensors + 1 prefix
+    // words, so shaders that do not know it are unaffected.
+    h->bucket_code = 0;
+    if (!h->descriptor_memory && h->n_tensors > 1 && h->n_tensors < 65536) {
+        const uint64_t n_tiles = h->n_chunks / 32;
+        uint32_t shift = 4;
+        while ((n_tiles >> shift) + 1 > (1u << 18)) ++shift;
+        const uint64_t buckets = (n_tiles >> shift) + 1;
+        const size_t first_word = prefix.size();
+        prefix.resize(first_word + (size_t)((buckets + 3) / 4), 0);
+        size_t entry = 0;
+        for (uint64_t b = 0; b < buckets; ++b) {
+            const uint64_t chunk = (b << shift) * 32;
+            while (entry + 1 < h->n_tensors && prefix[entry + 1] <= chunk) ++entry;
+            prefix[first_word + (size_t)(b / 4)] |= (uint64_t)entry << ((b & 3) * 16);
+        }
+        h->bucket_code = shift + 1;
+    }
 
     // Table + result buffers. The table is hot (binary-searched every gather) -> device-local.
     if (!make_buffer(h, prefix.size() * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,

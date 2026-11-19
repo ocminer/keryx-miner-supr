@@ -123,7 +123,7 @@ layout(push_constant) uniform Push {
     uint64_t n_pad;
     uint64_t pad_inv;
     uint     k_pad;
-    uint     pad1;
+    uint     bucket;   // tile-bucket table after the prefix words: shift + 1, 0 = absent
 #endif
 } pc;
 
@@ -377,6 +377,17 @@ void b3_hash_pair(uint in_base, uint out_base) {
 // wide arithmetic lives in the buffer_reference POINTER, never the index.
 uint locate_chunk(uint64_t c, bool lds_table, out uint64_t base) {
     if (N_TENSORS == 1u) { base = 0UL; return 0u; }
+#ifdef POM_V5
+    if (pc.bucket != 0u) {
+        // Entry holding the first chunk of this tile's bucket, then a short forward scan.
+        const uint b = uint(c >> (4u + pc.bucket));
+        const uint64_t packed = PREFIX.prefix[N_TENSORS + 1u + (b >> 2)];
+        uint at = uint(packed >> ((b & 3u) * 16u)) & 0xFFFFu;
+        while (PREFIX.prefix[at + 1u] <= c) ++at;
+        base = PREFIX.prefix[at];
+        return at;
+    }
+#endif
     uint lo = 0u, hi = N_TENSORS; // invariant: prefix[lo] <= c < prefix[hi]
     if (lds_table) {
         while (hi - lo > 1u) {
@@ -454,7 +465,11 @@ void load_chunk(uint64_t c, uint dst_base, bool lds_table) {
 // Mirror the prefix table into shared memory (uniform decision per dispatch; every lane must
 // take part — called before any barrier-dependent work).
 bool mirror_prefix_table(uint lid, uint group_size) {
+#ifdef POM_V5
+    const bool lds_table = pc.bucket == 0u && N_TENSORS + 1u <= PREFIX_LDS_MAX;
+#else
     const bool lds_table = N_TENSORS + 1u <= PREFIX_LDS_MAX;
+#endif
     if (lds_table) {
         for (uint i = lid; i <= N_TENSORS; i += group_size) prefix_lds[i] = PREFIX.prefix[i];
         memoryBarrierShared();

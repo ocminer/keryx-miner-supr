@@ -18,7 +18,7 @@ impl Api {
         if tiles == 0 { return Err("PoM v5: zero context-pad tiles".into()); }
         let sub_max = std::env::var("KERYX_VK_V5_SUB_DISPATCH").ok().and_then(|s| s.parse::<u64>().ok())
             .unwrap_or_else(|| self.preferred_batch.map_or(1024, |batch| unsafe { batch(model) as u64 }))
-            .clamp(8, 8192);
+            .clamp(8, 32768);
         let mut done = 0;
         while done < batch {
             if stop() { break; }
