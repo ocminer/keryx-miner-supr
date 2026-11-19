@@ -734,8 +734,10 @@ void main() {
             [[unroll]] for(uint w=0u;w<8u;++w) sf=mix64(sf^uint64_t(cm_tile[w]));
             const uint64_t raw=mix64(seed^(uint64_t(step+1u)*V4_OFFSET_STEP_SALT)^sf^h);
             const bool pad_step=((step+1u)*pc.k_pad)>>8 != (step*pc.k_pad)>>8;
-            const uint64_t pr=raw-mulhi64(raw,pc.pad_inv)*pc.n_pad;
-            off=pad_step?pc.n_tiles+(pr>=pc.n_pad?pr-pc.n_pad:pr):mod_tiles(raw);
+            // One exact reduction by whichever modulus this step uses.
+            const uint64_t mn=pad_step?pc.n_pad:pc.n_tiles;
+            const uint64_t mr=raw-mulhi64(raw,pad_step?pc.pad_inv:pc.n_tiles_inv)*mn;
+            off=(pad_step?pc.n_tiles:0UL)+(mr>=mn?mr-mn:mr);
         }
         coopmat<int8_t,gl_ScopeSubgroup,16,16,gl_MatrixUseA> A[2][2];
         coopmat<int8_t,gl_ScopeSubgroup,16,16,gl_MatrixUseB> B[2][2];
@@ -1059,8 +1061,9 @@ void main() {
 #endif
             const uint64_t raw = mix64(seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf ^ state_fold);
             const bool pad_step = ((step + 1u) * pc.k_pad) / 256u != (step * pc.k_pad) / 256u;
-            const uint64_t pr = raw - mulhi64(raw, pc.pad_inv) * pc.n_pad;
-            off = pad_step ? pc.n_tiles + (pr >= pc.n_pad ? pr - pc.n_pad : pr) : mod_tiles(raw);
+            const uint64_t mn = pad_step ? pc.n_pad : pc.n_tiles;
+            const uint64_t mr = raw - mulhi64(raw, pad_step ? pc.pad_inv : pc.n_tiles_inv) * mn;
+            off = (pad_step ? pc.n_tiles : 0UL) + (mr >= mn ? mr - mn : mr);
 #else
             off = mod_tiles(mix64(seed ^ (uint64_t(step + 1u) * V4_OFFSET_STEP_SALT) ^ sf));
 #endif
